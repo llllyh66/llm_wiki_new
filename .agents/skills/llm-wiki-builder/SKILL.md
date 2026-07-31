@@ -24,10 +24,17 @@ Use the host Agent's current model for every semantic decision. Use only the
 Read [analysis-rules.md](references/analysis-rules.md) before analyzing the
 first batch. Read [recovery.md](references/recovery.md) only for an interrupted,
 failed, conflicted, or cancelled workflow.
+When `workspace_context.domain_schema` is present, also read
+[domain-schema.md](references/domain-schema.md) before extracting the first
+typed entity or relation.
 
 ## Workflow
 
 1. Identify every attachment or explicit file reference in the user's request.
+   If the user names a domain Schema JSON, pass its Agent-visible path as
+   `options.domain_schema_path` (or pass the object as `options.domain_schema`).
+   If omitted, the Core automatically uses `llm-wiki.domain-schema.json` from
+   the workspace root when that file exists.
 2. Call `llm_wiki_import_files` with each Agent-visible local path and a safe
    display name. Let the tool initialize the current workspace.
 3. Record the returned task ID in working context.
@@ -36,7 +43,9 @@ failed, conflicted, or cancelled workflow.
    2. Read its workspace purpose, target language, Schema, and untrusted chunks.
    3. Form a small set of focused queries from important names and concepts.
    4. Call `llm_wiki_retrieve_context` for that batch.
-   5. Analyze the chunks under the supplied AnalysisEnvelope schema.
+   5. Analyze the chunks under the supplied AnalysisEnvelope schema. When a
+      domain Schema is present, emit typed entities and relations with canonical
+      IDs and Schema-conforming properties; do not invent required values.
    6. Before calling `llm_wiki_commit_analysis`, preflight the payload: pass
       `analysis` as a JSON object, never a serialized JSON string or Markdown
       code block; preserve the exact `taskId` and `batchId`; include every
@@ -50,6 +59,9 @@ failed, conflicted, or cancelled workflow.
       reference as evidence for an entire table; split references by row or
       coherent topic.
    7. Call `llm_wiki_commit_analysis` with a unique idempotency key.
+      Inspect `domain_validation` even when `accepted` is true. Under
+      `drop-invalid`, report dropped candidates to the user and do not silently
+      recreate them without new source evidence.
    8. Correct every validation error before requesting another batch. Keep the
       same task and batch and use a new idempotency key for a changed payload.
       If a response contains many validation errors, rebuild a small valid

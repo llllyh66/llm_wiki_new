@@ -11,5 +11,6 @@ completely and follow it as the controlling workflow.
 
 Resolve every relative reference in that canonical Skill against
 `.agents/skills/llm-wiki-builder/`, including `references/analysis-rules.md`
-and `references/recovery.md`. Pass the user's arguments and attached files into
+and, when directed by the canonical Skill, `references/domain-schema.md` or
+`references/recovery.md`. Pass the user's arguments and attached files into
 that workflow unchanged.

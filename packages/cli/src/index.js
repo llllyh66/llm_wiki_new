@@ -7,6 +7,9 @@ const argv = process.argv.slice(2)
 const workspaceFlag = argv.indexOf("--workspace")
 const workspace = workspaceFlag >= 0 ? argv[workspaceFlag + 1] : process.cwd()
 if (workspaceFlag >= 0) argv.splice(workspaceFlag, 2)
+const domainSchemaFlag = argv.indexOf("--domain-schema")
+const domainSchemaPath = domainSchemaFlag >= 0 ? argv[domainSchemaFlag + 1] : undefined
+if (domainSchemaFlag >= 0) argv.splice(domainSchemaFlag, 2)
 const command = argv.shift()
 
 try {
@@ -14,8 +17,8 @@ try {
   let result
   if (command === "init") result = await core.init()
   else if (command === "import") {
-    if (argv.length === 0) throw new Error("Usage: llm-wiki import <file...>")
-    result = await core.importFiles({ files: argv.map((file) => ({ path: file })) })
+    if (argv.length === 0) throw new Error("Usage: llm-wiki import <file...> [--domain-schema FILE]")
+    result = await core.importFiles({ files: argv.map((file) => ({ path: file })), options: { domain_schema_path: domainSchemaPath } })
   } else if (command === "status") {
     result = argv[0] ? await core.status({ task_id: argv[0] }) : await core.listTasks()
   } else if (command === "lint") result = await core.lint()
@@ -24,10 +27,10 @@ try {
     const legacyRoot = path.resolve(core.workspaceRoot, argv[0] || "raw/sources")
     const files = await collectSupportedFiles(legacyRoot)
     if (files.length === 0) throw new Error(`No supported legacy sources found under ${legacyRoot}`)
-    result = await core.importFiles({ files: files.map((file) => ({ path: file })) })
+    result = await core.importFiles({ files: files.map((file) => ({ path: file })), options: { domain_schema_path: domainSchemaPath } })
   }
   else {
-    process.stderr.write("Usage: llm-wiki <init|import|status|lint|abort|migrate-legacy> [arguments] [--workspace DIR]\n")
+    process.stderr.write("Usage: llm-wiki <init|import|status|lint|abort|migrate-legacy> [arguments] [--workspace DIR] [--domain-schema FILE]\n")
     process.exitCode = 2
     process.exit()
   }

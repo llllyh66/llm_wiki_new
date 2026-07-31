@@ -14,6 +14,7 @@ export function taskPaths(workspacePaths, taskId) {
     idempotency: path.join(root, "idempotency.json"),
     commits: path.join(root, "commits.json"),
     result: path.join(root, "result.json"),
+    domainSchema: path.join(root, "domain-schema.json"),
   }
 }
 
@@ -40,6 +41,7 @@ export async function createTask(workspace, sources, options = {}) {
     pagePlanRevision: 0,
     commitRevision: 0,
     retryCount: 0,
+    ...(options.domainSchema ? { domainSchema: options.domainSchema.metadata } : {}),
     options: {
       targetLanguage: options.targetLanguage ?? workspace.config.targetLanguage,
       maxChunkChars: workspace.config.limits.maxChunkChars,
@@ -49,6 +51,7 @@ export async function createTask(workspace, sources, options = {}) {
       enableGraph: true,
     },
   }
+  if (options.domainSchema) await writeJsonAtomic(paths.domainSchema, options.domainSchema.schema)
   await writeJsonAtomic(paths.task, task)
   await writeJsonAtomic(paths.batches, batches)
   await writeJsonAtomic(paths.idempotency, {})

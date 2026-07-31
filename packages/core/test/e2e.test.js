@@ -3,7 +3,10 @@ import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
+import { fileURLToPath } from "node:url"
 import { LlmWikiCore, LlmWikiError } from "../src/index.js"
+
+const domainSchemaPath = fileURLToPath(new URL("../../../llm-wiki.domain-schema.json", import.meta.url))
 
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-core-"))
@@ -175,6 +178,98 @@ test("grounding quality gate rejects a title-only SourceRef reused for many unre
       && error.details.validation_errors.some((message) => message.includes("reused by 12 grounded candidates")),
   )
   assert.equal((await f.core.status({ task_id: imported.task_id })).status, "prepared")
+})
+
+test("domain schema is snapshotted, exposed to the Agent, and normalizes or drops typed candidates", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const domainSource = path.join(f.incoming, "domain-record.md")
+  await writeFile(domainSource, "# 业务记录\n\n客户 C-001（张三）拥有产品 O-100（家庭宽带）。\n")
+  const imported = await f.core.importFiles({
+    files: [{ path: domainSource }],
+    options: { domain_schema_path: domainSchemaPath },
+  })
+  assert.equal(imported.domain_schema.schema_id, "your-domain-schema")
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  assert.equal(batch.workspace_context.domain_schema.policy.validationFailurePolicy, "drop-invalid")
+  assert.equal(batch.workspace_context.domain_schema.entityTypes.length, 3)
+  const chunk = batch.chunks[0]
+  const sourceRef = {
+    sourceId: chunk.sourceId,
+    chunkId: chunk.chunkId,
+    quote: "客户 C-001（张三）拥有产品 O-100（家庭宽带）。",
+    locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
+  }
+  const analysis = {
+    schemaVersion: 1,
+    taskId: imported.task_id,
+    batchId: batch.batch_id,
+    sourceRefs: [sourceRef],
+    entities: [
+      { local_id: "subject-1", name: "张三", entityType: "客户", properties: { "主体编号": "C-001", "主体名称": "张三" }, sourceRefs: [0] },
+      { localId: "object-1", name: "家庭宽带", entityTypeId: "business_object", properties: { object_id: "O-100", object_name: "家庭宽带" }, sourceRefs: [0] },
+      { localId: "event-1", name: "订购事件", entityTypeId: "business_event", properties: { event_id: "E-001" }, sourceRefs: [0] },
+      { localId: "unknown-1", name: "未知", entityTypeId: "unknown_type", properties: {}, sourceRefs: [0] },
+    ],
+    concepts: [],
+    claims: [],
+    relations: [
+      {
+        local_id: "owns-1",
+        name: "拥有",
+        content: "客户 C-001（张三）拥有产品 O-100（家庭宽带）。",
+        relationType: "业务主体拥有业务对象",
+        sourceLocalId: "subject-1",
+        targetLocalId: "object-1",
+        properties: {},
+        sourceRefs: [0],
+      },
+      {
+        localId: "affects-1",
+        name: "影响",
+        content: "客户 C-001（张三）拥有产品 O-100（家庭宽带）。",
+        relationTypeId: "event_affects_object",
+        sourceEntityLocalId: "event-1",
+        targetEntityLocalId: "object-1",
+        properties: {},
+        sourceRefs: [0],
+      },
+    ],
+    contradictions: [],
+    candidatePages: [],
+    reviewItems: [],
+    batchSummary: "客户拥有家庭宽带产品。",
+    unresolvedQuestions: [],
+  }
+  const committed = await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    analysis,
+    idempotency_key: "domain-schema-drop-invalid-v1",
+  })
+  assert.equal(committed.accepted, true)
+  assert.equal(committed.domain_validation.dropped_entities, 2)
+  assert.equal(committed.domain_validation.dropped_relations, 1)
+  assert.equal(committed.domain_validation.validation_error_count >= 3, true)
+  const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
+  assert.equal(plan.domain_schema.schemaId, "your-domain-schema")
+  assert.deepEqual(plan.analysis_summary.entities.map((item) => item.entityTypeId), ["business_subject", "business_object"])
+  assert.deepEqual(plan.analysis_summary.entities[0].properties, { subject_id: "C-001", subject_name: "张三" })
+  assert.equal(plan.analysis_summary.relations.length, 1)
+  assert.equal(plan.analysis_summary.relations[0].relationTypeId, "subject_owns_object")
+})
+
+test("invalid domain schema is rejected before a task is created", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  await assert.rejects(
+    () => f.core.importFiles({
+      files: [{ path: f.source }],
+      options: { domain_schema: { formatVersion: "1.0", schemaId: "broken" } },
+    }),
+    (error) => error instanceof LlmWikiError && error.code === "INVALID_DOMAIN_SCHEMA",
+  )
+  assert.equal((await f.core.listTasks()).tasks.length, 0)
 })
 
 test("Markdown attachment completes the model-free vertical slice", async (t) => {

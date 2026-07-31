@@ -168,6 +168,41 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
 
 相同内容会按 SHA-256 自动去重；同名文件内容改变后会被当作新版本处理。
 
+## 按领域 Schema 抽取
+
+仓库根目录的 `llm-wiki.domain-schema.json` 是当前默认领域 Schema。
+导入时 Core 会先校验它，再把一份不可变快照保存到当前任务中；
+因此任务进行期间修改原 Schema 不会改变已创建任务的抽取契约。
+
+直接告诉 Claude：
+
+```text
+/llm-wiki-builder 按 ./llm-wiki.domain-schema.json 的领域模型，
+从 ./data/业务记录.xlsx 抽取业务主体、业务对象、业务事件及关系，并生成 Wiki。
+```
+
+Agent 在 `entities` 中提交 `entityTypeId` 和 `properties`，在
+`relations` 中提交 `relationTypeId`、`sourceEntityLocalId` 和
+`targetEntityLocalId`。`compatible` 模式允许 Agent 使用中文名称或别名，
+Core 会将它们规范化为 Schema 中的稳定 ID。
+
+当 `validationFailurePolicy` 为 `drop-invalid` 时：
+
+- 缺少必填属性、属性类型错误或使用未知类型的实体会被丢弃；
+- 指向已丢弃实体或端点类型不合法的关系会被丢弃；
+- 批次仍可成功提交，返回的 `domain_validation` 会列出原因和丢弃数量。
+
+必填值在源文档中缺失时，Agent 不应编造。如果希望“有任何违规就拒绝
+整批”，将策略改为 `"validationFailurePolicy": "reject-batch"`；该错误会以
+可恢复的 `accepted: false` 返回，不会断开 MCP。
+
+也可显式指定其他 Schema：
+
+```bash
+npm run cli -- import ./data/业务记录.xlsx \
+  --domain-schema ./schemas/telecom.json --workspace .
+```
+
 ### 恢复中断任务
 
 ```text
@@ -193,6 +228,7 @@ CLI 适合初始化、预处理、查询状态、校验和恢复，不负责语�
 npm run cli -- init --workspace .
 npm run cli -- import ./document.md --workspace .
 npm run cli -- import ./data/客户清单.xlsx --workspace .
+npm run cli -- import ./data/客户清单.xlsx --domain-schema ./schemas/customer.json --workspace .
 npm run cli -- status --workspace .
 npm run cli -- status <task-id> --workspace .
 npm run cli -- lint --workspace .

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
@@ -200,5 +200,50 @@ test("built MCP server survives errors and completes the full workflow over one 
   assert.equal(tasks.structuredContent.tasks.length, 1)
   const abort = await client.callTool({ name: "llm_wiki_abort", arguments: { task_id: taskId } })
   assert.equal(abort.structuredContent.changed, false)
+
+  // A domain-schema rejection is also a recoverable business result and must
+  // not disconnect the same long-lived MCP process.
+  const domainSchema = JSON.parse(await readFile(fileURLToPath(new URL("../../../llm-wiki.domain-schema.json", import.meta.url)), "utf8"))
+  domainSchema.policy.validationFailurePolicy = "reject-batch"
+  const domainSource = path.join(workspace, "domain.md")
+  await writeFile(domainSource, "# Domain\n\n客户 C-001 名为张三。\n")
+  const domainImported = await client.callTool({
+    name: "llm_wiki_import_files",
+    arguments: { files: [{ path: domainSource }], options: { domain_schema: domainSchema } },
+  })
+  const domainTaskId = domainImported.structuredContent.task_id
+  const domainBatch = await client.callTool({ name: "llm_wiki_get_batch", arguments: { task_id: domainTaskId } })
+  const domainChunk = domainBatch.structuredContent.chunks[0]
+  const domainRef = {
+    sourceId: domainChunk.sourceId,
+    chunkId: domainChunk.chunkId,
+    quote: "客户 C-001 名为张三。",
+    locator: { headingPath: domainChunk.headingPath, startOffset: domainChunk.startOffset, endOffset: domainChunk.endOffset },
+  }
+  const domainRejected = await client.callTool({
+    name: "llm_wiki_commit_analysis",
+    arguments: {
+      task_id: domainTaskId,
+      batch_id: domainBatch.structuredContent.batch_id,
+      idempotency_key: "stdio-domain-rejection-v1",
+      analysis: {
+        schemaVersion: 1,
+        taskId: domainTaskId,
+        batchId: domainBatch.structuredContent.batch_id,
+        sourceRefs: [domainRef],
+        entities: [{ localId: "subject-1", name: "张三", sourceRefs: [0] }],
+        concepts: [], claims: [], relations: [], contradictions: [], candidatePages: [], reviewItems: [],
+        batchSummary: "Invalid domain analysis.",
+        unresolvedQuestions: [],
+      },
+    },
+  })
+  assert.equal(domainRejected.isError, undefined)
+  assert.equal(domainRejected.structuredContent.accepted, false)
+  assert.equal(domainRejected.structuredContent.error.code, "INVALID_DOMAIN_ANALYSIS")
+  assert.equal(domainRejected.structuredContent.validation_errors.length > 0, true)
+  assert.equal((await client.listTools()).tools.length, 11)
+  const domainStatus = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: domainTaskId } })
+  assert.equal(domainStatus.structuredContent.status, "prepared")
   assert.equal((await client.listTools()).tools.length, 11)
 })

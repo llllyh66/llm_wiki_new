@@ -25,6 +25,10 @@
   values supplied by the Core.
 - Detect exact duplicates before proposing semantic aliases or merges.
 - Do not copy large passages from the source.
+- If a domain Schema is active, follow
+  [domain-schema.md](domain-schema.md) for typed entity properties and relation
+  endpoints. The domain contract supplements, rather than replaces, SourceRef
+  grounding.
 
 Minimal shape:
 

@@ -14,6 +14,8 @@ export const TOOL_DEFINITIONS = Object.freeze([
         target_language: { type: "string" },
         force_reanalyze: { type: "boolean" },
         max_batch_chars: { type: "number", minimum: 1000, maximum: 30000 },
+        domain_schema_path: { type: "string", description: "Agent-visible path to a domain extraction Schema JSON file. The validated Schema is snapshotted into the task." },
+        domain_schema: { type: "object", description: "Inline domain extraction Schema. Use this or domain_schema_path, not both." },
       }),
     }, ["files"]),
   },
@@ -35,7 +37,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
   },
   {
     name: "llm_wiki_commit_analysis",
-    description: "Normalize catalog-indexed SourceRefs, validate, and persist the host Agent's structured analysis for one batch. The Core never generates semantic analysis or invents evidence.",
+    description: "Normalize SourceRefs, enforce the task's optional domain entity/relation Schema, and persist the host Agent's structured analysis. Domain drop-invalid policy returns a validation report without failing the batch.",
     inputSchema: closedObject({ task_id: taskId, batch_id: { type: "string" }, analysis: { type: "object" }, idempotency_key: { type: "string", minLength: 8, maxLength: 200 } }, ["task_id", "batch_id", "analysis", "idempotency_key"]),
   },
   {

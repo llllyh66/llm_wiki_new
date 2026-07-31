@@ -29,6 +29,14 @@ The Agent automatically imports the attachments, initializes the local
 workspace, extracts knowledge, writes Wiki pages, updates indexes, and reports
 the result.
 
+If `llm-wiki.domain-schema.json` exists at the workspace root, imports also
+snapshot and enforce it as the entity/property/relation extraction contract.
+You can instead pass `options.domain_schema_path` or `options.domain_schema` to
+`llm_wiki_import_files`. Compatible mode resolves names and aliases to stable
+IDs; `drop-invalid` safely removes nonconforming candidates and reports them in
+`domain_validation`, while `reject-batch` returns a recoverable
+`INVALID_DOMAIN_ANALYSIS` result.
+
 No desktop application, separate HTTP server, project creation, Provider API
 key, or `raw/sources/` directory is required.
 
@@ -90,6 +98,7 @@ wiki/
   locks/
   journal/
 llm-wiki.schema.md
+llm-wiki.domain-schema.json # optional domain extraction contract
 ```
 
 Sources are content-addressed and deduplicated. Task, batch, analysis,
@@ -136,6 +145,7 @@ does not perform semantic extraction:
 ```bash
 npm run cli -- init --workspace .
 npm run cli -- import ./document.md --workspace .
+npm run cli -- import ./document.md --domain-schema ./schemas/domain.json --workspace .
 npm run cli -- status <task-id> --workspace .
 npm run cli -- lint --workspace .
 npm run cli -- abort <task-id> --workspace .

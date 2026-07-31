@@ -48,7 +48,7 @@ test("MCP router returns structured Core errors", async (t) => {
 })
 
 test("commit_analysis validation failures are recoverable business results, not MCP errors", async () => {
-  for (const code of ["INVALID_ANALYSIS", "INVALID_SOURCE_REF", "ANALYSIS_TOO_LARGE"]) {
+  for (const code of ["INVALID_ANALYSIS", "INVALID_DOMAIN_ANALYSIS", "INVALID_SOURCE_REF", "ANALYSIS_TOO_LARGE"]) {
     const router = new HeadlessToolRouter({
       commitAnalysis: async () => {
         throw new LlmWikiError(code, `Recoverable ${code}.`, { details: { validation_errors: ["fix this field"] } })
