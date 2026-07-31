@@ -80,11 +80,16 @@ export function validateSourceRefs(refs, task, batches, limits) {
     }
     if (ref.locator !== undefined) {
       if (!ref.locator || typeof ref.locator !== "object" || Array.isArray(ref.locator)) fail("INVALID_SOURCE_REF", "SourceRef locator must be an object.")
-      const { startOffset, endOffset, page, headingPath } = ref.locator
+      const { startOffset, endOffset, page, headingPath, sheetName, cellRange } = ref.locator
       if (startOffset !== undefined && (!Number.isInteger(startOffset) || startOffset < 0)) fail("INVALID_SOURCE_REF", "locator.startOffset must be a non-negative integer.")
       if (endOffset !== undefined && (!Number.isInteger(endOffset) || endOffset < 0 || (startOffset !== undefined && endOffset < startOffset))) fail("INVALID_SOURCE_REF", "locator.endOffset is invalid.")
       if (page !== undefined && (!Number.isInteger(page) || page < 1)) fail("INVALID_SOURCE_REF", "locator.page must be a positive integer.")
       if (headingPath !== undefined && (!Array.isArray(headingPath) || headingPath.some((part) => typeof part !== "string"))) fail("INVALID_SOURCE_REF", "locator.headingPath must be a string array.")
+      if (sheetName !== undefined && (typeof sheetName !== "string" || !sheetName.trim() || sheetName.length > 500)) fail("INVALID_SOURCE_REF", "locator.sheetName must be a non-empty bounded string.")
+      if (cellRange !== undefined && (typeof cellRange !== "string" || !/^[A-Z]{1,3}[1-9]\d*:[A-Z]{1,3}[1-9]\d*$/i.test(cellRange))) fail("INVALID_SOURCE_REF", "locator.cellRange must be an A1-style range.")
+      const structuredTables = Array.isArray(chunk.structuredData) ? chunk.structuredData : []
+      if (sheetName !== undefined && ![chunk.sheetName, ...structuredTables.map((table) => table.sheetName)].includes(sheetName)) fail("INVALID_SOURCE_REF", "locator.sheetName does not match the source chunk.")
+      if (cellRange !== undefined && ![chunk.cellRange, ...structuredTables.map((table) => table.cellRange)].includes(cellRange)) fail("INVALID_SOURCE_REF", "locator.cellRange does not match the source chunk.")
     }
   }
 }

@@ -74,7 +74,7 @@ Codex / OpenCode / Claude Code current model
 - [x] Phase 3: STDIO MCP server directly calling Core.
 - [x] Phase 4: shared Skill and Agent configuration examples.
 - [x] Phase 5: OpenCode and Claude Code use the same checked-in MCP command and shared Skill. Host-specific drag/drop remains a manual acceptance check.
-- [x] Phase 6: HTML, DOCX, PDF, structured DOCX tables, BM25, local feature-vector cosine, graph neighbors, and RRF.
+- [x] Phase 6: HTML, DOCX, XLSX, PDF, structured Office tables, BM25, local feature-vector cosine, graph neighbors, and RRF.
 - [x] Phase 7: desktop UI, Tauri, providers, desktop HTTP API, old MCP proxy, extension, assets, and desktop build/release inputs were physically removed after explicit user approval.
 - [x] Phase 8: Headless dependencies, package contents, CI, release workflow, README, Agent configuration, and residual-reference audit are complete. Three-host drag/drop remains an external manual acceptance check rather than a code migration item.
 
@@ -94,7 +94,7 @@ workspace; the retained audit above records their former responsibility map.
 
 ## Implemented Headless architecture
 
-- `packages/core`: workspace, source object store, Markdown/TXT/HTML/DOCX/PDF
+- `packages/core`: workspace, source object store, Markdown/TXT/HTML/DOCX/XLSX/PDF
   parsers, structural chunking, persisted tasks, BM25/vector/graph retrieval,
   SourceRef and path validation, optimistic hashes, staging/rollback/journal,
   Finalize, indexes, lint, status, list, and abort.

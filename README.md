@@ -93,11 +93,15 @@ idempotency, transaction, and final result state survive Agent session restarts.
 - Markdown and UTF-8 text
 - HTML, including normalized tables
 - DOCX, including table rows, headers, column spans, and vertical merge metadata
+- XLSX workbooks, including sheet names, A1 ranges, cached formula results,
+  merged cells, hidden rows/columns, and date normalization
 - PDF text layers with page-number SourceRef locators
 
-DOCX macros and embedded objects are never executed. PDF parsing disables
-dynamic evaluation and does not launch an external viewer. Scanned PDF OCR is a
-future parser adapter and is not silently treated as trustworthy text.
+DOCX macros and embedded objects are never executed. XLSX formulas are never
+evaluated, macros and external links are ignored, and only stored cell values
+are imported. Legacy `.xls` files must first be saved as `.xlsx`. PDF parsing
+disables dynamic evaluation and does not launch an external viewer. Scanned PDF
+OCR is a future parser adapter and is not silently treated as trustworthy text.
 
 ## Retrieval and writing safety
 

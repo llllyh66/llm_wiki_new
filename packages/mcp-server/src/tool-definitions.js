@@ -4,7 +4,7 @@ const closedObject = (properties, required = []) => ({ type: "object", propertie
 export const TOOL_DEFINITIONS = Object.freeze([
   {
     name: "llm_wiki_import_files",
-    description: "Import Agent-visible Markdown or TXT attachments into the current workspace's managed source store, parse and batch them, and create a resumable task. Initializes the workspace automatically.",
+    description: "Import Agent-visible supported documents, including XLSX workbooks, into the current workspace's managed source store, parse and batch them, and create a resumable task. Initializes the workspace automatically.",
     inputSchema: closedObject({
       files: {
         type: "array", minItems: 1, maxItems: 100,

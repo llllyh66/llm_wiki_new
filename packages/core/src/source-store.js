@@ -61,7 +61,10 @@ async function importOne(workspace, input, displayName) {
   if (!linkInfo.isFile()) fail("SOURCE_NOT_READABLE", "The attachment must be a regular file.")
   const extension = path.extname(displayName).toLowerCase() || path.extname(sourcePath).toLowerCase()
   const mediaType = SUPPORTED_SOURCE_TYPES[extension]
-  if (!mediaType) fail("UNSUPPORTED_FILE_TYPE", `Unsupported file type: ${extension || "unknown"}`)
+  if (!mediaType) {
+    if (extension === ".xls") fail("UNSUPPORTED_FILE_TYPE", "Legacy .xls workbooks are not supported; save the workbook as .xlsx and retry.")
+    fail("UNSUPPORTED_FILE_TYPE", `Unsupported file type: ${extension || "unknown"}`)
+  }
   if (linkInfo.size > workspace.config.limits.maxSourceBytes) {
     fail("SOURCE_TOO_LARGE", `Source exceeds the ${workspace.config.limits.maxSourceBytes}-byte workspace limit.`)
   }
@@ -127,7 +130,7 @@ async function importOne(workspace, input, displayName) {
         sizeBytes,
         importedAt: nowIso(),
         originalLocationHint: stripPrivateLocation(sourcePath),
-        parserVersion: "headless-document-v1",
+        parserVersion: "headless-document-v2",
         extractedDocumentPath: relativePosix(workspace.paths.root, documentPath),
         chunksPath: relativePosix(workspace.paths.root, chunksPath),
         extractionHash: sha256(parsed.markdown),

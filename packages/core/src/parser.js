@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url"
 import JSZip from "jszip"
 import { fail } from "./errors.js"
 import { sha256 } from "./utils.js"
+import { xlsxToMarkdown } from "./xlsx.js"
 
 export const SUPPORTED_SOURCE_TYPES = Object.freeze({
   ".md": "text/markdown",
@@ -12,17 +13,27 @@ export const SUPPORTED_SOURCE_TYPES = Object.freeze({
   ".html": "text/html",
   ".htm": "text/html",
   ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   ".pdf": "application/pdf",
 })
 
 export async function parseManagedSource(filePath, sourceId, mediaType, options = {}) {
   let content
   let tableMetadata = []
+  let documentMetadata = {}
   try {
     if (mediaType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
       const parsed = await docxToMarkdown(await readFile(filePath))
       content = parsed.markdown
       tableMetadata = parsed.tables
+    } else if (mediaType === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") {
+      const parsed = await xlsxToMarkdown(await readFile(filePath), {
+        fileName: path.basename(filePath),
+        maxTableChars: Math.max(1_000, (options.maxChunkChars ?? 8_000) - 500),
+      })
+      content = parsed.markdown
+      tableMetadata = parsed.tables
+      documentMetadata = parsed.metadata
     } else if (mediaType === "application/pdf") {
       content = await pdfToMarkdown(await readFile(filePath))
     } else {
@@ -43,14 +54,17 @@ export async function parseManagedSource(filePath, sourceId, mediaType, options 
   if (tableMetadata.length > 0) {
     let tableIndex = 0
     for (const block of blocks) {
-      if (block.kind === "table") block.mergedCells = tableMetadata[tableIndex++]?.mergedCells ?? []
+      if (block.kind !== "table") continue
+      const metadata = tableMetadata[tableIndex++] ?? {}
+      const { markdown: _markdown, ...structuredMetadata } = metadata
+      Object.assign(block, structuredMetadata)
     }
   }
   const document = {
     sourceId,
     title: inferTitle(normalized, path.basename(filePath)),
     mediaType,
-    metadata: {},
+    metadata: documentMetadata,
     blocks,
     media: [],
   }
@@ -264,7 +278,7 @@ function parseBlocks(content) {
         index += 1
         offset += size
       }
-      const rows = tableLines.map((row) => row.trim().slice(1, -1).split("|").map((cell) => cell.trim()))
+      const rows = tableLines.map(parseMarkdownTableRow)
       const hasDelimiter = rows[1]?.every((cell) => /^:?-{3,}:?$/.test(cell)) ?? false
       blocks.push({
         kind: "table",
@@ -289,6 +303,24 @@ function parseBlocks(content) {
   }
   flushParagraph()
   return blocks
+}
+
+function parseMarkdownTableRow(row) {
+  const value = row.trim().slice(1, -1)
+  const cells = []
+  let cell = ""
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index]
+    if (character === "\\" && value[index + 1] === "|") {
+      cell += "|"
+      index += 1
+    } else if (character === "|") {
+      cells.push(cell.trim())
+      cell = ""
+    } else cell += character
+  }
+  cells.push(cell.trim())
+  return cells
 }
 
 function chunkDocument(document, options) {
@@ -322,6 +354,11 @@ function chunkDocument(document, options) {
       tokenEstimate: Math.ceil(text.length / 4),
       contentHash: sha256(text),
     })
+    const structured = chunks.at(-1).structuredData ?? []
+    const sheetNames = [...new Set(structured.map((table) => table.sheetName).filter(Boolean))]
+    const cellRanges = [...new Set(structured.map((table) => table.cellRange).filter(Boolean))]
+    if (sheetNames.length === 1) chunks.at(-1).sheetName = sheetNames[0]
+    if (cellRanges.length === 1) chunks.at(-1).cellRange = cellRanges[0]
     pending = []
     pendingKinds = []
     pendingStart = undefined

@@ -50,6 +50,91 @@ test("DOCX tables retain headers, rows, and merge metadata without executing act
   assert.deepEqual(table.mergedCells[0], { row: 0, column: 0, columnSpan: 2 })
 })
 
+test("XLSX worksheets retain ranges, cached formulas, merges, hidden cells, and dates", async (t) => {
+  const fixture = await formatFixture()
+  t.after(() => rm(fixture.root, { recursive: true, force: true }))
+  const source = path.join(fixture.incoming, "sales.xlsx")
+  await writeFile(source, await xlsxFixture())
+  const imported = await fixture.core.importFiles({ files: [{ path: source }] })
+  assert.equal(imported.rejected.length, 0)
+  const document = await managedDocument(fixture.workspace, imported.sources[0].content_hash)
+  const table = document.blocks.find((block) => block.kind === "table")
+  assert.equal(document.title, "sales")
+  assert.equal(document.mediaType, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+  assert.equal(document.metadata.formulasExecuted, false)
+  assert.deepEqual(document.metadata.sheets.map((sheet) => sheet.name), ["Sales & Forecast", "Hidden Notes"])
+  assert.equal(table.sheetName, "Sales & Forecast")
+  assert.equal(table.cellRange, "A1:E3")
+  assert.deepEqual(table.headers, ["Row", "A", "B", "C", "D", "E"])
+  assert.deepEqual(table.rows[1].slice(0, 4), ["2", "Widget | Pro", "42", "84"])
+  assert.equal(table.rows[2][2], "2024-01-01")
+  assert.deepEqual(table.mergedCells[0], {
+    range: "D1:E1",
+    startRow: 1,
+    endRow: 1,
+    startColumn: "D",
+    endColumn: "E",
+    rowSpan: 1,
+    columnSpan: 2,
+  })
+  assert.deepEqual(table.hiddenRows, [3])
+  assert.deepEqual(table.hiddenColumns, ["E"])
+  assert.deepEqual(table.formulas[0], {
+    cell: "C2",
+    formula: "B2*2",
+    cachedValue: "84",
+  })
+  const chunks = await managedChunks(fixture.workspace, imported.sources[0].content_hash)
+  const spreadsheetChunk = chunks.find((chunk) => chunk.sheetName === "Sales & Forecast")
+  assert.equal(spreadsheetChunk.cellRange, "A1:E3")
+  assert.equal(spreadsheetChunk.structuredData[0].formulas[0].cachedValue, "84")
+  const batch = await fixture.core.getBatch({ task_id: imported.task_id })
+  const analysis = spreadsheetAnalysis(imported.task_id, batch.batch_id, {
+    sourceId: imported.sources[0].source_id,
+    chunkId: spreadsheetChunk.chunkId,
+    locator: { sheetName: spreadsheetChunk.sheetName, cellRange: spreadsheetChunk.cellRange },
+  })
+  await assert.rejects(
+    fixture.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      analysis: spreadsheetAnalysis(imported.task_id, batch.batch_id, {
+        ...analysis.sourceRefs[0],
+        locator: { sheetName: spreadsheetChunk.sheetName, cellRange: "A1:A999" },
+      }),
+      idempotency_key: "xlsx-invalid-locator",
+    }),
+    (error) => error.code === "INVALID_SOURCE_REF",
+  )
+  const committed = await fixture.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    analysis,
+    idempotency_key: "xlsx-valid-locator",
+  })
+  assert.equal(committed.accepted, true)
+})
+
+test("XLSX tables are split into bounded A1 ranges and corrupt workbooks are rejected", async (t) => {
+  const fixture = await formatFixture()
+  t.after(() => rm(fixture.root, { recursive: true, force: true }))
+  const source = path.join(fixture.incoming, "large.xlsx")
+  await writeFile(source, await xlsxFixture({ rowCount: 600 }))
+  const imported = await fixture.core.importFiles({ files: [{ path: source }] })
+  const document = await managedDocument(fixture.workspace, imported.sources[0].content_hash)
+  const tables = document.blocks.filter((block) => block.kind === "table" && block.sheetName === "Sales & Forecast")
+  assert.equal(tables.length > 1, true)
+  assert.equal(tables.every((table) => /^[A-Z]+\d+:[A-Z]+\d+$/.test(table.cellRange)), true)
+  assert.equal(tables.every((table) => table.markdown.length <= 8_000), true)
+
+  const corrupt = path.join(fixture.incoming, "corrupt.xlsx")
+  await writeFile(corrupt, "not a zip archive")
+  await assert.rejects(
+    fixture.core.importFiles({ files: [{ path: corrupt }] }),
+    (error) => error.code === "SOURCE_IMPORT_FAILED" && error.details.rejected[0].code === "SOURCE_PARSE_FAILED",
+  )
+})
+
 test("PDF text is normalized page by page with traceable page numbers", async (t) => {
   const fixture = await formatFixture()
   t.after(() => rm(fixture.root, { recursive: true, force: true }))
@@ -63,6 +148,74 @@ test("PDF text is normalized page by page with traceable page numbers", async (t
 
 async function managedDocument(workspace, hash) {
   return JSON.parse(await readFile(path.join(workspace, ".llm-wiki", "sources", "objects", hash, "extracted", "document.json"), "utf8"))
+}
+
+async function managedChunks(workspace, hash) {
+  return JSON.parse(await readFile(path.join(workspace, ".llm-wiki", "sources", "objects", hash, "extracted", "chunks.json"), "utf8"))
+}
+
+function spreadsheetAnalysis(taskId, batchId, sourceRef) {
+  return {
+    schemaVersion: 1,
+    taskId,
+    batchId,
+    sourceRefs: [sourceRef],
+    entities: [],
+    concepts: [],
+    claims: [],
+    relations: [],
+    contradictions: [],
+    candidatePages: [],
+    reviewItems: [],
+    batchSummary: "Spreadsheet locator validation fixture.",
+    unresolvedQuestions: [],
+  }
+}
+
+async function xlsxFixture(options = {}) {
+  const rowCount = options.rowCount ?? 3
+  const zip = new JSZip()
+  zip.file("xl/workbook.xml", `<?xml version="1.0" encoding="UTF-8"?>
+    <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+      <sheets>
+        <sheet name="Sales &amp; Forecast" sheetId="1" r:id="rId1"/>
+        <sheet name="Hidden Notes" sheetId="2" state="hidden" r:id="rId2"/>
+      </sheets>
+    </workbook>`)
+  zip.file("xl/_rels/workbook.xml.rels", `<?xml version="1.0" encoding="UTF-8"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+      <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
+      <Relationship Id="external" TargetMode="External" Target="https://example.invalid/data"/>
+    </Relationships>`)
+  zip.file("xl/sharedStrings.xml", `<?xml version="1.0" encoding="UTF-8"?>
+    <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+      <si><t>Name</t></si><si><t>Amount</t></si><si><t>Total</t></si>
+      <si><t>Group</t></si><si><t>Widget | Pro</t></si><si><t>Notes</t></si>
+    </sst>`)
+  zip.file("xl/styles.xml", `<?xml version="1.0" encoding="UTF-8"?>
+    <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+      <cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="14"/></cellXfs>
+    </styleSheet>`)
+  const rows = [
+    `<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>2</v></c><c r="D1" t="s"><v>3</v></c></row>`,
+    `<row r="2"><c r="A2" t="s"><v>4</v></c><c r="B2"><v>42</v></c><c r="C2"><f>B2*2</f><v>84</v></c><c r="D2" t="inlineStr"><is><t>Retail</t></is></c><c r="E2" t="b"><v>1</v></c></row>`,
+    `<row r="3" hidden="1"><c r="A3" t="s"><v>5</v></c><c r="B3" s="1"><v>45292</v></c></row>`,
+  ]
+  for (let row = 4; row <= rowCount; row += 1) {
+    rows.push(`<row r="${row}"><c r="A${row}" t="inlineStr"><is><t>Item ${row}</t></is></c><c r="B${row}"><v>${row}</v></c><c r="C${row}"><f>B${row}*2</f><v>${row * 2}</v></c></row>`)
+  }
+  zip.file("xl/worksheets/sheet1.xml", `<?xml version="1.0" encoding="UTF-8"?>
+    <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+      <cols><col min="5" max="5" hidden="1"/></cols>
+      <sheetData>${rows.join("")}</sheetData>
+      <mergeCells count="1"><mergeCell ref="D1:E1"/></mergeCells>
+    </worksheet>`)
+  zip.file("xl/worksheets/sheet2.xml", `<?xml version="1.0" encoding="UTF-8"?>
+    <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+      <row r="1"><c r="A1" t="inlineStr"><is><t>Internal note</t></is></c></row>
+    </sheetData></worksheet>`)
+  return zip.generateAsync({ type: "nodebuffer" })
 }
 
 function minimalPdf(text) {
