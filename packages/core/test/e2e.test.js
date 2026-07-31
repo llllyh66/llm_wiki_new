@@ -149,6 +149,52 @@ test("duplicate content is reused and task recovery and abort stay workspace-sco
   assert.equal((await f.core.status({ task_id: second.task_id })).status, "cancelled")
 })
 
+test("page-plan pagination is revision-stable and oversized page commits are rejected", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const sourceRef = await analyzeAll(f.core, imported)
+  const concepts = path.join(f.workspace, "wiki", "concepts")
+  await import("node:fs/promises").then(({ mkdir }) => mkdir(concepts, { recursive: true }))
+  for (let index = 0; index < 5; index += 1) {
+    await writeFile(path.join(concepts, `existing-${index}.md`), `# Existing ${index}\n\n${"x".repeat(30_000)}\n`)
+  }
+
+  let cursor = 0
+  let revision
+  const existingPaths = []
+  do {
+    const page = await f.core.getPagePlanContext({ task_id: imported.task_id, cursor, max_chars: 20_000 })
+    revision ??= page.based_on_wiki_revision
+    assert.equal(page.based_on_wiki_revision, revision)
+    assert.equal(page.pagination.returned_items > 0, true)
+    existingPaths.push(...page.existing_pages.map((entry) => entry.path))
+    cursor = page.next_cursor
+  } while (cursor !== null)
+  assert.equal(existingPaths.length, 5)
+  assert.equal(new Set(existingPaths).size, 5)
+
+  const oversizedPatches = Array.from({ length: 11 }, (_, index) => ({
+    patchId: `oversized-${index}`,
+    path: `wiki/topics/oversized-${index}.md`,
+    operation: "create",
+    title: `Oversized ${index}`,
+    pageKind: "topic",
+    content: `# Oversized ${index}\n\n${"y".repeat(199_800)}`,
+    sourceRefs: [sourceRef],
+    rationale: "Exercise the aggregate commit limit.",
+  }))
+  await assert.rejects(
+    f.core.commitPages({
+      task_id: imported.task_id,
+      based_on_wiki_revision: revision,
+      idempotency_key: "oversized-page-commit",
+      patches: oversizedPatches,
+    }),
+    (error) => error instanceof LlmWikiError && error.code === "PAGE_COMMIT_TOO_LARGE",
+  )
+})
+
 test("invalid SourceRefs, page traversal, symlinks, and stale hashes are rejected", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))

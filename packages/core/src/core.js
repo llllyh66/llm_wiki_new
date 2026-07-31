@@ -140,6 +140,10 @@ export class LlmWikiCore {
     const record = await loadTask(workspace.paths, input?.task_id)
     const batch = record.batches.find((item) => item.batchId === input?.batch_id)
     if (!batch) fail("INVALID_ANALYSIS", "Batch does not belong to the task.")
+    const analysisBytes = Buffer.byteLength(JSON.stringify(input?.analysis ?? null))
+    if (analysisBytes > workspace.config.limits.maxAnalysisBytes) {
+      fail("ANALYSIS_TOO_LARGE", `Analysis exceeds the ${workspace.config.limits.maxAnalysisBytes}-byte workspace limit.`)
+    }
     validateAnalysisShape(input?.analysis, record.task.taskId, batch.batchId)
     validateSourceRefs(collectSourceRefs(input.analysis), record.task, record.batches, workspace.config.limits)
     const idempotent = await withIdempotency(record.paths, input?.idempotency_key, { operation: "commit_analysis", batchId: batch.batchId, analysis: input.analysis }, async () => {
@@ -186,20 +190,33 @@ export class LlmWikiCore {
     record.task.pagePlanRevision += 1
     record.task.wikiRevision = revision
     await saveTask(record.paths, record.task)
-    return {
-      task_id: record.task.taskId,
-      analysis_summary: {
-        batches: analyses.map((analysis) => ({ batch_id: analysis.batchId, summary: analysis.batchSummary, unresolved_questions: analysis.unresolvedQuestions })),
-        entities: analyses.flatMap((analysis) => analysis.entities),
-        concepts: analyses.flatMap((analysis) => analysis.concepts),
-        claims: deduplicateExact(analyses.flatMap((analysis) => analysis.claims)),
-        relations: deduplicateExact(analyses.flatMap((analysis) => analysis.relations)),
-      },
+    const context = {
+      batches: analyses.map((analysis) => ({ batch_id: analysis.batchId, summary: analysis.batchSummary, unresolved_questions: analysis.unresolvedQuestions })),
+      entities: analyses.flatMap((analysis) => analysis.entities),
+      concepts: analyses.flatMap((analysis) => analysis.concepts),
+      claims: deduplicateExact(analyses.flatMap((analysis) => analysis.claims)),
+      relations: deduplicateExact(analyses.flatMap((analysis) => analysis.relations)),
       candidate_pages: deduplicateExact(analyses.flatMap((analysis) => analysis.candidatePages)),
       existing_pages: existingPages,
       conflicts: analyses.flatMap((analysis) => analysis.contradictions),
+    }
+    const page = paginatePagePlan(context, input?.cursor, input?.max_chars, workspace.config.limits.maxPagePlanChars)
+    return {
+      task_id: record.task.taskId,
+      analysis_summary: {
+        batches: page.values.batches,
+        entities: page.values.entities,
+        concepts: page.values.concepts,
+        claims: page.values.claims,
+        relations: page.values.relations,
+      },
+      candidate_pages: page.values.candidate_pages,
+      existing_pages: page.values.existing_pages,
+      conflicts: page.values.conflicts,
       page_patch_schema: pagePatchSchema,
       based_on_wiki_revision: revision,
+      pagination: page.pagination,
+      next_cursor: page.pagination.next_cursor,
     }
   }
 
@@ -208,6 +225,10 @@ export class LlmWikiCore {
     const record = await loadTask(workspace.paths, input?.task_id)
     if (!Array.isArray(input?.patches) || input.patches.length === 0) fail("INVALID_PAGE_PATCH", "patches must not be empty.")
     if (input.patches.length > workspace.config.limits.maxPatchesPerCommit) fail("INVALID_PAGE_PATCH", "Too many patches in one commit.")
+    const commitChars = input.patches.reduce((sum, patch) => sum + (typeof patch?.content === "string" ? patch.content.length : 0), 0)
+    if (commitChars > workspace.config.limits.maxCommitChars) {
+      fail("PAGE_COMMIT_TOO_LARGE", `Page content exceeds the ${workspace.config.limits.maxCommitChars}-character commit limit. Submit smaller commits.`)
+    }
     const patchIds = new Set()
     for (const patch of input.patches) {
       validatePagePatchShape(patch, workspace.config.limits)
@@ -349,6 +370,37 @@ function deduplicateExact(values) {
     seen.add(key)
     return true
   })
+}
+
+function paginatePagePlan(context, requestedCursor, requestedMaxChars, configuredMaxChars) {
+  const cursor = requestedCursor === undefined || requestedCursor === null ? 0 : Number(requestedCursor)
+  if (!Number.isInteger(cursor) || cursor < 0) fail("INVALID_INPUT", "cursor must be a non-negative integer.")
+  const maxChars = Math.min(Math.max(Number(requestedMaxChars) || 120_000, 20_000), configuredMaxChars)
+  const categories = ["batches", "entities", "concepts", "claims", "relations", "candidate_pages", "existing_pages", "conflicts"]
+  const records = categories.flatMap((category) => context[category].map((value) => ({ category, value })))
+  if (cursor > records.length) fail("INVALID_INPUT", "cursor is beyond the available page-plan context.")
+  const values = Object.fromEntries(categories.map((category) => [category, []]))
+  let index = cursor
+  let usedChars = 0
+  while (index < records.length) {
+    const record = records[index]
+    const recordChars = JSON.stringify(record).length
+    if (index > cursor && usedChars + recordChars > maxChars) break
+    values[record.category].push(record.value)
+    usedChars += recordChars
+    index += 1
+  }
+  return {
+    values,
+    pagination: {
+      cursor,
+      next_cursor: index < records.length ? index : null,
+      total_items: records.length,
+      returned_items: index - cursor,
+      approximate_chars: usedChars,
+      truncated: index < records.length,
+    },
+  }
 }
 
 function statusResponse(task) {

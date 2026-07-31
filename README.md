@@ -69,6 +69,11 @@ not accept an arbitrary workspace or project path. The only external paths it
 opens are files explicitly passed to `llm_wiki_import_files`; after a safe,
 streaming import, all later work uses the managed copy.
 
+The Claude Code registration uses `CLAUDE_PROJECT_DIR` rather than a mutable
+shell working directory and keeps this bounded 11-tool server loaded for the
+session. MCP input/output budgets and paginated page-plan context prevent a
+single oversized request or response from closing the STDIO transport.
+
 ## Managed workspace
 
 The first import creates:

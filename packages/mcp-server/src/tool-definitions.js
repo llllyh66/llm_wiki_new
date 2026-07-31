@@ -40,8 +40,12 @@ export const TOOL_DEFINITIONS = Object.freeze([
   },
   {
     name: "llm_wiki_get_page_plan_context",
-    description: "Return normalized task analysis, existing page snapshots and hashes, conflicts, and the PagePatch schema for host-Agent page planning.",
-    inputSchema: closedObject({ task_id: taskId }, ["task_id"]),
+    description: "Return a bounded page of normalized task analysis, existing page snapshots and hashes, conflicts, and the PagePatch schema. Repeat with next_cursor until null before planning pages.",
+    inputSchema: closedObject({
+      task_id: taskId,
+      cursor: { type: ["integer", "null"], minimum: 0 },
+      max_chars: { type: "integer", minimum: 20000, maximum: 200000 },
+    }, ["task_id"]),
   },
   {
     name: "llm_wiki_commit_pages",

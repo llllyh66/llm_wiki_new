@@ -8,6 +8,9 @@ export const DEFAULT_LIMITS = Object.freeze({
   maxChunkChars: 8_000,
   maxBatchChars: 30_000,
   maxPageChars: 200_000,
+  maxAnalysisBytes: 2 * 1024 * 1024,
+  maxCommitChars: 2_000_000,
+  maxPagePlanChars: 200_000,
   maxPatchesPerCommit: 50,
   maxQuoteChars: 1_000,
 })

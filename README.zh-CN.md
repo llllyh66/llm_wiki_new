@@ -85,8 +85,9 @@ cd /path/to/llm_wiki_new
 claude
 ```
 
-根目录的 `.mcp.json` 会启动 `llm-wiki` STDIO MCP Server。第一次打开项目时，
-Claude Code 会请求批准项目 MCP，请确认批准。
+根目录的 `.mcp.json` 会使用 `CLAUDE_PROJECT_DIR` 锁定服务器脚本和工作区路径，
+并让这个 11 工具的服务器在会话期间保持加载。第一次打开项目时，Claude Code
+会请求批准项目 MCP，请确认批准。
 
 ### 2. 检查 MCP
 
@@ -109,6 +110,9 @@ llm-wiki: node packages/mcp-server/dist/index.js --workspace . - Connected
 ```
 
 `llm-wiki` 应显示 `Connected` 和 11 个工具。
+
+页面规划上下文会自动分页，Skill 会持续读取到 `next_cursor` 为空；大请求和大结果
+也有明确预算，超过限制时会返回可恢复错误，而不是关闭 MCP 连接。
 
 ### 3. 检查 Skill
 
@@ -280,4 +284,3 @@ npm test
 ```
 
 测试不调用真实模型，也不需要桌面程序或 HTTP 服务。
-

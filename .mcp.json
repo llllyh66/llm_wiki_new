@@ -3,10 +3,11 @@
     "llm-wiki": {
       "command": "node",
       "args": [
-        "packages/mcp-server/dist/index.js",
+        "${CLAUDE_PROJECT_DIR:-.}/packages/mcp-server/dist/index.js",
         "--workspace",
-        "."
-      ]
+        "${CLAUDE_PROJECT_DIR:-.}"
+      ],
+      "alwaysLoad": true
     }
   }
 }

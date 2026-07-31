@@ -39,8 +39,11 @@ failed, conflicted, or cancelled workflow.
    5. Analyze the chunks under the supplied AnalysisEnvelope schema.
    6. Call `llm_wiki_commit_analysis` with a unique idempotency key.
    7. Correct every validation error before requesting another batch.
-5. Call `llm_wiki_get_page_plan_context`.
-6. Plan canonical pages. Prefer useful existing pages, avoid duplicates, retain
+5. Call `llm_wiki_get_page_plan_context` with cursor `0`. While
+   `next_cursor` is not null, repeat with that cursor and accumulate every
+   returned context category. All pages must report the same
+   `based_on_wiki_revision`; restart page-plan collection if it changes.
+6. Plan canonical pages from the complete accumulated context. Prefer useful existing pages, avoid duplicates, retain
    grounded existing content, and surface unresolved contradictions as review
    items.
 7. Generate PagePatch objects under the returned schema. For `replace` or

@@ -1,6 +1,10 @@
 import { LlmWikiError, asLlmWikiError } from "@llm-wiki/core"
 import { TOOL_DEFINITIONS } from "./tool-definitions.js"
 
+const MAX_MCP_INPUT_BYTES = 12 * 1024 * 1024
+const MAX_MCP_OUTPUT_BYTES = 6 * 1024 * 1024
+const STRUCTURED_CONTENT_DUPLICATION_LIMIT = 128 * 1024
+
 export class HeadlessToolRouter {
   constructor(core) {
     this.core = core
@@ -29,11 +33,23 @@ export class HeadlessToolRouter {
 
   async callMcp(name, args = {}) {
     try {
-      const data = await this.call(name, args)
-      return {
-        content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-        structuredContent: data,
+      const inputBytes = Buffer.byteLength(JSON.stringify(args))
+      if (inputBytes > MAX_MCP_INPUT_BYTES) {
+        throw new LlmWikiError("MCP_INPUT_TOO_LARGE", `Tool input exceeds the ${MAX_MCP_INPUT_BYTES}-byte MCP limit. Submit smaller batches.`)
       }
+      const data = await this.call(name, args)
+      const text = JSON.stringify(data, null, 2)
+      const outputBytes = Buffer.byteLength(text)
+      if (outputBytes > MAX_MCP_OUTPUT_BYTES) {
+        throw new LlmWikiError("MCP_OUTPUT_TOO_LARGE", `Tool output exceeds the ${MAX_MCP_OUTPUT_BYTES}-byte MCP limit. Use pagination or a smaller result limit.`)
+      }
+      const result = {
+        content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+      }
+      // Large structured results would otherwise cross the wire twice: once as
+      // text and once as structuredContent. Keep the model-readable text copy.
+      if (outputBytes <= STRUCTURED_CONTENT_DUPLICATION_LIMIT) result.structuredContent = data
+      return result
     } catch (error) {
       const normalized = asLlmWikiError(error)
       const data = { error: normalized.toJSON() }
