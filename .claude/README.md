@@ -3,10 +3,11 @@
 The project root `.mcp.json` starts the Headless `llm-wiki` STDIO MCP server.
 Claude Code asks for project-server trust the first time it reads this file.
 
-`.claude/skills/llm-wiki-builder` is a relative symbolic link to the canonical
-`.agents/skills/llm-wiki-builder` directory. This lets Claude Code discover the
-project Skill while Codex and other Agent Skills clients use the same source.
-Do not replace the link with a copied Skill.
+`.claude/skills/llm-wiki-builder/SKILL.md` is a regular, discoverable Claude
+Code entrypoint that directs Claude to the canonical
+`.agents/skills/llm-wiki-builder/SKILL.md`. The workflow remains single-source
+without relying on directory symlink discovery, which is not consistent across
+Claude Code versions and cloned worktrees.
 
 Verify from the repository root:
 
@@ -14,6 +15,7 @@ Verify from the repository root:
 npm ci
 npm run build
 claude mcp list
+test -f .claude/skills/llm-wiki-builder/SKILL.md
 ```
 
 Expected MCP status:
