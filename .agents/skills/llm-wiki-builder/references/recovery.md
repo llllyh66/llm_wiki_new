@@ -10,6 +10,8 @@ match source names and timestamps in the current workspace.
 
 Keep the same task and batch. Correct the returned fields or SourceRefs, use a
 new idempotency key for a changed payload, and resubmit before continuing.
+Treat `accepted: false` as a normal validation result, not an MCP failure; do
+not restart or create another task for it.
 Submit `analysis` as an object rather than a serialized JSON string or Markdown
 code block. When many entries fail validation, rebuild a minimal envelope from
 the schema and include complete SourceRef objects on every grounded entry

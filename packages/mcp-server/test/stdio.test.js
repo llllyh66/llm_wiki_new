@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
+const textResult = (result) => JSON.parse(result.content[0].text)
+
 test("built MCP server survives errors and completes the full workflow over one STDIO connection", async (t) => {
   const workspace = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-stdio-"))
   t.after(() => rm(workspace, { recursive: true, force: true }))
@@ -26,7 +28,8 @@ test("built MCP server survives errors and completes the full workflow over one 
 
   const handledError = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: "invalid" } })
   assert.equal(handledError.isError, true)
-  assert.equal(handledError.structuredContent.error.code, "TASK_NOT_FOUND")
+  assert.equal(handledError.structuredContent, undefined)
+  assert.equal(textResult(handledError).error.code, "TASK_NOT_FOUND")
   assert.equal((await client.listTools()).tools.length, 11)
 
   const oversizedInput = await client.callTool({
@@ -34,7 +37,8 @@ test("built MCP server survives errors and completes the full workflow over one 
     arguments: { padding: "x".repeat(12 * 1024 * 1024 + 1) },
   })
   assert.equal(oversizedInput.isError, true)
-  assert.equal(oversizedInput.structuredContent.error.code, "MCP_INPUT_TOO_LARGE")
+  assert.equal(oversizedInput.structuredContent, undefined)
+  assert.equal(textResult(oversizedInput).error.code, "MCP_INPUT_TOO_LARGE")
   assert.equal((await client.listTools()).tools.length, 11)
 
   const lint = await client.callTool({ name: "llm_wiki_lint", arguments: {} })
@@ -109,8 +113,14 @@ test("built MCP server survives errors and completes the full workflow over one 
         idempotency_key: `stdio-invalid-analysis-${index}`,
       },
     })
-    assert.equal(invalid.isError, true)
+    assert.equal(invalid.isError, undefined)
+    assert.equal(invalid.structuredContent.accepted, false)
+    assert.equal(invalid.structuredContent.rejected, true)
     assert.match(invalid.structuredContent.error.code, /^INVALID_(ANALYSIS|SOURCE_REF)$/)
+    if (index === 0) {
+      assert.equal(invalid.structuredContent.error.details.validation_error_count, 60)
+      assert.equal(invalid.structuredContent.validation_errors.length, 51)
+    }
     assert.equal((await client.listTools()).tools.length, 11)
     const liveStatus = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: taskId } })
     assert.equal(liveStatus.isError, undefined)

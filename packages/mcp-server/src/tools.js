@@ -5,6 +5,7 @@ const MAX_MCP_INPUT_BYTES = 12 * 1024 * 1024
 const MAX_MCP_OUTPUT_BYTES = 6 * 1024 * 1024
 const STRUCTURED_CONTENT_DUPLICATION_LIMIT = 128 * 1024
 const MAX_ERROR_MESSAGE_CHARS = 2_000
+const RECOVERABLE_ANALYSIS_CODES = new Set(["INVALID_ANALYSIS", "INVALID_SOURCE_REF", "ANALYSIS_TOO_LARGE"])
 
 function serializeResult(data, isError = false) {
   const text = JSON.stringify(data, null, 2)
@@ -29,9 +30,10 @@ function serializeResult(data, isError = false) {
     ...(isError ? { isError: true } : {}),
     content: [{ type: "text", text }],
   }
-  // Large structured results would otherwise cross the wire twice: once as
-  // text and once as structuredContent. This applies to error details too.
-  if (outputBytes <= STRUCTURED_CONTENT_DUPLICATION_LIMIT) result.structuredContent = data
+  // Errors travel only as text. Some MCP clients treat structuredContent on an
+  // isError result as a protocol-level failure, and it also duplicates the
+  // potentially large validation payload on the wire.
+  if (!isError && outputBytes <= STRUCTURED_CONTENT_DUPLICATION_LIMIT) result.structuredContent = data
   return result
 }
 
@@ -71,6 +73,21 @@ export class HeadlessToolRouter {
       return serializeResult(data)
     } catch (error) {
       const normalized = asLlmWikiError(error)
+      if (name === "llm_wiki_commit_analysis" && RECOVERABLE_ANALYSIS_CODES.has(normalized.code)) {
+        const errorData = { ...normalized.toJSON(), retryable: true }
+        return serializeResult({
+          accepted: false,
+          rejected: true,
+          error: errorData,
+          validation_errors: Array.isArray(normalized.details?.validation_errors)
+            ? normalized.details.validation_errors
+            : [normalized.message],
+          next_action: {
+            tool: "llm_wiki_commit_analysis",
+            arguments: { task_id: args?.task_id, batch_id: args?.batch_id },
+          },
+        })
+      }
       const data = { error: normalized.toJSON() }
       return serializeResult(data, true)
     }

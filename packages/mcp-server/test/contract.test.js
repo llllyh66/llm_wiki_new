@@ -7,6 +7,8 @@ import { LlmWikiCore, LlmWikiError } from "../../core/src/index.js"
 import { TOOL_DEFINITIONS } from "../src/tool-definitions.js"
 import { HeadlessToolRouter } from "../src/tools.js"
 
+const textResult = (result) => JSON.parse(result.content[0].text)
+
 test("MCP publishes the complete Agent-first tool contract without desktop tools", () => {
   const names = TOOL_DEFINITIONS.map((tool) => tool.name)
   assert.deepEqual(names, [
@@ -41,7 +43,29 @@ test("MCP router returns structured Core errors", async (t) => {
   const router = new HeadlessToolRouter(await LlmWikiCore.open(root))
   const response = await router.callMcp("llm_wiki_status", { task_id: "outside" })
   assert.equal(response.isError, true)
-  assert.equal(response.structuredContent.error.code, "TASK_NOT_FOUND")
+  assert.equal(response.structuredContent, undefined)
+  assert.equal(textResult(response).error.code, "TASK_NOT_FOUND")
+})
+
+test("commit_analysis validation failures are recoverable business results, not MCP errors", async () => {
+  for (const code of ["INVALID_ANALYSIS", "INVALID_SOURCE_REF", "ANALYSIS_TOO_LARGE"]) {
+    const router = new HeadlessToolRouter({
+      commitAnalysis: async () => {
+        throw new LlmWikiError(code, `Recoverable ${code}.`, { details: { validation_errors: ["fix this field"] } })
+      },
+    })
+    const response = await router.callMcp("llm_wiki_commit_analysis", {
+      task_id: "task-example",
+      batch_id: "batch-0001",
+      analysis: {},
+      idempotency_key: "contract-retry-v1",
+    })
+    assert.equal(response.isError, undefined)
+    assert.equal(response.structuredContent.accepted, false)
+    assert.equal(response.structuredContent.error.code, code)
+    assert.deepEqual(response.structuredContent.validation_errors, ["fix this field"])
+    assert.equal(response.structuredContent.next_action.tool, "llm_wiki_commit_analysis")
+  }
 })
 
 test("every registered MCP tool routes errors without terminating the router", async (t) => {
@@ -71,7 +95,8 @@ test("large MCP results cross the wire once and over-budget results become recov
   })
   const excessive = await excessiveRouter.callMcp("llm_wiki_list_tasks", {})
   assert.equal(excessive.isError, true)
-  assert.equal(excessive.structuredContent.error.code, "MCP_OUTPUT_TOO_LARGE")
+  assert.equal(excessive.structuredContent, undefined)
+  assert.equal(textResult(excessive).error.code, "MCP_OUTPUT_TOO_LARGE")
 
   const largeErrorRouter = new HeadlessToolRouter({
     listTasks: async () => { throw new LlmWikiError("INVALID_ANALYSIS", "Invalid analysis.", { details: { validation_errors: ["x".repeat(160 * 1024)] } }) },
@@ -86,6 +111,7 @@ test("large MCP results cross the wire once and over-budget results become recov
   })
   const excessiveError = await excessiveErrorRouter.callMcp("llm_wiki_list_tasks", {})
   assert.equal(excessiveError.isError, true)
-  assert.equal(excessiveError.structuredContent.error.code, "INVALID_ANALYSIS")
-  assert.equal(excessiveError.structuredContent.error.details.truncated, true)
+  assert.equal(excessiveError.structuredContent, undefined)
+  assert.equal(textResult(excessiveError).error.code, "INVALID_ANALYSIS")
+  assert.equal(textResult(excessiveError).error.details.truncated, true)
 })

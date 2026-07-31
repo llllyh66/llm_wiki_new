@@ -27,7 +27,9 @@ async function main() {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const startedAt = Date.now()
     const result = await router.callMcp(request.params.name, request.params.arguments ?? {})
-    log("tool-call", { name: request.params.name, status: result.isError ? "error" : "ok", durationMs: Date.now() - startedAt })
+    const structured = result.structuredContent
+    const status = result.isError ? "error" : structured?.accepted === false ? "rejected" : "ok"
+    log("tool-call", { name: request.params.name, status, durationMs: Date.now() - startedAt })
     return result
   })
   const transport = new StdioServerTransport(process.stdin, process.stdout, { maxBufferSize: STDIO_MAX_BUFFER_BYTES })

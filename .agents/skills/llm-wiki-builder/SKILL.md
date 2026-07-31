@@ -50,8 +50,9 @@ failed, conflicted, or cancelled workflow.
       same task and batch and use a new idempotency key for a changed payload.
       If a response contains many validation errors, rebuild a small valid
       envelope from the supplied schema instead of patching or stringifying the
-      rejected payload. After an MCP transport error, call `llm_wiki_status`
-      before retrying the commit.
+      rejected payload. An `accepted: false` result is a normal, recoverable
+      business rejection: correct it without restarting MCP. Only after an
+      actual MCP transport error, call `llm_wiki_status` before retrying.
 5. Call `llm_wiki_get_page_plan_context` with cursor `0`. While
    `next_cursor` is not null, repeat with that cursor and accumulate every
    returned context category. All pages must report the same

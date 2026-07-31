@@ -272,7 +272,9 @@ npm test
 然后完全退出 Claude Code，从该项目根目录重新运行 `claude`，批准项目 MCP，
 并用 `/mcp` 确认 `llm-wiki` 为 `Connected` 且有 11 个工具。最新版包含连续
 `INVALID_ANALYSIS`、错误 SourceRef 和畸形重试后保持同一 STDIO 连接存活的
-回归测试；大型错误详情也会被限幅，避免错误响应本身撑断客户端连接。
+回归测试。`commit_analysis` 的可修正校验失败会作为正常工具结果返回
+`accepted: false`，不再进入 MCP `isError` 通道；验证错误最多返回 50 条，
+避免错误响应本身触发客户端断连。
 
 ### `sourceRefs` 或 `reviewItems` 校验失败
 
