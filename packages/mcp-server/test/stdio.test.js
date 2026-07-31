@@ -102,6 +102,26 @@ test("built MCP server survives errors and completes the full workflow over one 
       batchSummary: "Invalid SourceRef.",
       unresolvedQuestions: [],
     },
+    {
+      schemaVersion: 1,
+      taskId,
+      batchId: batch.structuredContent.batch_id,
+      sourceRefs: [{ ...sourceRef, quote: "Product" }],
+      entities: [],
+      concepts: [],
+      claims: Array.from({ length: 47 }, (_, index) => ({
+        localId: `kqi-claim-${index}`,
+        name: `DNS metric ${index}`,
+        content: `DNS query latency metric ${index} measures network response time.`,
+        sourceRefs: [0],
+      })),
+      relations: [],
+      contradictions: [],
+      candidatePages: [],
+      reviewItems: [],
+      batchSummary: "Invalid KQI-style title-only grounding.",
+      unresolvedQuestions: [],
+    },
   ]
   for (const [index, invalidAnalysis] of invalidAnalyses.entries()) {
     const invalid = await client.callTool({
@@ -120,6 +140,10 @@ test("built MCP server survives errors and completes the full workflow over one 
     if (index === 0) {
       assert.equal(invalid.structuredContent.error.details.validation_error_count, 60)
       assert.equal(invalid.structuredContent.validation_errors.length, 51)
+    }
+    if (index === 3) {
+      assert.equal(invalid.structuredContent.error.details.quality_gate, "source-ref-grounding-v1")
+      assert.equal(invalid.structuredContent.error.details.validation_error_count, 48)
     }
     assert.equal((await client.listTools()).tools.length, 11)
     const liveStatus = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: taskId } })

@@ -35,7 +35,7 @@ export const analysisSchema = Object.freeze({
       properties: {
         sourceId: { type: "string" },
         chunkId: { type: "string" },
-        quote: { type: "string", maxLength: 1000 },
+        quote: { type: "string", maxLength: 1000, description: "Short verbatim evidence. Claims, relations, contradictions, and review items require a quote that lexically supports their content." },
         locator: { type: "object" },
       },
       additionalProperties: false,

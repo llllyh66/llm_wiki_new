@@ -864,6 +864,11 @@ Core 在校验前将其确定性解析为完整 `SourceRef[]`，并仅持久化�
 `content` 和可解析的 `sourceRefs`。无法引用原文的问题放入
 `unresolvedQuestions`。
 
+Core 在结构校验之后执行确定性的 Grounding Quality Gate：详细 claim、关系、
+矛盾和 review item 的短 quote 必须与候选内容存在关键术语覆盖；文档标题不能
+作为整张表的通用证据。大型表格应按行或连贯主题拆分引用，单个 SourceRef
+最多支撑 8 个候选条目。门禁失败属于可恢复的业务拒绝，不是 MCP 传输错误。
+
 ## 9.6 Page Patch
 
 ```ts

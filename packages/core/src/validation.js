@@ -1,11 +1,14 @@
 import { lstat } from "node:fs/promises"
 import path from "node:path"
 import { fail } from "./errors.js"
-import { stableStringify } from "./utils.js"
+import { stableStringify, tokenize } from "./utils.js"
 
 const ANALYSIS_ARRAYS = ["sourceRefs", "entities", "concepts", "claims", "relations", "contradictions", "candidatePages", "reviewItems", "unresolvedQuestions"]
 const GROUNDED_ANALYSIS_COLLECTIONS = new Set(["entities", "concepts", "claims", "relations", "contradictions", "candidatePages", "reviewItems"])
 const MAX_ANALYSIS_VALIDATION_ERRORS = 50
+const MAX_SOURCE_REF_REUSE = 8
+const GROUNDING_QUALITY_COLLECTIONS = new Set(["claims", "relations", "contradictions", "reviewItems"])
+const GENERIC_GROUNDING_TERMS = new Set(["content", "data", "document", "item", "内容", "数据", "文档", "指标", "体系", "关系", "概述", "包含", "包括"])
 const ALLOWED_PAGE_ROOTS = new Set(["sources", "entities", "concepts", "topics", "comparisons"])
 const SYSTEM_PAGES = new Set(["wiki/index.md", "wiki/overview.md", "wiki/log.md"])
 
@@ -108,6 +111,71 @@ export function validateAnalysisShape(analysis, taskId, batchId) {
   }
   if (errorCount > errors.length) errors.push(`${errorCount - errors.length} additional validation errors were omitted`)
   if (errors.length > 0) fail("INVALID_ANALYSIS", "Analysis envelope validation failed.", { details: { validation_errors: errors, validation_error_count: errorCount } })
+}
+
+export function validateGroundingQuality(analysis) {
+  const errors = []
+  const refUses = new Map()
+  for (const collection of GROUNDED_ANALYSIS_COLLECTIONS) {
+    for (const [itemIndex, item] of (Array.isArray(analysis?.[collection]) ? analysis[collection] : []).entries()) {
+      if (!item || typeof item !== "object" || !Array.isArray(item.sourceRefs)) continue
+      for (const ref of item.sourceRefs) {
+        if (!isSourceRefObject(ref)) continue
+        const signature = stableStringify(ref)
+        const current = refUses.get(signature) ?? { count: 0, paths: [] }
+        current.count += 1
+        if (current.paths.length < 3) current.paths.push(`${collection}[${itemIndex}]`)
+        refUses.set(signature, current)
+      }
+      if (!GROUNDING_QUALITY_COLLECTIONS.has(collection)) continue
+      const semanticText = candidateSemanticText(item)
+      if (!semanticText) continue
+      const evidenceText = item.sourceRefs
+        .filter(isSourceRefObject)
+        .map((ref) => typeof ref.quote === "string" ? ref.quote.trim() : "")
+        .filter(Boolean)
+        .join("\n")
+      if (!evidenceText) {
+        errors.push(`${collection}[${itemIndex}] requires a non-empty SourceRef quote that supports its content`)
+      } else if (!evidenceSupportsCandidate(semanticText, evidenceText, item)) {
+        errors.push(`${collection}[${itemIndex}] SourceRef quote does not lexically support the candidate content; cite the relevant row or passage`)
+      }
+    }
+  }
+  for (const { count, paths } of refUses.values()) {
+    if (count > MAX_SOURCE_REF_REUSE) {
+      errors.push(`one SourceRef is reused by ${count} grounded candidates (${paths.join(", ")}, ...); split evidence by row or topic (maximum ${MAX_SOURCE_REF_REUSE} uses per reference)`)
+    }
+  }
+  if (errors.length > 0) {
+    fail("INVALID_ANALYSIS", "Analysis grounding quality validation failed.", {
+      details: {
+        validation_errors: errors.slice(0, MAX_ANALYSIS_VALIDATION_ERRORS),
+        validation_error_count: errors.length,
+        quality_gate: "source-ref-grounding-v1",
+      },
+    })
+  }
+}
+
+function candidateSemanticText(item) {
+  return [item.name, item.title, item.text, item.content, item.subject, item.predicate, item.object]
+    .filter((value) => typeof value === "string" && value.trim())
+    .join(" ")
+}
+
+function evidenceSupportsCandidate(semanticText, evidenceText, item) {
+  const normalizedEvidence = evidenceText.normalize("NFKC").toLowerCase()
+  for (const label of [item.name, item.title, item.text]) {
+    if (typeof label !== "string") continue
+    const normalizedLabel = label.normalize("NFKC").toLowerCase().trim()
+    if (normalizedLabel.length >= 3 && normalizedEvidence.includes(normalizedLabel)) return true
+  }
+  const semanticTerms = tokenize(semanticText).filter((term) => !GENERIC_GROUNDING_TERMS.has(term))
+  const evidenceTerms = new Set(tokenize(evidenceText).filter((term) => !GENERIC_GROUNDING_TERMS.has(term)))
+  if (semanticTerms.length === 0 || evidenceTerms.size === 0) return false
+  const overlap = semanticTerms.filter((term) => evidenceTerms.has(term)).length
+  return overlap >= 2 && overlap / semanticTerms.length >= 0.5
 }
 
 function isSourceRefObject(ref) {

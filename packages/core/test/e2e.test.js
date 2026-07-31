@@ -33,7 +33,7 @@ function analysisFor(taskId, batch) {
   const sourceRef = {
     sourceId: chunk.sourceId,
     chunkId: chunk.chunkId,
-    quote: chunk.text.slice(0, Math.min(30, chunk.text.length)),
+    quote: "Business Entity is the canonical business object.",
     locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
   }
   return {
@@ -115,7 +115,7 @@ test("analysis normalizer resolves SourceRef indexes and rejects out-of-range in
       && error.details.validation_errors.includes("reviewItems[0] must be an object"),
   )
 
-  analysis.reviewItems = [{ content: "The source leaves one issue for review.", sourceRefs: [0] }]
+  analysis.reviewItems = [{ content: "Business Entity requires review.", sourceRefs: [0] }]
   const committed = await f.core.commitAnalysis({
     task_id: imported.task_id,
     batch_id: batch.batch_id,
@@ -126,6 +126,55 @@ test("analysis normalizer resolves SourceRef indexes and rejects out-of-range in
   assert.equal(committed.normalized_source_ref_indexes, 2)
   const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
   assert.deepEqual(plan.analysis_summary.entities[0].sourceRefs, [sourceRef])
+})
+
+test("grounding quality gate rejects a title-only SourceRef reused for many unrelated claims", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  const chunk = batch.chunks[0]
+  const titleRef = {
+    sourceId: chunk.sourceId,
+    chunkId: chunk.chunkId,
+    quote: "Product Model",
+    locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
+  }
+  const analysis = {
+    schemaVersion: 1,
+    taskId: imported.task_id,
+    batchId: batch.batch_id,
+    sourceRefs: [titleRef],
+    entities: [],
+    concepts: [],
+    claims: Array.from({ length: 12 }, (_, index) => ({
+      localId: `claim-metric-${index}`,
+      name: `DNS metric ${index}`,
+      content: `DNS query latency metric ${index} measures network response time.`,
+      sourceRefs: [0],
+    })),
+    relations: [],
+    contradictions: [],
+    candidatePages: [],
+    reviewItems: [],
+    batchSummary: "Invalid title-only grounding fixture.",
+    unresolvedQuestions: [],
+  }
+
+  await assert.rejects(
+    () => f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      analysis,
+      idempotency_key: "title-only-grounding",
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "INVALID_ANALYSIS"
+      && error.details.quality_gate === "source-ref-grounding-v1"
+      && error.details.validation_errors.some((message) => message.includes("does not lexically support"))
+      && error.details.validation_errors.some((message) => message.includes("reused by 12 grounded candidates")),
+  )
+  assert.equal((await f.core.status({ task_id: imported.task_id })).status, "prepared")
 })
 
 test("Markdown attachment completes the model-free vertical slice", async (t) => {

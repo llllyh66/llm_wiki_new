@@ -294,6 +294,11 @@ npm test
 `reviewItems` 写成字符串数组。无法从原文引用的问题应放入
 `unresolvedQuestions`。
 
+标题引用不能支撑整张表的详细结论。`claims`、`relations`、
+`contradictions` 和 `reviewItems` 的 quote 必须包含该条目的关键术语；大型
+表格应按行或主题建立多个 SourceRef。单个 SourceRef 最多支撑 8 个候选条目，
+超过时 `commit_analysis` 会返回可恢复的 `accepted: false`。
+
 ### Excel 无法导入
 
 - 确认文件后缀是 `.xlsx`，不是 `.xls` 或 `.xlsm`。

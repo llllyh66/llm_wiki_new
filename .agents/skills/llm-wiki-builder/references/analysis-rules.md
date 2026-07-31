@@ -13,6 +13,10 @@
 - Write `reviewItems` as objects with non-empty `content` and indexed or
   complete `sourceRefs`; put unsourced questions in `unresolvedQuestions`.
 - Keep quotes short and verbatim; use locators returned with the chunk.
+- A title-only quote does not support detailed facts from a table. Claims,
+  relations, contradictions, and review items must cite quotes containing their
+  identifying terms. Split table evidence by row or coherent topic; a single
+  SourceRef may ground at most eight candidates.
 - Use conservative confidence values between 0 and 1.
 - Put uncertainty in `unresolvedQuestions` instead of guessing.
 - Keep sourced facts separate from inference.

@@ -19,6 +19,7 @@ import {
   collectSourceRefs,
   normalizeAnalysisEnvelope,
   validateAnalysisShape,
+  validateGroundingQuality,
   validatePagePatchShape,
   validateSourceRefs,
 } from "./validation.js"
@@ -148,6 +149,7 @@ export class LlmWikiCore {
     }
     validateAnalysisShape(normalized.analysis, record.task.taskId, batch.batchId)
     validateSourceRefs(collectSourceRefs(normalized.analysis), record.task, record.batches, workspace.config.limits)
+    validateGroundingQuality(normalized.analysis)
     const idempotent = await withIdempotency(record.paths, input?.idempotency_key, { operation: "commit_analysis", batchId: batch.batchId, analysis: normalized.analysis }, async () => {
       assertTaskStatus(record.task, ["prepared", "extracting"])
       await writeJsonAtomic(path.join(record.paths.analysis, `${batch.batchId}.json`), normalized.analysis)

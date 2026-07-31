@@ -44,7 +44,11 @@ failed, conflicted, or cancelled workflow.
       contradiction, candidate page, and review item at least one grounded
       SourceRef. Put complete SourceRef objects in the top-level catalog and
       preferably use checked zero-based catalog indexes in nested `sourceRefs`;
-      the Core resolves them to complete objects before persistence.
+      the Core resolves them to complete objects before persistence. For every
+      claim, relation, contradiction, and review item, cite a short verbatim
+      quote that contains its identifying terms. Never use one document-title
+      reference as evidence for an entire table; split references by row or
+      coherent topic.
    7. Call `llm_wiki_commit_analysis` with a unique idempotency key.
    8. Correct every validation error before requesting another batch. Keep the
       same task and batch and use a new idempotency key for a changed payload.
