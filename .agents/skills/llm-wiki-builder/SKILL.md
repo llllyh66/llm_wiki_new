@@ -41,7 +41,9 @@ failed, conflicted, or cancelled workflow.
       `analysis` as a JSON object, never a serialized JSON string or Markdown
       code block; preserve the exact `taskId` and `batchId`; include every
       required top-level array; and give every entity, concept, claim, relation,
-      and candidate page at least one SourceRef returned by the current task.
+      contradiction, candidate page, and review item at least one complete
+      SourceRef object returned by the current task. Nested `sourceRefs` repeat
+      those objects from the top-level catalog; never submit numeric indexes.
    7. Call `llm_wiki_commit_analysis` with a unique idempotency key.
    8. Correct every validation error before requesting another batch. Keep the
       same task and batch and use a new idempotency key for a changed payload.

@@ -81,6 +81,39 @@ async function analyzeAll(core, imported) {
   return lastRef
 }
 
+test("analysis contract rejects indexed SourceRefs and malformed review items with field paths", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  const { sourceRef, analysis } = analysisFor(imported.task_id, batch)
+  analysis.entities[0].sourceRefs = [0]
+  analysis.reviewItems = ["Missing formula"]
+
+  await assert.rejects(
+    () => f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      analysis,
+      idempotency_key: "invalid-indexed-source-refs",
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "INVALID_ANALYSIS"
+      && error.details.validation_errors.includes("entities[0].sourceRefs[0] must be a complete SourceRef object; integer indexes are not supported")
+      && error.details.validation_errors.includes("reviewItems[0] must be an object"),
+  )
+
+  analysis.entities[0].sourceRefs = [sourceRef]
+  analysis.reviewItems = [{ content: "The source leaves one issue for review.", sourceRefs: [sourceRef] }]
+  const committed = await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    analysis,
+    idempotency_key: "valid-object-source-refs",
+  })
+  assert.equal(committed.accepted, true)
+})
+
 test("Markdown attachment completes the model-free vertical slice", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))

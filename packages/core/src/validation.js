@@ -1,42 +1,80 @@
 import { lstat } from "node:fs/promises"
 import path from "node:path"
 import { fail } from "./errors.js"
+import { stableStringify } from "./utils.js"
 
 const ANALYSIS_ARRAYS = ["sourceRefs", "entities", "concepts", "claims", "relations", "contradictions", "candidatePages", "reviewItems", "unresolvedQuestions"]
+const GROUNDED_ANALYSIS_COLLECTIONS = new Set(["entities", "concepts", "claims", "relations", "contradictions", "candidatePages", "reviewItems"])
+const MAX_ANALYSIS_VALIDATION_ERRORS = 200
 const ALLOWED_PAGE_ROOTS = new Set(["sources", "entities", "concepts", "topics", "comparisons"])
 const SYSTEM_PAGES = new Set(["wiki/index.md", "wiki/overview.md", "wiki/log.md"])
 
 export function validateAnalysisShape(analysis, taskId, batchId) {
   const errors = []
-  if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) errors.push("analysis must be an object")
+  let errorCount = 0
+  const addError = (message) => {
+    errorCount += 1
+    if (errors.length < MAX_ANALYSIS_VALIDATION_ERRORS) errors.push(message)
+  }
+  if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) addError("analysis must be an object, not a serialized JSON string or array")
   else {
-    if (analysis.schemaVersion !== 1) errors.push("schemaVersion must be 1")
-    if (analysis.taskId !== taskId) errors.push("taskId does not match the task")
-    if (analysis.batchId !== batchId) errors.push("batchId does not match the batch")
-    for (const key of ANALYSIS_ARRAYS) if (!Array.isArray(analysis[key])) errors.push(`${key} must be an array`)
-    if (typeof analysis.batchSummary !== "string") errors.push("batchSummary must be a string")
+    if (analysis.schemaVersion !== 1) addError("schemaVersion must be 1")
+    if (analysis.taskId !== taskId) addError("taskId does not match the task")
+    if (analysis.batchId !== batchId) addError("batchId does not match the batch")
+    for (const key of ANALYSIS_ARRAYS) if (!Array.isArray(analysis[key])) addError(`${key} must be an array`)
+    if (typeof analysis.batchSummary !== "string") addError("batchSummary must be a string")
+    if (Array.isArray(analysis.unresolvedQuestions)) {
+      analysis.unresolvedQuestions.forEach((item, index) => {
+        if (typeof item !== "string") addError(`unresolvedQuestions[${index}] must be a string`)
+      })
+    }
+    const catalog = new Set()
+    if (Array.isArray(analysis.sourceRefs)) {
+      if (analysis.sourceRefs.length === 0) addError("sourceRefs must not be empty")
+      analysis.sourceRefs.forEach((ref, index) => {
+        if (!isSourceRefObject(ref)) addError(`sourceRefs[${index}] must be a complete SourceRef object; integer indexes are not supported`)
+        else catalog.add(stableStringify(ref))
+      })
+    }
     const localIds = new Set()
     for (const collection of ["entities", "concepts", "claims", "relations", "contradictions", "candidatePages", "reviewItems"]) {
-      for (const item of Array.isArray(analysis[collection]) ? analysis[collection] : []) {
-        if (!item || typeof item !== "object" || Array.isArray(item)) errors.push(`${collection} entries must be objects`)
+      for (const [itemIndex, item] of (Array.isArray(analysis[collection]) ? analysis[collection] : []).entries()) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          addError(`${collection}[${itemIndex}] must be an object`)
+          continue
+        }
         const localId = item?.localId ?? item?.local_id
         if (typeof localId === "string") {
-          if (localIds.has(localId)) errors.push(`duplicate local ID: ${localId}`)
+          if (localIds.has(localId)) addError(`duplicate local ID: ${localId}`)
           localIds.add(localId)
         }
         const confidence = item?.confidence
         if (confidence !== undefined && (typeof confidence !== "number" || confidence < 0 || confidence > 1)) {
-          errors.push(`${collection} confidence must be between 0 and 1`)
+          addError(`${collection}[${itemIndex}].confidence must be between 0 and 1`)
         }
-        if (["entities", "concepts", "claims", "relations", "candidatePages"].includes(collection)
-          && (!Array.isArray(item?.sourceRefs) || item.sourceRefs.length === 0)) {
-          errors.push(`${collection} entries require sourceRefs`)
+        if (collection === "reviewItems" && (typeof item.content !== "string" || !item.content.trim())) {
+          addError(`reviewItems[${itemIndex}].content must be a non-empty string`)
+        }
+        if (GROUNDED_ANALYSIS_COLLECTIONS.has(collection)) {
+          if (!Array.isArray(item.sourceRefs) || item.sourceRefs.length === 0) {
+            addError(`${collection}[${itemIndex}].sourceRefs must contain at least one complete SourceRef object`)
+          } else {
+            item.sourceRefs.forEach((ref, refIndex) => {
+              const field = `${collection}[${itemIndex}].sourceRefs[${refIndex}]`
+              if (!isSourceRefObject(ref)) addError(`${field} must be a complete SourceRef object; integer indexes are not supported`)
+              else if (!catalog.has(stableStringify(ref))) addError(`${field} must also appear in the top-level sourceRefs catalog`)
+            })
+          }
         }
       }
     }
-    if (Array.isArray(analysis.sourceRefs) && analysis.sourceRefs.length === 0) errors.push("sourceRefs must not be empty")
   }
-  if (errors.length > 0) fail("INVALID_ANALYSIS", "Analysis envelope validation failed.", { details: { validation_errors: errors } })
+  if (errorCount > errors.length) errors.push(`${errorCount - errors.length} additional validation errors were omitted`)
+  if (errors.length > 0) fail("INVALID_ANALYSIS", "Analysis envelope validation failed.", { details: { validation_errors: errors, validation_error_count: errorCount } })
+}
+
+function isSourceRefObject(ref) {
+  return Boolean(ref && typeof ref === "object" && !Array.isArray(ref) && typeof ref.sourceId === "string" && typeof ref.chunkId === "string")
 }
 
 export function collectSourceRefs(value) {

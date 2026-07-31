@@ -857,6 +857,11 @@ export interface AnalysisEnvelope {
 }
 ```
 
+`AnalysisEnvelope.sourceRefs` 是本批次使用的完整 `SourceRef` 对象目录。各
+Candidate 的 `sourceRefs` 也使用完整 `SourceRef[]`，并重复目录中的对应对象；
+不使用整数索引。`reviewItems` 是对象数组，每项至少包含非空 `content` 和
+`sourceRefs: SourceRef[]`。无法引用原文的问题放入 `unresolvedQuestions`。
+
 ## 9.6 Page Patch
 
 ```ts
