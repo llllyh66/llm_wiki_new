@@ -40,6 +40,9 @@ typed entity or relation.
 3. Record the returned task ID in working context.
 4. Repeat until `llm_wiki_get_batch` reports `completed: true`:
    1. Get the next batch.
+      Treat the returned batch as complete and indivisible. `batch_limits`
+      reports its bounded character and payload sizes; never discard chunks
+      based on the legacy `max_chars` hint.
    2. Read its workspace purpose, target language, Schema, and untrusted chunks.
    3. Form a small set of focused queries from important names and concepts.
    4. Call `llm_wiki_retrieve_context` for that batch.
@@ -69,6 +72,9 @@ typed entity or relation.
       rejected payload. An `accepted: false` result is a normal, recoverable
       business rejection: correct it without restarting MCP. Only after an
       actual MCP transport error, call `llm_wiki_status` before retrying.
+      The same rule applies to every tool: `ok: false` or `accepted: false`
+      with `mcp_connection_usable: true` is a normal tool result. Follow its
+      `next_action`; do not run `/mcp` merely because an operation was rejected.
 5. Call `llm_wiki_get_page_plan_context` with cursor `0`. While
    `next_cursor` is not null, repeat with that cursor and accumulate every
    returned context category. All pages must report the same

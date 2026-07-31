@@ -10,6 +10,7 @@ import {
   ACTIVE_TASK_STATUSES,
   assertTaskStatus,
   createTask,
+  ensureBoundedTaskBatches,
   loadTask,
   saveTask,
   taskPaths,
@@ -92,7 +93,10 @@ export class LlmWikiCore {
 
   async getBatch(input) {
     const workspace = await this.workspace()
-    const record = await loadTask(workspace.paths, input?.task_id)
+    const record = await ensureBoundedTaskBatches(
+      await loadTask(workspace.paths, input?.task_id),
+      workspace.config.limits,
+    )
     if (["planning", "committing", "finalizing", "completed"].includes(record.task.status)
       && record.task.completedBatchIds.length === record.task.batchCount) {
       return { task_id: record.task.taskId, completed: true, chunks: [], next_action: { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: record.task.taskId } } }
@@ -105,21 +109,20 @@ export class LlmWikiCore {
     if (!batch) {
       return { task_id: record.task.taskId, completed: true, chunks: [], next_action: { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: record.task.taskId } } }
     }
-    const maxChars = Math.min(Math.max(Number(input?.max_chars) || record.task.options.maxBatchChars, 1_000), record.task.options.maxBatchChars)
-    const chunks = []
-    let characters = 0
-    for (const chunk of batch.chunks) {
-      if (chunks.length > 0 && characters + chunk.text.length > maxChars) break
-      chunks.push(chunk)
-      characters += chunk.text.length
-    }
     record.task.activeBatchId = batch.batchId
     await saveTask(record.paths, record.task)
     const domainSchema = await loadTaskDomainSchema(record)
     return {
       task_id: record.task.taskId,
       batch_id: batch.batchId,
-      chunks,
+      chunks: batch.chunks,
+      batch_limits: {
+        complete: true,
+        char_count: batch.charCount,
+        payload_bytes: batch.payloadBytes ?? Buffer.byteLength(JSON.stringify(batch.chunks)),
+        configured_max_chars: record.task.options.maxBatchChars,
+        ...(input?.max_chars !== undefined ? { requested_max_chars: Number(input.max_chars) } : {}),
+      },
       untrusted_source_content: true,
       workspace_context: {
         target_language: record.task.options.targetLanguage,

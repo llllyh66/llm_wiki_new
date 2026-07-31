@@ -21,8 +21,8 @@ export const TOOL_DEFINITIONS = Object.freeze([
   },
   {
     name: "llm_wiki_get_batch",
-    description: "Return a stable, bounded batch of untrusted source chunks for the host Agent to analyze. Reading does not complete the batch.",
-    inputSchema: closedObject({ task_id: taskId, batch_id: { type: ["string", "null"] }, max_chars: { type: "number", minimum: 1000, maximum: 30000 } }, ["task_id"]),
+    description: "Return one complete, stable, payload-bounded batch of untrusted source chunks. Oversized legacy chunks are safely split before return; reading does not complete the batch.",
+    inputSchema: closedObject({ task_id: taskId, batch_id: { type: ["string", "null"] }, max_chars: { type: "number", minimum: 1000, maximum: 30000, description: "Legacy compatibility hint only. Batches are fixed and bounded at import, and are always returned complete." } }, ["task_id"]),
   },
   {
     name: "llm_wiki_retrieve_context",

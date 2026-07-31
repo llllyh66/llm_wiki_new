@@ -135,6 +135,31 @@ test("XLSX tables are split into bounded A1 ranges and corrupt workbooks are rej
   )
 })
 
+test("very large Markdown tables and code blocks produce complete payload-bounded batches", async (t) => {
+  const fixture = await formatFixture()
+  t.after(() => rm(fixture.root, { recursive: true, force: true }))
+  const source = path.join(fixture.incoming, "large-structures.md")
+  const tableRows = Array.from({ length: 5_000 }, (_, index) => `| metric-${index} | ${"value ".repeat(8)}${index} |`)
+  const largeCode = "x".repeat(300_000)
+  await writeFile(source, `# Large structures\n\n| Name | Value |\n| --- | --- |\n${tableRows.join("\n")}\n\n\`\`\`text\n${largeCode}\n\`\`\`\n`)
+  const imported = await fixture.core.importFiles({
+    files: [{ path: source }],
+    options: { max_batch_chars: 12_000 },
+  })
+  const batches = JSON.parse(await readFile(path.join(fixture.workspace, ".llm-wiki", "tasks", imported.task_id, "batches.json"), "utf8"))
+  assert.equal(batches.length > 10, true)
+  assert.equal(batches.every((batch) => batch.charCount <= 12_000), true)
+  assert.equal(batches.every((batch) => batch.payloadBytes <= 128 * 1024), true)
+  assert.equal(batches.flatMap((batch) => batch.chunks).every((chunk) => chunk.text.length <= 8_000), true)
+
+  const smallHint = await fixture.core.getBatch({ task_id: imported.task_id, max_chars: 1_000 })
+  const normal = await fixture.core.getBatch({ task_id: imported.task_id })
+  assert.equal(smallHint.batch_limits.complete, true)
+  assert.equal(smallHint.batch_id, normal.batch_id)
+  assert.deepEqual(smallHint.chunks, normal.chunks)
+  assert.equal(Buffer.byteLength(JSON.stringify(smallHint)) < 512 * 1024, true)
+})
+
 test("PDF text is normalized page by page with traceable page numbers", async (t) => {
   const fixture = await formatFixture()
   t.after(() => rm(fixture.root, { recursive: true, force: true }))

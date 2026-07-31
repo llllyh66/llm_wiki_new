@@ -329,6 +329,7 @@ function chunkDocument(document, options) {
   const chunks = []
   let pending = []
   let pendingKinds = []
+  let pendingStructured = []
   let pendingStart
   let pendingEnd
 
@@ -348,7 +349,7 @@ function chunkDocument(document, options) {
       headingPath: headingPath(),
       blockKinds: [...new Set(pendingKinds)],
       text,
-      ...(pendingKinds.includes("table") ? { structuredData: document.blocks.filter((block) => block.kind === "table" && text.includes(block.markdown)) } : {}),
+      ...(pendingStructured.length > 0 ? { structuredData: pendingStructured } : {}),
       startOffset: pendingStart,
       endOffset: pendingEnd,
       tokenEstimate: Math.ceil(text.length / 4),
@@ -361,6 +362,7 @@ function chunkDocument(document, options) {
     if (cellRanges.length === 1) chunks.at(-1).cellRange = cellRanges[0]
     pending = []
     pendingKinds = []
+    pendingStructured = []
     pendingStart = undefined
     pendingEnd = undefined
   }
@@ -368,21 +370,26 @@ function chunkDocument(document, options) {
   for (const block of document.blocks) {
     if (block.kind === "heading") {
       emit()
-      headings[block.level] = block.text
+      headings[block.level] = block.text.slice(0, 500)
       for (let level = block.level + 1; level <= 6; level += 1) delete headings[level]
-      pending.push(`${"#".repeat(block.level)} ${block.text}`)
-      pendingKinds.push(block.kind)
-      pendingStart = block.startOffset
-      pendingEnd = block.endOffset
+      const rendered = `${"#".repeat(block.level)} ${block.text}`
+      for (const piece of splitText(rendered, maxChars)) {
+        pending = [piece]
+        pendingKinds = [block.kind]
+        pendingStart = block.startOffset
+        pendingEnd = block.endOffset
+        if (rendered.length > maxChars) emit()
+      }
       continue
     }
     const text = block.text || block.markdown || ""
     if (pending.length > 0 && pending.join("\n\n").length + text.length + 2 > maxChars) emit()
-    if (text.length > maxChars && !["code", "table"].includes(block.kind)) {
+    if (text.length > maxChars) {
       const pieces = splitText(text, maxChars)
       for (const piece of pieces) {
         pending = [piece]
         pendingKinds = [block.kind]
+        pendingStructured = block.kind === "table" ? [tableFragment(block, piece)] : []
         pendingStart = block.startOffset
         pendingEnd = block.endOffset
         emit()
@@ -392,10 +399,23 @@ function chunkDocument(document, options) {
     if (pendingStart === undefined) pendingStart = block.startOffset
     pending.push(text)
     pendingKinds.push(block.kind)
+    if (block.kind === "table") pendingStructured.push(block)
     pendingEnd = block.endOffset
   }
   emit()
   return chunks
+}
+
+function tableFragment(block, markdown) {
+  return {
+    kind: "table",
+    markdown,
+    text: markdown,
+    fragmented: true,
+    ...(block.sheetName ? { sheetName: block.sheetName } : {}),
+    ...(block.cellRange ? { cellRange: block.cellRange } : {}),
+    ...(block.sheetState ? { sheetState: block.sheetState } : {}),
+  }
 }
 
 function splitText(text, maxChars) {

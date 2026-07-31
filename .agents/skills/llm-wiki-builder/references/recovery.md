@@ -8,6 +8,13 @@ match source names and timestamps in the current workspace.
 
 ## Validation failure
 
+All llm_wiki tool exceptions are returned as ordinary MCP tool results with
+`ok: false`, `accepted: false`, an `error` object, a `next_action`, and
+`mcp_connection_usable: true`. This includes import, batch, retrieval, page,
+finalize, status, abort, lint, input-budget, and output-budget failures. Follow
+the returned action without restarting MCP. Only a real transport exception or
+closed connection requires reconnecting the server.
+
 Keep the same task and batch. Correct the returned fields or SourceRefs, use a
 new idempotency key for a changed payload, and resubmit before continuing.
 Treat `accepted: false` as a normal validation result, not an MCP failure; do
@@ -19,8 +26,8 @@ or valid zero-based indexes into the top-level catalog. Check every index
 against the catalog length instead of incrementally mutating the rejected
 payload.
 
-If the client reports a transport failure after `llm_wiki_commit_analysis`, do
-not create another task. Restart or reconnect the MCP server, call
+If the client reports a real transport failure after any tool call, do not
+create another task. Restart or reconnect the MCP server, call
 `llm_wiki_status` for the existing task, and retry only the active batch if it
 was not committed.
 

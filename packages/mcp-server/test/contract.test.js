@@ -42,9 +42,10 @@ test("MCP router returns structured Core errors", async (t) => {
   t.after(() => rm(root, { recursive: true, force: true }))
   const router = new HeadlessToolRouter(await LlmWikiCore.open(root))
   const response = await router.callMcp("llm_wiki_status", { task_id: "outside" })
-  assert.equal(response.isError, true)
-  assert.equal(response.structuredContent, undefined)
-  assert.equal(textResult(response).error.code, "TASK_NOT_FOUND")
+  assert.equal(response.isError, undefined)
+  assert.equal(response.structuredContent.ok, false)
+  assert.equal(response.structuredContent.error.code, "TASK_NOT_FOUND")
+  assert.equal(response.structuredContent.mcp_connection_usable, true)
 })
 
 test("commit_analysis validation failures are recoverable business results, not MCP errors", async () => {
@@ -75,6 +76,32 @@ test("every registered MCP tool routes errors without terminating the router", a
   for (const tool of TOOL_DEFINITIONS) {
     const response = await router.callMcp(tool.name, {})
     assert.equal(Array.isArray(response.content), true, tool.name)
+    assert.equal(response.isError, undefined, tool.name)
+    const result = textResult(response)
+    if (result.error) assert.equal(result.mcp_connection_usable, true, tool.name)
+  }
+  const unknown = await router.callMcp("llm_wiki_unknown", {})
+  assert.equal(unknown.isError, undefined)
+  assert.equal(unknown.structuredContent.error.code, "TOOL_NOT_FOUND")
+  const failing = async () => { throw new LlmWikiError("TEST_TOOL_FAILURE", "Expected tool failure.") }
+  const failureRouter = new HeadlessToolRouter({
+    importFiles: failing,
+    getBatch: failing,
+    retrieveContext: failing,
+    commitAnalysis: failing,
+    getPagePlanContext: failing,
+    commitPages: failing,
+    finalize: failing,
+    status: failing,
+    listTasks: failing,
+    abort: failing,
+    lint: failing,
+  })
+  for (const tool of TOOL_DEFINITIONS) {
+    const response = await failureRouter.callMcp(tool.name, {})
+    assert.equal(response.isError, undefined, tool.name)
+    assert.equal(response.structuredContent.error.code, "TEST_TOOL_FAILURE", tool.name)
+    assert.equal(response.structuredContent.mcp_connection_usable, true, tool.name)
   }
   const afterErrors = await router.callMcp("llm_wiki_list_tasks", {})
   assert.equal(afterErrors.isError, undefined)
@@ -94,15 +121,15 @@ test("large MCP results cross the wire once and over-budget results become recov
     listTasks: async () => ({ payload: "x".repeat(6 * 1024 * 1024 + 1) }),
   })
   const excessive = await excessiveRouter.callMcp("llm_wiki_list_tasks", {})
-  assert.equal(excessive.isError, true)
-  assert.equal(excessive.structuredContent, undefined)
-  assert.equal(textResult(excessive).error.code, "MCP_OUTPUT_TOO_LARGE")
+  assert.equal(excessive.isError, undefined)
+  assert.equal(excessive.structuredContent.error.code, "MCP_OUTPUT_TOO_LARGE")
+  assert.equal(excessive.structuredContent.mcp_connection_usable, true)
 
   const largeErrorRouter = new HeadlessToolRouter({
     listTasks: async () => { throw new LlmWikiError("INVALID_ANALYSIS", "Invalid analysis.", { details: { validation_errors: ["x".repeat(160 * 1024)] } }) },
   })
   const largeError = await largeErrorRouter.callMcp("llm_wiki_list_tasks", {})
-  assert.equal(largeError.isError, true)
+  assert.equal(largeError.isError, undefined)
   assert.equal(largeError.structuredContent, undefined)
   assert.equal(JSON.parse(largeError.content[0].text).error.code, "INVALID_ANALYSIS")
 
@@ -110,8 +137,8 @@ test("large MCP results cross the wire once and over-budget results become recov
     listTasks: async () => { throw new LlmWikiError("INVALID_ANALYSIS", "Invalid analysis.", { details: { validation_errors: ["x".repeat(6 * 1024 * 1024 + 1)] } }) },
   })
   const excessiveError = await excessiveErrorRouter.callMcp("llm_wiki_list_tasks", {})
-  assert.equal(excessiveError.isError, true)
-  assert.equal(excessiveError.structuredContent, undefined)
-  assert.equal(textResult(excessiveError).error.code, "INVALID_ANALYSIS")
-  assert.equal(textResult(excessiveError).error.details.truncated, true)
+  assert.equal(excessiveError.isError, undefined)
+  assert.equal(excessiveError.structuredContent.error.code, "INVALID_ANALYSIS")
+  assert.equal(excessiveError.structuredContent.error.details.truncated, true)
+  assert.equal(excessiveError.structuredContent.mcp_connection_usable, true)
 })

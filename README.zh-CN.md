@@ -291,7 +291,7 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
    不要使用 shell。
    ```
 
-### `llm_wiki_commit_analysis` 报错后 MCP 断开
+### 任何 llm_wiki 工具报错后 MCP 断开
 
 先确认另一台电脑没有继续运行旧的 `dist`。`dist/` 不提交到 Git，单独执行
 `git pull` 不会刷新 MCP 实际运行的 JavaScript；而 `/mcp` 重启只会重新启动
@@ -308,9 +308,23 @@ npm test
 然后完全退出 Claude Code，从该项目根目录重新运行 `claude`，批准项目 MCP，
 并用 `/mcp` 确认 `llm-wiki` 为 `Connected` 且有 11 个工具。最新版包含连续
 `INVALID_ANALYSIS`、错误 SourceRef 和畸形重试后保持同一 STDIO 连接存活的
-回归测试。`commit_analysis` 的可修正校验失败会作为正常工具结果返回
-`accepted: false`，不再进入 MCP `isError` 通道；验证错误最多返回 50 条，
-避免错误响应本身触发客户端断连。
+回归测试。现在 11 个工具的所有异常都作为普通工具结果返回，不再进入
+MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
+`error`、`next_action` 和 `mcp_connection_usable: true`。Agent 应按
+`next_action` 修正或恢复，不需要执行 `/mcp`。
+
+### 超大文件的 `llm_wiki_get_batch` 报错
+
+旧版本不会拆分超大 Markdown/HTML/DOCX 表格和代码块，单个 chunk 可能
+突破 batch 和 MCP 输出限制。新版本会：
+
+- 把所有超大文本块拆分到 `maxChunkChars` 以内；
+- 同时按文字数和序列化字节数限制 batch；
+- `get_batch` 始终返回完整批次，并在 `batch_limits` 中报告实际大小；
+- 自动重建尚未完成的旧版超大 batch，已提交的批次不受影响。
+
+`max_chars` 现在仅作为兼容性提示，不会再截断批次并造成漏分析。如果希望
+调小批次，应在导入时设置 `options.max_batch_chars`。
 
 ### `sourceRefs` 或 `reviewItems` 校验失败
 

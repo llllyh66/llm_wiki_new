@@ -27,19 +27,37 @@ test("built MCP server survives errors and completes the full workflow over one 
   assert.equal(listed.tools.some((tool) => tool.name === "llm_wiki_projects"), false)
 
   const handledError = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: "invalid" } })
-  assert.equal(handledError.isError, true)
-  assert.equal(handledError.structuredContent, undefined)
-  assert.equal(textResult(handledError).error.code, "TASK_NOT_FOUND")
+  assert.equal(handledError.isError, undefined)
+  assert.equal(handledError.structuredContent.error.code, "TASK_NOT_FOUND")
+  assert.equal(handledError.structuredContent.mcp_connection_usable, true)
   assert.equal((await client.listTools()).tools.length, 11)
 
   const oversizedInput = await client.callTool({
     name: "llm_wiki_lint",
     arguments: { padding: "x".repeat(12 * 1024 * 1024 + 1) },
   })
-  assert.equal(oversizedInput.isError, true)
-  assert.equal(oversizedInput.structuredContent, undefined)
-  assert.equal(textResult(oversizedInput).error.code, "MCP_INPUT_TOO_LARGE")
+  assert.equal(oversizedInput.isError, undefined)
+  assert.equal(oversizedInput.structuredContent.error.code, "MCP_INPUT_TOO_LARGE")
+  assert.equal(oversizedInput.structuredContent.mcp_connection_usable, true)
   assert.equal((await client.listTools()).tools.length, 11)
+
+  const failingCalls = [
+    { name: "llm_wiki_import_files", arguments: {} },
+    { name: "llm_wiki_get_batch", arguments: { task_id: "invalid" } },
+    { name: "llm_wiki_retrieve_context", arguments: { task_id: "invalid", batch_id: "batch-0001", queries: ["x"] } },
+    { name: "llm_wiki_get_page_plan_context", arguments: { task_id: "invalid" } },
+    { name: "llm_wiki_commit_pages", arguments: { task_id: "invalid", patches: [], based_on_wiki_revision: "0".repeat(64), idempotency_key: "invalid-pages-v1" } },
+    { name: "llm_wiki_finalize", arguments: { task_id: "invalid" } },
+    { name: "llm_wiki_abort", arguments: { task_id: "invalid" } },
+    { name: "llm_wiki_lint", arguments: { task_id: "invalid" } },
+  ]
+  for (const call of failingCalls) {
+    const failed = await client.callTool(call)
+    assert.equal(failed.isError, undefined, call.name)
+    assert.equal(failed.structuredContent.ok, false, call.name)
+    assert.equal(failed.structuredContent.mcp_connection_usable, true, call.name)
+    assert.equal((await client.listTools()).tools.length, 11, call.name)
+  }
 
   const lint = await client.callTool({ name: "llm_wiki_lint", arguments: {} })
   assert.equal(lint.isError, undefined)
@@ -246,4 +264,24 @@ test("built MCP server survives errors and completes the full workflow over one 
   const domainStatus = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: domainTaskId } })
   assert.equal(domainStatus.structuredContent.status, "prepared")
   assert.equal((await client.listTools()).tools.length, 11)
+
+  const largeSource = path.join(workspace, "large.md")
+  const largeRows = Array.from({ length: 4_000 }, (_, index) => `| metric-${index} | ${"value ".repeat(8)}${index} |`)
+  await writeFile(largeSource, `# Large\n\n| Name | Value |\n| --- | --- |\n${largeRows.join("\n")}\n\n\`\`\`text\n${"x".repeat(500_000)}\n\`\`\`\n`)
+  const largeImported = await client.callTool({
+    name: "llm_wiki_import_files",
+    arguments: { files: [{ path: largeSource }], options: { max_batch_chars: 12_000 } },
+  })
+  assert.equal(largeImported.isError, undefined)
+  const largeBatch = await client.callTool({
+    name: "llm_wiki_get_batch",
+    arguments: { task_id: largeImported.structuredContent.task_id, max_chars: 1_000 },
+  })
+  assert.equal(largeBatch.isError, undefined)
+  assert.equal(largeBatch.structuredContent.batch_limits.complete, true)
+  assert.equal(largeBatch.structuredContent.batch_limits.char_count <= 12_000, true)
+  assert.equal(largeBatch.structuredContent.chunks.every((chunk) => chunk.text.length <= 8_000), true)
+  assert.equal((await client.listTools()).tools.length, 11)
+  const largeStatus = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: largeImported.structuredContent.task_id } })
+  assert.equal(largeStatus.structuredContent.status, "prepared")
 })

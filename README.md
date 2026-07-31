@@ -81,6 +81,14 @@ The Claude Code registration uses `CLAUDE_PROJECT_DIR` rather than a mutable
 shell working directory and keeps this bounded 11-tool server loaded for the
 session. MCP input/output budgets and paginated page-plan context prevent a
 single oversized request or response from closing the STDIO transport.
+Every tool exception is returned as a normal result (`ok: false`,
+`accepted: false`, `error`, `next_action`, and `mcp_connection_usable: true`)
+instead of entering MCP's `isError` channel.
+
+Large tables, code blocks, and legacy oversized chunks are split before
+`get_batch`. Batches are bounded by both text and serialized payload size and
+are always returned complete; `batch_limits` reports the actual size. Set
+`options.max_batch_chars` during import to request smaller batches.
 
 ## Managed workspace
 

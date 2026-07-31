@@ -130,7 +130,7 @@ async function importOne(workspace, input, displayName) {
         sizeBytes,
         importedAt: nowIso(),
         originalLocationHint: stripPrivateLocation(sourcePath),
-        parserVersion: "headless-document-v2",
+        parserVersion: "headless-document-v3",
         extractedDocumentPath: relativePosix(workspace.paths.root, documentPath),
         chunksPath: relativePosix(workspace.paths.root, chunksPath),
         extractionHash: sha256(parsed.markdown),

@@ -340,6 +340,32 @@ test("duplicate content is reused and task recovery and abort stay workspace-sco
   assert.equal((await f.core.status({ task_id: second.task_id })).status, "cancelled")
 })
 
+test("get_batch repairs an unfinished legacy oversized batch without changing its requested ID", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const batchesPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "batches.json")
+  const batches = JSON.parse(await readFile(batchesPath, "utf8"))
+  const originalBatchId = batches[0].batchId
+  const originalChunk = batches[0].chunks[0]
+  const oversizedText = `Legacy table\n${"| metric | value |\n".repeat(20_000)}`
+  batches[0] = {
+    ...batches[0],
+    chunks: [{ ...originalChunk, text: oversizedText, structuredData: [{ rows: Array(20_000).fill(["metric", "value"]) }] }],
+    charCount: oversizedText.length,
+  }
+  await writeFile(batchesPath, JSON.stringify(batches))
+
+  const repaired = await f.core.getBatch({ task_id: imported.task_id, batch_id: originalBatchId })
+  assert.equal(repaired.batch_id, originalBatchId)
+  assert.equal(repaired.batch_limits.complete, true)
+  assert.equal(repaired.chunks.every((chunk) => chunk.text.length <= 8_000), true)
+  assert.equal(repaired.batch_limits.payload_bytes <= 240_000, true)
+  const persisted = JSON.parse(await readFile(batchesPath, "utf8"))
+  assert.equal(persisted.length > 1, true)
+  assert.equal(persisted[0].batchId, originalBatchId)
+})
+
 test("page-plan pagination is revision-stable and oversized page commits are rejected", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))

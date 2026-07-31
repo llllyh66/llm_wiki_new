@@ -28,7 +28,7 @@ async function main() {
     const startedAt = Date.now()
     const result = await router.callMcp(request.params.name, request.params.arguments ?? {})
     const structured = result.structuredContent
-    const status = result.isError ? "error" : structured?.accepted === false ? "rejected" : "ok"
+    const status = result._meta?.llmWikiStatus === "rejected" || structured?.accepted === false ? "rejected" : "ok"
     log("tool-call", { name: request.params.name, status, durationMs: Date.now() - startedAt })
     return result
   })

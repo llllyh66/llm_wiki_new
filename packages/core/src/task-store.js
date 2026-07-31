@@ -3,6 +3,8 @@ import { fail } from "./errors.js"
 import { ensureDir, newId, nowIso, pathExists, readJson, sha256, stableStringify, writeJsonAtomic } from "./utils.js"
 
 export const ACTIVE_TASK_STATUSES = ["importing", "parsing", "prepared", "extracting", "planning", "committing", "finalizing", "failed"]
+const MAX_TASK_CHUNK_PAYLOAD_BYTES = 96 * 1024
+const MIN_BATCH_PAYLOAD_BYTES = 128 * 1024
 
 export function taskPaths(workspacePaths, taskId) {
   const root = path.join(workspacePaths.tasks, taskId)
@@ -22,8 +24,13 @@ export async function createTask(workspace, sources, options = {}) {
   const taskId = newId("task")
   const paths = taskPaths(workspace.paths, taskId)
   await ensureDir(paths.analysis)
-  const allChunks = sources.flatMap((source) => source.chunks)
-  const batches = makeBatches(taskId, allChunks, options.maxBatchChars ?? workspace.config.limits.maxBatchChars)
+  const maxChunkChars = workspace.config.limits.maxChunkChars
+  const requestedBatchChars = Number(options.maxBatchChars)
+  const maxBatchChars = Number.isFinite(requestedBatchChars)
+    ? Math.min(Math.max(requestedBatchChars, 1_000), workspace.config.limits.maxBatchChars)
+    : workspace.config.limits.maxBatchChars
+  const allChunks = boundTaskChunks(sources.flatMap((source) => source.chunks), maxChunkChars)
+  const batches = makeBatches(taskId, allChunks, maxBatchChars)
   const timestamp = nowIso()
   const task = {
     schemaVersion: 1,
@@ -44,8 +51,8 @@ export async function createTask(workspace, sources, options = {}) {
     ...(options.domainSchema ? { domainSchema: options.domainSchema.metadata } : {}),
     options: {
       targetLanguage: options.targetLanguage ?? workspace.config.targetLanguage,
-      maxChunkChars: workspace.config.limits.maxChunkChars,
-      maxBatchChars: options.maxBatchChars ?? workspace.config.limits.maxBatchChars,
+      maxChunkChars,
+      maxBatchChars,
       enableBm25: true,
       enableVector: true,
       enableGraph: true,
@@ -63,20 +70,108 @@ function makeBatches(taskId, chunks, maxChars) {
   const batches = []
   let current = []
   let chars = 0
+  let payloadBytes = 0
+  const maxPayloadBytes = Math.max(MIN_BATCH_PAYLOAD_BYTES, maxChars * 8)
   const emit = () => {
     if (current.length === 0) return
-    batches.push({ taskId, batchId: `batch-${String(batches.length + 1).padStart(4, "0")}`, chunks: current, charCount: chars })
+    batches.push({ taskId, batchId: `batch-${String(batches.length + 1).padStart(4, "0")}`, chunks: current, charCount: chars, payloadBytes })
     current = []
     chars = 0
+    payloadBytes = 0
   }
   for (const chunk of chunks) {
-    if (current.length > 0 && chars + chunk.text.length > maxChars) emit()
+    const chunkBytes = Buffer.byteLength(JSON.stringify(chunk))
+    if (current.length > 0 && (chars + chunk.text.length > maxChars || payloadBytes + chunkBytes > maxPayloadBytes)) emit()
     current.push(chunk)
     chars += chunk.text.length
-    if (chars >= maxChars) emit()
+    payloadBytes += chunkBytes
+    if (chars >= maxChars || payloadBytes >= maxPayloadBytes) emit()
   }
   emit()
   return batches
+}
+
+export async function ensureBoundedTaskBatches(record, limits) {
+  let changed = false
+  const batches = []
+  for (const batch of record.batches) {
+    if (record.task.completedBatchIds.includes(batch.batchId)) {
+      batches.push(batch)
+      continue
+    }
+    const bounded = boundTaskChunks(batch.chunks, limits.maxChunkChars)
+    const rebuilt = makeBatches(record.task.taskId, bounded, record.task.options.maxBatchChars)
+    const originalBytes = batch.chunks.reduce((sum, chunk) => sum + Buffer.byteLength(JSON.stringify(chunk)), 0)
+    const needsRebuild = bounded.length !== batch.chunks.length
+      || bounded.some((chunk, index) => chunk.chunkId !== batch.chunks[index]?.chunkId)
+      || batch.charCount > record.task.options.maxBatchChars
+      || originalBytes > Math.max(MIN_BATCH_PAYLOAD_BYTES, record.task.options.maxBatchChars * 8)
+    if (!needsRebuild) {
+      batches.push(batch)
+      continue
+    }
+    changed = true
+    rebuilt.forEach((item, index) => {
+      batches.push({
+        ...item,
+        batchId: index === 0 ? batch.batchId : `${batch.batchId}-part-${String(index + 1).padStart(4, "0")}`,
+      })
+    })
+  }
+  if (!changed) return record
+  record.batches = batches
+  record.task.batchCount = batches.length
+  record.task.activeBatchId = undefined
+  await writeJsonAtomic(record.paths.batches, batches)
+  await saveTask(record.paths, record.task)
+  return record
+}
+
+function boundTaskChunks(chunks, maxChars) {
+  return chunks.flatMap((chunk) => {
+    const text = typeof chunk?.text === "string" ? chunk.text : ""
+    const payloadBytes = Buffer.byteLength(JSON.stringify(chunk))
+    if (text.length <= maxChars && payloadBytes <= MAX_TASK_CHUNK_PAYLOAD_BYTES) return [chunk]
+    const pieces = splitChunkText(text, maxChars)
+    return pieces.map((piece, index) => {
+      const { structuredData: _structuredData, ...base } = chunk
+      return {
+        ...base,
+        chunkId: `chunk-${sha256(`${chunk.chunkId}:${index}:${piece}`).slice(0, 24)}`,
+        parentChunkId: chunk.chunkId,
+        partIndex: index,
+        headingPath: Array.isArray(chunk.headingPath) ? chunk.headingPath.map((heading) => String(heading).slice(0, 500)).slice(0, 12) : [],
+        text: piece,
+        tokenEstimate: Math.ceil(piece.length / 4),
+        contentHash: sha256(piece),
+        ...(Array.isArray(chunk.structuredData) ? { structuredData: compactStructuredData(chunk.structuredData) } : {}),
+      }
+    })
+  })
+}
+
+function compactStructuredData(values) {
+  return values.slice(0, 20).map((value) => ({
+    kind: "table",
+    compacted: true,
+    ...(typeof value?.sheetName === "string" ? { sheetName: value.sheetName.slice(0, 500) } : {}),
+    ...(typeof value?.cellRange === "string" ? { cellRange: value.cellRange.slice(0, 100) } : {}),
+    ...(typeof value?.sheetState === "string" ? { sheetState: value.sheetState.slice(0, 100) } : {}),
+  }))
+}
+
+function splitChunkText(text, maxChars) {
+  if (!text) return [""]
+  const pieces = []
+  let rest = text
+  while (rest.length > maxChars) {
+    const window = rest.slice(0, maxChars + 1)
+    const cut = Math.max(window.lastIndexOf("\n"), window.lastIndexOf("。"), window.lastIndexOf(". "), window.lastIndexOf(" "), Math.floor(maxChars * 0.6))
+    pieces.push(rest.slice(0, cut).trim())
+    rest = rest.slice(cut).trimStart()
+  }
+  if (rest.trim() || pieces.length === 0) pieces.push(rest.trim())
+  return pieces
 }
 
 export async function loadTask(workspacePaths, taskId) {
