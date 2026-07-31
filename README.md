@@ -1,5 +1,7 @@
 # llm_wiki
 
+[Chinese usage guide / 中文使用说明](README.zh-CN.md)
+
 `llm_wiki` is a headless, Agent-first local knowledge-base engine. The current
 Codex, OpenCode, or Claude Code model understands your documents; a model-free
 Core manages source files, tasks, validation, transactions, retrieval, indexes,
