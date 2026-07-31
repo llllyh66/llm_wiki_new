@@ -81,37 +81,51 @@ async function analyzeAll(core, imported) {
   return lastRef
 }
 
-test("analysis contract rejects indexed SourceRefs and malformed review items with field paths", async (t) => {
+test("analysis normalizer resolves SourceRef indexes and rejects out-of-range indexes and malformed review items", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
   const imported = await f.core.importFiles({ files: [{ path: f.source }] })
   const batch = await f.core.getBatch({ task_id: imported.task_id })
   const { sourceRef, analysis } = analysisFor(imported.task_id, batch)
-  analysis.entities[0].sourceRefs = [0]
-  analysis.reviewItems = ["Missing formula"]
+  analysis.entities[0].sourceRefs = [3]
 
   await assert.rejects(
     () => f.core.commitAnalysis({
       task_id: imported.task_id,
       batch_id: batch.batch_id,
       analysis,
-      idempotency_key: "invalid-indexed-source-refs",
+      idempotency_key: "out-of-range-source-ref-index",
     }),
     (error) => error instanceof LlmWikiError
       && error.code === "INVALID_ANALYSIS"
-      && error.details.validation_errors.includes("entities[0].sourceRefs[0] must be a complete SourceRef object; integer indexes are not supported")
+      && error.details.validation_errors.includes("entities[0].sourceRefs[0] index 3 is out of range for top-level sourceRefs length 1"),
+  )
+
+  analysis.entities[0].sourceRefs = [0]
+  analysis.reviewItems = ["Missing formula"]
+  await assert.rejects(
+    () => f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      analysis,
+      idempotency_key: "malformed-review-item",
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "INVALID_ANALYSIS"
       && error.details.validation_errors.includes("reviewItems[0] must be an object"),
   )
 
-  analysis.entities[0].sourceRefs = [sourceRef]
-  analysis.reviewItems = [{ content: "The source leaves one issue for review.", sourceRefs: [sourceRef] }]
+  analysis.reviewItems = [{ content: "The source leaves one issue for review.", sourceRefs: [0] }]
   const committed = await f.core.commitAnalysis({
     task_id: imported.task_id,
     batch_id: batch.batch_id,
     analysis,
-    idempotency_key: "valid-object-source-refs",
+    idempotency_key: "valid-indexed-source-refs",
   })
   assert.equal(committed.accepted, true)
+  assert.equal(committed.normalized_source_ref_indexes, 2)
+  const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
+  assert.deepEqual(plan.analysis_summary.entities[0].sourceRefs, [sourceRef])
 })
 
 test("Markdown attachment completes the model-free vertical slice", async (t) => {

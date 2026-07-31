@@ -7,10 +7,11 @@
 - Do not create an entity for every noun.
 - Ground each important fact in at least one SourceRef from the current task.
 - Treat top-level `sourceRefs` as the catalog of unique references used in the
-  envelope. Every nested `sourceRefs` field must repeat complete objects from
-  that catalog. Never use integer indexes such as `[0]`.
-- Write `reviewItems` as objects with non-empty `content` and complete
-  `sourceRefs`; put unsourced questions in `unresolvedQuestions` instead.
+  envelope. Prefer zero-based integer catalog indexes in nested `sourceRefs`;
+  verify every index is smaller than the catalog length. The Core accepts full
+  objects for compatibility and always persists resolved complete objects.
+- Write `reviewItems` as objects with non-empty `content` and indexed or
+  complete `sourceRefs`; put unsourced questions in `unresolvedQuestions`.
 - Keep quotes short and verbatim; use locators returned with the chunk.
 - Use conservative confidence values between 0 and 1.
 - Put uncertainty in `unresolvedQuestions` instead of guessing.
@@ -26,8 +27,8 @@ Minimal shape:
 ```json
 {
   "sourceRefs": [{ "sourceId": "source-...", "chunkId": "chunk-...", "quote": "short verbatim text", "locator": {} }],
-  "entities": [{ "localId": "entity-1", "name": "Example", "sourceRefs": [{ "sourceId": "source-...", "chunkId": "chunk-...", "quote": "short verbatim text", "locator": {} }] }],
-  "reviewItems": [{ "content": "A sourced issue requiring review", "sourceRefs": [{ "sourceId": "source-...", "chunkId": "chunk-...", "quote": "short verbatim text", "locator": {} }] }]
+  "entities": [{ "localId": "entity-1", "name": "Example", "sourceRefs": [0] }],
+  "reviewItems": [{ "content": "A sourced issue requiring review", "sourceRefs": [0] }]
 }
 ```
 

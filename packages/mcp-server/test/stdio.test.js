@@ -121,12 +121,12 @@ test("built MCP server survives errors and completes the full workflow over one 
     taskId,
     batchId: batch.structuredContent.batch_id,
     sourceRefs: [sourceRef],
-    entities: [{ localId: "entity-business", name: "Business Entity", sourceRefs: [sourceRef] }],
+    entities: [{ localId: "entity-business", name: "Business Entity", sourceRefs: [0] }],
     concepts: [],
-    claims: [{ localId: "claim-business", text: "Business Entity is canonical.", sourceRefs: [sourceRef] }],
+    claims: [{ localId: "claim-business", text: "Business Entity is canonical.", sourceRefs: [0] }],
     relations: [],
     contradictions: [],
-    candidatePages: [{ localId: "page-business", title: "Business Entity", sourceRefs: [sourceRef] }],
+    candidatePages: [{ localId: "page-business", title: "Business Entity", sourceRefs: [0] }],
     reviewItems: [],
     batchSummary: "Defines Business Entity.",
     unresolvedQuestions: [],
@@ -136,6 +136,7 @@ test("built MCP server survives errors and completes the full workflow over one 
     arguments: { task_id: taskId, batch_id: batch.structuredContent.batch_id, analysis, idempotency_key: "stdio-analysis-v1" },
   })
   assert.equal(analyzed.isError, undefined)
+  assert.equal(analyzed.structuredContent.normalized_source_ref_indexes, 3)
   const plan = await client.callTool({ name: "llm_wiki_get_page_plan_context", arguments: { task_id: taskId, cursor: 0 } })
   assert.equal(plan.structuredContent.next_cursor, null)
   const pages = await client.callTool({

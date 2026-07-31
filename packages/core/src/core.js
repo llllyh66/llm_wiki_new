@@ -17,6 +17,7 @@ import {
 import { commitPageTransaction, committedPageRecords } from "./transaction.js"
 import {
   collectSourceRefs,
+  normalizeAnalysisEnvelope,
   validateAnalysisShape,
   validatePagePatchShape,
   validateSourceRefs,
@@ -140,15 +141,16 @@ export class LlmWikiCore {
     const record = await loadTask(workspace.paths, input?.task_id)
     const batch = record.batches.find((item) => item.batchId === input?.batch_id)
     if (!batch) fail("INVALID_ANALYSIS", "Batch does not belong to the task.")
-    const analysisBytes = Buffer.byteLength(JSON.stringify(input?.analysis ?? null))
+    const normalized = normalizeAnalysisEnvelope(input?.analysis)
+    const analysisBytes = Buffer.byteLength(JSON.stringify(normalized.analysis ?? null))
     if (analysisBytes > workspace.config.limits.maxAnalysisBytes) {
       fail("ANALYSIS_TOO_LARGE", `Analysis exceeds the ${workspace.config.limits.maxAnalysisBytes}-byte workspace limit.`)
     }
-    validateAnalysisShape(input?.analysis, record.task.taskId, batch.batchId)
-    validateSourceRefs(collectSourceRefs(input.analysis), record.task, record.batches, workspace.config.limits)
-    const idempotent = await withIdempotency(record.paths, input?.idempotency_key, { operation: "commit_analysis", batchId: batch.batchId, analysis: input.analysis }, async () => {
+    validateAnalysisShape(normalized.analysis, record.task.taskId, batch.batchId)
+    validateSourceRefs(collectSourceRefs(normalized.analysis), record.task, record.batches, workspace.config.limits)
+    const idempotent = await withIdempotency(record.paths, input?.idempotency_key, { operation: "commit_analysis", batchId: batch.batchId, analysis: normalized.analysis }, async () => {
       assertTaskStatus(record.task, ["prepared", "extracting"])
-      await writeJsonAtomic(path.join(record.paths.analysis, `${batch.batchId}.json`), input.analysis)
+      await writeJsonAtomic(path.join(record.paths.analysis, `${batch.batchId}.json`), normalized.analysis)
       if (!record.task.completedBatchIds.includes(batch.batchId)) record.task.completedBatchIds.push(batch.batchId)
       record.task.analysisRevision += 1
       record.task.activeBatchId = undefined
@@ -161,6 +163,7 @@ export class LlmWikiCore {
         batch_completed: true,
         remaining_batches: remaining,
         validation_errors: [],
+        normalized_source_ref_indexes: normalized.resolvedSourceRefIndexes,
         next_action: remaining === 0
           ? { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: record.task.taskId } }
           : { tool: "llm_wiki_get_batch", arguments: { task_id: record.task.taskId } },

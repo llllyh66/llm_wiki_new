@@ -276,20 +276,21 @@ npm test
 
 ### `sourceRefs` 或 `reviewItems` 校验失败
 
-`sourceRefs` 不使用数组索引。顶层 `sourceRefs` 保存本批分析使用的完整引用，
-实体、概念、声明、关系、矛盾、候选页面和 review item 的 `sourceRefs` 必须
-重复其中的完整对象：
+顶层 `sourceRefs` 保存本批分析使用的完整引用。实体、概念、声明、关系、
+矛盾、候选页面和 review item 推荐使用指向该目录的零起始整数索引。Core
+会在校验前把索引解析为完整对象，并只保存规范化结果：
 
 ```json
 {
   "sourceRefs": [{ "sourceId": "source-...", "chunkId": "chunk-...", "quote": "原文", "locator": {} }],
-  "entities": [{ "name": "Ping时延", "sourceRefs": [{ "sourceId": "source-...", "chunkId": "chunk-...", "quote": "原文", "locator": {} }] }],
-  "reviewItems": [{ "content": "部分指标计算公式为空", "sourceRefs": [{ "sourceId": "source-...", "chunkId": "chunk-...", "quote": "原文", "locator": {} }] }]
+  "entities": [{ "name": "Ping时延", "sourceRefs": [0] }],
+  "reviewItems": [{ "content": "部分指标计算公式为空", "sourceRefs": [0] }]
 }
 ```
 
-不要提交 `sourceRefs: [0]`，也不要把 `reviewItems` 写成字符串数组。无法从
-原文引用的问题应放入 `unresolvedQuestions`。
+所有索引必须小于顶层 `sourceRefs.length`。完整对象形式仍向后兼容；不要把
+`reviewItems` 写成字符串数组。无法从原文引用的问题应放入
+`unresolvedQuestions`。
 
 ### Excel 无法导入
 

@@ -12,7 +12,7 @@ export const analysisSchema = Object.freeze({
     batchId: { type: "string" },
     sourceRefs: {
       type: "array",
-      description: "Catalog of every unique SourceRef used by this envelope. Nested sourceRefs repeat full SourceRef objects; integer indexes are not supported.",
+      description: "Catalog of every unique complete SourceRef used by this envelope. Nested sourceRefs may use zero-based indexes into this catalog or repeat complete objects.",
       items: { $ref: "#/$defs/sourceRef" },
       minItems: 1,
       maxItems: 500,
@@ -42,8 +42,13 @@ export const analysisSchema = Object.freeze({
     },
     sourceRefList: {
       type: "array",
-      description: "One or more complete SourceRef objects from the top-level sourceRefs catalog. Do not use numeric indexes.",
-      items: { $ref: "#/$defs/sourceRef" },
+      description: "One or more zero-based indexes into the top-level sourceRefs catalog. Complete SourceRef objects remain accepted for backward compatibility. The Core resolves indexes before validation and persistence.",
+      items: {
+        oneOf: [
+          { type: "integer", minimum: 0 },
+          { $ref: "#/$defs/sourceRef" },
+        ],
+      },
       minItems: 1,
       maxItems: 500,
     },

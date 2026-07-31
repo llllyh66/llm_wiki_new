@@ -9,6 +9,43 @@ const MAX_ANALYSIS_VALIDATION_ERRORS = 200
 const ALLOWED_PAGE_ROOTS = new Set(["sources", "entities", "concepts", "topics", "comparisons"])
 const SYSTEM_PAGES = new Set(["wiki/index.md", "wiki/overview.md", "wiki/log.md"])
 
+export function normalizeAnalysisEnvelope(analysis) {
+  if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) {
+    return { analysis, resolvedSourceRefIndexes: 0 }
+  }
+  const catalog = Array.isArray(analysis.sourceRefs) ? analysis.sourceRefs : []
+  const errors = []
+  let resolvedSourceRefIndexes = 0
+  const normalized = { ...analysis }
+  for (const collection of GROUNDED_ANALYSIS_COLLECTIONS) {
+    if (!Array.isArray(analysis[collection])) continue
+    normalized[collection] = analysis[collection].map((item, itemIndex) => {
+      if (!item || typeof item !== "object" || Array.isArray(item) || !Array.isArray(item.sourceRefs)) return item
+      const sourceRefs = item.sourceRefs.map((ref, refIndex) => {
+        if (typeof ref !== "number") return ref
+        const field = `${collection}[${itemIndex}].sourceRefs[${refIndex}]`
+        if (!Number.isInteger(ref) || ref < 0) {
+          errors.push(`${field} must be a non-negative integer index or a complete SourceRef object`)
+          return ref
+        }
+        if (ref >= catalog.length) {
+          errors.push(`${field} index ${ref} is out of range for top-level sourceRefs length ${catalog.length}`)
+          return ref
+        }
+        resolvedSourceRefIndexes += 1
+        return catalog[ref]
+      })
+      return { ...item, sourceRefs }
+    })
+  }
+  if (errors.length > 0) {
+    fail("INVALID_ANALYSIS", "Analysis SourceRef normalization failed.", {
+      details: { validation_errors: errors.slice(0, MAX_ANALYSIS_VALIDATION_ERRORS), validation_error_count: errors.length },
+    })
+  }
+  return { analysis: normalized, resolvedSourceRefIndexes }
+}
+
 export function validateAnalysisShape(analysis, taskId, batchId) {
   const errors = []
   let errorCount = 0
@@ -32,7 +69,7 @@ export function validateAnalysisShape(analysis, taskId, batchId) {
     if (Array.isArray(analysis.sourceRefs)) {
       if (analysis.sourceRefs.length === 0) addError("sourceRefs must not be empty")
       analysis.sourceRefs.forEach((ref, index) => {
-        if (!isSourceRefObject(ref)) addError(`sourceRefs[${index}] must be a complete SourceRef object; integer indexes are not supported`)
+        if (!isSourceRefObject(ref)) addError(`sourceRefs[${index}] must be a complete SourceRef object`)
         else catalog.add(stableStringify(ref))
       })
     }
@@ -61,7 +98,7 @@ export function validateAnalysisShape(analysis, taskId, batchId) {
           } else {
             item.sourceRefs.forEach((ref, refIndex) => {
               const field = `${collection}[${itemIndex}].sourceRefs[${refIndex}]`
-              if (!isSourceRefObject(ref)) addError(`${field} must be a complete SourceRef object; integer indexes are not supported`)
+              if (!isSourceRefObject(ref)) addError(`${field} must be a complete SourceRef object after normalization`)
               else if (!catalog.has(stableStringify(ref))) addError(`${field} must also appear in the top-level sourceRefs catalog`)
             })
           }

@@ -35,7 +35,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
   },
   {
     name: "llm_wiki_commit_analysis",
-    description: "Validate and persist the host Agent's structured analysis for one batch. The Core never generates this semantic analysis.",
+    description: "Normalize catalog-indexed SourceRefs, validate, and persist the host Agent's structured analysis for one batch. The Core never generates semantic analysis or invents evidence.",
     inputSchema: closedObject({ task_id: taskId, batch_id: { type: "string" }, analysis: { type: "object" }, idempotency_key: { type: "string", minLength: 8, maxLength: 200 } }, ["task_id", "batch_id", "analysis", "idempotency_key"]),
   },
   {
