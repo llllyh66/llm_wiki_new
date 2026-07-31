@@ -62,6 +62,60 @@ test("built MCP server survives errors and completes the full workflow over one 
     arguments: { task_id: taskId, batch_id: batch.structuredContent.batch_id, queries: ["Business Entity"] },
   })
   assert.equal(retrieval.isError, undefined)
+
+  // Reproduce the failure sequence seen in real Agent runs: a dense analysis
+  // with many validation errors, a malformed retry, and a bad SourceRef. None
+  // of these handled tool errors may close or poison the STDIO connection.
+  const invalidAnalyses = [
+    {
+      schemaVersion: 1,
+      taskId,
+      batchId: batch.structuredContent.batch_id,
+      sourceRefs: [sourceRef],
+      entities: Array.from({ length: 60 }, (_, index) => ({ localId: `missing-ref-${index}`, name: `Entity ${index}` })),
+      concepts: [],
+      claims: [],
+      relations: [],
+      contradictions: [],
+      candidatePages: [],
+      reviewItems: [],
+      batchSummary: "Invalid dense analysis.",
+      unresolvedQuestions: [],
+    },
+    "analysis is not an object",
+    {
+      schemaVersion: 1,
+      taskId,
+      batchId: batch.structuredContent.batch_id,
+      sourceRefs: [{ ...sourceRef, chunkId: "chunk-does-not-exist" }],
+      entities: [],
+      concepts: [],
+      claims: [],
+      relations: [],
+      contradictions: [],
+      candidatePages: [],
+      reviewItems: [],
+      batchSummary: "Invalid SourceRef.",
+      unresolvedQuestions: [],
+    },
+  ]
+  for (const [index, invalidAnalysis] of invalidAnalyses.entries()) {
+    const invalid = await client.callTool({
+      name: "llm_wiki_commit_analysis",
+      arguments: {
+        task_id: taskId,
+        batch_id: batch.structuredContent.batch_id,
+        analysis: invalidAnalysis,
+        idempotency_key: `stdio-invalid-analysis-${index}`,
+      },
+    })
+    assert.equal(invalid.isError, true)
+    assert.match(invalid.structuredContent.error.code, /^INVALID_(ANALYSIS|SOURCE_REF)$/)
+    assert.equal((await client.listTools()).tools.length, 11)
+    const liveStatus = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: taskId } })
+    assert.equal(liveStatus.isError, undefined)
+  }
+
   const analysis = {
     schemaVersion: 1,
     taskId,

@@ -255,6 +255,25 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
    不要使用 shell。
    ```
 
+### `llm_wiki_commit_analysis` 报错后 MCP 断开
+
+先确认另一台电脑没有继续运行旧的 `dist`。`dist/` 不提交到 Git，单独执行
+`git pull` 不会刷新 MCP 实际运行的 JavaScript；而 `/mcp` 重启只会重新启动
+当前磁盘上的构建产物。
+
+```bash
+cd /path/to/llm_wiki_new
+git pull --ff-only
+npm ci
+npm run build
+npm test
+```
+
+然后完全退出 Claude Code，从该项目根目录重新运行 `claude`，批准项目 MCP，
+并用 `/mcp` 确认 `llm-wiki` 为 `Connected` 且有 11 个工具。最新版包含连续
+`INVALID_ANALYSIS`、错误 SourceRef 和畸形重试后保持同一 STDIO 连接存活的
+回归测试；大型错误详情也会被限幅，避免错误响应本身撑断客户端连接。
+
 ### Excel 无法导入
 
 - 确认文件后缀是 `.xlsx`，不是 `.xls` 或 `.xlsm`。

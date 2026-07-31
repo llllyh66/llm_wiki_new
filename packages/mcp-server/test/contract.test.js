@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
-import { LlmWikiCore } from "../../core/src/index.js"
+import { LlmWikiCore, LlmWikiError } from "../../core/src/index.js"
 import { TOOL_DEFINITIONS } from "../src/tool-definitions.js"
 import { HeadlessToolRouter } from "../src/tools.js"
 
@@ -72,4 +72,20 @@ test("large MCP results cross the wire once and over-budget results become recov
   const excessive = await excessiveRouter.callMcp("llm_wiki_list_tasks", {})
   assert.equal(excessive.isError, true)
   assert.equal(excessive.structuredContent.error.code, "MCP_OUTPUT_TOO_LARGE")
+
+  const largeErrorRouter = new HeadlessToolRouter({
+    listTasks: async () => { throw new LlmWikiError("INVALID_ANALYSIS", "Invalid analysis.", { details: { validation_errors: ["x".repeat(160 * 1024)] } }) },
+  })
+  const largeError = await largeErrorRouter.callMcp("llm_wiki_list_tasks", {})
+  assert.equal(largeError.isError, true)
+  assert.equal(largeError.structuredContent, undefined)
+  assert.equal(JSON.parse(largeError.content[0].text).error.code, "INVALID_ANALYSIS")
+
+  const excessiveErrorRouter = new HeadlessToolRouter({
+    listTasks: async () => { throw new LlmWikiError("INVALID_ANALYSIS", "Invalid analysis.", { details: { validation_errors: ["x".repeat(6 * 1024 * 1024 + 1)] } }) },
+  })
+  const excessiveError = await excessiveErrorRouter.callMcp("llm_wiki_list_tasks", {})
+  assert.equal(excessiveError.isError, true)
+  assert.equal(excessiveError.structuredContent.error.code, "INVALID_ANALYSIS")
+  assert.equal(excessiveError.structuredContent.error.details.truncated, true)
 })

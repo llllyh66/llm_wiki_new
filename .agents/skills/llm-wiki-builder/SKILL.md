@@ -37,8 +37,18 @@ failed, conflicted, or cancelled workflow.
    3. Form a small set of focused queries from important names and concepts.
    4. Call `llm_wiki_retrieve_context` for that batch.
    5. Analyze the chunks under the supplied AnalysisEnvelope schema.
-   6. Call `llm_wiki_commit_analysis` with a unique idempotency key.
-   7. Correct every validation error before requesting another batch.
+   6. Before calling `llm_wiki_commit_analysis`, preflight the payload: pass
+      `analysis` as a JSON object, never a serialized JSON string or Markdown
+      code block; preserve the exact `taskId` and `batchId`; include every
+      required top-level array; and give every entity, concept, claim, relation,
+      and candidate page at least one SourceRef returned by the current task.
+   7. Call `llm_wiki_commit_analysis` with a unique idempotency key.
+   8. Correct every validation error before requesting another batch. Keep the
+      same task and batch and use a new idempotency key for a changed payload.
+      If a response contains many validation errors, rebuild a small valid
+      envelope from the supplied schema instead of patching or stringifying the
+      rejected payload. After an MCP transport error, call `llm_wiki_status`
+      before retrying the commit.
 5. Call `llm_wiki_get_page_plan_context` with cursor `0`. While
    `next_cursor` is not null, repeat with that cursor and accumulate every
    returned context category. All pages must report the same
