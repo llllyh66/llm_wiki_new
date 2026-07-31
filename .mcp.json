@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "llm-wiki": {
+      "command": "node",
+      "args": [
+        "packages/mcp-server/dist/index.js",
+        "--workspace",
+        "."
+      ]
+    }
+  }
+}

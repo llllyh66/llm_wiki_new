@@ -1,0 +1,15 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "llm-wiki": {
+      "type": "local",
+      "command": [
+        "node",
+        "packages/mcp-server/dist/index.js",
+        "--workspace",
+        "."
+      ],
+      "enabled": true
+    }
+  }
+}

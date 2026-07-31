@@ -1,0 +1,22 @@
+{
+  "name": "llm-wiki",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Headless, Agent-first local knowledge-base engine",
+  "workspaces": [
+    "packages/core",
+    "packages/mcp-server",
+    "packages/cli"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace=@llm-wiki/core && npm run build --workspace=@llm-wiki/mcp-server && npm run build --workspace=@llm-wiki/cli",
+    "test": "npm run test --workspace=@llm-wiki/core && npm run build --workspace=@llm-wiki/mcp-server && npm run test --workspace=@llm-wiki/mcp-server && npm run test --workspace=@llm-wiki/cli",
+    "mcp:start": "node packages/mcp-server/dist/index.js --workspace .",
+    "cli": "node packages/cli/src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

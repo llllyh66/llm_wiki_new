@@ -1,0 +1,4 @@
+interface:
+  display_name: "llm_wiki Builder"
+  short_description: "Build a traceable local wiki from attached documents"
+  default_prompt: "Use $llm-wiki-builder to build or update this workspace knowledge base from my attached files."

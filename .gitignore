@@ -1,0 +1,32 @@
+# Dependencies and build output
+node_modules/
+dist/
+*.tgz
+
+# Local knowledge-base runtime state. The readable wiki/ may be versioned.
+.llm-wiki/
+
+# Environment and logs
+.env
+.env.local
+.env.*.local
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editors and operating systems
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Local Agent scratch state, not shared project Skills/configuration
+.superpowers/
+AGENTS.md

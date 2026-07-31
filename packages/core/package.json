@@ -1,0 +1,21 @@
+{
+  "name": "@llm-wiki/core",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": "./src/index.js",
+  "files": [
+    "src"
+  ],
+  "dependencies": {
+    "jszip": "^3.10.1",
+    "pdfjs-dist": "^5.7.284"
+  },
+  "scripts": {
+    "build": "node --check src/index.js && node --check src/core.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

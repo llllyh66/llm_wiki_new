@@ -1,0 +1,22 @@
+{
+  "name": "@llm-wiki/cli",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "llm-wiki": "src/index.js"
+  },
+  "files": [
+    "src"
+  ],
+  "dependencies": {
+    "@llm-wiki/core": "1.0.0"
+  },
+  "scripts": {
+    "build": "node --check src/index.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
