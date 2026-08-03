@@ -62,6 +62,7 @@ never launches a model, `codex`, `claude`, or arbitrary shell command.
 
 - `llm_wiki_import_files`
 - `llm_wiki_get_batch`
+- `llm_wiki_get_domain_schema`
 - `llm_wiki_retrieve_context`
 - `llm_wiki_commit_analysis`
 - `llm_wiki_get_page_plan_context`
@@ -78,7 +79,7 @@ opens are files explicitly passed to `llm_wiki_import_files`; after a safe,
 streaming import, all later work uses the managed copy.
 
 The Claude Code registration uses `CLAUDE_PROJECT_DIR` rather than a mutable
-shell working directory and keeps this bounded 11-tool server loaded for the
+shell working directory and keeps this bounded 12-tool server loaded for the
 session. MCP input/output budgets and paginated page-plan context prevent a
 single oversized request or response from closing the STDIO transport.
 Every tool exception is returned as a normal result (`ok: false`,
@@ -89,6 +90,9 @@ Large tables, code blocks, and legacy oversized chunks are split before
 `get_batch`. Batches are bounded by both text and serialized payload size and
 are always returned complete; `batch_limits` reports the actual size. Set
 `options.max_batch_chars` during import to request smaller batches.
+Domain Schemas up to 1 MiB are accepted. Schemas larger than 64 KiB are
+summarized in batch and page-plan responses and exposed through bounded
+`llm_wiki_get_domain_schema` pages.
 
 ## Managed workspace
 
@@ -129,8 +133,29 @@ OCR is a future parser adapter and is not silently treated as trustworthy text.
 
 ## Retrieval and writing safety
 
-Retrieval uses BM25, deterministic feature-hash vector cosine similarity, graph
-neighbors, and reciprocal-rank fusion. Channels are local and model-free.
+Retrieval recalls source chunks, committed analysis, and Wiki sections through
+BM25, configurable real embeddings, and Wiki title/path/link-graph ranking,
+then combines the independent rankings with reciprocal-rank fusion (RRF).
+Corpora and responses have explicit limits; results report truncation and each
+channel's status. Embedding requests are batched, timed out, cached by content
+hash in sharded files, and automatically degrade to the local feature-hash
+fallback without failing BM25 or Wiki recall.
+
+Embedding is disabled by default. Configure an OpenAI-compatible endpoint at
+runtime without saving its API key in the repository:
+
+```bash
+export LLM_WIKI_EMBEDDING_PROVIDER=openai-compatible
+export LLM_WIKI_EMBEDDING_MODEL=your-embedding-model
+export LLM_WIKI_EMBEDDING_URL=http://127.0.0.1:8000/v1/embeddings
+export LLM_WIKI_EMBEDDING_API_KEY=your-runtime-key # omit when not required
+```
+
+For Ollama, use `LLM_WIKI_EMBEDDING_PROVIDER=ollama` and set the model; the
+default endpoint is `http://127.0.0.1:11434/api/embed`. Persistent, non-secret
+tuning is available under `retrieval` in `.llm-wiki/config.json`, including
+`maxDocuments`, `rrfK`, and embedding `batchSize`, `timeoutMs`,
+`totalTimeoutMs`, `maxInputChars`, and `maxDocuments`.
 
 Agent page writes are limited to `wiki/sources/`, `wiki/entities/`,
 `wiki/concepts/`, `wiki/topics/`, and `wiki/comparisons/`. Each patch is checked

@@ -86,7 +86,7 @@ claude
 ```
 
 根目录的 `.mcp.json` 会使用 `CLAUDE_PROJECT_DIR` 锁定服务器脚本和工作区路径，
-并让这个 11 工具的服务器在会话期间保持加载。第一次打开项目时，Claude Code
+并让这个 12 工具的服务器在会话期间保持加载。第一次打开项目时，Claude Code
 会请求批准项目 MCP，请确认批准。
 
 ### 2. 检查 MCP
@@ -109,7 +109,7 @@ llm-wiki: node packages/mcp-server/dist/index.js --workspace . - Connected
 /mcp
 ```
 
-`llm-wiki` 应显示 `Connected` 和 11 个工具。
+`llm-wiki` 应显示 `Connected` 和 12 个工具。
 
 页面规划上下文会自动分页，Skill 会持续读取到 `next_cursor` 为空；大请求和大结果
 也有明确预算，超过限制时会返回可恢复错误，而不是关闭 MCP 连接。
@@ -173,6 +173,9 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
 仓库根目录的 `llm-wiki.domain-schema.json` 是当前默认领域 Schema。
 导入时 Core 会先校验它，再把一份不可变快照保存到当前任务中；
 因此任务进行期间修改原 Schema 不会改变已创建任务的抽取契约。
+Schema 最大可为 1 MiB。超过 64 KiB 时不会塞进 `get_batch` 的主响应，Core
+只返回摘要；Skill 会调用 `llm_wiki_get_domain_schema` 按 UTF-8 字节预算逐页
+读取完整类型、属性和关系定义，避免大型中文 Schema 撑爆 MCP 输出。
 
 直接告诉 Claude：
 
@@ -219,6 +222,32 @@ Skill 会先调用 `llm_wiki_list_tasks` 和 `llm_wiki_status`，然后按 `next
 ```text
 阅读 wiki/，总结系统中的核心实体、关键概念以及它们的关系。
 ```
+
+### BM25 + Embedding + Wiki 多路召回
+
+`llm_wiki_retrieve_context` 会并行考虑受管理的源文档块、已提交分析和 Wiki
+页面分段，通过 BM25、真实 Embedding、Wiki 标题/路径/双向链接图三路排序，
+最后用 RRF 融合。大型语料采用公平、有上限的候选集，返回值中的
+`corpus.truncated`、`corpus.max_documents` 和 `channel_status` 会说明是否截断
+或降级。
+
+Embedding 默认关闭；此时该通道自动使用本地 feature-hash 后备，不影响 BM25
+与 Wiki 通道。配置 OpenAI-compatible 服务：
+
+```bash
+export LLM_WIKI_EMBEDDING_PROVIDER=openai-compatible
+export LLM_WIKI_EMBEDDING_MODEL=你的向量模型
+export LLM_WIKI_EMBEDDING_URL=http://127.0.0.1:8000/v1/embeddings
+export LLM_WIKI_EMBEDDING_API_KEY=运行时密钥  # 服务不要求时可省略
+```
+
+使用 Ollama 时将 Provider 设为 `ollama` 并设置模型；默认地址为
+`http://127.0.0.1:11434/api/embed`。请求会分批、超时控制，并按内容哈希缓存到
+`.llm-wiki/indexes/embeddings/` 的分片目录。端点超时、断开或返回畸形向量时，
+工具会自动降级并保持 MCP 连接可用。可在 `.llm-wiki/config.json` 的
+`retrieval` 中调整 `maxDocuments`、`rrfK`，以及 Embedding 的 `batchSize`、
+`timeoutMs`、`totalTimeoutMs`、`maxInputChars` 和 `maxDocuments`；不要把 API
+Key 写入该文件。
 
 ## CLI 用法
 
@@ -281,7 +310,7 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
 
 ### MCP 已连接，但工具无法调用
 
-1. 在 Claude Code 中运行 `/mcp`，确认已批准且工具数为 11。
+1. 在 Claude Code 中运行 `/mcp`，确认已批准且工具数为 12。
 2. 运行 `npm run build`，然后重启 Claude Code。
 3. 确保是从项目根目录启动。
 4. 显式测试：
@@ -306,9 +335,9 @@ npm test
 ```
 
 然后完全退出 Claude Code，从该项目根目录重新运行 `claude`，批准项目 MCP，
-并用 `/mcp` 确认 `llm-wiki` 为 `Connected` 且有 11 个工具。最新版包含连续
+并用 `/mcp` 确认 `llm-wiki` 为 `Connected` 且有 12 个工具。最新版包含连续
 `INVALID_ANALYSIS`、错误 SourceRef 和畸形重试后保持同一 STDIO 连接存活的
-回归测试。现在 11 个工具的所有异常都作为普通工具结果返回，不再进入
+回归测试。现在 12 个工具的所有异常都作为普通工具结果返回，不再进入
 MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 `error`、`next_action` 和 `mcp_connection_usable: true`。Agent 应按
 `next_action` 修正或恢复，不需要执行 `/mcp`。

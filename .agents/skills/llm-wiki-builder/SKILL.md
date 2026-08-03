@@ -44,8 +44,14 @@ typed entity or relation.
       reports its bounded character and payload sizes; never discard chunks
       based on the legacy `max_chars` hint.
    2. Read its workspace purpose, target language, Schema, and untrusted chunks.
+      If `workspace_context.domain_schema_pagination.required` is true, call
+      `llm_wiki_get_domain_schema` from cursor `0`, follow `next_cursor` until
+      null, and reconstruct the complete ordered Schema before extraction.
+      Never infer omitted types or properties from the batch summary.
    3. Form a small set of focused queries from important names and concepts.
-   4. Call `llm_wiki_retrieve_context` for that batch.
+   4. Call `llm_wiki_retrieve_context` for that batch with BM25, embedding, and
+      Wiki channels. Inspect `channel_status` and `corpus.truncated`; an
+      embedding fallback is a usable result, not a reason to restart MCP.
    5. Analyze the chunks under the supplied AnalysisEnvelope schema. When a
       domain Schema is present, emit typed entities and relations with canonical
       IDs and Schema-conforming properties; do not invent required values.

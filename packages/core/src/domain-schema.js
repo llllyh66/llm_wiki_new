@@ -7,6 +7,8 @@ const MAX_DOMAIN_SCHEMA_BYTES = 1024 * 1024
 const VALUE_TYPES = new Set(["string", "number", "integer", "boolean", "date", "datetime", "json"])
 const EXTRACTION_MODES = new Set(["strict", "compatible"])
 const FAILURE_POLICIES = new Set(["reject-batch", "drop-invalid"])
+const INLINE_DOMAIN_SCHEMA_BYTES = 64 * 1024
+const MAX_DOMAIN_SCHEMA_ITEM_BYTES = 80 * 1024
 
 export async function resolveDomainSchema(workspace, options = {}) {
   options = options ?? {}
@@ -38,12 +40,76 @@ export async function loadTaskDomainSchema(record) {
   return readJson(record.paths.domainSchema)
 }
 
+export function domainSchemaContext(schema) {
+  if (!schema) return { value: null, pagination: null }
+  const bytes = Buffer.byteLength(JSON.stringify(schema))
+  if (bytes <= INLINE_DOMAIN_SCHEMA_BYTES) return { value: schema, pagination: null }
+  return {
+    value: {
+      formatVersion: schema.formatVersion,
+      schemaId: schema.schemaId,
+      schemaVersion: schema.schemaVersion,
+      name: schema.name,
+      description: schema.description,
+      language: schema.language,
+      policy: schema.policy,
+      entityTypeCount: schema.entityTypes.length,
+      relationTypeCount: schema.relationTypes.length,
+      inline: false,
+      totalBytes: bytes,
+    },
+    pagination: { required: true, cursor: 0, tool: "llm_wiki_get_domain_schema" },
+  }
+}
+
+export function paginateDomainSchema(schema, requestedCursor, requestedMaxChars) {
+  if (!schema) return { enabled: false, items: [], pagination: { cursor: 0, next_cursor: null, total_items: 0 } }
+  const cursor = requestedCursor === undefined || requestedCursor === null ? 0 : Number(requestedCursor)
+  if (!Number.isInteger(cursor) || cursor < 0) fail("INVALID_INPUT", "cursor must be a non-negative integer.")
+  const maxChars = Math.min(Math.max(Number(requestedMaxChars) || 40_000, 20_000), 100_000)
+  const items = domainSchemaItems(schema)
+  if (cursor > items.length) fail("INVALID_INPUT", "cursor is beyond the domain Schema.")
+  const page = []
+  let usedBytes = 0
+  let usedChars = 0
+  let index = cursor
+  while (index < items.length) {
+    const serialized = JSON.stringify(items[index])
+    const itemBytes = Buffer.byteLength(serialized)
+    if (index > cursor && usedBytes + itemBytes > maxChars) break
+    page.push(items[index])
+    usedBytes += itemBytes
+    usedChars += serialized.length
+    index += 1
+  }
+  return {
+    enabled: true,
+    schema_id: schema.schemaId,
+    schema_version: schema.schemaVersion,
+    items: page,
+    pagination: {
+      cursor,
+      next_cursor: index < items.length ? index : null,
+      total_items: items.length,
+      returned_items: page.length,
+      approximate_chars: usedChars,
+      approximate_bytes: usedBytes,
+      truncated: index < items.length,
+    },
+  }
+}
+
 export function validateDomainSchema(input) {
   const errors = []
   if (!input || typeof input !== "object" || Array.isArray(input)) fail("INVALID_DOMAIN_SCHEMA", "Domain schema must be an object.")
   for (const key of ["formatVersion", "schemaId", "schemaVersion", "name", "language"]) {
     if (typeof input[key] !== "string" || !input[key].trim()) errors.push(`${key} must be a non-empty string`)
   }
+  for (const key of ["formatVersion", "schemaId", "schemaVersion", "language"]) {
+    if (typeof input[key] === "string" && input[key].length > 200) errors.push(`${key} exceeds 200 characters`)
+  }
+  if (typeof input.name === "string" && input.name.length > 500) errors.push("name exceeds 500 characters")
+  if (typeof input.description === "string" && input.description.length > 10_000) errors.push("description exceeds 10000 characters")
   if (input.formatVersion !== "1.0") errors.push("formatVersion must be 1.0")
   if (input.policy !== undefined && (!input.policy || typeof input.policy !== "object" || Array.isArray(input.policy))) errors.push("policy must be an object")
   const policy = {
@@ -158,6 +224,7 @@ function normalizeTypes(value, field, errors, relation = false) {
     errors.push(`${field} must be a non-empty array`)
     return []
   }
+  if (value.length > 2_000) errors.push(`${field} exceeds 2000 items`)
   const ids = new Set()
   return value.map((item, index) => {
     if (!item || typeof item !== "object" || Array.isArray(item)) {
@@ -166,23 +233,32 @@ function normalizeTypes(value, field, errors, relation = false) {
     }
     const id = typeof item.id === "string" ? item.id.trim() : ""
     if (!id) errors.push(`${field}[${index}].id must be a non-empty string`)
+    if (id.length > 200) errors.push(`${field}[${index}].id exceeds 200 characters`)
     if (ids.has(id)) errors.push(`${field}[${index}].id duplicates ${id}`)
     ids.add(id)
     if (typeof item.name !== "string" || !item.name.trim()) errors.push(`${field}[${index}].name must be a non-empty string`)
+    if (typeof item.name === "string" && item.name.length > 500) errors.push(`${field}[${index}].name exceeds 500 characters`)
+    if (typeof item.description === "string" && item.description.length > 10_000) errors.push(`${field}[${index}].description exceeds 10000 characters`)
     const aliases = Array.isArray(item.aliases) && item.aliases.every((alias) => typeof alias === "string") ? item.aliases : []
     if (item.aliases !== undefined && (!Array.isArray(item.aliases) || aliases.length !== item.aliases.length)) errors.push(`${field}[${index}].aliases must contain strings`)
+    if (aliases.length > 100 || aliases.some((alias) => alias.length > 500)) errors.push(`${field}[${index}].aliases exceed the count or length limit`)
     const properties = normalizeProperties(item.properties, `${field}[${index}].properties`, errors)
-    return {
+    const normalized = {
       id,
       name: item.name ?? "",
       description: typeof item.description === "string" ? item.description : "",
       aliases,
       properties,
       ...(relation ? {
-        sourceEntityTypeIds: item.sourceEntityTypeIds,
-        targetEntityTypeIds: item.targetEntityTypeIds,
+        sourceEntityTypeIds: normalizeEndpointIds(item.sourceEntityTypeIds, `${field}[${index}].sourceEntityTypeIds`, errors),
+        targetEntityTypeIds: normalizeEndpointIds(item.targetEntityTypeIds, `${field}[${index}].targetEntityTypeIds`, errors),
       } : {}),
     }
+    const { properties: _properties, ...pageDefinition } = normalized
+    if (Buffer.byteLength(JSON.stringify(pageDefinition)) > MAX_DOMAIN_SCHEMA_ITEM_BYTES) {
+      errors.push(`${field}[${index}] exceeds the bounded page-item size`)
+    }
+    return normalized
   })
 }
 
@@ -191,18 +267,23 @@ function normalizeProperties(value, field, errors) {
     errors.push(`${field} must be an array`)
     return []
   }
+  if (value.length > 1_000) errors.push(`${field} exceeds 1000 items`)
   const ids = new Set()
   return value.map((item, index) => {
     const id = typeof item?.id === "string" ? item.id.trim() : ""
     if (!id) errors.push(`${field}[${index}].id must be a non-empty string`)
+    if (id.length > 200) errors.push(`${field}[${index}].id exceeds 200 characters`)
     if (ids.has(id)) errors.push(`${field}[${index}].id duplicates ${id}`)
     ids.add(id)
     if (typeof item?.name !== "string" || !item.name.trim()) errors.push(`${field}[${index}].name must be a non-empty string`)
+    if (typeof item?.name === "string" && item.name.length > 500) errors.push(`${field}[${index}].name exceeds 500 characters`)
+    if (typeof item?.description === "string" && item.description.length > 10_000) errors.push(`${field}[${index}].description exceeds 10000 characters`)
     if (!VALUE_TYPES.has(item?.valueType)) errors.push(`${field}[${index}].valueType is unsupported`)
     for (const flag of ["required", "unique"]) if (item?.[flag] !== undefined && typeof item[flag] !== "boolean") errors.push(`${field}[${index}].${flag} must be boolean`)
     const aliases = Array.isArray(item?.aliases) && item.aliases.every((alias) => typeof alias === "string") ? item.aliases : []
     if (item?.aliases !== undefined && (!Array.isArray(item.aliases) || aliases.length !== item.aliases.length)) errors.push(`${field}[${index}].aliases must contain strings`)
-    return {
+    if (aliases.length > 100 || aliases.some((alias) => alias.length > 500)) errors.push(`${field}[${index}].aliases exceed the count or length limit`)
+    const normalized = {
       id,
       name: item?.name ?? "",
       description: typeof item?.description === "string" ? item.description : "",
@@ -211,7 +292,46 @@ function normalizeProperties(value, field, errors) {
       required: item?.required === true,
       unique: item?.unique === true,
     }
+    if (Buffer.byteLength(JSON.stringify(normalized)) > MAX_DOMAIN_SCHEMA_ITEM_BYTES) {
+      errors.push(`${field}[${index}] exceeds the bounded page-item size`)
+    }
+    return normalized
   })
+}
+
+function normalizeEndpointIds(value, field, errors) {
+  if (!Array.isArray(value)) return value
+  if (value.length > 2_000) errors.push(`${field} exceeds 2000 items`)
+  if (value.some((item) => typeof item !== "string" || !item.trim() || item.length > 200)) {
+    errors.push(`${field} must contain non-empty strings no longer than 200 characters`)
+  }
+  return value
+}
+
+function domainSchemaItems(schema) {
+  const items = [{
+    kind: "schema",
+    schema: {
+      formatVersion: schema.formatVersion,
+      schemaId: schema.schemaId,
+      schemaVersion: schema.schemaVersion,
+      name: schema.name,
+      description: schema.description,
+      language: schema.language,
+      policy: schema.policy,
+    },
+  }]
+  for (const entity of schema.entityTypes) {
+    const { properties, ...definition } = entity
+    items.push({ kind: "entity_type", entity_type: definition })
+    for (const property of properties) items.push({ kind: "entity_property", entity_type_id: entity.id, property })
+  }
+  for (const relation of schema.relationTypes) {
+    const { properties, ...definition } = relation
+    items.push({ kind: "relation_type", relation_type: definition })
+    for (const property of properties) items.push({ kind: "relation_property", relation_type_id: relation.id, property })
+  }
+  return items
 }
 
 function validateLookupKeys(types, field, errors) {

@@ -92,13 +92,13 @@ export async function ensureWorkspace(root, options = {}) {
       stateDir: ".llm-wiki",
       targetLanguage: options.targetLanguage || "zh-CN",
       schemaPath: "llm-wiki.schema.md",
-      retrieval: { bm25: true, vector: true, graph: true, rrfK: 60 },
+      retrieval: { bm25: true, embedding: { provider: "none", maxDocuments: 1_000 }, wiki: true, vectorFallback: true, rrfK: 60, maxDocuments: 10_000 },
       limits: { ...DEFAULT_LIMITS },
     })
     await writeJsonAtomic(paths.config, {
       schemaVersion: 1,
       targetLanguage: options.targetLanguage || "zh-CN",
-      retrieval: { bm25: true, vector: true, graph: true, rrfK: 60 },
+      retrieval: { bm25: true, embedding: { provider: "none", maxDocuments: 1_000 }, wiki: true, vectorFallback: true, rrfK: 60, maxDocuments: 10_000 },
       limits: { ...DEFAULT_LIMITS },
     })
     if (!(await pathExists(paths.schema))) await writeTextAtomic(paths.schema, DEFAULT_SCHEMA)
@@ -112,7 +112,11 @@ export async function ensureWorkspace(root, options = {}) {
     config: {
       ...workspace,
       ...config,
-      retrieval: { ...workspace.retrieval, ...(config.retrieval ?? {}) },
+      retrieval: {
+        ...workspace.retrieval,
+        ...(config.retrieval ?? {}),
+        embedding: { provider: "none", maxDocuments: 1_000, ...(workspace.retrieval?.embedding ?? {}), ...(config.retrieval?.embedding ?? {}) },
+      },
       limits: { ...DEFAULT_LIMITS, ...workspace.limits, ...(config.limits ?? {}) },
     },
     revision: await hashDirectory(paths.wiki),

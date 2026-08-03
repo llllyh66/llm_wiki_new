@@ -3,6 +3,10 @@
 Use this contract only when `llm_wiki_get_batch` returns a non-null
 `workspace_context.domain_schema`. The task owns a validated snapshot, so do
 not reload or reinterpret a later version of the source Schema file mid-task.
+When `workspace_context.domain_schema_pagination.required` is true, the inline
+value is only a summary. Read `llm_wiki_get_domain_schema` from cursor `0`
+through a null `next_cursor` and reconstruct all ordered type and property
+items before classifying any entity or relation.
 
 ## Entity output
 

@@ -22,7 +22,7 @@ test("built MCP server survives errors and completes the full workflow over one 
   t.after(() => transport.close().catch(() => {}))
   await client.connect(transport)
   const listed = await client.listTools()
-  assert.equal(listed.tools.length, 11)
+  assert.equal(listed.tools.length, 12)
   assert.equal(listed.tools.some((tool) => tool.name === "llm_wiki_import_files"), true)
   assert.equal(listed.tools.some((tool) => tool.name === "llm_wiki_projects"), false)
 
@@ -30,7 +30,7 @@ test("built MCP server survives errors and completes the full workflow over one 
   assert.equal(handledError.isError, undefined)
   assert.equal(handledError.structuredContent.error.code, "TASK_NOT_FOUND")
   assert.equal(handledError.structuredContent.mcp_connection_usable, true)
-  assert.equal((await client.listTools()).tools.length, 11)
+  assert.equal((await client.listTools()).tools.length, 12)
 
   const oversizedInput = await client.callTool({
     name: "llm_wiki_lint",
@@ -39,11 +39,12 @@ test("built MCP server survives errors and completes the full workflow over one 
   assert.equal(oversizedInput.isError, undefined)
   assert.equal(oversizedInput.structuredContent.error.code, "MCP_INPUT_TOO_LARGE")
   assert.equal(oversizedInput.structuredContent.mcp_connection_usable, true)
-  assert.equal((await client.listTools()).tools.length, 11)
+  assert.equal((await client.listTools()).tools.length, 12)
 
   const failingCalls = [
     { name: "llm_wiki_import_files", arguments: {} },
     { name: "llm_wiki_get_batch", arguments: { task_id: "invalid" } },
+    { name: "llm_wiki_get_domain_schema", arguments: { task_id: "invalid" } },
     { name: "llm_wiki_retrieve_context", arguments: { task_id: "invalid", batch_id: "batch-0001", queries: ["x"] } },
     { name: "llm_wiki_get_page_plan_context", arguments: { task_id: "invalid" } },
     { name: "llm_wiki_commit_pages", arguments: { task_id: "invalid", patches: [], based_on_wiki_revision: "0".repeat(64), idempotency_key: "invalid-pages-v1" } },
@@ -56,7 +57,7 @@ test("built MCP server survives errors and completes the full workflow over one 
     assert.equal(failed.isError, undefined, call.name)
     assert.equal(failed.structuredContent.ok, false, call.name)
     assert.equal(failed.structuredContent.mcp_connection_usable, true, call.name)
-    assert.equal((await client.listTools()).tools.length, 11, call.name)
+    assert.equal((await client.listTools()).tools.length, 12, call.name)
   }
 
   const lint = await client.callTool({ name: "llm_wiki_lint", arguments: {} })
@@ -163,7 +164,7 @@ test("built MCP server survives errors and completes the full workflow over one 
       assert.equal(invalid.structuredContent.error.details.quality_gate, "source-ref-grounding-v1")
       assert.equal(invalid.structuredContent.error.details.validation_error_count, 48)
     }
-    assert.equal((await client.listTools()).tools.length, 11)
+    assert.equal((await client.listTools()).tools.length, 12)
     const liveStatus = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: taskId } })
     assert.equal(liveStatus.isError, undefined)
   }
@@ -260,10 +261,10 @@ test("built MCP server survives errors and completes the full workflow over one 
   assert.equal(domainRejected.structuredContent.accepted, false)
   assert.equal(domainRejected.structuredContent.error.code, "INVALID_DOMAIN_ANALYSIS")
   assert.equal(domainRejected.structuredContent.validation_errors.length > 0, true)
-  assert.equal((await client.listTools()).tools.length, 11)
+  assert.equal((await client.listTools()).tools.length, 12)
   const domainStatus = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: domainTaskId } })
   assert.equal(domainStatus.structuredContent.status, "prepared")
-  assert.equal((await client.listTools()).tools.length, 11)
+  assert.equal((await client.listTools()).tools.length, 12)
 
   const largeSource = path.join(workspace, "large.md")
   const largeRows = Array.from({ length: 4_000 }, (_, index) => `| metric-${index} | ${"value ".repeat(8)}${index} |`)
@@ -281,7 +282,7 @@ test("built MCP server survives errors and completes the full workflow over one 
   assert.equal(largeBatch.structuredContent.batch_limits.complete, true)
   assert.equal(largeBatch.structuredContent.batch_limits.char_count <= 12_000, true)
   assert.equal(largeBatch.structuredContent.chunks.every((chunk) => chunk.text.length <= 8_000), true)
-  assert.equal((await client.listTools()).tools.length, 11)
+  assert.equal((await client.listTools()).tools.length, 12)
   const largeStatus = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: largeImported.structuredContent.task_id } })
   assert.equal(largeStatus.structuredContent.status, "prepared")
 })

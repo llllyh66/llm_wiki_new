@@ -25,14 +25,24 @@ export const TOOL_DEFINITIONS = Object.freeze([
     inputSchema: closedObject({ task_id: taskId, batch_id: { type: ["string", "null"] }, max_chars: { type: "number", minimum: 1000, maximum: 30000, description: "Legacy compatibility hint only. Batches are fixed and bounded at import, and are always returned complete." } }, ["task_id"]),
   },
   {
+    name: "llm_wiki_get_domain_schema",
+    description: "Return one bounded page of the task's validated domain Schema. For large Schemas, repeat with next_cursor until null before extracting entities and relations.",
+    inputSchema: closedObject({
+      task_id: taskId,
+      cursor: { type: ["integer", "null"], minimum: 0 },
+      max_chars: { type: "integer", minimum: 20000, maximum: 100000, description: "Compatibility name for the approximate UTF-8 byte budget of one Schema page." },
+    }, ["task_id"]),
+  },
+  {
     name: "llm_wiki_retrieve_context",
-    description: "Retrieve relevant existing Wiki pages and committed task analysis with deterministic BM25. Unavailable vector/graph channels degrade without failing.",
+    description: "Recall source chunks, committed analysis, and Wiki sections through BM25, configurable real Embedding, and Wiki-native title/link/graph channels, then fuse rankings with RRF. Embedding failures degrade without failing the tool.",
     inputSchema: closedObject({
       task_id: taskId,
       batch_id: { type: "string" },
-      queries: { type: "array", minItems: 1, maxItems: 20, items: { type: "string" } },
-      channels: { type: "array", items: { enum: ["bm25", "vector", "graph"] } },
+      queries: { type: "array", minItems: 1, maxItems: 20, items: { type: "string", minLength: 1, maxLength: 2000 } },
+      channels: { type: "array", items: { enum: ["bm25", "embedding", "wiki", "vector", "graph"] }, description: "Use bm25, embedding, and wiki. vector and graph are backward-compatible aliases." },
       limit: { type: "number", minimum: 1, maximum: 100 },
+      max_chars: { type: "number", minimum: 1000, maximum: 120000 },
     }, ["task_id", "batch_id", "queries"]),
   },
   {

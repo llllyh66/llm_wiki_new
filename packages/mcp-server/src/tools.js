@@ -84,6 +84,7 @@ export class HeadlessToolRouter {
     switch (name) {
       case "llm_wiki_import_files": return this.core.importFiles(args)
       case "llm_wiki_get_batch": return this.core.getBatch(args)
+      case "llm_wiki_get_domain_schema": return this.core.getDomainSchema(args)
       case "llm_wiki_retrieve_context": return this.core.retrieveContext(args)
       case "llm_wiki_commit_analysis": return this.core.commitAnalysis(args)
       case "llm_wiki_get_page_plan_context": return this.core.getPagePlanContext(args)

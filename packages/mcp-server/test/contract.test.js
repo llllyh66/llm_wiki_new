@@ -14,6 +14,7 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
   assert.deepEqual(names, [
     "llm_wiki_import_files",
     "llm_wiki_get_batch",
+    "llm_wiki_get_domain_schema",
     "llm_wiki_retrieve_context",
     "llm_wiki_commit_analysis",
     "llm_wiki_get_page_plan_context",
@@ -87,6 +88,7 @@ test("every registered MCP tool routes errors without terminating the router", a
   const failureRouter = new HeadlessToolRouter({
     importFiles: failing,
     getBatch: failing,
+    getDomainSchema: failing,
     retrieveContext: failing,
     commitAnalysis: failing,
     getPagePlanContext: failing,

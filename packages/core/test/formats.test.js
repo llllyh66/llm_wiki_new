@@ -158,6 +158,23 @@ test("very large Markdown tables and code blocks produce complete payload-bounde
   assert.equal(smallHint.batch_id, normal.batch_id)
   assert.deepEqual(smallHint.chunks, normal.chunks)
   assert.equal(Buffer.byteLength(JSON.stringify(smallHint)) < 512 * 1024, true)
+
+  const configPath = path.join(fixture.workspace, ".llm-wiki", "config.json")
+  const config = JSON.parse(await readFile(configPath, "utf8"))
+  config.retrieval.maxDocuments = 100
+  await writeFile(configPath, JSON.stringify(config))
+  const retrieval = await fixture.core.retrieveContext({
+    task_id: imported.task_id,
+    batch_id: normal.batch_id,
+    queries: ["metric-0"],
+    channels: ["bm25", "embedding", "wiki"],
+    max_chars: 10_000,
+  })
+  assert.equal(retrieval.fusion, "rrf")
+  assert.equal(retrieval.corpus.max_documents, 100)
+  assert.equal(retrieval.corpus.truncated, true)
+  assert.equal(retrieval.channel_status.embedding.mode, "feature-hash-fallback")
+  assert.equal(Buffer.byteLength(JSON.stringify(retrieval)) < 20_000, true)
 })
 
 test("PDF text is normalized page by page with traceable page numbers", async (t) => {

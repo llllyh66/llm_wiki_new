@@ -33,7 +33,7 @@ call a model, an Agent CLI, a desktop API, or an HTTP service.
 | Page merge/write | `src/lib/page-merge.ts`, `src/commands/fs.ts` | Replace with Core-owned optimistic concurrency, staging, atomic rename, rollback, and journal records. No LLM merge is retained. |
 | Frontmatter and schema routing | `src/lib/frontmatter.ts`, `src/lib/wiki-schema.ts` | Preserve the structural intent; enforce a smaller deterministic page contract in Core for the first slice. |
 | Structural lint | `src/lib/lint-structural-core.ts`, `src/lib/lint.ts` | Reimplement deterministic broken-link/orphan checks in Core. The semantic LLM lint path is deleted. |
-| Keyword/vector/graph retrieval | `src-tauri/src/commands/search.rs`, `src/lib/search.ts`, graph modules, embedding modules | First slice implements Core BM25 plus exact title matching. Vector and graph are reported as unavailable/pending rather than blocking. Graph materialization is deterministic at finalize. Provider-backed embeddings are not migrated. |
+| Keyword/vector/graph retrieval | `src-tauri/src/commands/search.rs`, `src/lib/search.ts`, graph modules, embedding modules | Reimplemented in Core across source chunks, committed analysis, and Wiki sections: BM25, configurable OpenAI-compatible/Ollama embeddings with sharded cache and safe fallback, Wiki title/path/bidirectional-link ranking, and RRF fusion. Corpus, candidate, timeout, and response budgets bound large workspaces. |
 | Desktop project/state | `src/App.tsx`, `src/components/`, `src/stores/`, `src/lib/project-store.ts` | Delete after the headless E2E is green. Workspace identity replaces project selection. |
 | Desktop shell and HTTP APIs | `src-tauri/`, including `api_server.rs`, `clip_server.rs`, window/tray startup | Delete after the headless E2E is green. No HTTP compatibility layer will remain. |
 | Built-in model providers | `src/lib/llm-client.ts`, `src/lib/llm-providers.ts`, `src/lib/claude-cli-transport.ts`, `src/lib/codex-cli-transport.ts`, `src-tauri/src/agent/provider.rs` | Delete. Core and MCP are model-free. |
@@ -95,7 +95,8 @@ workspace; the retained audit above records their former responsibility map.
 ## Implemented Headless architecture
 
 - `packages/core`: workspace, source object store, Markdown/TXT/HTML/DOCX/XLSX/PDF
-  parsers, structural chunking, persisted tasks, BM25/vector/graph retrieval,
+  parsers, structural chunking, persisted tasks, BM25/embedding/Wiki retrieval
+  with RRF, bounded domain-Schema pagination,
   SourceRef and path validation, optimistic hashes, staging/rollback/journal,
   Finalize, indexes, lint, status, list, and abort.
 - `packages/mcp-server`: STDIO-only MCP adapter that directly imports Core.

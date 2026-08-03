@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
@@ -259,6 +259,69 @@ test("domain schema is snapshotted, exposed to the Agent, and normalizes or drop
   assert.equal(plan.analysis_summary.relations[0].relationTypeId, "subject_owns_object")
 })
 
+test("large domain schemas are summarized in batches and retrieved through bounded pages", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const entityTypes = Array.from({ length: 120 }, (_, typeIndex) => ({
+    id: `entity_type_${typeIndex}`,
+    name: `实体类型 ${typeIndex}`,
+    description: `领域实体 ${typeIndex} ${"说明".repeat(80)}`,
+    aliases: [`类型别名 ${typeIndex}`],
+    properties: Array.from({ length: 6 }, (_, propertyIndex) => ({
+      id: `property_${propertyIndex}`,
+      name: `属性 ${typeIndex}-${propertyIndex}`,
+      description: `属性定义 ${typeIndex}-${propertyIndex} ${"约束".repeat(60)}`,
+      valueType: "string",
+      required: propertyIndex === 0,
+      unique: propertyIndex === 0,
+    })),
+  }))
+  const schema = {
+    formatVersion: "1.0",
+    schemaId: "large-domain-schema",
+    schemaVersion: "1.0.0",
+    name: "大型领域模型",
+    description: "用于验证大型 Schema 的分页传输。",
+    language: "zh-CN",
+    policy: {
+      extractionMode: "compatible",
+      validationFailurePolicy: "drop-invalid",
+      allowUnknownEntityTypes: false,
+      allowUnknownRelationTypes: false,
+      allowUnknownProperties: false,
+    },
+    entityTypes,
+    relationTypes: [{
+      id: "relates_to",
+      name: "关联",
+      description: "实体之间的关联。",
+      aliases: [],
+      sourceEntityTypeIds: ["entity_type_0"],
+      targetEntityTypeIds: ["entity_type_1"],
+      properties: [],
+    }],
+  }
+  assert.equal(Buffer.byteLength(JSON.stringify(schema)) > 64 * 1024, true)
+  const imported = await f.core.importFiles({ files: [{ path: f.source }], options: { domain_schema: schema } })
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  assert.equal(batch.workspace_context.domain_schema.inline, false)
+  assert.equal(batch.workspace_context.domain_schema.entityTypeCount, 120)
+  assert.equal(batch.workspace_context.domain_schema.entityTypes, undefined)
+  assert.deepEqual(batch.workspace_context.domain_schema_pagination, { required: true, cursor: 0, tool: "llm_wiki_get_domain_schema" })
+
+  const items = []
+  let cursor = 0
+  do {
+    const page = await f.core.getDomainSchema({ task_id: imported.task_id, cursor, max_chars: 20_000 })
+    assert.equal(Buffer.byteLength(JSON.stringify(page)) < 30_000, true)
+    items.push(...page.items)
+    cursor = page.pagination.next_cursor
+  } while (cursor !== null)
+  assert.equal(items.filter((item) => item.kind === "entity_type").length, 120)
+  assert.equal(items.filter((item) => item.kind === "entity_property").length, 720)
+  assert.equal(items.filter((item) => item.kind === "relation_type").length, 1)
+})
+
 test("invalid domain schema is rejected before a task is created", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
@@ -270,6 +333,79 @@ test("invalid domain schema is rejected before a task is created", async (t) => 
     (error) => error instanceof LlmWikiError && error.code === "INVALID_DOMAIN_SCHEMA",
   )
   assert.equal((await f.core.listTasks()).tasks.length, 0)
+})
+
+test("real embedding recall is cached and endpoint failures degrade without failing retrieval", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const semanticSource = path.join(f.incoming, "semantic.md")
+  await writeFile(semanticSource, "# Transport\n\nAn automobile carries passengers between cities.\n")
+  let requests = 0
+  let endpointUnavailable = false
+  let endpointMalformed = false
+  const originalFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = originalFetch })
+  globalThis.fetch = async (_url, options) => {
+    requests += 1
+    if (endpointUnavailable) throw new Error("endpoint unavailable")
+    const payload = JSON.parse(options.body)
+    const inputs = Array.isArray(payload.input) ? payload.input : [payload.input]
+    return new Response(JSON.stringify({
+      data: endpointMalformed ? [] : inputs.map((input, index) => ({
+        index,
+        embedding: /\b(car|automobile)\b/i.test(input) ? [1, 0, 0] : [0, 1, 0],
+      })),
+    }), { status: 200, headers: { "content-type": "application/json" } })
+  }
+  const endpoint = "http://embedding.test/v1/embeddings"
+  const imported = await f.core.importFiles({ files: [{ path: semanticSource }] })
+  const configPath = path.join(f.workspace, ".llm-wiki", "config.json")
+  const config = JSON.parse(await readFile(configPath, "utf8"))
+  config.retrieval.embedding = { provider: "openai-compatible", model: "test-embedding", endpoint, batchSize: 8, maxDocuments: 100 }
+  await writeFile(configPath, JSON.stringify(config))
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+
+  const first = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: batch.batch_id, queries: ["car"], channels: ["bm25", "embedding", "wiki"] })
+  assert.equal(first.channel_status.embedding.mode, "embedding")
+  assert.equal(first.hits.some((hit) => hit.kind === "source-chunk" && hit.snippet.includes("automobile")), true)
+  assert.equal(first.corpus.by_kind["source-chunk"] > 0, true)
+  const requestsAfterFirst = requests
+  const second = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: batch.batch_id, queries: ["car"], channels: ["embedding"] })
+  assert.equal(second.channel_status.embedding.cache_hits > 0, true)
+  assert.equal(requests - requestsAfterFirst, 1)
+
+  endpointMalformed = true
+  const malformed = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: batch.batch_id, queries: ["car"], channels: ["embedding"] })
+  assert.equal(malformed.channel_status.embedding.mode, "feature-hash-fallback")
+  assert.equal(malformed.channel_status.embedding.reason, "EMBEDDING_INVALID_RESPONSE")
+
+  endpointMalformed = false
+  endpointUnavailable = true
+  const degraded = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: batch.batch_id, queries: ["car"], channels: ["embedding"] })
+  assert.equal(degraded.channel_status.embedding.mode, "feature-hash-fallback")
+  assert.equal(degraded.channel_status.embedding.degraded, true)
+  assert.equal(Array.isArray(degraded.hits), true)
+})
+
+test("Wiki title and bidirectional link neighbors participate in RRF", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const topics = path.join(f.workspace, "wiki", "topics")
+  await mkdir(topics, { recursive: true })
+  await writeFile(path.join(topics, "alpha.md"), "# AlphaTerm\n\nSee [[topics/hidden-neighbor]].\n")
+  await writeFile(path.join(topics, "hidden-neighbor.md"), "# Hidden Neighbor\n\nLinked background knowledge.\n")
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  const retrieval = await f.core.retrieveContext({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    queries: ["AlphaTerm"],
+    channels: ["bm25", "wiki"],
+  })
+  assert.equal(retrieval.fusion, "rrf")
+  assert.deepEqual(retrieval.fusion_details.channels, ["bm25", "wiki"])
+  assert.equal(retrieval.hits.some((hit) => hit.path === "wiki/topics/alpha.md"), true)
+  assert.equal(retrieval.hits.some((hit) => hit.path === "wiki/topics/hidden-neighbor.md"), true)
 })
 
 test("Markdown attachment completes the model-free vertical slice", async (t) => {
