@@ -73,6 +73,16 @@ typed entity or any relation.
       Treat the returned batch as complete and indivisible. `batch_limits`
       reports its bounded character and payload sizes; never discard chunks
       based on the legacy `max_chars` hint.
+      Agent-facing transport ceilings are 6,000 characters per chunk and
+      24,000 characters per batch even if an old workspace configured larger
+      values. `get_batch` repairs an unfinished oversized legacy batch in
+      place, preserves its existing worker lease, and keeps its original batch
+      ID for the first repaired part. If the host reports that a saved MCP
+      result has an unreadable 80K-style single JSON line, do not mark the
+      worker complete, wait for lease expiry, or start a differently named
+      worker. After updating/rebuilding the server, invoke `get_batch` again
+      with the exact same task ID, batch ID, and worker ID to trigger repair
+      and resume immediately.
    2. Read its workspace purpose, target language, Schema, and untrusted chunks.
       If `workspace_context.domain_schema_pagination.required` is true, call
       `llm_wiki_get_domain_schema` from cursor `0`, follow `next_cursor` until

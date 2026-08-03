@@ -907,30 +907,41 @@ test("duplicate content is reused and task recovery and abort stay workspace-sco
   assert.equal((await f.core.status({ task_id: second.task_id })).status, "cancelled")
 })
 
-test("get_batch repairs an unfinished legacy oversized batch without changing its requested ID", async (t) => {
+test("get_batch repairs an 81K single-line legacy batch in place and preserves its worker lease", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
   const imported = await f.core.importFiles({ files: [{ path: f.source }] })
   const batchesPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "batches.json")
+  const taskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
+  const leased = await f.core.getBatch({ task_id: imported.task_id, worker_id: "extractor-2" })
   const batches = JSON.parse(await readFile(batchesPath, "utf8"))
   const originalBatchId = batches[0].batchId
   const originalChunk = batches[0].chunks[0]
-  const oversizedText = `Legacy table\n${"| metric | value |\n".repeat(20_000)}`
+  assert.equal(leased.batch_id, originalBatchId)
+  const oversizedText = "大".repeat(81_073)
   batches[0] = {
     ...batches[0],
-    chunks: [{ ...originalChunk, text: oversizedText, structuredData: [{ rows: Array(20_000).fill(["metric", "value"]) }] }],
+    chunks: [{ ...originalChunk, text: oversizedText, structuredData: [{ rows: [["metric", oversizedText]] }] }],
     charCount: oversizedText.length,
   }
   await writeFile(batchesPath, JSON.stringify(batches))
+  const task = JSON.parse(await readFile(taskPath, "utf8"))
+  task.options.maxChunkChars = 100_000
+  task.options.maxBatchChars = 100_000
+  await writeFile(taskPath, JSON.stringify(task))
 
-  const repaired = await f.core.getBatch({ task_id: imported.task_id, batch_id: originalBatchId })
+  const repaired = await f.core.getBatch({ task_id: imported.task_id, worker_id: "extractor-2", batch_id: originalBatchId })
   assert.equal(repaired.batch_id, originalBatchId)
   assert.equal(repaired.batch_limits.complete, true)
-  assert.equal(repaired.chunks.every((chunk) => chunk.text.length <= 8_000), true)
-  assert.equal(repaired.batch_limits.payload_bytes <= 240_000, true)
+  assert.equal(repaired.chunks.every((chunk) => chunk.text.length <= 6_000), true)
+  assert.equal(repaired.batch_limits.char_count <= 24_000, true)
+  assert.equal(Math.max(...JSON.stringify(repaired, null, 2).split("\n").map((line) => line.length)) <= 7_000, true)
+  assert.equal(repaired.chunks.every((chunk) => chunk.structuredData?.every((table) => table.compacted === true)), true)
   const persisted = JSON.parse(await readFile(batchesPath, "utf8"))
   assert.equal(persisted.length > 1, true)
   assert.equal(persisted[0].batchId, originalBatchId)
+  const status = await f.core.status({ task_id: imported.task_id })
+  assert.deepEqual(status.worker_recovery.leases.map(({ worker_id, batch_id }) => ({ worker_id, batch_id })), [{ worker_id: "extractor-2", batch_id: originalBatchId }])
 })
 
 test("page-plan pagination is revision-stable and oversized page commits are rejected", async (t) => {

@@ -5,8 +5,8 @@ import { ensureDir, hashDirectory, newId, nowIso, pathExists, readJson, writeJso
 
 export const DEFAULT_LIMITS = Object.freeze({
   maxSourceBytes: 25 * 1024 * 1024,
-  maxChunkChars: 8_000,
-  maxBatchChars: 30_000,
+  maxChunkChars: 6_000,
+  maxBatchChars: 24_000,
   maxPageChars: 200_000,
   maxAnalysisBytes: 2 * 1024 * 1024,
   maxCommitChars: 2_000_000,

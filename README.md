@@ -133,6 +133,11 @@ Large tables, code blocks, and legacy oversized chunks are split before
 `get_batch`. Batches are bounded by both text and serialized payload size and
 are always returned complete; `batch_limits` reports the actual size. Set
 `options.max_batch_chars` during import to request smaller batches.
+Agent transport ceilings are fixed at 6,000 characters per chunk and 24,000
+characters per batch, even when an old workspace requested larger values.
+Oversized structured table fields are compacted so pretty-printed MCP JSON does
+not contain an unreadable 80K single line. An unfinished legacy batch is
+repaired in place while preserving its original batch ID and worker lease.
 One chunk is bounded by the smaller of the chunk and batch limits, so legacy
 repair does not repeatedly rebuild the same batch or invalidate worker leases.
 Domain Schemas up to 5 MiB are accepted. Schemas larger than 64 KiB are

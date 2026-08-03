@@ -13,7 +13,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
       options: closedObject({
         target_language: { type: "string" },
         force_reanalyze: { type: "boolean" },
-        max_batch_chars: { type: "number", minimum: 1000, maximum: 30000 },
+        max_batch_chars: { type: "number", minimum: 1000, maximum: 24000 },
         domain_schema_path: { type: "string", description: "Agent-visible path to a domain extraction Schema JSON file. The validated Schema is snapshotted into the task." },
         domain_schema: { type: "object", description: "Inline domain extraction Schema. Use this or domain_schema_path, not both." },
       }),
@@ -21,7 +21,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
   },
   {
     name: "llm_wiki_get_batch",
-    description: "Lease and return one complete, stable, payload-bounded batch to an extraction worker. Different worker_id values receive different available batches; expired leases are safely reclaimed.",
+    description: "Lease and return one complete, stable, Agent-readable batch to an extraction worker. Hard transport ceilings prevent oversized JSON lines; legacy oversized batches are repaired in place while preserving the same worker_id lease and original batch ID.",
     inputSchema: closedObject({
       task_id: taskId,
       batch_id: { type: ["string", "null"] },

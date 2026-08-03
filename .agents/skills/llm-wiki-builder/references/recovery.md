@@ -16,6 +16,14 @@ connection failure when an actual coordinator tool call raises a transport
 exception. A successful `llm_wiki_status` call proves the current turn's MCP
 connection is usable.
 
+If a worker reports that the saved MCP result contains one source/JSON line too
+large for the host reader, resume that lease with the same worker and batch IDs
+after rebuilding the current server. `get_batch` enforces hard Agent-facing
+ceilings (6K per chunk, 24K per batch), compacts oversized structured table
+metadata, and repairs unfinished legacy batches without discarding the lease.
+Do not wait for expiry or send another worker to repeat the same unreadable
+response.
+
 ## Validation failure
 
 All llm_wiki tool exceptions are returned as ordinary MCP tool results with

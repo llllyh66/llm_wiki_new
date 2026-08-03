@@ -453,14 +453,17 @@ MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 旧版本不会拆分超大 Markdown/HTML/DOCX 表格和代码块，单个 chunk 可能
 突破 batch 和 MCP 输出限制。新版本会：
 
-- 把所有超大文本块拆分到 `maxChunkChars` 以内；
+- 把所有超大文本块拆分到 Agent 传输硬上限 6,000 字符以内；
+- 即使工作区或旧任务把限制改得更大，每个 batch 也不会超过 24,000 字符；
 - 同时按文字数和序列化字节数限制 batch；
+- 压缩包含超长单元格/表格字符串的 `structuredData`，避免 MCP JSON 出现 81K 单行；
 - 单个 chunk 同时服从 chunk 上限和 batch 上限，不会在每次调用时重复拆分；
 - `get_batch` 始终返回完整批次，并在 `batch_limits` 中报告实际大小；
-- 自动重建尚未完成的旧版超大 batch，已提交的批次不受影响。
+- 自动原地重建尚未完成的旧版超大 batch，保留原 batch ID 和 worker 租约，已提交的批次不受影响。
 
 并行抽取时，`get_batch` 会按 `worker_id` 租约批次，多个后台 Agent 不会拿到
-同一批；租约过期后可由替代 Agent 安全接管。
+同一批。如果报“单行 81,073 字符”，不需要等租约过期；构建新版服务后，
+使用原 `task_id + batch_id + worker_id` 再调用一次 `get_batch` 即会修复并继续。
 
 `max_chars` 现在仅作为兼容性提示，不会再截断批次并造成漏分析。如果希望
 调小批次，应在导入时设置 `options.max_batch_chars`。
