@@ -69,6 +69,7 @@ export class LlmWikiCore {
   constructor(workspaceRoot) {
     this.workspaceRoot = workspaceRoot
     this.taskLocks = new Map()
+    this.workspaceWriteTail = Promise.resolve()
   }
 
   async workspace(options = {}) {
@@ -386,7 +387,7 @@ export class LlmWikiCore {
   }
 
   async getPagePlanContext(input) {
-    return this.#withTaskLock(input?.task_id, () => this.#getPagePlanContext(input))
+    return this.#withWorkspaceWriteLock(() => this.#withTaskLock(input?.task_id, () => this.#getPagePlanContext(input)))
   }
 
   async #getPagePlanContext(input) {
@@ -453,17 +454,12 @@ export class LlmWikiCore {
       }
     }
     const revision = await hashDirectory(workspace.paths.wiki)
-    if (projection?.wikiRevision && projection.wikiRevision !== revision) {
-      projectionState(record.task).lease = null
-      await saveTask(record.paths, record.task)
-      fail("WIKI_REVISION_CONFLICT", "The Wiki changed while collecting projection context.", {
-        retryable: true,
-        taskId: record.task.taskId,
-        details: { expected: projection.wikiRevision, actual: revision },
-        suggestedAction: "Request a new projection immediately and rebuild the page plan from the latest Wiki revision.",
-      })
-    }
-    if (projection) projection.wikiRevision = revision
+    // Freeze the projection's initial workspace revision for diagnostics, but
+    // do not invalidate paginated context when another task changes unrelated
+    // pages. commitPageTransaction performs path-scoped create/hash checks.
+    const planRevision = projection?.wikiRevision ?? revision
+    const concurrentWikiChangesDetected = Boolean(projection?.wikiRevision && projection.wikiRevision !== revision)
+    if (projection && !projection.wikiRevision) projection.wikiRevision = revision
     record.task.pagePlanRevision += 1
     record.task.wikiRevision = revision
     await saveTask(record.paths, record.task)
@@ -501,7 +497,10 @@ export class LlmWikiCore {
         domain_schema: pagePlanDomainSchemaMetadata(record.task.domainSchema),
         domain_schema_pagination: null,
       } : {}),
-      based_on_wiki_revision: revision,
+      based_on_wiki_revision: planRevision,
+      current_wiki_revision: revision,
+      revision_scope: "target-pages",
+      concurrent_wiki_changes_detected: concurrentWikiChangesDetected,
       ...(projection ? {
         projection: publicProjection(projection),
         provisional: projection.mode === "incremental",
@@ -512,7 +511,7 @@ export class LlmWikiCore {
   }
 
   async commitPages(input) {
-    return this.#withTaskLock(input?.task_id, () => this.#commitPages(input))
+    return this.#withWorkspaceWriteLock(() => this.#withTaskLock(input?.task_id, () => this.#commitPages(input)))
   }
 
   async #commitPages(input) {
@@ -621,6 +620,8 @@ export class LlmWikiCore {
         transaction_id: journal.transactionId,
         commit_revision: record.task.commitRevision,
         wiki_revision: journal.wikiRevision,
+        transaction_base_revision: journal.actualBaseRevision,
+        unrelated_wiki_changes_accepted: journal.concurrentWikiChange,
         written_pages: journal.patches.map((patch) => ({ path: patch.path, file_hash: patch.fileHash })),
         ...(projection ? {
           projection: publicProjection(projection),
@@ -653,6 +654,10 @@ export class LlmWikiCore {
   }
 
   async finalize(input) {
+    return this.#withWorkspaceWriteLock(() => this.#withTaskLock(input?.task_id, () => this.#finalize(input)))
+  }
+
+  async #finalize(input) {
     const workspace = await this.workspace()
     const record = await loadTask(workspace.paths, input?.task_id)
     if (record.task.status === "completed") return readJson(record.paths.result)
@@ -825,6 +830,13 @@ export class LlmWikiCore {
       if (this.taskLocks.get(key) === tail) this.taskLocks.delete(key)
     }
   }
+
+  async #withWorkspaceWriteLock(operation) {
+    const previous = this.workspaceWriteTail
+    const run = previous.then(operation, operation)
+    this.workspaceWriteTail = run.then(() => undefined, () => undefined)
+    return run
+  }
 }
 
 function normalizeWorkerId(value) {
@@ -903,7 +915,14 @@ function projectionState(task) {
   Object.assign(current, {
     batchThreshold: Number.isInteger(current.batchThreshold) && current.batchThreshold > 0 ? current.batchThreshold : 4,
     batchLimit: Number.isInteger(current.batchLimit) && current.batchLimit > 0 ? current.batchLimit : 4,
-    writerProjectionQuantum: Number.isInteger(current.writerProjectionQuantum) && current.writerProjectionQuantum > 0 ? current.writerProjectionQuantum : 3,
+    // Upgrade the earlier three-projection default in persisted tasks too. Six
+    // bounded projections can drain 24 queued batches without turning one
+    // projection into an oversized prompt.
+    writerProjectionQuantum: current.writerProjectionQuantum === 3
+      ? 6
+      : Number.isInteger(current.writerProjectionQuantum) && current.writerProjectionQuantum > 0
+        ? current.writerProjectionQuantum
+        : 6,
     debounceMs: Number.isInteger(current.debounceMs) && current.debounceMs >= 0 ? current.debounceMs : 30_000,
     projectedBatchIds: Array.isArray(current.projectedBatchIds) ? current.projectedBatchIds : [],
     revision: Number.isInteger(current.revision) && current.revision >= 0 ? current.revision : 0,

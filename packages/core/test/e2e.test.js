@@ -963,7 +963,7 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
   const imported = await f.core.importFiles({ files, options: { max_batch_chars: 1_000 } })
   assert.equal(imported.batch_count, 12)
   assert.equal(imported.wiki_projection.batch_limit, 4)
-  assert.equal(imported.wiki_projection.writer_projection_quantum, 3)
+  assert.equal(imported.wiki_projection.writer_projection_quantum, 6)
 
   const refs = []
   for (let index = 0; index < 8; index += 1) {
@@ -1009,6 +1009,21 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
   assert.equal(catalogEntry.content_included, false)
   assert.equal(catalogEntry.content, undefined)
 
+  // An unrelated workspace change must not invalidate this projection or
+  // force the Writer to recollect every page-plan cursor.
+  await writeFile(path.join(concepts, "concurrent-unrelated.md"), "# Concurrent Unrelated\n\nWritten by another task.\n")
+  const continued = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: first.projection.projection_id,
+    cursor: first.next_cursor ?? 0,
+    max_chars: 40_000,
+  })
+  assert.equal(continued.projection.projection_id, first.projection.projection_id)
+  assert.equal(continued.based_on_wiki_revision, first.based_on_wiki_revision)
+  assert.equal(continued.revision_scope, "target-pages")
+  assert.equal(continued.concurrent_wiki_changes_detected, true)
+
   const committed = await f.core.commitPages({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
@@ -1027,6 +1042,7 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
       rationale: "Materialize the bounded backlog projection.",
     }],
   })
+  assert.equal(committed.unrelated_wiki_changes_accepted, true)
   assert.equal(committed.wiki_projection.ready, true)
   assert.equal(committed.wiki_projection.unprojected_batches, 4)
   assert.equal(committed.next_action.tool, "llm_wiki_get_page_plan_context")
@@ -1038,6 +1054,67 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
   const affected = second.existing_pages.find((page) => page.path === "wiki/concepts/business-entity.md")
   assert.equal(typeof affected.content, "string")
   assert.equal(second.existing_page_catalog.some((page) => page.path === "wiki/concepts/unrelated-large.md"), true)
+})
+
+test("concurrent task writers serialize transactions and accept stale global revisions for different pages", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const secondSource = path.join(f.incoming, "second-product.md")
+  await writeFile(secondSource, `${f.content}\nSecond task owns a distinct source.\n`)
+
+  const [firstTask, secondTask] = await Promise.all([
+    f.core.importFiles({ files: [{ path: f.source }] }),
+    f.core.importFiles({ files: [{ path: secondSource }] }),
+  ])
+  const [firstRef, secondRef] = await Promise.all([
+    analyzeAll(f.core, firstTask),
+    analyzeAll(f.core, secondTask),
+  ])
+  const [firstPlan, secondPlan] = await Promise.all([
+    f.core.getPagePlanContext({ task_id: firstTask.task_id }),
+    f.core.getPagePlanContext({ task_id: secondTask.task_id }),
+  ])
+  assert.equal(firstPlan.based_on_wiki_revision, secondPlan.based_on_wiki_revision)
+
+  const results = await Promise.all([
+    f.core.commitPages({
+      task_id: firstTask.task_id,
+      based_on_wiki_revision: firstPlan.based_on_wiki_revision,
+      idempotency_key: "concurrent-writer-first-page",
+      patches: [{
+        patchId: "concurrent-first",
+        path: "wiki/topics/concurrent-first.md",
+        operation: "create",
+        title: "Concurrent First",
+        pageKind: "topic",
+        content: "# Concurrent First\n\nFirst task content.",
+        covers: firstPlan.page_requirements.map((requirement) => requirement.requirement_id),
+        sourceRefs: [firstRef],
+        rationale: "Exercise workspace transaction serialization.",
+      }],
+    }),
+    f.core.commitPages({
+      task_id: secondTask.task_id,
+      based_on_wiki_revision: secondPlan.based_on_wiki_revision,
+      idempotency_key: "concurrent-writer-second-page",
+      patches: [{
+        patchId: "concurrent-second",
+        path: "wiki/topics/concurrent-second.md",
+        operation: "create",
+        title: "Concurrent Second",
+        pageKind: "topic",
+        content: "# Concurrent Second\n\nSecond task content.",
+        covers: secondPlan.page_requirements.map((requirement) => requirement.requirement_id),
+        sourceRefs: [secondRef],
+        rationale: "Exercise workspace transaction serialization.",
+      }],
+    }),
+  ])
+
+  assert.equal(results.every((result) => result.accepted), true)
+  assert.equal(results.filter((result) => result.unrelated_wiki_changes_accepted).length, 1)
+  assert.match(await readFile(path.join(f.workspace, "wiki", "topics", "concurrent-first.md"), "utf8"), /First task content/)
+  assert.match(await readFile(path.join(f.workspace, "wiki", "topics", "concurrent-second.md"), "utf8"), /Second task content/)
 })
 
 test("duplicate content is reused and task recovery and abort stay workspace-scoped", async (t) => {

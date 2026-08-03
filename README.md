@@ -75,7 +75,7 @@ pages, even when the task Schema is several MiB. The main Agent remains availabl
 generation through exactly one background Wiki writer. After four new batches,
 or after a 30-second debounce, that writer incrementally updates affected
 pages while extractors continue. Each projection is capped at four batches;
-one Writer invocation drains up to three ready projections immediately when a
+one Writer invocation drains up to six ready projections (24 batches) immediately when a
 backlog exists. Incremental plans include full content only for affected pages
 and compact catalog metadata for unrelated pages. A final all-batch reconciliation stabilizes
 the pages before Finalize.
@@ -189,6 +189,9 @@ across every active task. Large projections may use several commits of at most
 bypass the normal cooldown while at least four unprojected batches remain, but
 each projection stays bounded and independently checkpointed. Finalize is
 blocked until one full reconciliation clears all provisional paths.
+Different tasks may run one Writer each. Core serializes their workspace write
+transactions and validates only the exact target page paths and hashes, so an
+unrelated page commit no longer invalidates another Writer's paginated plan.
 
 ## Managed workspace
 

@@ -271,7 +271,7 @@ typed entity or any relation.
    backlog is checkpointed in bounded slices rather than becoming one giant
    Writer prompt.
 8. One Wiki-writer invocation processes up to
-   `wiki_projection.writer_projection_quantum` projections (currently three),
+   `wiki_projection.writer_projection_quantum` projections (currently six),
    committing each projection independently:
    1. Call `llm_wiki_get_page_plan_context` with task ID, writer ID, and cursor
       `0`, explicitly using `max_chars: 40000`. If it returns `waiting: true`,
@@ -282,7 +282,11 @@ typed entity or any relation.
    2. Record the returned `projection.projection_id`, `projection.mode`, and
       `based_on_wiki_revision`. Follow `next_cursor` to null, passing the same
       writer and projection IDs on every page, and accumulate all categories.
-      If any revision changes, discard the plan and acquire a fresh projection.
+      Revision validation is target-page scoped. Keep the projection's original
+      `based_on_wiki_revision` while paginating even when
+      `current_wiki_revision` changes or
+      `concurrent_wiki_changes_detected: true`; those fields mean another task
+      changed unrelated Wiki paths, not that this plan is invalid.
       `existing_pages` contains full content only for pages affected by this
       projection (matching path, title, coverage, or provisional ownership).
       `existing_page_catalog` contains compact metadata for unrelated pages;
@@ -328,13 +332,15 @@ typed entity or any relation.
       it requests `llm_wiki_get_page_plan_context` and the Writer quantum still
       has capacity, immediately start the next projection with cursor zero and
       the same writer ID; do not call status or wait for the 30-second debounce.
-      Return after three projections, when no backlog is ready, after a final
+      Return after the reported projection quantum (currently six), when no backlog is ready, after a final
       projection, or on a recoverable error. The coordinator then calls status
       and immediately starts another bounded Writer invocation if backlog
       remains ready.
 9. Continue extraction and Wiki projections as a pipeline. A Wiki writer may
-   run while extractors process later batches; task locks and the single writer
-   lease serialize state and page transactions without blocking retrieval.
+   run while extractors process later batches. Multiple tasks may each have one
+   Writer: Core serializes workspace transactions and checks exact target-page
+   hashes, so a write to an unrelated page does not invalidate another task's
+   projection or block retrieval.
 10. When completed batches equal total batches, ensure a `final` projection
     completes and `wiki_projection.final_completed` is true. Then call
     `llm_wiki_finalize`. Never Finalize while provisional pages remain.

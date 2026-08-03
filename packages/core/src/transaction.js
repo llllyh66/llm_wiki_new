@@ -25,14 +25,13 @@ export async function commitPageTransaction(workspace, task, patches, basedOnWik
     await lock.writeFile(`${JSON.stringify({ transactionId, taskId: task.taskId, createdAt: nowIso() })}\n`)
     await lock.sync()
     const actualRevision = await hashDirectory(workspace.paths.wiki)
-    if (actualRevision !== basedOnWikiRevision) {
-      fail("WIKI_REVISION_CONFLICT", "The Wiki changed after page planning.", {
-        retryable: true,
-        taskId: task.taskId,
-        details: { expected: basedOnWikiRevision, actual: actualRevision },
-        suggestedAction: "Retrieve a fresh page plan context and rebase the patches.",
-      })
-    }
+    // The Wiki revision covers the whole workspace. Another task may have
+    // safely changed an unrelated page after this Writer collected its plan.
+    // Rejecting that transaction creates needless global contention. The
+    // create/replace checks below are the real optimistic-concurrency guard:
+    // they validate every target path and its exact expected file hash while
+    // this workspace transaction lock is held.
+    const concurrentWikiChange = actualRevision !== basedOnWikiRevision
     await ensureDir(stagingRoot)
     await ensureDir(backupRoot)
     for (const patch of patches) {
@@ -91,6 +90,8 @@ export async function commitPageTransaction(workspace, task, patches, basedOnWik
       taskId: task.taskId,
       committedAt: nowIso(),
       basedOnWikiRevision,
+      actualBaseRevision: actualRevision,
+      concurrentWikiChange,
       wikiRevision: newRevision,
       patches: targets.map((item) => ({
         patchId: item.patch.patchId,

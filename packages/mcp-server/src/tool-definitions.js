@@ -62,7 +62,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_page_plan_context",
-    description: "Lease and return bounded page-planning context. Incremental leases contain at most four batches, affected page bodies, and a compact unrelated-page catalog. Full domain Schema definitions are omitted because extraction already enforced them. Repeat with the returned projection_id and next_cursor.",
+    description: "Lease and return bounded page-planning context. Incremental leases contain at most four batches, affected page bodies, and a compact unrelated-page catalog. Pagination tolerates concurrent changes to unrelated Wiki paths; target-page hashes remain authoritative. Full domain Schema definitions are omitted because extraction already enforced it. Repeat with the returned projection_id and next_cursor.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
@@ -73,7 +73,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_commit_pages",
-    description: "Atomically commit one leased Wiki projection. Incremental commits remain provisional; the final full reconciliation stabilizes them. An empty patches array is accepted only to acknowledge a leased projection with no page changes.",
+    description: "Atomically commit one leased Wiki projection. Transactions are workspace-serialized and use target-page create/hash checks, so unrelated task writes do not invalidate the plan. Incremental commits remain provisional; the final full reconciliation stabilizes them. An empty patches array is accepted only to acknowledge a leased projection with no page changes.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },

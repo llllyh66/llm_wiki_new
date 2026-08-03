@@ -70,12 +70,20 @@ was not committed.
 
 ## File or Wiki revision conflict
 
-For a leased projection, discard its remaining plan and call
-`llm_wiki_get_page_plan_context` with the same writer ID to acquire a fresh
-projection. Read the latest page content and hash, semantically rebase the
-proposed content, then submit a new patch with the latest `expectedFileHash`
-and `based_on_wiki_revision`. Never force an overwrite or start a second Wiki
-writer.
+Current Core revisions validate the exact target pages, not the global Wiki
+hash. If page-plan pagination reports `concurrent_wiki_changes_detected: true`,
+continue the same projection: another task changed unrelated paths and no
+re-plan is required. `llm_wiki_commit_pages` reports
+`unrelated_wiki_changes_accepted: true` when it safely rebases the transaction
+onto that newer workspace state.
+
+On `FILE_HASH_CONFLICT`, no patches in that atomic commit were applied. Call
+`llm_wiki_get_page_plan_context` with the same task, Writer, and projection IDs,
+read the newest content/hash for the reported target path, semantically rebase
+that page, and retry. Never force an overwrite or start a second Writer for the
+same task. A `WIKI_REVISION_CONFLICT` from an unrelated-path change indicates
+an older Core process is still running; restart that process on the updated
+build, then resume the existing task and lease instead of creating a new task.
 
 If a multipart projection worker stops, inspect `wiki_projection` in status.
 While `in_progress` remains true, do not compete for its lease. After expiry,
@@ -87,8 +95,10 @@ batches and reports `projection.safely_repartitioned: true`. Remaining batches
 stay queued and are not discarded.
 If the Writer returns normally after reaching its projection quantum and
 status still reports `ready: true`, immediately launch another bounded
-`wiki-writer-1` invocation. A ready backlog of at least four batches bypasses
-the normal debounce, and each new lease remains capped at four batches.
+`wiki-writer-1` invocation. The current quantum is six projections, so one
+invocation can drain up to 24 queued batches. A ready backlog of at least four
+batches bypasses the normal debounce, and each new lease remains capped at four
+batches.
 
 ## Failed Finalize
 
