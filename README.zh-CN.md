@@ -243,6 +243,9 @@ Schema 快照校验，因此不会降低约束强度。
 `get_batch` 还会返回可直接填充的 `analysis_scaffold`，固定数字型
 `schemaVersion` 、正确的 `taskId` / `batchId` 和所有必需数组，减少反复的
 AnalysisEnvelope 格式修补。
+每个 chunk 还会返回 Core 生成的 `source_ref_templates`。Worker 只需复制模板并
+添加精确 quote，不再自行拼写 Excel 的 `sheetName` 和 `cellRange`。如果仍校验
+失败，错误结果会返回该 chunk 允许的精确工作表名和区域值。
 
 为了降低每个 batch 的延迟，`get_batch` 会直接用 batch 原文匹配 Schema 中的类型 ID、
 名称、别名和属性名，并内联少量相关类型的完整抽取约束（省略冗长描述）。大多数 batch 不再需要

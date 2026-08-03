@@ -36,7 +36,10 @@ directly when `ready: true`; do not make a Schema tool call on that normal path.
 Use `llm_wiki_get_domain_schema` search only when auto-selection is not ready or
 classification remains ambiguous. Never load the full Schema or search memories.
 Build the payload by copying `get_batch.analysis_scaffold`, not from memory.
-Use only exact contiguous batch-chunk text for SourceRef quotes; retrieval
+Build each SourceRef by copying one exact `chunk.source_ref_templates` entry
+and adding a quote. Never reconstruct spreadsheet `sheetName` or `cellRange`;
+choose the matching template when several are present. Use only exact
+contiguous batch-chunk text for SourceRef quotes; retrieval
 snippets are supplemental and must not become evidence.
 After `get_batch` succeeds, do not call status. Skip retrieval by default; the
 batch is complete evidence and final projection performs cross-batch

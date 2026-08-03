@@ -232,8 +232,20 @@ export function validateSourceRefs(refs, task, batches, limits) {
       if (sheetName !== undefined && (typeof sheetName !== "string" || !sheetName.trim() || sheetName.length > 500)) fail("INVALID_SOURCE_REF", "locator.sheetName must be a non-empty bounded string.")
       if (cellRange !== undefined && (typeof cellRange !== "string" || !/^[A-Z]{1,3}[1-9]\d*:[A-Z]{1,3}[1-9]\d*$/i.test(cellRange))) fail("INVALID_SOURCE_REF", "locator.cellRange must be an A1-style range.")
       const structuredTables = Array.isArray(chunk.structuredData) ? chunk.structuredData : []
-      if (sheetName !== undefined && ![chunk.sheetName, ...structuredTables.map((table) => table.sheetName)].includes(sheetName)) fail("INVALID_SOURCE_REF", "locator.sheetName does not match the source chunk.")
-      if (cellRange !== undefined && ![chunk.cellRange, ...structuredTables.map((table) => table.cellRange)].includes(cellRange)) fail("INVALID_SOURCE_REF", "locator.cellRange does not match the source chunk.")
+      const allowedSheetNames = [...new Set([chunk.sheetName, ...structuredTables.map((table) => table.sheetName)].filter((value) => typeof value === "string"))]
+      const allowedCellRanges = [...new Set([chunk.cellRange, ...structuredTables.map((table) => table.cellRange)].filter((value) => typeof value === "string"))]
+      if (sheetName !== undefined && !allowedSheetNames.includes(sheetName)) {
+        fail("INVALID_SOURCE_REF", `locator.sheetName ${JSON.stringify(sheetName)} does not match chunk ${ref.chunkId}; copy an exact chunk.source_ref_templates value.`, {
+          retryable: true,
+          details: { allowed_sheet_names: allowedSheetNames },
+        })
+      }
+      if (cellRange !== undefined && !allowedCellRanges.includes(cellRange)) {
+        fail("INVALID_SOURCE_REF", `locator.cellRange ${JSON.stringify(cellRange)} does not match chunk ${ref.chunkId}; copy an exact chunk.source_ref_templates value.`, {
+          retryable: true,
+          details: { allowed_cell_ranges: allowedCellRanges },
+        })
+      }
     }
   }
 }

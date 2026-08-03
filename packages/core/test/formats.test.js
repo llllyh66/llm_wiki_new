@@ -89,10 +89,17 @@ test("XLSX worksheets retain ranges, cached formulas, merges, hidden cells, and 
   assert.equal(spreadsheetChunk.cellRange, "A1:E3")
   assert.equal(spreadsheetChunk.structuredData[0].formulas[0].cachedValue, "84")
   const batch = await fixture.core.getBatch({ task_id: imported.task_id })
+  const returnedSpreadsheetChunk = batch.chunks.find((chunk) => chunk.chunkId === spreadsheetChunk.chunkId)
+  assert.equal(returnedSpreadsheetChunk.source_ref_templates.length, 1)
+  assert.deepEqual(returnedSpreadsheetChunk.source_ref_templates[0].locator, {
+    headingPath: returnedSpreadsheetChunk.headingPath,
+    startOffset: returnedSpreadsheetChunk.startOffset,
+    endOffset: returnedSpreadsheetChunk.endOffset,
+    sheetName: "Sales & Forecast",
+    cellRange: "A1:E3",
+  })
   const analysis = spreadsheetAnalysis(imported.task_id, batch.batch_id, {
-    sourceId: imported.sources[0].source_id,
-    chunkId: spreadsheetChunk.chunkId,
-    locator: { sheetName: spreadsheetChunk.sheetName, cellRange: spreadsheetChunk.cellRange },
+    ...returnedSpreadsheetChunk.source_ref_templates[0],
   })
   await assert.rejects(
     fixture.core.commitAnalysis({
@@ -104,7 +111,8 @@ test("XLSX worksheets retain ranges, cached formulas, merges, hidden cells, and 
       }),
       idempotency_key: "xlsx-invalid-locator",
     }),
-    (error) => error.code === "INVALID_SOURCE_REF",
+    (error) => error.code === "INVALID_SOURCE_REF"
+      && error.details.allowed_cell_ranges.includes("A1:E3"),
   )
   const committed = await fixture.core.commitAnalysis({
     task_id: imported.task_id,

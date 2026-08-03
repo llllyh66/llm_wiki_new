@@ -157,7 +157,11 @@ typed entity or any relation.
       Start by copying `analysis_scaffold` from `get_batch` exactly, preserving
       numeric `schemaVersion: 1`, `taskId`, `batchId`, and every empty required
       collection; only then fill extracted values. Do not recreate the envelope
-      from memory. Copy every quote as a short exact contiguous substring of a
+      from memory. For each top-level SourceRef, copy one exact
+      `chunk.source_ref_templates` object and then add its quote. If a spreadsheet
+      chunk exposes multiple templates, select the one for the cited table;
+      never type, normalize, or infer `sheetName` or `cellRange`. Copy every
+      quote as a short exact contiguous substring of a
       returned batch chunk. Put a concern in `reviewItems` only when that exact
       quote supports it; otherwise put the question in `unresolvedQuestions`.
    6. Call `llm_wiki_commit_analysis` with its `worker_id` and a unique
@@ -203,6 +207,9 @@ typed entity or any relation.
       directly from the returned validation list. If the second is rejected,
       return a compact recoverable report with the exact errors instead of
       continuing a speculative retry loop.
+      For `INVALID_SOURCE_REF` locator failures, rebuild the reference from the
+      returned chunk template. Error details include `allowed_sheet_names` or
+      `allowed_cell_ranges`; do not patch the rejected spelling manually.
    8. When `waiting: true` or `completed: true`, stop this worker normally;
       other leased workers may still be processing the remaining batches. Do
       not poll in a tight loop.

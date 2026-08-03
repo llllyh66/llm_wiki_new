@@ -208,7 +208,7 @@ export class LlmWikiCore {
       batch_id: batch.batchId,
       worker_id: workerId,
       lease_expires_at: expiresAt,
-      chunks: batch.chunks,
+      chunks: batch.chunks.map(agentChunkWithSourceRefTemplates),
       batch_limits: {
         complete: true,
         char_count: batch.charCount,
@@ -265,6 +265,7 @@ export class LlmWikiCore {
       analysis_preflight: {
         start_from_scaffold: true,
         schema_version_type: "number",
+        source_ref_templates: "Copy one chunk.source_ref_templates entry exactly, then add a short exact quote. Never reconstruct sheetName or cellRange.",
         nested_source_refs: "Use checked zero-based indexes into top-level sourceRefs.",
         evidence: "Copy short exact contiguous quotes from returned batch chunks only; do not use ellipsized retrieval snippets as evidence.",
         review_items: "Use {content, sourceRefs} objects only when a batch quote directly supports the concern; otherwise use unresolvedQuestions.",
@@ -850,6 +851,40 @@ function recommendedWorkerBatchQuantum(batchCount, workerCount) {
 function automaticBatchDomainSchemaSelection(domainSchema, batch) {
   const text = batch.chunks.map((chunk) => chunk.text).join("\n")
   return compactDomainSchemaSelectionForText(domainSchema, text)
+}
+
+function agentChunkWithSourceRefTemplates(chunk) {
+  const baseLocator = {
+    ...(Array.isArray(chunk.headingPath) ? { headingPath: chunk.headingPath } : {}),
+    ...(Number.isInteger(chunk.startOffset) ? { startOffset: chunk.startOffset } : {}),
+    ...(Number.isInteger(chunk.endOffset) ? { endOffset: chunk.endOffset } : {}),
+    ...(Number.isInteger(chunk.pageNumber) ? { page: chunk.pageNumber } : {}),
+  }
+  const spreadsheetLocators = []
+  if (typeof chunk.sheetName === "string" || typeof chunk.cellRange === "string") {
+    spreadsheetLocators.push({
+      ...(typeof chunk.sheetName === "string" ? { sheetName: chunk.sheetName } : {}),
+      ...(typeof chunk.cellRange === "string" ? { cellRange: chunk.cellRange } : {}),
+    })
+  }
+  for (const table of (Array.isArray(chunk.structuredData) ? chunk.structuredData : [])) {
+    if (typeof table?.sheetName !== "string" && typeof table?.cellRange !== "string") continue
+    spreadsheetLocators.push({
+      ...(typeof table.sheetName === "string" ? { sheetName: table.sheetName } : {}),
+      ...(typeof table.cellRange === "string" ? { cellRange: table.cellRange } : {}),
+    })
+  }
+  const locators = spreadsheetLocators.length > 0
+    ? uniqueByStable(spreadsheetLocators).slice(0, 12).map((locator) => ({ ...baseLocator, ...locator }))
+    : [baseLocator]
+  return {
+    ...chunk,
+    source_ref_templates: locators.map((locator) => ({
+      sourceId: chunk.sourceId,
+      chunkId: chunk.chunkId,
+      locator,
+    })),
+  }
 }
 
 function validBatchLeases(task) {

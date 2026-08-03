@@ -58,6 +58,10 @@ the schema and include complete SourceRef objects on every grounded entry
 or valid zero-based indexes into the top-level catalog. Check every index
 against the catalog length instead of incrementally mutating the rejected
 payload.
+For a spreadsheet locator rejection, copy the SourceRef again from the leased
+chunk's `source_ref_templates`; `allowed_sheet_names` and
+`allowed_cell_ranges` in the error are diagnostic values, not text to guess or
+normalize.
 
 If the client reports a real transport failure after any tool call, do not
 create another task. Restart or reconnect the MCP server, call

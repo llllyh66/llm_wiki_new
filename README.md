@@ -171,6 +171,9 @@ modes resolve ambiguous classifications without reconstructing the full Schema
 in Agent context; Core validation still enforces the complete task snapshot.
 Every batch also includes a ready-to-fill `analysis_scaffold`, so workers keep
 the numeric schema version, task and batch IDs, and required collections intact.
+Every returned chunk also includes canonical `source_ref_templates`. Workers
+copy a template and add an exact quote instead of reconstructing spreadsheet
+sheet names or cell ranges; locator rejections report the allowed exact values.
 For large Schemas, `get_batch` now performs deterministic batch-text matching
 against canonical type IDs, names, aliases, and property labels and embeds the
 bounded complete definitions directly. Most batches therefore need no separate
