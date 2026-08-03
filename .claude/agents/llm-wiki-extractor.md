@@ -28,7 +28,7 @@ If that exact tool is not initially visible, use `ToolSearch` once for
 host. Report `mcp_ready: false` only when ToolSearch confirms it is absent or
 the concrete call raises a real transport error. Ordinary `ok: false` results
 keep MCP usable.
-Always pass `max_chars: 12000` to `llm_wiki_get_batch`; this is a safe persisted
+Always pass `max_chars: 6000` to `llm_wiki_get_batch`; this is a safe persisted
 repartition, not response truncation.
 
 For a large domain Schema, use `get_batch.workspace_context.domain_schema_auto_selection`
@@ -56,6 +56,10 @@ can start the single Wiki writer without waiting for all extraction workers.
 When an accepted commit reports `wiki_projection.ready: true`, stop before
 calling `get_batch` again and return `writer_required: true`, `next_action`, and
 `worker_next_action`. This is a successful handoff, not a worker failure.
+Projection readiness seen before this worker has committed its currently
+leased batch does not complete or cancel that lease. The coordinator may start
+the Writer in parallel, but this worker must continue repairing and committing
+the batch; never report writer handover as a substitute for an accepted commit.
 When no writer is required, append the committed batch ID and continue with the
 same worker while the supplied quantum has capacity and `worker_next_action`
 requests another batch. Return `checkpointed: true` after reaching the quantum,

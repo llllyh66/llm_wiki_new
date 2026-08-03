@@ -6,9 +6,11 @@ not reload or reinterpret a later version of the source Schema file mid-task.
 When `workspace_context.domain_schema_pagination.required` is true, the inline
 value is only a summary. First inspect
 `workspace_context.domain_schema_auto_selection`. When it is `ready: true`, its
-items are complete definitions selected deterministically from canonical type,
-alias, and property labels present in the batch; use them without another MCP
-call. Only when it is absent/false or semantically ambiguous, search the
+items contain the complete extraction constraints (canonical IDs, names,
+aliases, property types/required/unique flags, and relation endpoints) selected
+deterministically from labels present in the batch; verbose descriptions are
+omitted from this hot path. Use them without another MCP call. Only when it is
+absent/false or semantically ambiguous, search the
 server-side snapshot with `llm_wiki_get_domain_schema` mode `search`. When
 needed, use mode `catalog` for bounded summaries and mode `types` with exact
 IDs. The Core still validates the

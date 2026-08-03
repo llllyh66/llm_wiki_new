@@ -313,11 +313,13 @@ test("built MCP server survives errors and completes the full workflow over one 
   })
   assert.equal(largeBatch.isError, undefined)
   assert.equal(largeBatch.structuredContent.batch_limits.complete, true)
-  assert.equal(largeBatch.structuredContent.batch_limits.char_count <= 12_000, true)
-  assert.equal(largeBatch.structuredContent.batch_limits.payload_bytes <= 64 * 1024, true)
-  assert.equal(largeBatch.structuredContent.batch_limits.agent_payload_ceiling_bytes, 64 * 1024)
-  assert.equal(largeBatch.structuredContent.chunks.every((chunk) => chunk.text.length <= 6_000), true)
-  assert.equal(Math.max(...largeBatch.content[0].text.split("\n").map((line) => line.length)) <= 7_000, true)
+  assert.equal(largeBatch.structuredContent.batch_limits.char_count <= 6_000, true)
+  assert.equal(largeBatch.structuredContent.batch_limits.payload_bytes <= 24 * 1024, true)
+  assert.equal(largeBatch.structuredContent.batch_limits.agent_payload_ceiling_bytes, 24 * 1024)
+  assert.equal(largeBatch.structuredContent.batch_limits.complete_response_bytes < 40 * 1024, true)
+  assert.equal(Buffer.byteLength(largeBatch.content[0].text) < 40 * 1024, true)
+  assert.equal(largeBatch.structuredContent.chunks.every((chunk) => chunk.text.length <= 3_000), true)
+  assert.equal(Math.max(...largeBatch.content[0].text.split("\n").map((line) => line.length)) <= 4_000, true)
   const secondLargeBatch = await client.callTool({
     name: "llm_wiki_get_batch",
     arguments: { task_id: largeImported.structuredContent.task_id, worker_id: "large-worker-2" },

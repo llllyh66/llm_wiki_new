@@ -40,10 +40,10 @@ export async function loadTaskDomainSchema(record) {
   return readJson(record.paths.domainSchema)
 }
 
-export function domainSchemaContext(schema) {
+export function domainSchemaContext(schema, inlineBytes = INLINE_DOMAIN_SCHEMA_BYTES) {
   if (!schema) return { value: null, pagination: null }
   const bytes = Buffer.byteLength(JSON.stringify(schema))
-  if (bytes <= INLINE_DOMAIN_SCHEMA_BYTES) return { value: schema, pagination: null }
+  if (bytes <= inlineBytes) return { value: schema, pagination: null }
   return {
     value: {
       formatVersion: schema.formatVersion,
@@ -67,6 +67,92 @@ export function domainSchemaContext(schema) {
       fallback_modes: ["catalog", "types"],
       full_scan_required: false,
     },
+  }
+}
+
+export function compactDomainSchemaSelectionForText(schema, text, maxBytes = 6 * 1024) {
+  const matched = matchDomainSchemaTypesForText(schema, text, 12)
+  if (matched.entityTypeIds.length === 0 && matched.relationTypeIds.length === 0) {
+    return {
+      ready: false,
+      mode: "batch-text-compact",
+      matched_terms: [],
+      reason: "No canonical type, alias, or property label matched the batch text.",
+    }
+  }
+  const entityIds = new Set(matched.entityTypeIds)
+  const relationIds = new Set(matched.relationTypeIds)
+  for (const relation of schema.relationTypes) {
+    if (!relationIds.has(relation.id)) continue
+    relation.sourceEntityTypeIds.forEach((id) => entityIds.add(id))
+    relation.targetEntityTypeIds.forEach((id) => entityIds.add(id))
+  }
+  const compactProperty = (property) => ({
+    id: property.id,
+    name: property.name,
+    ...(property.aliases.length > 0 ? { aliases: property.aliases } : {}),
+    valueType: property.valueType,
+    required: property.required,
+    unique: property.unique,
+  })
+  const candidates = [
+    {
+      kind: "schema",
+      schema: {
+        schemaId: schema.schemaId,
+        schemaVersion: schema.schemaVersion,
+        language: schema.language,
+        policy: schema.policy,
+      },
+    },
+    ...schema.entityTypes.filter((type) => entityIds.has(type.id)).map((type) => ({
+      kind: "entity_type",
+      entity_type: {
+        id: type.id,
+        name: type.name,
+        ...(type.aliases.length > 0 ? { aliases: type.aliases } : {}),
+        properties: type.properties.map(compactProperty),
+      },
+    })),
+    ...schema.relationTypes.filter((type) => relationIds.has(type.id)).map((type) => ({
+      kind: "relation_type",
+      relation_type: {
+        id: type.id,
+        name: type.name,
+        ...(type.aliases.length > 0 ? { aliases: type.aliases } : {}),
+        sourceEntityTypeIds: type.sourceEntityTypeIds,
+        targetEntityTypeIds: type.targetEntityTypeIds,
+        properties: type.properties.map(compactProperty),
+      },
+    })),
+  ]
+  const items = []
+  let usedBytes = 0
+  for (const item of candidates) {
+    const itemBytes = Buffer.byteLength(JSON.stringify(item))
+    if (usedBytes + itemBytes > maxBytes) break
+    items.push(item)
+    usedBytes += itemBytes
+  }
+  const includedEntityIds = items.filter((item) => item.kind === "entity_type").map((item) => item.entity_type.id)
+  const includedRelationIds = items.filter((item) => item.kind === "relation_type").map((item) => item.relation_type.id)
+  const complete = includedEntityIds.length === entityIds.size && includedRelationIds.length === relationIds.size
+  return {
+    ready: complete,
+    mode: "batch-text-compact",
+    matched_terms: matched.matchedTerms,
+    selection: {
+      mode: "types",
+      full_schema_scan: false,
+      matched_entity_type_ids: [...entityIds],
+      matched_relation_type_ids: [...relationIds],
+      included_entity_type_ids: includedEntityIds,
+      included_relation_type_ids: includedRelationIds,
+      complete_for_selection: complete,
+    },
+    items,
+    payload_bytes: usedBytes,
+    ...(complete ? {} : { reason: "Matched compact definitions exceed the batch response budget; fetch them with llm_wiki_get_domain_schema mode=types." }),
   }
 }
 

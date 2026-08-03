@@ -229,7 +229,8 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
 仓库根目录的 `llm-wiki.domain-schema.json` 是当前默认领域 Schema。
 导入时 Core 会先校验它，再把一份不可变快照保存到当前任务中；
 因此任务进行期间修改原 Schema 不会改变已创建任务的抽取契约。
-Schema 最大可为 5 MiB。超过 64 KiB 时不会塞进 `get_batch` 的主响应，Core
+Schema 最大可为 5 MiB。抽取热路径上超过 8 KiB 时不会塞进 `get_batch`
+的主响应，Core
 只返回摘要。抽取 Worker 会优先调用 `llm_wiki_get_domain_schema`
 的 `search` 模式，由服务端根据当前 batch 术语选出少量相关类型，并返回这些
 类型的完整属性和关系定义。分类仍有歧义时，再用有界的 `catalog` 摘要和
@@ -241,7 +242,7 @@ Schema 快照校验，因此不会降低约束强度。
 AnalysisEnvelope 格式修补。
 
 为了降低每个 batch 的延迟，`get_batch` 会直接用 batch 原文匹配 Schema 中的类型 ID、
-名称、别名和属性名，并内联少量相关类型的完整定义。大多数 batch 不再需要
+名称、别名和属性名，并内联少量相关类型的完整抽取约束（省略冗长描述）。大多数 batch 不再需要
 额外调用 Schema 工具。抽取热路径也默认不做 BM25/Embedding 检索，因为当前
 batch 已是完整证据，最终 Wiki 投影会统一合并跨 batch 重复。这不会关闭用户查询的
 BM25 + Embedding + Wiki 多路召回；只是不再为每次抽取强制支付该开销。
@@ -480,9 +481,9 @@ MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 旧版本不会拆分超大 Markdown/HTML/DOCX 表格和代码块，单个 chunk 可能
 突破 batch 和 MCP 输出限制。新版本会：
 
-- 把所有超大文本块拆分到 Agent 传输硬上限 6,000 字符以内；
-- 即使工作区或旧任务把限制改得更大，每个 batch 也不会超过 24,000 字符；
-- 每个 batch 的序列化 chunk 载荷不超过 64 KiB，避免“文本不大但表格元数据很大”；
+- 把所有超大文本块拆分到 Agent 传输硬上限 3,000 字符以内；
+- 即使工作区或旧任务把限制改得更大，每个 batch 也不会超过 6,000 正文字符；
+- 每个 batch 的序列化 chunk 载荷不超过 24 KiB，避免“文本不大但表格元数据很大”；
 - 同时按文字数和序列化字节数限制 batch；
 - 压缩包含超长单元格/表格字符串的 `structuredData`，避免 MCP JSON 出现 81K 单行；
 - 单个 chunk 同时服从 chunk 上限和 batch 上限，不会在每次调用时重复拆分；
@@ -495,7 +496,12 @@ MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 
 `max_chars` 现在是安全的未完成批次重分片目标，不会截断或丢弃内容；
 原 batch 的第一个分片保留 batch ID 和 worker 租约。Builder 默认使用
-`max_chars: 12000`，以降低复杂领域 Schema 下每个 Worker 的单次上下文负担。
+`max_chars: 6000`，以降低复杂领域 Schema 下每个 Worker 的单次上下文负担。
+
+`get_batch` 现在还约束完整工具响应，不再只统计正文：它不向抽取
+Worker 重复传输 Wiki 页面 Schema，Analysis Schema 改为紧凑契约，大型领域
+Schema 只返回当前 batch 命中的紧凑定义。`batch_limits` 会同时报告 chunk
+载荷和完整响应字节数，目标上限为 40 KiB。
 
 ### `sourceRefs` 或 `reviewItems` 校验失败
 

@@ -3,16 +3,16 @@ import { fail } from "./errors.js"
 import { ensureDir, newId, nowIso, pathExists, readJson, sha256, stableStringify, writeJsonAtomic } from "./utils.js"
 
 export const ACTIVE_TASK_STATUSES = ["importing", "parsing", "prepared", "extracting", "planning", "committing", "finalizing", "failed"]
-const MAX_TASK_CHUNK_PAYLOAD_BYTES = 32 * 1024
-const MIN_BATCH_PAYLOAD_BYTES = 24 * 1024
-const MAX_AGENT_BATCH_PAYLOAD_BYTES = 64 * 1024
+const MAX_TASK_CHUNK_PAYLOAD_BYTES = 20 * 1024
+const MIN_BATCH_PAYLOAD_BYTES = 16 * 1024
+const MAX_AGENT_BATCH_PAYLOAD_BYTES = 24 * 1024
 // These are transport-safety ceilings, not tuning defaults. Claude may persist
 // a large MCP result as pretty JSON and read it line by line; one JSON string
 // must therefore never contain an 80K source line even when workspace limits
 // were raised or came from an older task.
-const MAX_AGENT_CHUNK_CHARS = 6_000
-const MAX_AGENT_BATCH_CHARS = 24_000
-const MAX_AGENT_NESTED_STRING_CHARS = 6_000
+const MAX_AGENT_CHUNK_CHARS = 3_000
+const MAX_AGENT_BATCH_CHARS = 6_000
+const MAX_AGENT_NESTED_STRING_CHARS = 3_000
 
 export function taskPaths(workspacePaths, taskId) {
   const root = path.join(workspacePaths.tasks, taskId)
@@ -204,7 +204,7 @@ function boundTaskChunks(chunks, maxChars, maxPayloadBytes = MAX_TASK_CHUNK_PAYL
 function batchPayloadLimit(maxChars) {
   return Math.min(
     MAX_AGENT_BATCH_PAYLOAD_BYTES,
-    Math.max(MIN_BATCH_PAYLOAD_BYTES, Math.ceil(maxChars * 4)),
+    Math.max(MIN_BATCH_PAYLOAD_BYTES, Math.ceil(maxChars * 3.5)),
   )
 }
 

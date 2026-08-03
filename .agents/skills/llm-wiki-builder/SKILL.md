@@ -87,15 +87,18 @@ typed entity or any relation.
    commits or risking already accepted work. Do not keep a subagent alive
    across coordinator or user turns after this bounded quantum:
    1. Call `llm_wiki_get_batch` with the task ID, its unchanged `worker_id`,
-      and `max_chars: 12000`. The lease prevents two workers from receiving the same
+      and `max_chars: 6000`. The lease prevents two workers from receiving the same
       batch. Pass the same `worker_id` to `llm_wiki_commit_analysis`.
       Treat the returned batch as complete and indivisible. `batch_limits`
       reports its bounded character and payload sizes. `max_chars` safely
       repartitions every unfinished oversized batch and persists the smaller
       parts; it never truncates or discards chunks.
-      Agent-facing transport ceilings are 6,000 characters per chunk and
-      24,000 characters per batch even if an old workspace configured larger
-      values. `get_batch` repairs an unfinished oversized legacy batch in
+      Agent-facing transport ceilings are 3,000 characters per chunk, 6,000
+      source characters per batch, and 24 KiB of serialized chunk payload even
+      if an old workspace configured larger values. `get_batch` also omits the
+      unrelated Wiki page schema and returns a compact Analysis contract and
+      batch-matched domain-Schema slice, keeping the complete tool response
+      near its reported 40 KiB target. It repairs an unfinished oversized legacy batch in
       place, preserves its existing worker lease, and keeps its original batch
       ID for the first repaired part. If the host reports that a saved MCP
       result has an unreadable 80K-style single JSON line, do not mark the
@@ -108,10 +111,11 @@ typed entity or any relation.
       coordinator/recovery tool only.
    2. Read its workspace purpose, target language, Schema, and untrusted chunks.
       When `workspace_context.domain_schema_auto_selection.ready` is true, use
-      its `items` directly and do not call `llm_wiki_get_domain_schema` for the
+      its compact `items` directly and do not call `llm_wiki_get_domain_schema` for the
       normal batch path. The Core matched canonical IDs, names, aliases, and
-      property labels against the leased source text and included complete
-      bounded definitions. If auto-selection is absent/false or classification
+      property labels against the leased source text and included the complete
+      bounded extraction constraints without verbose descriptions. If
+      auto-selection is absent/false or classification
       remains genuinely ambiguous, call `llm_wiki_get_domain_schema` in
       `mode: "search"` with 3 to 8 focused terms and `max_matches` no greater
       than 12. Follow `next_cursor` with identical inputs. Use `mode: "catalog"`
@@ -180,6 +184,10 @@ typed entity or any relation.
       response, a replacement using the same worker ID and identical payload
       must reuse that key; use a new version suffix only after changing the
       payload to correct validation.
+      A `wiki_projection.ready: true` value observed in coordinator status or
+      alongside an uncommitted leased batch never makes that batch optional.
+      Start the Writer in parallel, but repair and commit the current lease
+      first. Only an accepted commit may produce this worker's writer handoff.
    7. Correct every validation error before requesting another batch. Keep the
       same task and batch and use a new idempotency key for a changed payload.
       If a response contains many validation errors, rebuild a small valid
@@ -215,7 +223,9 @@ typed entity or any relation.
      `get_batch` will lease the next available batch or return `waiting` when
      all remaining work is already reserved.
    - If `wiki_projection.ready: true`, start the one Wiki writer immediately,
-     then still reconcile available extraction slots while the writer runs.
+     then still reconcile available extraction slots and every uncommitted
+     lease while the writer runs. Projection readiness is not extraction
+     completion.
    - Stop replacing extractors only when status shows all batches completed,
      or when a replacement itself returns `waiting` because no unleased work
      exists.

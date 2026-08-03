@@ -144,19 +144,24 @@ Large tables, code blocks, and legacy oversized chunks are split before
 `get_batch`. Batches are bounded by both text and serialized payload size and
 are always returned complete; `batch_limits` reports the actual size. Set
 `options.max_batch_chars` during import to request smaller batches. Extractors
-also pass `max_chars: 12000` to `get_batch`; this safely persists smaller parts
+also pass `max_chars: 6000` to `get_batch`; this safely persists smaller parts
 for every unfinished batch without truncating content, while preserving each
 original batch ID and reservation on its first repaired part.
-Agent transport ceilings are fixed at 6,000 characters per chunk and 24,000
-characters per batch, with a 64 KiB serialized chunk-payload ceiling per batch,
+Agent transport ceilings are fixed at 3,000 characters per chunk and 6,000
+source characters per batch, with a 24 KiB serialized chunk-payload ceiling per batch,
 even when an old workspace requested larger values.
+The full `get_batch` result is also budgeted: the unrelated Wiki page schema is
+omitted, the Analysis schema is represented by a compact contract, and a large
+domain Schema contributes only a compact batch-matched slice. `batch_limits`
+reports chunk-payload bytes and complete-response bytes against a 40 KiB target.
 Oversized structured table fields are compacted so pretty-printed MCP JSON does
 not contain an unreadable 80K single line. An unfinished legacy batch is
 repaired in place while preserving its original batch ID and worker lease.
 One chunk is bounded by the smaller of the chunk and batch limits, so legacy
 repair does not repeatedly rebuild the same batch or invalidate worker leases.
-Domain Schemas up to 5 MiB are accepted. Schemas larger than 64 KiB are
-summarized in batch responses. Extractors use server-side
+Domain Schemas up to 5 MiB are accepted. Schemas larger than 8 KiB are
+summarized on the extraction hot path so the complete batch response remains
+bounded. Extractors use server-side
 `llm_wiki_get_domain_schema` search to receive only the complete definitions
 and properties matched to the current batch. Bounded catalog and exact-type
 modes resolve ambiguous classifications without reconstructing the full Schema
