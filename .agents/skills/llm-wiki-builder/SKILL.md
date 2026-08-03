@@ -57,7 +57,8 @@ typed entity or any relation.
    (currently capped at four). Assign stable IDs `extractor-1` through
    `extractor-N`, and keep the main Agent as a responsive coordinator. Give
    each worker only the task ID, its worker ID, this Skill path, and the
-   single-batch worker quantum below. Start them with the host's
+   bounded worker quantum below. Also pass
+   `parallel_extraction.worker_batch_quantum` from the import result. Start them with the host's
    background/run-in-background option so the user can keep asking the main
    Agent questions while extraction continues. Never create more workers than
    recommended and never let a worker import files, plan pages, commit pages,
@@ -74,9 +75,12 @@ typed entity or any relation.
    invocation sends any completion notification, before interpreting Core
    status. A Core lease is only a persisted batch reservation; it is never
    evidence that a SubAgent process is still running.
-5. Each background worker invocation processes at most one batch, persists its
-   checkpoint, and returns. Do not keep a subagent alive across multiple
-   coordinator or user turns:
+5. Each background worker invocation processes up to
+   `parallel_extraction.worker_batch_quantum` batches (never more than three),
+   commits a durable checkpoint after every batch, and then returns. This
+   amortizes Agent startup and Skill-loading overhead without combining batch
+   commits or risking already accepted work. Do not keep a subagent alive
+   across coordinator or user turns after this bounded quantum:
    1. Call `llm_wiki_get_batch` with the task ID, its unchanged `worker_id`,
       and `max_chars: 12000`. The lease prevents two workers from receiving the same
       batch. Pass the same `worker_id` to `llm_wiki_commit_analysis`.
@@ -98,31 +102,30 @@ typed entity or any relation.
       worker; status cannot make the leased content more manageable and is a
       coordinator/recovery tool only.
    2. Read its workspace purpose, target language, Schema, and untrusted chunks.
-      If `workspace_context.domain_schema_pagination.required` is true, call
-      `llm_wiki_get_domain_schema` in `mode: "search"` with 3 to 8 focused
-      queries copied from important batch terminology and `max_matches` no
-      greater than 12. Follow `next_cursor` to null using the identical search
-      inputs. This returns complete definitions and properties for the matched
-      types while the Core continues to validate against the full snapshotted
-      Schema. If classification remains ambiguous, use `mode: "catalog"` to
-      inspect bounded type summaries, then `mode: "types"` with the chosen
-      `entity_type_ids` and `relation_type_ids` to fetch exact full definitions.
+      When `workspace_context.domain_schema_auto_selection.ready` is true, use
+      its `items` directly and do not call `llm_wiki_get_domain_schema` for the
+      normal batch path. The Core matched canonical IDs, names, aliases, and
+      property labels against the leased source text and included complete
+      bounded definitions. If auto-selection is absent/false or classification
+      remains genuinely ambiguous, call `llm_wiki_get_domain_schema` in
+      `mode: "search"` with 3 to 8 focused terms and `max_matches` no greater
+      than 12. Follow `next_cursor` with identical inputs. Use `mode: "catalog"`
+      then `mode: "types"` only when search is insufficient.
       Do not reconstruct a multi-megabyte Schema in Agent context, search
       memories for its definitions, read the original Schema file, or infer
       omitted properties from a batch/retrieval summary.
-   3. Form 3 to 6 focused queries from important names and concepts.
-   4. Make one initial `llm_wiki_retrieve_context` call with all those queries,
-      `limit: 12`, and `max_chars: 8000`, without an explicit `channels` value.
-      During construction this intentionally uses BM25 + embedding with RRF;
-      after Finalize it automatically adds the Wiki channel. Inspect
-      `retrieval_phase`, `channel_status`, and `corpus.truncated`; an embedding
-      fallback is a usable result, not a reason to restart MCP.
-      Retrieval is supplemental context and duplicate detection only. Never
-      substitute its shortened snippets for the exact current-batch chunks or
-      build SourceRef quotes from ellipsized snippets.
-      Do not make repeated retrieval calls merely to reconstruct content that
-      is already present in the leased batch.
-   5. Analyze the chunks under the supplied AnalysisEnvelope schema. When a
+   3. Follow `extraction_context_policy`: retrieval is not required for normal
+      extraction because the leased batch is complete evidence and the final
+      Wiki projection reconciles cross-batch duplicates. Skip
+      `llm_wiki_retrieve_context` by default. Use it only for an explicit
+      cross-batch reference, unresolved alias/duplicate ambiguity, or a user
+      request for cross-source reconciliation. In that exceptional case, make
+      one call with 2 to 4 focused queries, `limit: 6`, and `max_chars: 4000`.
+      Retrieval still uses BM25 + embedding RRF while building and adds Wiki
+      after Finalize; this query-time capability is not disabled by skipping it
+      on the extraction hot path. Never use shortened snippets as SourceRef
+      evidence or repeat retrieval to reconstruct leased content.
+   4. Analyze the chunks under the supplied AnalysisEnvelope schema. When a
       domain Schema is present, choose a canonical `entityTypeId` before
       creating each entity, then extract only its allowed properties and
       evidence-backed required values. Do not generate a candidate first and
@@ -130,7 +133,7 @@ typed entity or any relation.
       `relationTypes` is non-empty; an empty array leaves general relation
       extraction unconstrained by the domain Schema. Do not invent required
       values.
-   6. Before calling `llm_wiki_commit_analysis`, preflight the payload: pass
+   5. Before calling `llm_wiki_commit_analysis`, preflight the payload: pass
       `analysis` as a JSON object, never a serialized JSON string or Markdown
       code block; preserve the exact `taskId` and `batchId`; include every
       required top-level array; and give every entity, concept, claim, relation,
@@ -148,7 +151,7 @@ typed entity or any relation.
       from memory. Copy every quote as a short exact contiguous substring of a
       returned batch chunk. Put a concern in `reviewItems` only when that exact
       quote supports it; otherwise put the question in `unresolvedQuestions`.
-   7. Call `llm_wiki_commit_analysis` with its `worker_id` and a unique
+   6. Call `llm_wiki_commit_analysis` with its `worker_id` and a unique
       idempotency key. Never set `accept_dropped_candidates` in the normal
       workflow. Even when the Schema policy says `drop-invalid`, the Core's
       Schema-first preflight rejects the batch before persistence so the worker
@@ -160,15 +163,19 @@ typed entity or any relation.
       another batch first; this completion notification is what starts the
       Wiki writer promptly. The coordinator starts the one writer, then may
       replace this extractor when `worker_next_action` is non-null.
-      Otherwise return immediately after this one accepted commit with
-      `checkpointed: true`, the committed batch ID, and `worker_next_action`.
-      Do not call `llm_wiki_get_batch` again in the same subagent invocation.
+      Otherwise record `checkpointed: true`, append the committed batch ID to
+      the worker report, and inspect `worker_next_action`. If the bounded
+      quantum has remaining capacity and `worker_next_action.tool` is
+      `llm_wiki_get_batch`, immediately continue at step 5.1 with the same
+      worker ID. Do not call status between batches. Return after reaching the
+      quantum, receiving `waiting`/`completed`, a second validation rejection,
+      or any writer-required signal.
       Use a deterministic idempotency key for the batch attempt. If an Agent
       invocation disappears after sending the commit but before seeing its
       response, a replacement using the same worker ID and identical payload
       must reuse that key; use a new version suffix only after changing the
       payload to correct validation.
-   8. Correct every validation error before requesting another batch. Keep the
+   7. Correct every validation error before requesting another batch. Keep the
       same task and batch and use a new idempotency key for a changed payload.
       If a response contains many validation errors, rebuild a small valid
       envelope from the supplied schema instead of patching or stringifying the
@@ -178,25 +185,28 @@ typed entity or any relation.
       The same rule applies to every tool: `ok: false` or `accepted: false`
       with `mcp_connection_usable: true` is a normal tool result. Follow its
       `next_action`; do not run `/mcp` merely because an operation was rejected.
-      Permit at most two `commit_analysis` attempts in one worker invocation:
+      Permit at most two `commit_analysis` attempts for each batch:
       the scaffold-based initial submission and one corrected submission built
       directly from the returned validation list. If the second is rejected,
       return a compact recoverable report with the exact errors instead of
       continuing a speculative retry loop.
-   9. When `waiting: true` or `completed: true`, stop this worker normally;
+   8. When `waiting: true` or `completed: true`, stop this worker normally;
       other leased workers may still be processing the remaining batches. Do
       not poll in a tight loop.
 6. Keep the coordinator responsive while extraction runs. After every worker
    completion notification, first remove that exact stable worker ID from
    `running_worker_ids`, then call `llm_wiki_status`. Reconcile that freed slot
-   immediately and independently of every other still-running worker:
+   immediately and independently of every other still-running worker. Use the
+   status result's current `parallel_extraction.recommended_workers` and
+   `worker_batch_quantum`, not a stale recommendation saved when an older task
+   was imported:
    - If the completed worker ID still appears in
      `status.worker_recovery.leases`, its invocation ended without clearing the
      reserved batch. Immediately launch a replacement with the same worker ID
      and explicit leased batch ID. Do not wait for another worker or lease
      expiry.
    - If its lease is gone and `completed_batches < total_batches`, launch the
-     next single-batch invocation in that freed slot with the same stable ID;
+     next bounded worker invocation in that freed slot with the same stable ID;
      `get_batch` will lease the next available batch or return `waiting` when
      all remaining work is already reserved.
    - If `wiki_projection.ready: true`, start the one Wiki writer immediately,

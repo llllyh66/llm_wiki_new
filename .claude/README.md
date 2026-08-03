@@ -45,10 +45,11 @@ reference documents, then ask:
 For imports with multiple batches, the coordinator verifies the imported task
 with one direct `llm_wiki_status` call, then starts up to four background
 `llm-wiki-extractor` agents using distinct worker leases. It does not create a
-throwaway probe Agent or manage a Team. Each extractor invocation processes one batch,
-persists it, and exits; the coordinator then starts the next short invocation
-in that slot. This avoids depending on one long-lived subagent across user
-turns. Each project agent explicitly reuses the parent
+throwaway probe Agent or manage a Team. Each extractor invocation processes a
+bounded quantum of up to three batches and persists every batch independently;
+the coordinator then starts the next bounded invocation in that slot. This
+reduces repeated Agent startup and Skill-loading overhead without depending on
+one long-lived subagent across user turns. Each project agent explicitly reuses the parent
 `llm-wiki` MCP connection and uses a denylist for shell, writes, network, and
 nested agents; it does not use a fragile MCP wildcard as its complete tool
 allowlist. The agent runs in `dontAsk` mode. One
@@ -58,6 +59,13 @@ pages remain provisional and excluded from retrieval until the writer completes
 the final all-batch reconciliation. The main Agent remains responsive for
 questions: retrieval defaults to BM25 + embedding while the task is building,
 then adds the Wiki channel automatically after Finalize.
+
+The extraction hot path does not invoke retrieval for every batch. `get_batch`
+automatically includes bounded domain-Schema definitions matched from canonical
+labels in the source text, and the worker analyzes the complete leased evidence
+directly. Schema search and BM25/embedding retrieval are reserved for genuine
+classification or cross-batch ambiguity. User questions still use the normal
+multi-route retrieval defaults.
 
 An extractor stops and reports `writer_required: true` as soon as its accepted
 commit makes a projection ready. The coordinator starts `wiki-writer-1` before

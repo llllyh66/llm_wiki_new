@@ -21,7 +21,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
   },
   {
     name: "llm_wiki_get_batch",
-    description: "Lease and return one complete, stable, Agent-readable batch to an extraction worker. Hard transport ceilings prevent oversized JSON lines; legacy oversized batches are repaired in place while preserving the same worker_id lease and original batch ID.",
+    description: "Lease and return one complete, stable, Agent-readable batch to an extraction worker, including automatic bounded domain-Schema type selection and a retrieval-optional extraction policy. Hard transport ceilings prevent oversized JSON lines; legacy oversized batches are repaired in place while preserving the same worker_id lease and original batch ID.",
     inputSchema: closedObject({
       task_id: taskId,
       batch_id: { type: ["string", "null"] },
@@ -91,7 +91,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
   },
   {
     name: "llm_wiki_status",
-    description: "Return one current-workspace task's persisted status, next action, and resumable worker reservations. Leases do not indicate live SubAgent processes; after a worker invocation ends, the same worker_id resumes any remaining reservation immediately.",
+    description: "Return one current-workspace task's persisted status, current parallel worker recommendation and batch quantum, next action, and resumable worker reservations. Leases do not indicate live SubAgent processes; after a worker invocation ends, the same worker_id resumes any remaining reservation immediately.",
     inputSchema: closedObject({ task_id: taskId }, ["task_id"]),
   },
   {

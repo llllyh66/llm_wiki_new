@@ -282,7 +282,7 @@ test("large domain schemas are summarized in batches and retrieved through bound
     id: `entity_type_${typeIndex}`,
     name: `实体类型 ${typeIndex}`,
     description: `领域实体 ${typeIndex} ${"说明".repeat(80)}`,
-    aliases: [`类型别名 ${typeIndex}`],
+    aliases: [`类型别名 ${typeIndex}`, ...(typeIndex === 42 ? ["Business Entity"] : [])],
     properties: Array.from({ length: 6 }, (_, propertyIndex) => ({
       id: `property_${propertyIndex}`,
       name: `属性 ${typeIndex}-${propertyIndex}`,
@@ -332,8 +332,12 @@ test("large domain schemas are summarized in batches and retrieved through bound
     fallback_modes: ["catalog", "types"],
     full_scan_required: false,
   })
-  assert.match(batch.workspace_context.domain_extraction_instructions, /mode=search/)
-  assert.match(batch.workspace_context.domain_extraction_instructions, /do not scan the full schema/)
+  assert.equal(batch.workspace_context.domain_schema_auto_selection.ready, true)
+  assert.equal(batch.workspace_context.domain_schema_auto_selection.selection.matched_entity_type_ids.includes("entity_type_42"), true)
+  assert.equal(batch.workspace_context.domain_schema_auto_selection.items.some((item) => item.kind === "entity_type" && item.entity_type.id === "entity_type_42"), true)
+  assert.match(batch.workspace_context.domain_extraction_instructions, /no Schema tool call is needed/)
+  assert.equal(batch.extraction_context_policy.retrieval_required, false)
+  assert.equal(batch.extraction_context_policy.default, "skip_retrieve_context")
   assert.equal(batch.analysis_scaffold.schemaVersion, 1)
   assert.equal(batch.analysis_scaffold.taskId, imported.task_id)
   assert.equal(batch.analysis_scaffold.batchId, batch.batch_id)
@@ -720,7 +724,9 @@ test("parallel workers lease distinct batches and concurrent commits preserve ev
   }
   const imported = await f.core.importFiles({ files, options: { max_batch_chars: 1_000 } })
   assert.equal(imported.batch_count > 1, true)
-  assert.equal(imported.parallel_extraction.recommended_workers > 1, true)
+  assert.equal(imported.parallel_extraction.recommended_workers, Math.min(4, imported.batch_count))
+  assert.equal(imported.parallel_extraction.worker_batch_quantum, Math.min(3, Math.ceil(imported.batch_count / imported.parallel_extraction.recommended_workers)))
+  assert.equal(imported.parallel_extraction.checkpoint_each_batch, true)
   const workerCount = imported.batch_count
   const leased = await Promise.all(Array.from({ length: workerCount }, (_, index) => (
     f.core.getBatch({ task_id: imported.task_id, worker_id: `worker-${index}` })
@@ -729,6 +735,10 @@ test("parallel workers lease distinct batches and concurrent commits preserve ev
   const waiting = await f.core.getBatch({ task_id: imported.task_id, worker_id: "worker-overflow" })
   assert.equal(waiting.waiting, true)
   assert.equal(waiting.completed, false)
+  const extractingStatus = await f.core.status({ task_id: imported.task_id })
+  assert.equal(extractingStatus.parallel_extraction.recommended_workers, Math.min(4, imported.batch_count))
+  assert.equal(extractingStatus.parallel_extraction.worker_batch_quantum, imported.parallel_extraction.worker_batch_quantum)
+  assert.equal(extractingStatus.parallel_extraction.checkpoint_each_batch, true)
 
   await Promise.all(leased.map((batch, index) => {
     const chunk = batch.chunks.find((item) => item.text.includes("Business Entity is the canonical business object.")) ?? batch.chunks[0]

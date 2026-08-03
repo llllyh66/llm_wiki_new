@@ -70,6 +70,63 @@ export function domainSchemaContext(schema) {
   }
 }
 
+export function matchDomainSchemaTypesForText(schema, text, maxMatches = 12) {
+  if (!schema || typeof text !== "string" || !text.trim()) {
+    return { entityTypeIds: [], relationTypeIds: [], matchedTerms: [] }
+  }
+  const haystack = text.normalize("NFKC").toLowerCase()
+  const limit = Math.min(Math.max(Number(maxMatches) || 12, 1), 50)
+  const rank = (type, relation = false) => {
+    const matches = []
+    let score = 0
+    let identityScore = 0
+    let propertyMatches = 0
+    for (const [value, weight] of [
+      [type.id, 60],
+      [type.name, 50],
+      ...type.aliases.map((alias) => [alias, 40]),
+    ]) {
+      const key = usefulSchemaMatchKey(value)
+      if (!key || !haystack.includes(key)) continue
+      score += weight
+      identityScore += weight
+      matches.push(value)
+    }
+    for (const [value, weight] of type.properties.flatMap((property) => [
+        [property.id, 8],
+        [property.name, 6],
+        ...property.aliases.map((alias) => [alias, 5]),
+      ])) {
+      const key = usefulSchemaMatchKey(value)
+      if (!key || !haystack.includes(key)) continue
+      score += weight
+      propertyMatches += 1
+      matches.push(value)
+    }
+    const sufficientlySpecific = identityScore > 0 || propertyMatches >= 2
+    if (!sufficientlySpecific || (relation && score === 0)) return { id: type.id, score: 0, matches: [] }
+    return { id: type.id, score, matches }
+  }
+  const entities = schema.entityTypes.map((type) => rank(type))
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score || left.id.localeCompare(right.id))
+    .slice(0, limit)
+  const entityIds = new Set(entities.map((item) => item.id))
+  const relations = schema.relationTypes.map((type) => {
+    const result = rank(type, true)
+    const connectsSelectedTypes = type.sourceEntityTypeIds.some((id) => entityIds.has(id))
+      && type.targetEntityTypeIds.some((id) => entityIds.has(id))
+    return { ...result, score: result.score + (connectsSelectedTypes ? 2 : 0) }
+  }).filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score || left.id.localeCompare(right.id))
+    .slice(0, limit)
+  return {
+    entityTypeIds: entities.map((item) => item.id),
+    relationTypeIds: relations.map((item) => item.id),
+    matchedTerms: [...new Set([...entities, ...relations].flatMap((item) => item.matches))].slice(0, 50),
+  }
+}
+
 export function paginateDomainSchema(schema, requestedCursor, requestedMaxChars, selection = {}) {
   if (!schema) return { enabled: false, items: [], pagination: { cursor: 0, next_cursor: null, total_items: 0 } }
   const cursor = requestedCursor === undefined || requestedCursor === null ? 0 : Number(requestedCursor)
@@ -491,6 +548,15 @@ function normalizeSelectionStrings(values, field, maxItems = 100, maxLength = 20
     fail("INVALID_INPUT", `${field} must contain at most ${maxItems} non-empty strings no longer than ${maxLength} characters.`)
   }
   return [...new Set(values.map((value) => value.normalize("NFKC").trim()))]
+}
+
+function usefulSchemaMatchKey(value) {
+  if (typeof value !== "string") return null
+  const key = value.normalize("NFKC").toLowerCase().trim()
+  if (!key) return null
+  const containsCjk = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(key)
+  if (containsCjk ? key.length < 2 : key.length < 3) return null
+  return key
 }
 
 function validateLookupKeys(types, field, errors) {

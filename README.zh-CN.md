@@ -132,7 +132,8 @@ llm-wiki: node packages/mcp-server/dist/index.js --workspace . - Connected
 Claude Code。
 
 多批次任务默认按 `parallel_extraction.recommended_workers` 启动后台抽取
-Agent，当前最多 4 个。每个 Agent 使用固定 `worker_id` 租约不同批次，Core
+Agent，当前最多 4 个；大型 Schema 也不再降为 2 个，因为每个 worker 只获取服务端选中的
+相关类型。每个 Agent 使用固定 `worker_id` 租约不同批次，Core
 串行保护同一任务的状态提交，因此不会抢同一批次或覆盖其他 Agent 的结果。
 主 Agent 只负责协调和回答用户问题；唯一的后台 Wiki Writer 与抽取 Agent
 形成流水线，每新增 4 个 batch 或等待满 30 秒后增量更新受影响页面。
@@ -151,9 +152,9 @@ Agent，当前最多 4 个。每个 Agent 使用固定 `worker_id` 租约不同�
 `.claude/agents/llm-wiki-writer.md` 使用同样的 MCP 复用方式，且每个任务同时
 只允许一个 `wiki-writer-1` 租约，避免页面冲突。
 
-新版 extractor 每次后台调用只处理一个 batch，提交落盘后立即返回；
-主 Agent 再用稳定 `worker_id` 启动下一个短任务，不依赖一个长时间跨
-turn 存活的子 Agent。后续 turn 先调用 `llm_wiki_status`，
+新版 extractor 每次后台调用最多连续处理 3 个 batch，但每个 batch 都单独提交落盘；
+主 Agent 再用稳定 `worker_id` 启动下一个有界任务。这样减少反复启动 Agent 和加载 Skill
+的开销，同时不依赖长时间跨 turn 存活的子 Agent。后续 turn 先调用 `llm_wiki_status`，
 `worker_recovery.leases` 会返回已持久化的 worker 和 batch 租约。使用相同
 `worker_id` 启动新子 Agent，即可通过新 MCP 客户端继续同一 batch。
 因此旧后台 Agent 消失不等于 MCP 断开，也不会丢失进度。
@@ -233,6 +234,12 @@ Schema 快照校验，因此不会降低约束强度。
 `get_batch` 还会返回可直接填充的 `analysis_scaffold`，固定数字型
 `schemaVersion` 、正确的 `taskId` / `batchId` 和所有必需数组，减少反复的
 AnalysisEnvelope 格式修补。
+
+为了降低每个 batch 的延迟，`get_batch` 会直接用 batch 原文匹配 Schema 中的类型 ID、
+名称、别名和属性名，并内联少量相关类型的完整定义。大多数 batch 不再需要
+额外调用 Schema 工具。抽取热路径也默认不做 BM25/Embedding 检索，因为当前
+batch 已是完整证据，最终 Wiki 投影会统一合并跨 batch 重复。这不会关闭用户查询的
+BM25 + Embedding + Wiki 多路召回；只是不再为每次抽取强制支付该开销。
 
 直接告诉 Claude：
 

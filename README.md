@@ -69,8 +69,10 @@ or after a 30-second debounce, that writer incrementally updates affected
 pages while extractors continue. A final all-batch reconciliation stabilizes
 the pages before Finalize.
 
-Each extractor invocation handles one batch and exits after its persisted
-checkpoint. On a later turn, `llm_wiki_status` exposes
+Each extractor invocation handles a bounded quantum of up to three batches,
+persisting an independent checkpoint after every batch. This amortizes Agent
+startup and Skill-loading time while preserving recovery. On a later turn,
+`llm_wiki_status` exposes
 `worker_recovery.leases`; relaunching a short-lived extractor with the same
 `worker_id` resumes the same batch using a fresh MCP client connection. The
 workflow therefore does not depend on background Agent or MCP-client lifetime
@@ -153,6 +155,13 @@ modes resolve ambiguous classifications without reconstructing the full Schema
 in Agent context; Core validation still enforces the complete task snapshot.
 Every batch also includes a ready-to-fill `analysis_scaffold`, so workers keep
 the numeric schema version, task and batch IDs, and required collections intact.
+For large Schemas, `get_batch` now performs deterministic batch-text matching
+against canonical type IDs, names, aliases, and property labels and embeds the
+bounded complete definitions directly. Most batches therefore need no separate
+Schema call. Extraction also skips BM25/embedding retrieval by default because
+the leased batch is complete evidence and final projection reconciles batches;
+retrieval remains available for explicit cross-batch ambiguity and remains the
+default multi-route path for user questions.
 
 Incremental page projection is single-writer and lease-based. Intermediate
 paths are persisted as provisional task state and excluded from retrieval

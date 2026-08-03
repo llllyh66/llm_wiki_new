@@ -5,6 +5,7 @@ import {
   applyDomainSchema,
   domainSchemaContext,
   loadTaskDomainSchema,
+  matchDomainSchemaTypesForText,
   paginateDomainSchema,
   resolveDomainSchema,
 } from "./domain-schema.js"
@@ -97,7 +98,8 @@ export class LlmWikiCore {
       maxBatchChars: input?.options?.max_batch_chars,
       domainSchema,
     })
-    const recommendedWorkers = recommendedWorkerCount(batches.length, task.domainSchema?.size_bytes)
+    const recommendedWorkers = recommendedWorkerCount(batches.length)
+    const workerBatchQuantum = recommendedWorkerBatchQuantum(batches.length, recommendedWorkers)
     return {
       workspace_initialized: workspace.initialized,
       task_id: task.taskId,
@@ -111,6 +113,8 @@ export class LlmWikiCore {
         enabled: batches.length > 1,
         recommended_workers: recommendedWorkers,
         max_workers: 4,
+        worker_batch_quantum: workerBatchQuantum,
+        checkpoint_each_batch: true,
         ...(task.domainSchema?.size_bytes ? { domain_schema_bytes: task.domainSchema.size_bytes } : {}),
         lease_minutes: BATCH_LEASE_MS / 60_000,
       },
@@ -191,6 +195,9 @@ export class LlmWikiCore {
     await saveTask(record.paths, record.task)
     const domainSchema = await loadTaskDomainSchema(record)
     const schemaContext = domainSchemaContext(domainSchema)
+    const automaticSchemaSelection = domainSchema && schemaContext.pagination
+      ? automaticBatchDomainSchemaSelection(domainSchema, batch)
+      : null
     return {
       task_id: record.task.taskId,
       batch_id: batch.batchId,
@@ -212,8 +219,9 @@ export class LlmWikiCore {
         schema: await readFile(workspace.paths.schema, "utf8"),
         domain_schema: schemaContext.value,
         domain_schema_pagination: schemaContext.pagination,
+        domain_schema_auto_selection: automaticSchemaSelection,
         domain_extraction_instructions: domainSchema
-          ? `${schemaContext.pagination ? "Use llm_wiki_get_domain_schema mode=search with focused batch terms; do not scan the full schema. Use catalog then types only if classification is ambiguous. " : ""}Extract entities under this domain schema with localId, entityTypeId, properties, and sourceRefs. ${domainSchema.relationTypes.length > 0 ? "Relations require localId, relationTypeId, sourceEntityLocalId, targetEntityLocalId, properties, and sourceRefs." : "relationTypes is empty, so relations use the general AnalysisEnvelope format and are not constrained by the domain schema."} Do not infer missing required properties.`
+          ? `${automaticSchemaSelection?.ready ? "Use domain_schema_auto_selection directly; no Schema tool call is needed for this batch unless classification remains ambiguous. " : schemaContext.pagination ? "The automatic Schema selection was insufficient; use llm_wiki_get_domain_schema mode=search with focused batch terms, never a full scan. " : ""}Extract entities under this domain schema with localId, entityTypeId, properties, and sourceRefs. ${domainSchema.relationTypes.length > 0 ? "Relations require localId, relationTypeId, sourceEntityLocalId, targetEntityLocalId, properties, and sourceRefs." : "relationTypes is empty, so relations use the general AnalysisEnvelope format and are not constrained by the domain schema."} Do not infer missing required properties.`
           : null,
       },
       analysis_schema: analysisSchema,
@@ -238,6 +246,12 @@ export class LlmWikiCore {
         nested_source_refs: "Use checked zero-based indexes into top-level sourceRefs.",
         evidence: "Copy short exact contiguous quotes from returned batch chunks only; do not use ellipsized retrieval snippets as evidence.",
         review_items: "Use {content, sourceRefs} objects only when a batch quote directly supports the concern; otherwise use unresolvedQuestions.",
+      },
+      extraction_context_policy: {
+        retrieval_required: false,
+        default: "skip_retrieve_context",
+        use_retrieval_only_for: ["explicit cross-batch reference", "unresolved alias or duplicate ambiguity", "user-requested cross-source reconciliation"],
+        rationale: "The leased batch is complete evidence; final Wiki reconciliation handles cross-batch canonicalization.",
       },
       completed: false,
     }
@@ -769,15 +783,46 @@ function normalizeWorkerId(value) {
   return value
 }
 
-function recommendedWorkerCount(batchCount, domainSchemaBytes = 0) {
-  if (batchCount <= 1) return 1
-  // Every semantic worker needs the task Schema in its own context. Keep a
-  // useful amount of parallelism for very large Schemas without multiplying
-  // multi-megabyte context loading fourfold.
-  const schemaAwareCap = domainSchemaBytes > 1024 * 1024
-    ? 2
-    : domainSchemaBytes > 256 * 1024 ? 3 : 4
-  return Math.min(schemaAwareCap, batchCount)
+function recommendedWorkerCount(batchCount) {
+  if (batchCount <= 0) return 0
+  if (batchCount === 1) return 1
+  // Large Schemas are selected server-side per batch, so their full byte size
+  // no longer needs to reduce semantic worker parallelism.
+  return Math.min(4, batchCount)
+}
+
+function recommendedWorkerBatchQuantum(batchCount, workerCount) {
+  if (batchCount <= 0 || workerCount <= 0) return 1
+  return Math.min(3, Math.max(1, Math.ceil(batchCount / workerCount)))
+}
+
+function automaticBatchDomainSchemaSelection(domainSchema, batch) {
+  const text = batch.chunks.map((chunk) => chunk.text).join("\n")
+  const matched = matchDomainSchemaTypesForText(domainSchema, text, 12)
+  if (matched.entityTypeIds.length === 0 && matched.relationTypeIds.length === 0) {
+    return {
+      ready: false,
+      mode: "batch-text",
+      matched_terms: [],
+      reason: "No canonical type, alias, or property label matched the batch text.",
+    }
+  }
+  const selected = paginateDomainSchema(domainSchema, 0, 30_000, {
+    mode: "types",
+    entityTypeIds: matched.entityTypeIds,
+    relationTypeIds: matched.relationTypeIds,
+  })
+  return {
+    ready: selected.pagination.next_cursor === null,
+    mode: "batch-text",
+    matched_terms: matched.matchedTerms,
+    selection: selected.selection,
+    items: selected.items,
+    pagination: selected.pagination,
+    ...(selected.pagination.next_cursor !== null
+      ? { reason: "Selected definitions exceed the inline budget; fetch the remaining exact type selection pages." }
+      : {}),
+  }
 }
 
 function validBatchLeases(task) {
@@ -1198,6 +1243,8 @@ function pagePlanDomainSchemaMetadata(metadata) {
 
 function statusResponse(task) {
   const wikiProjection = pageProjectionStatus(task)
+  const remainingBatches = Math.max(0, task.batchCount - task.completedBatchIds.length)
+  const recommendedWorkers = recommendedWorkerCount(remainingBatches)
   const workerLeases = Object.entries(validBatchLeases(task)).map(([batchId, lease]) => ({
     worker_id: lease.workerId,
     batch_id: batchId,
@@ -1211,6 +1258,13 @@ function statusResponse(task) {
     total_batches: task.batchCount,
     leased_batches: workerLeases.length,
     leased_batches_semantics: "persisted-reservations-not-live-agents",
+    parallel_extraction: {
+      enabled: remainingBatches > 1,
+      recommended_workers: recommendedWorkers,
+      max_workers: 4,
+      worker_batch_quantum: recommendedWorkerBatchQuantum(remainingBatches, recommendedWorkers),
+      checkpoint_each_batch: true,
+    },
     worker_recovery: {
       resumable: true,
       strategy: "restart-same-worker-id",
