@@ -252,6 +252,19 @@ test("built MCP server survives errors and completes the full workflow over one 
   })
   const domainTaskId = domainImported.structuredContent.task_id
   const domainBatch = await client.callTool({ name: "llm_wiki_get_batch", arguments: { task_id: domainTaskId } })
+  assert.equal(domainBatch.structuredContent.analysis_scaffold.schemaVersion, 1)
+  assert.equal(domainBatch.structuredContent.analysis_scaffold.taskId, domainTaskId)
+  assert.equal(domainBatch.structuredContent.analysis_scaffold.batchId, domainBatch.structuredContent.batch_id)
+  assert.deepEqual(domainBatch.structuredContent.analysis_scaffold.reviewItems, [])
+  const selectedDomainSchema = await client.callTool({
+    name: "llm_wiki_get_domain_schema",
+    arguments: { task_id: domainTaskId, mode: "search", queries: ["客户"], max_matches: 3, max_chars: 20_000 },
+  })
+  assert.equal(selectedDomainSchema.isError, undefined)
+  assert.equal(selectedDomainSchema.structuredContent.selection.mode, "search")
+  assert.equal(selectedDomainSchema.structuredContent.selection.full_schema_scan, false)
+  assert.equal(selectedDomainSchema.structuredContent.selection.matched_entity_type_ids.includes("business_subject"), true)
+  assert.equal(selectedDomainSchema.structuredContent.items.some((item) => item.kind === "entity_type" && item.entity_type.id === "business_subject"), true)
   const domainChunk = domainBatch.structuredContent.chunks[0]
   const domainRef = {
     sourceId: domainChunk.sourceId,

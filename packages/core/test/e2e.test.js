@@ -323,7 +323,49 @@ test("large domain schemas are summarized in batches and retrieved through bound
   assert.equal(batch.workspace_context.domain_schema.inline, false)
   assert.equal(batch.workspace_context.domain_schema.entityTypeCount, 120)
   assert.equal(batch.workspace_context.domain_schema.entityTypes, undefined)
-  assert.deepEqual(batch.workspace_context.domain_schema_pagination, { required: true, cursor: 0, tool: "llm_wiki_get_domain_schema" })
+  assert.deepEqual(batch.workspace_context.domain_schema_pagination, {
+    required: true,
+    cursor: 0,
+    tool: "llm_wiki_get_domain_schema",
+    recommended_mode: "search",
+    recommended_max_matches: 12,
+    fallback_modes: ["catalog", "types"],
+    full_scan_required: false,
+  })
+  assert.match(batch.workspace_context.domain_extraction_instructions, /mode=search/)
+  assert.match(batch.workspace_context.domain_extraction_instructions, /do not scan the full schema/)
+  assert.equal(batch.analysis_scaffold.schemaVersion, 1)
+  assert.equal(batch.analysis_scaffold.taskId, imported.task_id)
+  assert.equal(batch.analysis_scaffold.batchId, batch.batch_id)
+  assert.deepEqual(batch.analysis_scaffold.reviewItems, [])
+
+  const selected = await f.core.getDomainSchema({
+    task_id: imported.task_id,
+    mode: "search",
+    queries: ["实体类型 42"],
+    max_matches: 3,
+    max_chars: 20_000,
+  })
+  assert.equal(selected.selection.mode, "search")
+  assert.equal(selected.selection.full_schema_scan, false)
+  assert.equal(selected.selection.matched_entity_type_ids.includes("entity_type_42"), true)
+  assert.equal(selected.items.some((item) => item.kind === "entity_type" && item.entity_type.id === "entity_type_42"), true)
+  assert.equal(selected.items.filter((item) => item.kind === "entity_type").length <= 3, true)
+
+  const exact = await f.core.getDomainSchema({
+    task_id: imported.task_id,
+    mode: "types",
+    entity_type_ids: ["entity_type_42"],
+    relation_type_ids: ["relates_to"],
+    max_chars: 20_000,
+  })
+  assert.deepEqual(exact.selection.matched_relation_type_ids, ["relates_to"])
+  assert.equal(exact.items.some((item) => item.kind === "entity_property" && item.entity_type_id === "entity_type_42"), true)
+
+  const catalog = await f.core.getDomainSchema({ task_id: imported.task_id, mode: "catalog", max_chars: 20_000 })
+  assert.equal(catalog.selection.mode, "catalog")
+  assert.equal(catalog.items.some((item) => item.kind === "entity_type_summary"), true)
+  assert.equal(catalog.items.some((item) => item.kind === "entity_property"), false)
 
   const items = []
   let cursor = 0
@@ -716,8 +758,11 @@ test("parallel workers lease distinct batches and concurrent commits preserve ev
   const status = await f.core.status({ task_id: imported.task_id })
   assert.equal(status.completed_batches, workerCount)
   assert.equal(status.leased_batches, 0)
+  assert.equal(status.leased_batches_semantics, "persisted-reservations-not-live-agents")
   assert.equal(status.worker_recovery.resumable, true)
   assert.equal(status.worker_recovery.strategy, "restart-same-worker-id")
+  assert.equal(status.worker_recovery.process_liveness_known, false)
+  assert.equal(status.worker_recovery.leases_are_live_agents, false)
   assert.equal(status.status, "planning")
 })
 
@@ -727,6 +772,7 @@ test("a worker invocation can resume its leased batch by stable worker ID after 
   const imported = await f.core.importFiles({ files: [{ path: f.source }] })
   const leased = await f.core.getBatch({ task_id: imported.task_id, worker_id: "extractor-resume-1" })
   const status = await f.core.status({ task_id: imported.task_id })
+  assert.equal(status.worker_recovery.leases_are_live_agents, false)
   assert.deepEqual(status.worker_recovery.leases.map(({ worker_id, batch_id }) => ({ worker_id, batch_id })), [{
     worker_id: "extractor-resume-1",
     batch_id: leased.batch_id,
@@ -930,11 +976,12 @@ test("get_batch repairs an 81K single-line legacy batch in place and preserves i
   task.options.maxBatchChars = 100_000
   await writeFile(taskPath, JSON.stringify(task))
 
-  const repaired = await f.core.getBatch({ task_id: imported.task_id, worker_id: "extractor-2", batch_id: originalBatchId })
+  const repaired = await f.core.getBatch({ task_id: imported.task_id, worker_id: "extractor-2", batch_id: originalBatchId, max_chars: 12_000 })
   assert.equal(repaired.batch_id, originalBatchId)
   assert.equal(repaired.batch_limits.complete, true)
   assert.equal(repaired.chunks.every((chunk) => chunk.text.length <= 6_000), true)
-  assert.equal(repaired.batch_limits.char_count <= 24_000, true)
+  assert.equal(repaired.batch_limits.char_count <= 12_000, true)
+  assert.equal(repaired.batch_limits.safely_repartitioned, true)
   assert.equal(Math.max(...JSON.stringify(repaired, null, 2).split("\n").map((line) => line.length)) <= 7_000, true)
   assert.equal(repaired.chunks.every((chunk) => chunk.structuredData?.every((table) => table.compacted === true)), true)
   const persisted = JSON.parse(await readFile(batchesPath, "utf8"))

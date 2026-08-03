@@ -58,16 +58,25 @@ export function domainSchemaContext(schema) {
       inline: false,
       totalBytes: bytes,
     },
-    pagination: { required: true, cursor: 0, tool: "llm_wiki_get_domain_schema" },
+    pagination: {
+      required: true,
+      cursor: 0,
+      tool: "llm_wiki_get_domain_schema",
+      recommended_mode: "search",
+      recommended_max_matches: 12,
+      fallback_modes: ["catalog", "types"],
+      full_scan_required: false,
+    },
   }
 }
 
-export function paginateDomainSchema(schema, requestedCursor, requestedMaxChars) {
+export function paginateDomainSchema(schema, requestedCursor, requestedMaxChars, selection = {}) {
   if (!schema) return { enabled: false, items: [], pagination: { cursor: 0, next_cursor: null, total_items: 0 } }
   const cursor = requestedCursor === undefined || requestedCursor === null ? 0 : Number(requestedCursor)
   if (!Number.isInteger(cursor) || cursor < 0) fail("INVALID_INPUT", "cursor must be a non-negative integer.")
   const maxChars = Math.min(Math.max(Number(requestedMaxChars) || 40_000, 20_000), 100_000)
-  const items = domainSchemaItems(schema)
+  const selected = selectDomainSchemaItems(schema, selection)
+  const items = selected.items
   if (cursor > items.length) fail("INVALID_INPUT", "cursor is beyond the domain Schema.")
   const page = []
   let usedBytes = 0
@@ -86,6 +95,7 @@ export function paginateDomainSchema(schema, requestedCursor, requestedMaxChars)
     enabled: true,
     schema_id: schema.schemaId,
     schema_version: schema.schemaVersion,
+    selection: selected.metadata,
     items: page,
     pagination: {
       cursor,
@@ -330,7 +340,7 @@ function normalizeEndpointIds(value, field, errors) {
   return value
 }
 
-function domainSchemaItems(schema) {
+function domainSchemaItems(schema, entityTypeIds, relationTypeIds) {
   const items = [{
     kind: "schema",
     schema: {
@@ -343,17 +353,144 @@ function domainSchemaItems(schema) {
       policy: schema.policy,
     },
   }]
-  for (const entity of schema.entityTypes) {
+  for (const entity of schema.entityTypes.filter((item) => !entityTypeIds || entityTypeIds.has(item.id))) {
     const { properties, ...definition } = entity
     items.push({ kind: "entity_type", entity_type: definition })
     for (const property of properties) items.push({ kind: "entity_property", entity_type_id: entity.id, property })
   }
-  for (const relation of schema.relationTypes) {
+  for (const relation of schema.relationTypes.filter((item) => !relationTypeIds || relationTypeIds.has(item.id))) {
     const { properties, ...definition } = relation
     items.push({ kind: "relation_type", relation_type: definition })
     for (const property of properties) items.push({ kind: "relation_property", relation_type_id: relation.id, property })
   }
   return items
+}
+
+function selectDomainSchemaItems(schema, selection) {
+  const mode = selection.mode ?? ((selection.queries?.length ?? 0) > 0 ? "search" : "page")
+  if (!new Set(["page", "catalog", "search", "types"]).has(mode)) fail("INVALID_INPUT", "domain Schema mode must be page, catalog, search, or types.")
+  if (mode === "page") {
+    return { items: domainSchemaItems(schema), metadata: { mode: "page", full_schema_scan: true } }
+  }
+  if (mode === "catalog") {
+    return {
+      items: domainSchemaCatalogItems(schema),
+      metadata: {
+        mode: "catalog",
+        full_schema_scan: false,
+        entity_type_count: schema.entityTypes.length,
+        relation_type_count: schema.relationTypes.length,
+      },
+    }
+  }
+
+  const requestedEntityIds = new Set(normalizeSelectionStrings(selection.entityTypeIds, "entity_type_ids"))
+  const requestedRelationIds = new Set(normalizeSelectionStrings(selection.relationTypeIds, "relation_type_ids"))
+  const knownEntityIds = new Set(schema.entityTypes.map((item) => item.id))
+  const knownRelationIds = new Set(schema.relationTypes.map((item) => item.id))
+  const unknownEntityIds = [...requestedEntityIds].filter((id) => !knownEntityIds.has(id))
+  const unknownRelationIds = [...requestedRelationIds].filter((id) => !knownRelationIds.has(id))
+  const queries = normalizeSelectionStrings(selection.queries, "queries", 20, 2_000)
+  const maximumMatches = Math.min(Math.max(Number(selection.maxMatches) || 12, 1), 50)
+  if (mode === "search" && queries.length === 0) fail("INVALID_INPUT", "search mode requires at least one query.")
+  if (mode === "types" && requestedEntityIds.size === 0 && requestedRelationIds.size === 0) {
+    fail("INVALID_INPUT", "types mode requires entity_type_ids or relation_type_ids.")
+  }
+
+  if (mode === "search") {
+    for (const match of rankedSchemaMatches(schema.entityTypes, queries, maximumMatches)) requestedEntityIds.add(match.id)
+    for (const match of rankedSchemaMatches(schema.relationTypes, queries, maximumMatches)) requestedRelationIds.add(match.id)
+  }
+  // A selected relation is unusable without its endpoint entity definitions.
+  for (const relation of schema.relationTypes) {
+    if (!requestedRelationIds.has(relation.id)) continue
+    relation.sourceEntityTypeIds.forEach((id) => requestedEntityIds.add(id))
+    relation.targetEntityTypeIds.forEach((id) => requestedEntityIds.add(id))
+  }
+
+  const entityTypeIds = new Set([...requestedEntityIds].filter((id) => knownEntityIds.has(id)))
+  const relationTypeIds = new Set([...requestedRelationIds].filter((id) => knownRelationIds.has(id)))
+  return {
+    items: domainSchemaItems(schema, entityTypeIds, relationTypeIds),
+    metadata: {
+      mode,
+      full_schema_scan: false,
+      queries,
+      matched_entity_type_ids: [...entityTypeIds],
+      matched_relation_type_ids: [...relationTypeIds],
+      unknown_entity_type_ids: unknownEntityIds,
+      unknown_relation_type_ids: unknownRelationIds,
+      complete_for_selection: true,
+    },
+  }
+}
+
+function domainSchemaCatalogItems(schema) {
+  const items = [{
+    kind: "schema_catalog",
+    schema: {
+      schemaId: schema.schemaId,
+      schemaVersion: schema.schemaVersion,
+      name: schema.name,
+      language: schema.language,
+      policy: schema.policy,
+    },
+  }]
+  for (const entity of schema.entityTypes) {
+    items.push({
+      kind: "entity_type_summary",
+      id: entity.id,
+      name: entity.name,
+      aliases: entity.aliases,
+      description: entity.description.slice(0, 500),
+      property_count: entity.properties.length,
+      required_property_ids: entity.properties.filter((property) => property.required).map((property) => property.id),
+    })
+  }
+  for (const relation of schema.relationTypes) {
+    items.push({
+      kind: "relation_type_summary",
+      id: relation.id,
+      name: relation.name,
+      aliases: relation.aliases,
+      description: relation.description.slice(0, 500),
+      source_entity_type_ids: relation.sourceEntityTypeIds,
+      target_entity_type_ids: relation.targetEntityTypeIds,
+      property_count: relation.properties.length,
+    })
+  }
+  return items
+}
+
+function rankedSchemaMatches(types, queries, limit) {
+  const terms = [...new Set(queries.flatMap((query) => [query, ...query.split(/[\s,;:/|()\[\]{}\-_]+/u)])
+    .map((term) => term.normalize("NFKC").toLowerCase().trim()).filter((term) => term.length >= 2))]
+  return types.map((type) => {
+    const identity = [type.id, type.name, ...type.aliases].join(" ").normalize("NFKC").toLowerCase()
+    const searchable = [
+      identity,
+      type.description,
+      ...type.properties.flatMap((property) => [property.id, property.name, ...property.aliases, property.description]),
+    ].join(" ").normalize("NFKC").toLowerCase()
+    let score = 0
+    for (const term of terms) {
+      if (identity === term) score += 100
+      else if (identity.includes(term)) score += 20
+      else if (searchable.includes(term)) score += 3
+    }
+    return { id: type.id, score }
+  }).filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score || left.id.localeCompare(right.id))
+    .slice(0, limit)
+}
+
+function normalizeSelectionStrings(values, field, maxItems = 100, maxLength = 200) {
+  if (values === undefined) return []
+  if (!Array.isArray(values) || values.length > maxItems
+    || values.some((value) => typeof value !== "string" || !value.trim() || value.length > maxLength)) {
+    fail("INVALID_INPUT", `${field} must contain at most ${maxItems} non-empty strings no longer than ${maxLength} characters.`)
+  }
+  return [...new Set(values.map((value) => value.normalize("NFKC").trim()))]
 }
 
 function validateLookupKeys(types, field, errors) {

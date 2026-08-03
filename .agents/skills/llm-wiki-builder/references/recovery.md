@@ -16,6 +16,14 @@ connection failure when an actual coordinator tool call raises a transport
 exception. A successful `llm_wiki_status` call proves the current turn's MCP
 connection is usable.
 
+Lease state does not expose process liveness. Maintain live subagents in the
+coordinator's own `running_worker_ids` set. When a worker completion
+notification arrives, remove that ID first. If status still lists a lease for
+the completed ID, restart it immediately with that same worker and batch ID.
+If no lease remains but batches are incomplete, reuse the freed ID to request
+the next batch. Never wait for a different running worker before refilling the
+completed worker's slot.
+
 If a worker reports that the saved MCP result contains one source/JSON line too
 large for the host reader, resume that lease with the same worker and batch IDs
 after rebuilding the current server. `get_batch` enforces hard Agent-facing

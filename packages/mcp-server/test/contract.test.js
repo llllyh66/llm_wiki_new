@@ -29,6 +29,12 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(skill, /processes at most one batch/)
   assert.match(skill, /same\s+`worker_id`/)
   assert.match(skill, /Never claim that MCP is "unreliable across\s+turns"/)
+  assert.match(skill, /running_worker_ids/)
+  assert.match(skill, /Never say "both leases active, waiting\s+for the other Agent"/)
+  assert.match(skill, /mode: "search"/)
+  assert.match(skill, /do not call `llm_wiki_status` inside this\s+worker/)
+  assert.match(skill, /Start by copying `analysis_scaffold`/)
+  assert.match(skill, /at most two `commit_analysis` attempts/)
 })
 
 test("MCP publishes the complete Agent-first tool contract without desktop tools", () => {

@@ -132,7 +132,10 @@ instead of entering MCP's `isError` channel.
 Large tables, code blocks, and legacy oversized chunks are split before
 `get_batch`. Batches are bounded by both text and serialized payload size and
 are always returned complete; `batch_limits` reports the actual size. Set
-`options.max_batch_chars` during import to request smaller batches.
+`options.max_batch_chars` during import to request smaller batches. Extractors
+also pass `max_chars: 12000` to `get_batch`; this safely persists smaller parts
+for every unfinished batch without truncating content, while preserving each
+original batch ID and reservation on its first repaired part.
 Agent transport ceilings are fixed at 6,000 characters per chunk and 24,000
 characters per batch, even when an old workspace requested larger values.
 Oversized structured table fields are compacted so pretty-printed MCP JSON does
@@ -141,8 +144,13 @@ repaired in place while preserving its original batch ID and worker lease.
 One chunk is bounded by the smaller of the chunk and batch limits, so legacy
 repair does not repeatedly rebuild the same batch or invalidate worker leases.
 Domain Schemas up to 5 MiB are accepted. Schemas larger than 64 KiB are
-summarized in batch and page-plan responses and exposed through bounded
-`llm_wiki_get_domain_schema` pages.
+summarized in batch responses. Extractors use server-side
+`llm_wiki_get_domain_schema` search to receive only the complete definitions
+and properties matched to the current batch. Bounded catalog and exact-type
+modes resolve ambiguous classifications without reconstructing the full Schema
+in Agent context; Core validation still enforces the complete task snapshot.
+Every batch also includes a ready-to-fill `analysis_scaffold`, so workers keep
+the numeric schema version, task and batch IDs, and required collections intact.
 
 Incremental page projection is single-writer and lease-based. Intermediate
 paths are persisted as provisional task state and excluded from retrieval

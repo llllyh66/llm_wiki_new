@@ -26,14 +26,19 @@ export const TOOL_DEFINITIONS = Object.freeze([
       task_id: taskId,
       batch_id: { type: ["string", "null"] },
       worker_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
-      max_chars: { type: "number", minimum: 1000, maximum: 30000, description: "Legacy compatibility hint only. Batches are fixed and bounded at import, and are always returned complete." },
+      max_chars: { type: "integer", minimum: 1000, maximum: 24000, description: "Safe persisted repartition target for unfinished batches. It never truncates content; original batch IDs and active worker reservations are preserved for each first repaired part." },
     }, ["task_id"]),
   },
   {
     name: "llm_wiki_get_domain_schema",
-    description: "Return one bounded page of the task's validated domain Schema. For large Schemas, repeat with next_cursor until null before extracting entities and relations.",
+    description: "Return a bounded catalog, server-side lexical selection, exact type selection, or legacy full page from the validated domain Schema. Prefer search mode for large Schemas, then request exact matched type IDs; Core validation still enforces the complete snapshot.",
     inputSchema: closedObject({
       task_id: taskId,
+      mode: { enum: ["page", "catalog", "search", "types"], description: "Use search for batch terms, catalog only when search is insufficient, types for exact IDs, or page for backward-compatible full scanning." },
+      queries: { type: "array", minItems: 1, maxItems: 20, items: { type: "string", minLength: 1, maxLength: 2000 } },
+      entity_type_ids: { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 200 } },
+      relation_type_ids: { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 200 } },
+      max_matches: { type: "integer", minimum: 1, maximum: 50 },
       cursor: { type: ["integer", "null"], minimum: 0 },
       max_chars: { type: "integer", minimum: 20000, maximum: 100000, description: "Compatibility name for the approximate UTF-8 byte budget of one Schema page." },
     }, ["task_id"]),
@@ -86,7 +91,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
   },
   {
     name: "llm_wiki_status",
-    description: "Return one current-workspace task's persisted status, next action, and resumable worker leases. A replacement Agent using the same worker_id resumes its leased batch with a fresh MCP client connection.",
+    description: "Return one current-workspace task's persisted status, next action, and resumable worker reservations. Leases do not indicate live SubAgent processes; after a worker invocation ends, the same worker_id resumes any remaining reservation immediately.",
     inputSchema: closedObject({ task_id: taskId }, ["task_id"]),
   },
   {

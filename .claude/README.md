@@ -72,6 +72,13 @@ Agent does not lose task state and is not evidence that MCP disconnected. A
 successful status call proves MCP is usable in the current turn; do not ask the
 user to run `/mcp` unless an actual transport call fails.
 
+`worker_recovery.leases` describes persisted batch reservations, not live
+SubAgent processes. The coordinator tracks live invocations separately. When
+one extractor reports completion, its slot is refilled immediately: if its ID
+still owns a lease, the same ID resumes that batch; otherwise it requests the
+next available batch. It never waits for a different extractor merely because
+both reservations were present before the completion notification.
+
 If the probe reports `mcp_ready: false`, the Skill does not retry with a
 `general-purpose` agent. It continues in the coordinator, because changing the
 agent name cannot repair an MCP server that was not inherited by subagents.

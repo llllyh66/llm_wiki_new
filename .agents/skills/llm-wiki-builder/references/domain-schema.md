@@ -4,9 +4,14 @@ Use this contract only when `llm_wiki_get_batch` returns a non-null
 `workspace_context.domain_schema`. The task owns a validated snapshot, so do
 not reload or reinterpret a later version of the source Schema file mid-task.
 When `workspace_context.domain_schema_pagination.required` is true, the inline
-value is only a summary. Read `llm_wiki_get_domain_schema` from cursor `0`
-through a null `next_cursor` and reconstruct all ordered type and property
-items before classifying any entity or relation.
+value is only a summary. Do not load the complete multi-megabyte Schema. Search
+the server-side snapshot with `llm_wiki_get_domain_schema` mode `search` and
+focused terms from the current batch, following that selection's pagination.
+When needed, use mode `catalog` for bounded summaries and mode `types` with
+exact IDs for complete selected definitions. The Core still validates the
+analysis against the entire snapshot, so selection reduces Agent context but
+does not weaken the Schema contract. Never use memory search or read the
+original Schema file as a substitute for these task-scoped results.
 
 ## Entity output
 

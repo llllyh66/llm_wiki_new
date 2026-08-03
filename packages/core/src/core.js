@@ -132,9 +132,16 @@ export class LlmWikiCore {
 
   async #getBatch(input) {
     const workspace = await this.workspace()
+    const requestedBatchChars = input?.max_chars === undefined ? null : Number(input.max_chars)
+    if (requestedBatchChars !== null && (!Number.isInteger(requestedBatchChars) || requestedBatchChars < 1_000 || requestedBatchChars > 24_000)) {
+      fail("INVALID_INPUT", "max_chars must be an integer from 1000 to 24000; it safely repartitions unfinished batches and never truncates content.")
+    }
+    const effectiveLimits = requestedBatchChars === null
+      ? workspace.config.limits
+      : { ...workspace.config.limits, maxBatchChars: Math.min(workspace.config.limits.maxBatchChars, requestedBatchChars) }
     const record = await ensureBoundedTaskBatches(
       await loadTask(workspace.paths, input?.task_id),
-      workspace.config.limits,
+      effectiveLimits,
     )
     if (["planning", "committing", "finalizing", "completed"].includes(record.task.status)
       && record.task.completedBatchIds.length === record.task.batchCount) {
@@ -195,7 +202,7 @@ export class LlmWikiCore {
         char_count: batch.charCount,
         payload_bytes: batch.payloadBytes ?? Buffer.byteLength(JSON.stringify(batch.chunks)),
         configured_max_chars: record.task.options.maxBatchChars,
-        ...(input?.max_chars !== undefined ? { requested_max_chars: Number(input.max_chars) } : {}),
+        ...(requestedBatchChars !== null ? { requested_max_chars: requestedBatchChars, safely_repartitioned: true } : {}),
       },
       untrusted_source_content: true,
       workspace_context: {
@@ -205,10 +212,32 @@ export class LlmWikiCore {
         domain_schema: schemaContext.value,
         domain_schema_pagination: schemaContext.pagination,
         domain_extraction_instructions: domainSchema
-          ? `${schemaContext.pagination ? "Fetch every llm_wiki_get_domain_schema page before analysis. " : ""}Extract entities under this domain schema with localId, entityTypeId, properties, and sourceRefs. ${domainSchema.relationTypes.length > 0 ? "Relations require localId, relationTypeId, sourceEntityLocalId, targetEntityLocalId, properties, and sourceRefs." : "relationTypes is empty, so relations use the general AnalysisEnvelope format and are not constrained by the domain schema."} Do not infer missing required properties.`
+          ? `${schemaContext.pagination ? "Use llm_wiki_get_domain_schema mode=search with focused batch terms; do not scan the full schema. Use catalog then types only if classification is ambiguous. " : ""}Extract entities under this domain schema with localId, entityTypeId, properties, and sourceRefs. ${domainSchema.relationTypes.length > 0 ? "Relations require localId, relationTypeId, sourceEntityLocalId, targetEntityLocalId, properties, and sourceRefs." : "relationTypes is empty, so relations use the general AnalysisEnvelope format and are not constrained by the domain schema."} Do not infer missing required properties.`
           : null,
       },
       analysis_schema: analysisSchema,
+      analysis_scaffold: {
+        schemaVersion: 1,
+        taskId: record.task.taskId,
+        batchId: batch.batchId,
+        sourceRefs: [],
+        entities: [],
+        concepts: [],
+        claims: [],
+        relations: [],
+        contradictions: [],
+        candidatePages: [],
+        reviewItems: [],
+        batchSummary: "",
+        unresolvedQuestions: [],
+      },
+      analysis_preflight: {
+        start_from_scaffold: true,
+        schema_version_type: "number",
+        nested_source_refs: "Use checked zero-based indexes into top-level sourceRefs.",
+        evidence: "Copy short exact contiguous quotes from returned batch chunks only; do not use ellipsized retrieval snippets as evidence.",
+        review_items: "Use {content, sourceRefs} objects only when a batch quote directly supports the concern; otherwise use unresolvedQuestions.",
+      },
       completed: false,
     }
   }
@@ -220,7 +249,13 @@ export class LlmWikiCore {
     if (!domainSchema) fail("DOMAIN_SCHEMA_NOT_CONFIGURED", "This task does not have a domain Schema.")
     return {
       task_id: record.task.taskId,
-      ...paginateDomainSchema(domainSchema, input?.cursor, input?.max_chars),
+      ...paginateDomainSchema(domainSchema, input?.cursor, input?.max_chars, {
+        mode: input?.mode,
+        queries: input?.queries,
+        entityTypeIds: input?.entity_type_ids,
+        relationTypeIds: input?.relation_type_ids,
+        maxMatches: input?.max_matches,
+      }),
     }
   }
 
@@ -1174,11 +1209,14 @@ function statusResponse(task) {
     completed_batches: task.completedBatchIds.length,
     total_batches: task.batchCount,
     leased_batches: workerLeases.length,
+    leased_batches_semantics: "persisted-reservations-not-live-agents",
     worker_recovery: {
       resumable: true,
       strategy: "restart-same-worker-id",
       leases: workerLeases,
-      note: "A new Agent invocation using the same worker_id resumes its existing batch lease; task state does not depend on an old MCP client connection.",
+      process_liveness_known: false,
+      leases_are_live_agents: false,
+      note: "A lease is a persisted batch reservation, not proof that a SubAgent process is running. After a worker completion notification, if that worker_id still has a lease, restart the same worker_id immediately; do not wait for other workers.",
     },
     updated_at: task.updatedAt,
     domain_schema: task.domainSchema ?? null,

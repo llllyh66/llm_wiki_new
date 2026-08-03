@@ -156,6 +156,12 @@ turn 存活的子 Agent。后续 turn 先调用 `llm_wiki_status`，
 `worker_id` 启动新子 Agent，即可通过新 MCP 客户端继续同一 batch。
 因此旧后台 Agent 消失不等于 MCP 断开，也不会丢失进度。
 
+`worker_recovery.leases` 表示持久化的 batch 预留，不表示 SubAgent 进程仍在运行。
+主 Agent 会另外维护 `running_worker_ids`。任何 extractor 发出完成通知后，
+应立即释放它的执行槽位：如果该 ID 仍有租约，立即使用相同 ID 恢复；
+如果租约已消失但 batch 尚未全部完成，立即用该 ID 领取下一批。
+不会再因为“两个 lease 都 active”而等待另一个 Agent 完成。
+
 ### 3. 检查 Skill
 
 项目必须存在真实文件：
@@ -216,8 +222,15 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
 导入时 Core 会先校验它，再把一份不可变快照保存到当前任务中；
 因此任务进行期间修改原 Schema 不会改变已创建任务的抽取契约。
 Schema 最大可为 5 MiB。超过 64 KiB 时不会塞进 `get_batch` 的主响应，Core
-只返回摘要；Skill 会调用 `llm_wiki_get_domain_schema` 按 UTF-8 字节预算逐页
-读取完整类型、属性和关系定义，避免大型中文 Schema 撑爆 MCP 输出。
+只返回摘要。抽取 Worker 会优先调用 `llm_wiki_get_domain_schema`
+的 `search` 模式，由服务端根据当前 batch 术语选出少量相关类型，并返回这些
+类型的完整属性和关系定义。分类仍有歧义时，再用有界的 `catalog` 摘要和
+`types` 精确查询；不再让 Agent 逐页重建数 MiB Schema。Core 仍使用任务的完整
+Schema 快照校验，因此不会降低约束强度。
+
+`get_batch` 还会返回可直接填充的 `analysis_scaffold`，固定数字型
+`schemaVersion` 、正确的 `taskId` / `batchId` 和所有必需数组，减少反复的
+AnalysisEnvelope 格式修补。
 
 直接告诉 Claude：
 
@@ -465,8 +478,9 @@ MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 同一批。如果报“单行 81,073 字符”，不需要等租约过期；构建新版服务后，
 使用原 `task_id + batch_id + worker_id` 再调用一次 `get_batch` 即会修复并继续。
 
-`max_chars` 现在仅作为兼容性提示，不会再截断批次并造成漏分析。如果希望
-调小批次，应在导入时设置 `options.max_batch_chars`。
+`max_chars` 现在是安全的未完成批次重分片目标，不会截断或丢弃内容；
+原 batch 的第一个分片保留 batch ID 和 worker 租约。Builder 默认使用
+`max_chars: 12000`，以降低复杂领域 Schema 下每个 Worker 的单次上下文负担。
 
 ### `sourceRefs` 或 `reviewItems` 校验失败
 
