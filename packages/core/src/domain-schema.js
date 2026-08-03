@@ -3,7 +3,7 @@ import path from "node:path"
 import { fail } from "./errors.js"
 import { pathExists, readJson, sha256, stableStringify } from "./utils.js"
 
-const MAX_DOMAIN_SCHEMA_BYTES = 1024 * 1024
+const MAX_DOMAIN_SCHEMA_BYTES = 5 * 1024 * 1024
 const VALUE_TYPES = new Set(["string", "number", "integer", "boolean", "date", "datetime", "json"])
 const EXTRACTION_MODES = new Set(["strict", "compatible"])
 const FAILURE_POLICIES = new Set(["reject-batch", "drop-invalid"])
@@ -216,6 +216,9 @@ function domainSchemaRecord(input) {
   }
   if (bytes > MAX_DOMAIN_SCHEMA_BYTES) fail("INVALID_DOMAIN_SCHEMA", `The domain schema exceeds ${MAX_DOMAIN_SCHEMA_BYTES} bytes.`)
   const schema = validateDomainSchema(input)
+  if (Buffer.byteLength(JSON.stringify(schema)) > MAX_DOMAIN_SCHEMA_BYTES) {
+    fail("INVALID_DOMAIN_SCHEMA", `The normalized domain schema exceeds ${MAX_DOMAIN_SCHEMA_BYTES} bytes.`)
+  }
   return { schema, metadata: { schema_id: schema.schemaId, schema_version: schema.schemaVersion, hash: sha256(stableStringify(schema)) } }
 }
 

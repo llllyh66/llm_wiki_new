@@ -322,6 +322,66 @@ test("large domain schemas are summarized in batches and retrieved through bound
   assert.equal(items.filter((item) => item.kind === "relation_type").length, 1)
 })
 
+test("domain schema accepts bounded multi-megabyte input and rejects payloads over 5 MiB", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const makeSchema = (propertyCount, descriptionChars) => ({
+    formatVersion: "1.0",
+    schemaId: `sized-schema-${propertyCount}`,
+    schemaVersion: "1.0.0",
+    name: "容量边界模型",
+    description: "验证领域 Schema 总大小限制。",
+    language: "zh-CN",
+    policy: {
+      extractionMode: "strict",
+      validationFailurePolicy: "drop-invalid",
+      allowUnknownEntityTypes: false,
+      allowUnknownRelationTypes: false,
+      allowUnknownProperties: false,
+    },
+    entityTypes: [{
+      id: "large_entity",
+      name: "大型实体",
+      description: "包含大量属性定义。",
+      aliases: [],
+      properties: Array.from({ length: propertyCount }, (_, index) => ({
+        id: `property_${index}`,
+        name: `属性 ${index}`,
+        description: "x".repeat(descriptionChars),
+        valueType: "string",
+        required: false,
+        unique: false,
+      })),
+    }],
+    relationTypes: [{
+      id: "self_relation",
+      name: "自关联",
+      description: "大型实体之间的关联。",
+      aliases: [],
+      sourceEntityTypeIds: ["large_entity"],
+      targetEntityTypeIds: ["large_entity"],
+      properties: [],
+    }],
+  })
+
+  const acceptedSchema = makeSchema(450, 10_000)
+  const acceptedBytes = Buffer.byteLength(JSON.stringify(acceptedSchema))
+  assert.equal(acceptedBytes > 4 * 1024 * 1024, true)
+  assert.equal(acceptedBytes < 5 * 1024 * 1024, true)
+  const imported = await f.core.importFiles({ files: [{ path: f.source }], options: { domain_schema: acceptedSchema } })
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  assert.equal(batch.workspace_context.domain_schema.inline, false)
+  assert.equal(batch.workspace_context.domain_schema.totalBytes >= acceptedBytes, true)
+  assert.equal(batch.workspace_context.domain_schema.totalBytes < 5 * 1024 * 1024, true)
+
+  const oversizedSchema = makeSchema(550, 10_000)
+  assert.equal(Buffer.byteLength(JSON.stringify(oversizedSchema)) > 5 * 1024 * 1024, true)
+  await assert.rejects(
+    () => f.core.importFiles({ files: [{ path: f.source }], options: { domain_schema: oversizedSchema } }),
+    (error) => error instanceof LlmWikiError && error.code === "INVALID_DOMAIN_SCHEMA" && error.message.includes("5242880"),
+  )
+})
+
 test("invalid domain schema is rejected before a task is created", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))

@@ -173,7 +173,7 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
 仓库根目录的 `llm-wiki.domain-schema.json` 是当前默认领域 Schema。
 导入时 Core 会先校验它，再把一份不可变快照保存到当前任务中；
 因此任务进行期间修改原 Schema 不会改变已创建任务的抽取契约。
-Schema 最大可为 1 MiB。超过 64 KiB 时不会塞进 `get_batch` 的主响应，Core
+Schema 最大可为 5 MiB。超过 64 KiB 时不会塞进 `get_batch` 的主响应，Core
 只返回摘要；Skill 会调用 `llm_wiki_get_domain_schema` 按 UTF-8 字节预算逐页
 读取完整类型、属性和关系定义，避免大型中文 Schema 撑爆 MCP 输出。
 

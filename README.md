@@ -90,7 +90,7 @@ Large tables, code blocks, and legacy oversized chunks are split before
 `get_batch`. Batches are bounded by both text and serialized payload size and
 are always returned complete; `batch_limits` reports the actual size. Set
 `options.max_batch_chars` during import to request smaller batches.
-Domain Schemas up to 1 MiB are accepted. Schemas larger than 64 KiB are
+Domain Schemas up to 5 MiB are accepted. Schemas larger than 64 KiB are
 summarized in batch and page-plan responses and exposed through bounded
 `llm_wiki_get_domain_schema` pages.
 
