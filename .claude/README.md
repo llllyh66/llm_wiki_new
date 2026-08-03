@@ -2,9 +2,16 @@
 
 The project root `.mcp.json` starts the Headless `llm-wiki` STDIO MCP server.
 It resolves the executable and workspace from `CLAUDE_PROJECT_DIR` and marks
-the small 11-tool server as `alwaysLoad`, so changing the shell working
+the small 12-tool server as `alwaysLoad`, so changing the shell working
 directory or deferred tool discovery cannot detach the workflow. Claude Code
 asks for project-server trust the first time it reads this file.
+
+`.claude/settings.json` approves the project `llm-wiki` server, every tool from
+that server, the builder Skill, all subagents, and read-only repository tools.
+It uses `dontAsk`, so background agents never pause for permission: tools not
+needed by the extraction workflow are denied instead of prompting. It does not
+grant blanket Bash, arbitrary file-write, network, or bypass-permissions access
+to untrusted document content.
 
 `.claude/skills/llm-wiki-builder/SKILL.md` is a regular, discoverable Claude
 Code entrypoint that directs Claude to the canonical
@@ -28,7 +35,7 @@ llm-wiki: node packages/mcp-server/dist/index.js --workspace . - Connected
 ```
 
 Start Claude Code from the repository root, approve the project MCP server if
-prompted, and confirm `/mcp` reports `Connected` with 11 tools. Attach or
+prompted, and confirm `/mcp` reports `Connected` with 12 tools. Attach or
 reference documents, then ask:
 
 ```text

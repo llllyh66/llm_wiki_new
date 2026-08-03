@@ -1,0 +1,17 @@
+{
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "llm-wiki"
+  ],
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "allow": [
+      "Agent",
+      "Skill(llm-wiki-builder)",
+      "mcp__llm-wiki__*",
+      "Read",
+      "Glob",
+      "Grep"
+    ]
+  }
+}

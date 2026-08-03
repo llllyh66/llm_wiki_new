@@ -114,6 +114,12 @@ llm-wiki: node packages/mcp-server/dist/index.js --workspace . - Connected
 页面规划上下文会自动分页，Skill 会持续读取到 `next_cursor` 为空；大请求和大结果
 也有明确预算，超过限制时会返回可恢复错误，而不是关闭 MCP 连接。
 
+项目中的 `.claude/settings.json` 已为主 Agent 和所有后台 Agent 预先允许
+`llm-wiki-builder`、全部 `llm-wiki` MCP 工具以及只读文件工具，并使用
+`dontAsk` 模式。抽取所需调用不会再弹出权限确认；工作流不需要的 Shell、任意
+文件写入和外部网络工具会直接拒绝而不是询问。修改配置后需完全退出并重新启动
+Claude Code。
+
 ### 3. 检查 Skill
 
 项目必须存在真实文件：

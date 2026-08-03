@@ -20,6 +20,10 @@ Use the host Agent's current model for every semantic decision. Use only the
   owns them.
 - Never overwrite a changed page after a hash conflict. Rebase first.
 - Do not expose private absolute paths, tokens, or large source passages.
+- Main and background extraction agents must use the pre-approved
+  `mcp__llm-wiki__*` tools for state changes. Do not request Bash, generic file
+  writes, network access, or permission bypass as a workaround; under project
+  `dontAsk` those unrelated tools are intentionally unavailable.
 
 Read [analysis-rules.md](references/analysis-rules.md) before analyzing the
 first batch. Read [recovery.md](references/recovery.md) only for an interrupted,

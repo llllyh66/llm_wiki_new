@@ -45,7 +45,11 @@ key, or `raw/sources/` directory is required.
 
 For Claude Code, run `claude` from the repository root. The checked-in
 `.mcp.json` registers the server, and `.claude/skills/llm-wiki-builder` links to
-the canonical shared Skill. Approve the project MCP server on first use.
+the canonical shared Skill. The checked-in `.claude/settings.json` pre-approves
+all `llm-wiki` MCP tools for the main and background agents and uses `dontAsk`
+for unattended extraction. Unrelated shell, write, and network tools remain
+unapproved. Approve project trust on first use, then restart Claude Code after
+changing these files.
 
 ## Architecture
 
