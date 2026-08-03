@@ -8,6 +8,7 @@
     "allow": [
       "Agent",
       "Skill(llm-wiki-builder)",
+      "mcp__llm-wiki",
       "mcp__llm-wiki__*",
       "Read",
       "Glob",

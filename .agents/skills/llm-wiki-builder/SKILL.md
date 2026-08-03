@@ -43,16 +43,27 @@ typed entity or any relation.
    display name. Let the tool initialize the current workspace.
 3. Record the returned task ID in working context.
 4. Use background parallel extraction by default when
-   `parallel_extraction.enabled` is true. Start exactly
-   `parallel_extraction.recommended_workers` background subagents (currently
-   capped at four), using the project `llm-wiki-extractor` subagent when it is
-   available. Assign stable IDs `extractor-1` through `extractor-N`, and keep
-   the main Agent as a responsive coordinator. Give each worker only the task
-   ID, its worker ID, this Skill path, and the batch-worker loop below.
-   Start them with the host's background/run-in-background option so the user
-   can keep asking the main Agent questions while extraction continues. Never
-   create more workers than recommended and never let a worker import files,
-   plan pages, commit pages, finalize, or answer the user.
+   `parallel_extraction.enabled` is true. Before leasing any batch, start one
+   project `llm-wiki-extractor` with the task ID and
+   `mode=capability-probe`; wait for its single `llm_wiki_status` result. The
+   project agent explicitly reuses the configured `llm-wiki` MCP server and
+   denies unrelated built-in tools instead of allowlisting an MCP wildcard.
+   Continue with subagents only when the probe reports `mcp_ready: true` for
+   the same task. If it reports a missing MCP tool, do not retry with a
+   `general-purpose` or differently named subagent: those agents may inherit
+   the same restricted tool set. Run the batch-worker loop in the coordinator
+   for this session and report one compact compatibility warning.
+
+   After a successful probe, start exactly
+   `parallel_extraction.recommended_workers` background project subagents
+   (currently capped at four). Assign stable IDs `extractor-1` through
+   `extractor-N`, and keep the main Agent as a responsive coordinator. Give
+   each worker only the task ID, its worker ID, this Skill path, and the
+   batch-worker loop below. Start them with the host's
+   background/run-in-background option so the user can keep asking the main
+   Agent questions while extraction continues. Never create more workers than
+   recommended and never let a worker import files, plan pages, commit pages,
+   finalize, or answer the user.
 5. Each background worker repeats until `llm_wiki_get_batch` returns
    `completed: true` or `waiting: true`:
    1. Call `llm_wiki_get_batch` with the task ID and its unchanged
@@ -113,12 +124,17 @@ typed entity or any relation.
 6. Keep the coordinator responsive while extraction runs. After every worker
    completion notification, call `llm_wiki_status`. If batches remain
    unleased after a worker failure or lease expiry, start only enough
-   replacement extractors to reach the recommended count.
+   replacement extractors to reach the recommended count. If a worker reports
+   `mcp_ready: false`, stop spawning replacements and continue remaining
+   batches in the coordinator; never enter a loop that launches differently
+   named agents to test the same missing MCP capability.
 7. Inspect `wiki_projection` in every analysis commit report and status result.
    When `ready: true` and `in_progress: false`, start exactly one background
    project `llm-wiki-writer` with task ID and stable writer ID
-   `wiki-writer-1`. Never run two Wiki writers for one task. The Core normally
-   opens a projection after four new batches, after the 30-second debounce, or
+   `wiki-writer-1`. Never run two Wiki writers for one task. If it reports
+   `mcp_ready: false`, perform the same writer loop in the coordinator instead
+   of launching a general-purpose replacement. The Core normally opens a
+   projection after four new batches, after the 30-second debounce, or
    immediately for final reconciliation when all batches finish.
 8. The Wiki writer performs one projection:
    1. Call `llm_wiki_get_page_plan_context` with task ID, writer ID, and cursor

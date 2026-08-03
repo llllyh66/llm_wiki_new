@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp, readFile, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
@@ -8,6 +8,25 @@ import { TOOL_DEFINITIONS } from "../src/tool-definitions.js"
 import { HeadlessToolRouter } from "../src/tools.js"
 
 const textResult = (result) => JSON.parse(result.content[0].text)
+
+test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool allowlist", async () => {
+  const extractor = await readFile(new URL("../../../.claude/agents/llm-wiki-extractor.md", import.meta.url), "utf8")
+  const writer = await readFile(new URL("../../../.claude/agents/llm-wiki-writer.md", import.meta.url), "utf8")
+  const settings = JSON.parse(await readFile(new URL("../../../.claude/settings.json", import.meta.url), "utf8"))
+  const skill = await readFile(new URL("../../../.agents/skills/llm-wiki-builder/SKILL.md", import.meta.url), "utf8")
+
+  for (const agent of [extractor, writer]) {
+    assert.doesNotMatch(agent, /^tools:/m)
+    assert.match(agent, /^disallowedTools:/m)
+    assert.match(agent, /^mcpServers:\n  - llm-wiki$/m)
+    assert.match(agent, /^permissionMode: dontAsk$/m)
+  }
+  assert.equal(settings.enableAllProjectMcpServers, true)
+  assert.equal(settings.permissions.allow.includes("mcp__llm-wiki"), true)
+  assert.equal(settings.permissions.allow.includes("mcp__llm-wiki__*"), true)
+  assert.match(skill, /mode=capability-probe/)
+  assert.match(skill, /do not retry with a\s+`general-purpose`/)
+})
 
 test("MCP publishes the complete Agent-first tool contract without desktop tools", () => {
   const names = TOOL_DEFINITIONS.map((tool) => tool.name)

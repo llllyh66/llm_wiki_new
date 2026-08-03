@@ -55,7 +55,10 @@ changing these files.
 For multi-batch imports, the Skill starts the Core-recommended number of
 background extraction agents (up to four). Stable worker leases keep batches
 distinct and task-level serialization prevents concurrent commits from losing
-state. The main Agent remains available for questions and coordinates page
+state. A non-leasing status probe first verifies that the project subagent can
+call the explicitly inherited `llm-wiki` MCP server; if not, the workflow
+falls back once to the coordinator instead of relaunching a general-purpose
+agent with the same restricted tools. The main Agent remains available for questions and coordinates page
 generation through exactly one background Wiki writer. After four new batches,
 or after a 30-second debounce, that writer incrementally updates affected
 pages while extractors continue. A final all-batch reconciliation stabilizes

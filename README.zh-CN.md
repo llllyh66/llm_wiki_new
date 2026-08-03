@@ -125,9 +125,13 @@ Agent，当前最多 4 个。每个 Agent 使用固定 `worker_id` 租约不同�
 串行保护同一任务的状态提交，因此不会抢同一批次或覆盖其他 Agent 的结果。
 主 Agent 只负责协调和回答用户问题；唯一的后台 Wiki Writer 与抽取 Agent
 形成流水线，每新增 4 个 batch 或等待满 30 秒后增量更新受影响页面。
-项目级 `.claude/agents/llm-wiki-extractor.md` 把后台 Agent 限定为 Read 和
-`llm-wiki` MCP 工具，并单独使用 `dontAsk`，不会因 Shell 或任意写入权限中断。
-`.claude/agents/llm-wiki-writer.md` 使用同样的最小权限，且每个任务同时
+项目级 `.claude/agents/llm-wiki-extractor.md` 会显式复用项目的
+`llm-wiki` MCP 连接，并通过 `disallowedTools` 禁用 Shell、任意写入、网络和
+嵌套 Agent。它不再用 `tools: Read, mcp__llm-wiki__*` 作为严格白名单，避免
+某些 Claude Code 版本未展开 MCP 通配符后只剩 Read 工具。启动 worker 池前
+会先运行一个不领取 batch 的 `llm_wiki_status` 能力探测；失败时不会再改用
+`general-purpose` Agent 反复尝试，而由主 Agent 继续当前任务。
+`.claude/agents/llm-wiki-writer.md` 使用同样的 MCP 复用方式，且每个任务同时
 只允许一个 `wiki-writer-1` 租约，避免页面冲突。
 
 ### 3. 检查 Skill
@@ -362,6 +366,12 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
    请调用 llm-wiki MCP 的 llm_wiki_list_tasks 工具列出当前任务，
    不要使用 shell。
    ```
+
+如果主 Agent 可以调用，但后台 Agent 报告“只有 Read 工具”，说明当前会话仍
+加载了旧的子代理定义。确认两个 `.claude/agents/llm-wiki-*.md` 都包含
+`mcpServers: - llm-wiki`（YAML 分行形式）且没有 `tools:` 字段，然后完全退出
+Claude Code 并从项目根目录重新启动。新版会先做子代理能力探测；探测失败只
+回退一次到主 Agent，不会继续启动 `general-purpose` worker。
 
 ### 任何 llm_wiki 工具报错后 MCP 断开
 

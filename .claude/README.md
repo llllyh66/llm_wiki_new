@@ -42,14 +42,23 @@ reference documents, then ask:
 把这些文档构建成 llm_wiki 知识库。
 ```
 
-For imports with multiple batches, the Skill starts up to four background
-`llm-wiki-extractor` agents using distinct worker leases. That project agent is
-restricted to Read and `llm-wiki` MCP tools and runs in `dontAsk` mode. One
+For imports with multiple batches, the Skill first runs one non-leasing MCP
+capability probe, then starts up to four background `llm-wiki-extractor` agents
+using distinct worker leases. Each project agent explicitly reuses the parent
+`llm-wiki` MCP connection and uses a denylist for shell, writes, network, and
+nested agents; it does not use a fragile MCP wildcard as its complete tool
+allowlist. The agent runs in `dontAsk` mode. One
 `llm-wiki-writer` agent consumes leased micro-batch projections after four new
 batches or a 30-second debounce, while later extraction continues. Incremental
 pages remain provisional and excluded from retrieval until the writer completes
 the final all-batch reconciliation. The main Agent remains responsive for
 questions: retrieval defaults to BM25 + embedding while the task is building,
 then adds the Wiki channel automatically after Finalize.
+
+If the probe reports `mcp_ready: false`, the Skill does not retry with a
+`general-purpose` agent. It continues in the coordinator, because changing the
+agent name cannot repair an MCP server that was not inherited by subagents.
+After pulling this configuration change, fully restart Claude Code so existing
+subagent definitions are not reused from the prior session.
 
 You may also explicitly invoke the workflow with `/llm-wiki-builder`.

@@ -1,18 +1,27 @@
 ---
 name: llm-wiki-extractor
 description: Process leased llm_wiki analysis batches in the background. Use only when the llm-wiki-builder coordinator supplies a task ID and stable worker ID.
-tools: Read, mcp__llm-wiki__*
+disallowedTools: Agent, Bash, PowerShell, Edit, Write, NotebookEdit, WebFetch, WebSearch
 model: inherit
 permissionMode: dontAsk
+mcpServers:
+  - llm-wiki
 skills:
   - llm-wiki-builder
 background: true
 ---
 
 Act only as one background extraction worker. The coordinator must provide a
-task ID and an unchanged worker ID. Follow the batch-worker loop in step 5 of
-the preloaded `llm-wiki-builder` Skill until `get_batch` returns `completed` or
-`waiting`.
+task ID and either an unchanged worker ID or `mode=capability-probe`.
+
+For `mode=capability-probe`, call `llm_wiki_status` once with the supplied task
+ID. Do not lease a batch. Return `mcp_ready: true`, the task ID, and the tool
+name only after the call succeeds. If the MCP tool is absent, report
+`mcp_ready: false` immediately; do not use Read, shell, or another agent as a
+substitute.
+
+For normal worker mode, follow the batch-worker loop in step 5 of the preloaded
+`llm-wiki-builder` Skill until `get_batch` returns `completed` or `waiting`.
 
 Never import files, spawn agents, plan or write Wiki pages, finalize a task, or
 answer the user. Never use shell commands or generic writes. Use only the

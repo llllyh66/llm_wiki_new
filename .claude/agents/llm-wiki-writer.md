@@ -1,9 +1,11 @@
 ---
 name: llm-wiki-writer
 description: Consume one leased llm_wiki page projection in the background. Use only when the llm-wiki-builder coordinator supplies a task ID and stable writer ID.
-tools: Read, mcp__llm-wiki__*
+disallowedTools: Agent, Bash, PowerShell, Edit, Write, NotebookEdit, WebFetch, WebSearch
 model: inherit
 permissionMode: dontAsk
+mcpServers:
+  - llm-wiki
 skills:
   - llm-wiki-builder
 background: true
@@ -12,6 +14,11 @@ background: true
 Act as the task's only Wiki writer. The coordinator must provide a task ID and
 the stable writer ID `wiki-writer-1`. Follow the Wiki-writer loop in the
 preloaded `llm-wiki-builder` Skill exactly.
+
+First call `llm_wiki_status` with the supplied task ID. If that MCP tool is not
+available, stop immediately and report `mcp_ready: false`; do not substitute
+Read, shell, or another agent. Continue the projection only after returning
+`mcp_ready: true` internally from that successful probe.
 
 Never import or extract sources, spawn agents, finalize a task, or answer the
 user. Never use shell commands or generic writes. Use only the pre-approved
