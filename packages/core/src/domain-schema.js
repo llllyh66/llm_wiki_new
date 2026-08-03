@@ -177,17 +177,22 @@ export function applyDomainSchema(analysis, schema) {
   const relationLocalIds = new Set()
   const relationUniqueValues = new Map()
   let droppedRelations = 0
-  for (const [index, original] of analysis.relations.entries()) {
-    const result = normalizeRelation(original, index, schema, relationLookup, entityTypesByLocalId, relationUniqueValues)
-    if (result.value?.localId && relationLocalIds.has(result.value.localId)) result.errors.push(`relations[${index}].localId duplicates ${result.value.localId}`)
-    if (result.errors.length > 0) {
-      violations.push(...result.errors)
-      droppedRelations += 1
-      continue
+  const relationConstraintsApplied = schema.relationTypes.length > 0
+  if (!relationConstraintsApplied) {
+    relations.push(...analysis.relations)
+  } else {
+    for (const [index, original] of analysis.relations.entries()) {
+      const result = normalizeRelation(original, index, schema, relationLookup, entityTypesByLocalId, relationUniqueValues)
+      if (result.value?.localId && relationLocalIds.has(result.value.localId)) result.errors.push(`relations[${index}].localId duplicates ${result.value.localId}`)
+      if (result.errors.length > 0) {
+        violations.push(...result.errors)
+        droppedRelations += 1
+        continue
+      }
+      relations.push(result.value)
+      for (const key of result.uniqueKeys) relationUniqueValues.set(key, true)
+      relationLocalIds.add(result.value.localId)
     }
-    relations.push(result.value)
-    for (const key of result.uniqueKeys) relationUniqueValues.set(key, true)
-    relationLocalIds.add(result.value.localId)
   }
   const validationErrorCount = violations.length
   const report = {
@@ -200,6 +205,7 @@ export function applyDomainSchema(analysis, schema) {
     validation_errors_truncated: validationErrorCount > 100,
     dropped_entities: droppedEntities,
     dropped_relations: droppedRelations,
+    relation_constraints_applied: relationConstraintsApplied,
   }
   if (violations.length > 0 && schema.policy.validationFailurePolicy === "reject-batch") {
     fail("INVALID_DOMAIN_ANALYSIS", "Analysis does not conform to the task domain schema.", { details: report })
@@ -223,8 +229,12 @@ function domainSchemaRecord(input) {
 }
 
 function normalizeTypes(value, field, errors, relation = false) {
-  if (!Array.isArray(value) || value.length === 0) {
-    errors.push(`${field} must be a non-empty array`)
+  if (!Array.isArray(value)) {
+    errors.push(`${field} must be an array${relation ? "" : " with at least one item"}`)
+    return []
+  }
+  if (!relation && value.length === 0) {
+    errors.push(`${field} must contain at least one item`)
     return []
   }
   if (value.length > 2_000) errors.push(`${field} exceeds 2000 items`)

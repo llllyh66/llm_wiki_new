@@ -138,7 +138,7 @@ export class LlmWikiCore {
         domain_schema: schemaContext.value,
         domain_schema_pagination: schemaContext.pagination,
         domain_extraction_instructions: domainSchema
-          ? `${schemaContext.pagination ? "Fetch every llm_wiki_get_domain_schema page before analysis. " : ""}Extract entities and relations under this domain schema. Entities require localId, entityTypeId, properties, and sourceRefs. Relations require localId, relationTypeId, sourceEntityLocalId, targetEntityLocalId, properties, and sourceRefs. Do not infer missing required properties.`
+          ? `${schemaContext.pagination ? "Fetch every llm_wiki_get_domain_schema page before analysis. " : ""}Extract entities under this domain schema with localId, entityTypeId, properties, and sourceRefs. ${domainSchema.relationTypes.length > 0 ? "Relations require localId, relationTypeId, sourceEntityLocalId, targetEntityLocalId, properties, and sourceRefs." : "relationTypes is empty, so relations use the general AnalysisEnvelope format and are not constrained by the domain schema."} Do not infer missing required properties.`
           : null,
       },
       analysis_schema: analysisSchema,

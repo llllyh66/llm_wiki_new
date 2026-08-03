@@ -36,6 +36,9 @@ You can instead pass `options.domain_schema_path` or `options.domain_schema` to
 IDs; `drop-invalid` safely removes nonconforming candidates and reports them in
 `domain_validation`, while `reject-batch` returns a recoverable
 `INVALID_DOMAIN_ANALYSIS` result.
+`relationTypes` may be an empty array; this disables domain-level relation
+constraints and keeps general relation extraction enabled. `entityTypes` must
+still contain at least one type.
 
 No desktop application, separate HTTP server, project creation, Provider API
 key, or `raw/sources/` directory is required.

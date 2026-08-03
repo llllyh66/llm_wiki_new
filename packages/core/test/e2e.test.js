@@ -322,6 +322,76 @@ test("large domain schemas are summarized in batches and retrieved through bound
   assert.equal(items.filter((item) => item.kind === "relation_type").length, 1)
 })
 
+test("domain schema allows an empty relationTypes array", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const schema = {
+    formatVersion: "1.0",
+    schemaId: "entity-only-schema",
+    schemaVersion: "1.0.0",
+    name: "仅实体领域模型",
+    description: "只约束实体抽取，不定义关系类型。",
+    language: "zh-CN",
+    policy: {
+      extractionMode: "strict",
+      validationFailurePolicy: "drop-invalid",
+      allowUnknownEntityTypes: false,
+      allowUnknownRelationTypes: false,
+      allowUnknownProperties: false,
+    },
+    entityTypes: [{
+      id: "business_entity",
+      name: "业务实体",
+      description: "一个业务实体。",
+      aliases: [],
+      properties: [],
+    }],
+    relationTypes: [],
+  }
+  const imported = await f.core.importFiles({ files: [{ path: f.source }], options: { domain_schema: schema } })
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  assert.deepEqual(batch.workspace_context.domain_schema.relationTypes, [])
+  assert.equal(batch.workspace_context.domain_schema.entityTypes.length, 1)
+  const chunk = batch.chunks[0]
+  const sourceRef = {
+    sourceId: chunk.sourceId,
+    chunkId: chunk.chunkId,
+    quote: "Business Entity is the canonical business object.",
+    locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
+  }
+  const committed = await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    idempotency_key: "entity-only-domain-analysis",
+    analysis: {
+      schemaVersion: 1,
+      taskId: imported.task_id,
+      batchId: batch.batch_id,
+      sourceRefs: [sourceRef],
+      entities: [{ localId: "entity-1", name: "Business Entity", entityTypeId: "business_entity", properties: {}, sourceRefs: [0] }],
+      concepts: [],
+      claims: [],
+      relations: [{
+        localId: "relation-1",
+        name: "self relation",
+        content: "Business Entity is the canonical business object.",
+        sourceRefs: [0],
+      }],
+      contradictions: [],
+      candidatePages: [],
+      reviewItems: [],
+      batchSummary: "Entity-only extraction.",
+      unresolvedQuestions: [],
+    },
+  })
+  assert.equal(committed.accepted, true)
+  assert.equal(committed.domain_validation.dropped_relations, 0)
+  assert.equal(committed.domain_validation.relation_constraints_applied, false)
+  const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
+  assert.equal(plan.analysis_summary.relations.length, 1)
+  assert.equal(plan.analysis_summary.relations[0].name, "self relation")
+})
+
 test("domain schema accepts bounded multi-megabyte input and rejects payloads over 5 MiB", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))

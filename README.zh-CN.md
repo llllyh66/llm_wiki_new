@@ -188,6 +188,10 @@ Agent 在 `entities` 中提交 `entityTypeId` 和 `properties`，在
 `relations` 中提交 `relationTypeId`、`sourceEntityLocalId` 和
 `targetEntityLocalId`。`compatible` 模式允许 Agent 使用中文名称或别名，
 Core 会将它们规范化为 Schema 中的稳定 ID。
+允许使用 `"relationTypes": []`；这表示不启用领域级关系约束，Agent 仍按通用
+AnalysisEnvelope 抽取并保存关系，不检查关系类型、端点类型或关系属性。
+`entityTypes` 仍必须至少包含一个实体类型。只有 `relationTypes` 非空时，Core
+才执行领域关系校验。
 
 当 `validationFailurePolicy` 为 `drop-invalid` 时：
 

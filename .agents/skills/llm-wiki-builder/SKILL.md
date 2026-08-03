@@ -26,7 +26,7 @@ first batch. Read [recovery.md](references/recovery.md) only for an interrupted,
 failed, conflicted, or cancelled workflow.
 When `workspace_context.domain_schema` is present, also read
 [domain-schema.md](references/domain-schema.md) before extracting the first
-typed entity or relation.
+typed entity or any relation.
 
 ## Workflow
 
@@ -53,8 +53,11 @@ typed entity or relation.
       Wiki channels. Inspect `channel_status` and `corpus.truncated`; an
       embedding fallback is a usable result, not a reason to restart MCP.
    5. Analyze the chunks under the supplied AnalysisEnvelope schema. When a
-      domain Schema is present, emit typed entities and relations with canonical
-      IDs and Schema-conforming properties; do not invent required values.
+      domain Schema is present, emit typed entities with canonical IDs and
+      Schema-conforming properties. Emit typed relations only when
+      `relationTypes` is non-empty; an empty array leaves general relation
+      extraction unconstrained by the domain Schema. Do not invent required
+      values.
    6. Before calling `llm_wiki_commit_analysis`, preflight the payload: pass
       `analysis` as a JSON object, never a serialized JSON string or Markdown
       code block; preserve the exact `taskId` and `batchId`; include every

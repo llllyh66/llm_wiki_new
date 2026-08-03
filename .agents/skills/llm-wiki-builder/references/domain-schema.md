@@ -37,7 +37,13 @@ For every domain entity, emit:
 
 ## Relation output
 
-Relations point to retained entity `localId` values:
+If `relationTypes` is empty, skip all domain-level relation validation rules in
+this section. Continue extracting source-grounded relations using the general
+AnalysisEnvelope candidate shape; `relationTypeId`, typed endpoints, and
+Schema-defined relation properties are not required.
+
+If `relationTypes` is non-empty, relations point to retained entity `localId`
+values and must use a defined relation type:
 
 ```json
 {
@@ -64,9 +70,10 @@ Relations point to retained entity `localId` values:
 - `compatible`: IDs, names, and aliases can resolve to canonical IDs.
 - `reject-batch`: any domain violation returns recoverable
   `INVALID_DOMAIN_ANALYSIS`; correct the payload and retry the same batch.
-- `drop-invalid`: invalid entities are removed, then relations pointing to
-  removed or incompatible endpoints are removed. A successful commit returns
-  `domain_validation` with violations and dropped counts.
+- `drop-invalid`: invalid entities are removed. When `relationTypes` is
+  non-empty, relations pointing to removed or incompatible endpoints are also
+  removed. A successful commit returns `domain_validation` with violations and
+  dropped counts.
 - Unknown types and properties are allowed only when their matching policy flag
   is true.
 
