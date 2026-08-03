@@ -937,6 +937,17 @@ function acquirePageProjection(task, input) {
   const state = projectionState(task)
   const status = pageProjectionStatus(task)
   const writerId = normalizeWorkerId(input?.writer_id)
+  // Older servers leased every accumulated incremental batch at once. A
+  // restarted writer always recollects from cursor zero, so safely shrink that
+  // legacy lease in place and leave the remainder queued for later projections.
+  if (state.lease?.mode === "incremental"
+    && Array.isArray(state.lease.batchIds)
+    && state.lease.batchIds.length > state.batchLimit
+    && (input?.cursor === undefined || input?.cursor === null || Number(input.cursor) === 0)) {
+    state.lease.repartitionedFromBatchCount = state.lease.batchIds.length
+    state.lease.batchIds = state.lease.batchIds.slice(0, state.batchLimit)
+    state.lease.safelyRepartitioned = true
+  }
   if (input?.projection_id !== undefined) {
     if (!state.lease || state.lease.projectionId !== input.projection_id) {
       fail("PAGE_PROJECTION_NOT_FOUND", "The page projection lease is missing or expired.", { retryable: true })
@@ -987,6 +998,10 @@ function publicProjection(projection) {
     batch_ids: projection.batchIds,
     analysis_revision: projection.analysisRevision,
     lease_expires_at: projection.expiresAt,
+    ...(projection.safelyRepartitioned ? {
+      safely_repartitioned: true,
+      repartitioned_from_batch_count: projection.repartitionedFromBatchCount,
+    } : {}),
   }
 }
 

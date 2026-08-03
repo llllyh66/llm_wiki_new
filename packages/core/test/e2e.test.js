@@ -984,9 +984,26 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
   await mkdir(concepts, { recursive: true })
   await writeFile(path.join(concepts, "unrelated-large.md"), `# Unrelated Large\n\n${"Unrelated content. ".repeat(2_000)}\n`)
 
+  // Simulate an in-progress projection created by the older unbounded Writer.
+  const taskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
+  const persisted = JSON.parse(await readFile(taskPath, "utf8"))
+  persisted.pageProjection.lease = {
+    projectionId: "projection-legacy-writer-backlog",
+    writerId: "wiki-writer-1",
+    mode: "incremental",
+    batchIds: [...persisted.completedBatchIds],
+    analysisRevision: persisted.analysisRevision,
+    leasedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    wikiRevision: null,
+  }
+  await writeFile(taskPath, JSON.stringify(persisted))
+
   const first = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 40_000 })
   assert.equal(first.projection.mode, "incremental")
   assert.equal(first.projection.batch_ids.length, 4)
+  assert.equal(first.projection.safely_repartitioned, true)
+  assert.equal(first.projection.repartitioned_from_batch_count, 8)
   assert.equal(first.existing_pages.some((page) => page.path === "wiki/concepts/unrelated-large.md"), false)
   const catalogEntry = first.existing_page_catalog.find((page) => page.path === "wiki/concepts/unrelated-large.md")
   assert.equal(catalogEntry.content_included, false)
