@@ -46,18 +46,22 @@ test("built MCP server survives errors and completes the full workflow over one 
     { name: "llm_wiki_get_batch", arguments: { task_id: "invalid" } },
     { name: "llm_wiki_get_domain_schema", arguments: { task_id: "invalid" } },
     { name: "llm_wiki_retrieve_context", arguments: { task_id: "invalid", batch_id: "batch-0001", queries: ["x"] } },
+    { name: "llm_wiki_commit_analysis", arguments: { task_id: "invalid", batch_id: "batch-0001", analysis: {}, idempotency_key: "invalid-analysis-v1" } },
     { name: "llm_wiki_get_page_plan_context", arguments: { task_id: "invalid" } },
     { name: "llm_wiki_commit_pages", arguments: { task_id: "invalid", patches: [], based_on_wiki_revision: "0".repeat(64), idempotency_key: "invalid-pages-v1" } },
     { name: "llm_wiki_finalize", arguments: { task_id: "invalid" } },
     { name: "llm_wiki_abort", arguments: { task_id: "invalid" } },
     { name: "llm_wiki_lint", arguments: { task_id: "invalid" } },
+    { name: "llm_wiki_unknown_tool", arguments: {} },
   ]
-  for (const call of failingCalls) {
-    const failed = await client.callTool(call)
-    assert.equal(failed.isError, undefined, call.name)
-    assert.equal(failed.structuredContent.ok, false, call.name)
-    assert.equal(failed.structuredContent.mcp_connection_usable, true, call.name)
-    assert.equal((await client.listTools()).tools.length, 12, call.name)
+  for (let round = 0; round < 3; round += 1) {
+    for (const call of failingCalls) {
+      const failed = await client.callTool(call)
+      assert.equal(failed.isError, undefined, `${call.name} round ${round}`)
+      assert.equal(failed.structuredContent.ok, false, `${call.name} round ${round}`)
+      assert.equal(failed.structuredContent.mcp_connection_usable, true, `${call.name} round ${round}`)
+      assert.equal((await client.listTools()).tools.length, 12, `${call.name} round ${round}`)
+    }
   }
 
   const lint = await client.callTool({ name: "llm_wiki_lint", arguments: {} })
@@ -82,9 +86,11 @@ test("built MCP server survives errors and completes the full workflow over one 
   }
   const retrieval = await client.callTool({
     name: "llm_wiki_retrieve_context",
-    arguments: { task_id: taskId, batch_id: batch.structuredContent.batch_id, queries: ["Business Entity"] },
+    arguments: { task_id: taskId, queries: ["Business Entity"] },
   })
   assert.equal(retrieval.isError, undefined)
+  assert.equal(retrieval.structuredContent.retrieval_phase, "building")
+  assert.deepEqual(retrieval.structuredContent.available_channels, ["bm25", "embedding"])
 
   // Reproduce the failure sequence seen in real Agent runs: a dense analysis
   // with many validation errors, a malformed retry, and a bad SourceRef. None
@@ -190,12 +196,25 @@ test("built MCP server survives errors and completes the full workflow over one 
   })
   assert.equal(analyzed.isError, undefined)
   assert.equal(analyzed.structuredContent.normalized_source_ref_indexes, 3)
-  const plan = await client.callTool({ name: "llm_wiki_get_page_plan_context", arguments: { task_id: taskId, cursor: 0 } })
+  const plan = await client.callTool({
+    name: "llm_wiki_get_page_plan_context",
+    arguments: { task_id: taskId, writer_id: "stdio-wiki-writer", cursor: 0 },
+  })
   assert.equal(plan.structuredContent.next_cursor, null)
+  assert.equal(plan.structuredContent.projection.mode, "final")
+  const competingProjection = await client.callTool({
+    name: "llm_wiki_get_page_plan_context",
+    arguments: { task_id: taskId, writer_id: "stdio-competing-writer", cursor: 0 },
+  })
+  assert.equal(competingProjection.isError, undefined)
+  assert.equal(competingProjection.structuredContent.waiting, true)
+  assert.equal(competingProjection.structuredContent.projection.writer_busy, true)
   const pages = await client.callTool({
     name: "llm_wiki_commit_pages",
     arguments: {
       task_id: taskId,
+      writer_id: "stdio-wiki-writer",
+      projection_id: plan.structuredContent.projection.projection_id,
       based_on_wiki_revision: plan.structuredContent.based_on_wiki_revision,
       idempotency_key: "stdio-pages-v1",
       patches: [{
@@ -211,6 +230,7 @@ test("built MCP server survives errors and completes the full workflow over one 
     },
   })
   assert.equal(pages.isError, undefined)
+  assert.equal(pages.structuredContent.wiki_projection.final_completed, true)
   const finalized = await client.callTool({ name: "llm_wiki_finalize", arguments: { task_id: taskId } })
   assert.equal(finalized.structuredContent.status, "completed")
   const status = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: taskId } })
@@ -276,13 +296,19 @@ test("built MCP server survives errors and completes the full workflow over one 
   assert.equal(largeImported.isError, undefined)
   const largeBatch = await client.callTool({
     name: "llm_wiki_get_batch",
-    arguments: { task_id: largeImported.structuredContent.task_id, max_chars: 1_000 },
+    arguments: { task_id: largeImported.structuredContent.task_id, worker_id: "large-worker-1", max_chars: 1_000 },
   })
   assert.equal(largeBatch.isError, undefined)
   assert.equal(largeBatch.structuredContent.batch_limits.complete, true)
   assert.equal(largeBatch.structuredContent.batch_limits.char_count <= 12_000, true)
   assert.equal(largeBatch.structuredContent.chunks.every((chunk) => chunk.text.length <= 8_000), true)
+  const secondLargeBatch = await client.callTool({
+    name: "llm_wiki_get_batch",
+    arguments: { task_id: largeImported.structuredContent.task_id, worker_id: "large-worker-2" },
+  })
+  assert.notEqual(secondLargeBatch.structuredContent.batch_id, largeBatch.structuredContent.batch_id)
   assert.equal((await client.listTools()).tools.length, 12)
   const largeStatus = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: largeImported.structuredContent.task_id } })
   assert.equal(largeStatus.structuredContent.status, "prepared")
+  assert.equal(largeStatus.structuredContent.leased_batches, 2)
 })

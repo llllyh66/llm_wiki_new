@@ -8,7 +8,12 @@ import { HeadlessToolRouter } from "./tools.js"
 const STDIO_MAX_BUFFER_BYTES = 32 * 1024 * 1024
 
 function log(event, details = {}) {
-  process.stderr.write(`${JSON.stringify({ component: "llm-wiki-mcp", event, ...details })}\n`)
+  try {
+    process.stderr.write(`${JSON.stringify({ component: "llm-wiki-mcp", event, ...details })}\n`)
+  } catch {
+    // Diagnostics must never turn a handled tool error into a rejected MCP
+    // request or terminate the STDIO server (for example after stderr closes).
+  }
 }
 
 function parseWorkspace(argv) {

@@ -21,8 +21,13 @@ export const TOOL_DEFINITIONS = Object.freeze([
   },
   {
     name: "llm_wiki_get_batch",
-    description: "Return one complete, stable, payload-bounded batch of untrusted source chunks. Oversized legacy chunks are safely split before return; reading does not complete the batch.",
-    inputSchema: closedObject({ task_id: taskId, batch_id: { type: ["string", "null"] }, max_chars: { type: "number", minimum: 1000, maximum: 30000, description: "Legacy compatibility hint only. Batches are fixed and bounded at import, and are always returned complete." } }, ["task_id"]),
+    description: "Lease and return one complete, stable, payload-bounded batch to an extraction worker. Different worker_id values receive different available batches; expired leases are safely reclaimed.",
+    inputSchema: closedObject({
+      task_id: taskId,
+      batch_id: { type: ["string", "null"] },
+      worker_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
+      max_chars: { type: "number", minimum: 1000, maximum: 30000, description: "Legacy compatibility hint only. Batches are fixed and bounded at import, and are always returned complete." },
+    }, ["task_id"]),
   },
   {
     name: "llm_wiki_get_domain_schema",
@@ -35,7 +40,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
   },
   {
     name: "llm_wiki_retrieve_context",
-    description: "Recall source chunks, committed analysis, and Wiki sections through BM25, configurable real Embedding, and Wiki-native title/link/graph channels, then fuse rankings with RRF. Embedding failures degrade without failing the tool.",
+    description: "Recall source chunks, committed analysis, and Wiki sections with RRF. batch_id is optional for task-wide user questions and may be supplied to prioritize one worker batch. Defaults to BM25 plus Embedding while building, then adds Wiki recall after completion.",
     inputSchema: closedObject({
       task_id: taskId,
       batch_id: { type: "string" },
@@ -43,29 +48,34 @@ export const TOOL_DEFINITIONS = Object.freeze([
       channels: { type: "array", items: { enum: ["bm25", "embedding", "wiki", "vector", "graph"] }, description: "Use bm25, embedding, and wiki. vector and graph are backward-compatible aliases." },
       limit: { type: "number", minimum: 1, maximum: 100 },
       max_chars: { type: "number", minimum: 1000, maximum: 120000 },
-    }, ["task_id", "batch_id", "queries"]),
+    }, ["task_id", "queries"]),
   },
   {
     name: "llm_wiki_commit_analysis",
-    description: "Normalize SourceRefs, enforce the task's optional domain entity/relation Schema, and persist the host Agent's structured analysis. Domain drop-invalid policy returns a validation report without failing the batch.",
-    inputSchema: closedObject({ task_id: taskId, batch_id: { type: "string" }, analysis: { type: "object" }, idempotency_key: { type: "string", minLength: 8, maxLength: 200 } }, ["task_id", "batch_id", "analysis", "idempotency_key"]),
+    description: "Normalize SourceRefs, enforce Schema-first extraction, and persist one worker's analysis. Invalid domain candidates are rejected before persistence even under drop-invalid unless accept_dropped_candidates is explicitly true.",
+    inputSchema: closedObject({ task_id: taskId, batch_id: { type: "string" }, worker_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" }, analysis: { type: "object" }, accept_dropped_candidates: { type: "boolean", description: "Explicit opt-in to destructive drop-invalid behavior. Omit or false for Schema-first rejection and correction." }, idempotency_key: { type: "string", minLength: 8, maxLength: 200 } }, ["task_id", "batch_id", "analysis", "idempotency_key"]),
   },
   {
     name: "llm_wiki_get_page_plan_context",
-    description: "Return a bounded page of normalized task analysis, existing page snapshots and hashes, conflicts, and the PagePatch schema. Repeat with next_cursor until null before planning pages.",
+    description: "Lease and return bounded page-planning context. With writer_id, supports one incremental Wiki writer while extraction continues and a final full reconciliation after all batches. Repeat with the returned projection_id and next_cursor.",
     inputSchema: closedObject({
       task_id: taskId,
+      writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
+      projection_id: { type: "string", minLength: 1, maxLength: 100 },
       cursor: { type: ["integer", "null"], minimum: 0 },
       max_chars: { type: "integer", minimum: 20000, maximum: 200000 },
     }, ["task_id"]),
   },
   {
     name: "llm_wiki_commit_pages",
-    description: "Validate SourceRefs, paths, size and optimistic hashes, then atomically commit host-Agent PagePatch objects through staging and a journaled transaction.",
+    description: "Atomically commit one leased Wiki projection. Incremental commits remain provisional; the final full reconciliation stabilizes them. An empty patches array is accepted only to acknowledge a leased projection with no page changes.",
     inputSchema: closedObject({
       task_id: taskId,
+      writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
+      projection_id: { type: "string", minLength: 1, maxLength: 100 },
+      projection_complete: { type: "boolean", description: "Set false when more bounded patch commits remain for this projection. Omit or true on the final commit, including an empty acknowledgement." },
       based_on_wiki_revision: { type: "string", pattern: "^[0-9a-f]{64}$" },
-      patches: { type: "array", minItems: 1, maxItems: 50, items: { type: "object" } },
+      patches: { type: "array", minItems: 0, maxItems: 50, items: { type: "object" } },
       idempotency_key: { type: "string", minLength: 8, maxLength: 200 },
     }, ["task_id", "based_on_wiki_revision", "patches", "idempotency_key"]),
   },

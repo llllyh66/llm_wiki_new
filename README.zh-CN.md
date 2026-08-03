@@ -120,6 +120,16 @@ llm-wiki: node packages/mcp-server/dist/index.js --workspace . - Connected
 文件写入和外部网络工具会直接拒绝而不是询问。修改配置后需完全退出并重新启动
 Claude Code。
 
+多批次任务默认按 `parallel_extraction.recommended_workers` 启动后台抽取
+Agent，当前最多 4 个。每个 Agent 使用固定 `worker_id` 租约不同批次，Core
+串行保护同一任务的状态提交，因此不会抢同一批次或覆盖其他 Agent 的结果。
+主 Agent 只负责协调和回答用户问题；唯一的后台 Wiki Writer 与抽取 Agent
+形成流水线，每新增 4 个 batch 或等待满 30 秒后增量更新受影响页面。
+项目级 `.claude/agents/llm-wiki-extractor.md` 把后台 Agent 限定为 Read 和
+`llm-wiki` MCP 工具，并单独使用 `dontAsk`，不会因 Shell 或任意写入权限中断。
+`.claude/agents/llm-wiki-writer.md` 使用同样的最小权限，且每个任务同时
+只允许一个 `wiki-writer-1` 租约，避免页面冲突。
+
 ### 3. 检查 Skill
 
 项目必须存在真实文件：
@@ -199,14 +209,20 @@ AnalysisEnvelope 抽取并保存关系，不检查关系类型、端点类型或
 `entityTypes` 仍必须至少包含一个实体类型。只有 `relationTypes` 非空时，Core
 才执行领域关系校验。
 
-当 `validationFailurePolicy` 为 `drop-invalid` 时：
+抽取采用 Schema-first：Agent 在生成候选时先选择 Schema 类型，再抽取允许的
+属性和有原文证据的必填值，不应先生成不合规候选再依赖 Core 丢弃。即使
+`validationFailurePolicy` 为 `drop-invalid`，默认提交也会在持久化前返回可
+恢复的 `INVALID_DOMAIN_ANALYSIS`，让后台 Agent 修正同一批次，不会静默丢失。
+
+只有用户明确接受数据损失并在提交中设置
+`accept_dropped_candidates: true` 时，`drop-invalid` 才执行：
 
 - 缺少必填属性、属性类型错误或使用未知类型的实体会被丢弃；
 - 指向已丢弃实体或端点类型不合法的关系会被丢弃；
 - 批次仍可成功提交，返回的 `domain_validation` 会列出原因和丢弃数量。
 
-必填值在源文档中缺失时，Agent 不应编造。如果希望“有任何违规就拒绝
-整批”，将策略改为 `"validationFailurePolicy": "reject-batch"`；该错误会以
+必填值在源文档中缺失时，Agent 不应编造。默认模板使用
+`"validationFailurePolicy": "reject-batch"`；该策略始终以
 可恢复的 `accepted: false` 返回，不会断开 MCP。
 
 也可显式指定其他 Schema：
@@ -227,7 +243,8 @@ Skill 会先调用 `llm_wiki_list_tasks` 和 `llm_wiki_status`，然后按 `next
 
 ### 使用已生成的 Wiki
 
-当前没有独立的通用问答 MCP 工具，但可以直接让 Agent 读取 `wiki/`：
+可直接向主 Agent 提问，Skill 会使用 `llm_wiki_retrieve_context` 召回证据；
+也可以明确让 Agent 综合 `wiki/`：
 
 ```text
 阅读 wiki/，总结系统中的核心实体、关键概念以及它们的关系。
@@ -235,11 +252,27 @@ Skill 会先调用 `llm_wiki_list_tasks` 和 `llm_wiki_status`，然后按 `next
 
 ### BM25 + Embedding + Wiki 多路召回
 
+页面生成使用“微批次投影”：
+
+- 新增 4 个已抽取 batch、最旧未投影 batch 等待超过 30 秒，或全部 batch
+  完成时，Core 会开放一个 Wiki 投影窗口。
+- 增量投影只更新受当前 batch 影响的页面，并标记为 provisional。
+- provisional 页面在所有未完成任务的检索中都被排除，不会污染用户问答。
+- 超大页面计划可在同一租约下分多次提交，每次最多 50 个 PagePatch。
+- 全部抽取完成后必须进行一次全局去重、矛盾合并和 provisional 复核；
+  在此之前 `finalize` 会被可恢复地拒绝。
+
 `llm_wiki_retrieve_context` 会并行考虑受管理的源文档块、已提交分析和 Wiki
-页面分段，通过 BM25、真实 Embedding、Wiki 标题/路径/双向链接图三路排序，
-最后用 RRF 融合。大型语料采用公平、有上限的候选集，返回值中的
+页面分段。任务构建期间默认先用 BM25 + Embedding 并以 RRF 融合，主 Agent
+无需等待 Wiki 完成即可回答问题；`finalize` 完成后，同一个无 `channels` 调用
+会自动切换为 BM25 + Embedding + Wiki 标题/路径/双向链接图三路 RRF。
+`retrieval_phase` 会明确返回 `building` 或 `knowledge-base-complete`。构建期
+回答可能不完整，主 Agent 应向用户保留这一状态。大型语料采用公平、有上限
+的候选集，返回值中的
 `corpus.truncated`、`corpus.max_documents` 和 `channel_status` 会说明是否截断
 或降级。
+已完成的旧 Wiki 页在新任务构建期仍可通过 BM25/Embedding 召回；只有
+未完成投影生成的 provisional 路径会被排除。
 
 Embedding 默认关闭；此时该通道自动使用本地 feature-hash 后备，不影响 BM25
 与 Wiki 通道。配置 OpenAI-compatible 服务：
@@ -359,8 +392,12 @@ MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 
 - 把所有超大文本块拆分到 `maxChunkChars` 以内；
 - 同时按文字数和序列化字节数限制 batch；
+- 单个 chunk 同时服从 chunk 上限和 batch 上限，不会在每次调用时重复拆分；
 - `get_batch` 始终返回完整批次，并在 `batch_limits` 中报告实际大小；
 - 自动重建尚未完成的旧版超大 batch，已提交的批次不受影响。
+
+并行抽取时，`get_batch` 会按 `worker_id` 租约批次，多个后台 Agent 不会拿到
+同一批；租约过期后可由替代 Agent 安全接管。
 
 `max_chars` 现在仅作为兼容性提示，不会再截断批次并造成漏分析。如果希望
 调小批次，应在导入时设置 `options.max_batch_chars`。

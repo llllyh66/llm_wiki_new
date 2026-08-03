@@ -33,16 +33,29 @@ was not committed.
 
 ## File or Wiki revision conflict
 
-Call `llm_wiki_get_page_plan_context` again. Read the latest page content and
-hash, semantically rebase the proposed content, then submit a new patch with the
-latest `expectedFileHash` and `based_on_wiki_revision`. Never force an overwrite.
+For a leased projection, discard its remaining plan and call
+`llm_wiki_get_page_plan_context` with the same writer ID to acquire a fresh
+projection. Read the latest page content and hash, semantically rebase the
+proposed content, then submit a new patch with the latest `expectedFileHash`
+and `based_on_wiki_revision`. Never force an overwrite or start a second Wiki
+writer.
+
+If a multipart projection worker stops, inspect `wiki_projection` in status.
+While `in_progress` remains true, do not compete for its lease. After expiry,
+the same stable writer ID can acquire a replacement projection. Paths written
+by an incomplete projection remain provisional and excluded from retrieval.
 
 ## Failed Finalize
 
 Call `llm_wiki_status`. Repair only deterministic lint errors that can be fixed
 from existing evidence, then retry `llm_wiki_finalize`, which is idempotent.
+`FINAL_PROJECTION_REQUIRED` means the single Wiki writer must run a final
+all-batch reconciliation first; it is not an MCP transport failure.
 
 ## Abort
 
 Use `llm_wiki_abort` only when the user requests cancellation or safe progress
 is impossible. Aborting removes uncommitted staging and retains committed pages.
+Abort is intentionally blocked while provisional pages remain because silently
+publishing or abandoning those pages would violate retrieval integrity. Finish
+the final projection before cancelling.

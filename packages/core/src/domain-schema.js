@@ -225,7 +225,16 @@ function domainSchemaRecord(input) {
   if (Buffer.byteLength(JSON.stringify(schema)) > MAX_DOMAIN_SCHEMA_BYTES) {
     fail("INVALID_DOMAIN_SCHEMA", `The normalized domain schema exceeds ${MAX_DOMAIN_SCHEMA_BYTES} bytes.`)
   }
-  return { schema, metadata: { schema_id: schema.schemaId, schema_version: schema.schemaVersion, hash: sha256(stableStringify(schema)) } }
+  const normalizedBytes = Buffer.byteLength(JSON.stringify(schema))
+  return {
+    schema,
+    metadata: {
+      schema_id: schema.schemaId,
+      schema_version: schema.schemaVersion,
+      hash: sha256(stableStringify(schema)),
+      size_bytes: normalizedBytes,
+    },
+  }
 }
 
 function normalizeTypes(value, field, errors, relation = false) {

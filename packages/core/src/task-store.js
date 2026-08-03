@@ -29,7 +29,13 @@ export async function createTask(workspace, sources, options = {}) {
   const maxBatchChars = Number.isFinite(requestedBatchChars)
     ? Math.min(Math.max(requestedBatchChars, 1_000), workspace.config.limits.maxBatchChars)
     : workspace.config.limits.maxBatchChars
-  const allChunks = boundTaskChunks(sources.flatMap((source) => source.chunks), maxChunkChars)
+  // A single chunk must fit both the chunk and batch limits. Otherwise a
+  // one-chunk batch can remain oversized forever and be rebuilt on every
+  // get_batch call, which also invalidates parallel worker leases.
+  const allChunks = boundTaskChunks(
+    sources.flatMap((source) => source.chunks),
+    Math.min(maxChunkChars, maxBatchChars),
+  )
   const batches = makeBatches(taskId, allChunks, maxBatchChars)
   const timestamp = nowIso()
   const task = {
@@ -44,6 +50,18 @@ export async function createTask(workspace, sources, options = {}) {
     wikiRevision: workspace.revision,
     batchCount: batches.length,
     completedBatchIds: [],
+    batchLeases: {},
+    batchCompletedAt: {},
+    pageProjection: {
+      batchThreshold: 4,
+      debounceMs: 30_000,
+      projectedBatchIds: [],
+      revision: 0,
+      lease: null,
+      lastCommittedAt: null,
+      finalCompleted: false,
+      provisionalPagePaths: [],
+    },
     analysisRevision: 0,
     pagePlanRevision: 0,
     commitRevision: 0,
@@ -99,7 +117,10 @@ export async function ensureBoundedTaskBatches(record, limits) {
       batches.push(batch)
       continue
     }
-    const bounded = boundTaskChunks(batch.chunks, limits.maxChunkChars)
+    const bounded = boundTaskChunks(
+      batch.chunks,
+      Math.min(limits.maxChunkChars, record.task.options.maxBatchChars),
+    )
     const rebuilt = makeBatches(record.task.taskId, bounded, record.task.options.maxBatchChars)
     const originalBytes = batch.chunks.reduce((sum, chunk) => sum + Buffer.byteLength(JSON.stringify(chunk)), 0)
     const needsRebuild = bounded.length !== batch.chunks.length
@@ -122,6 +143,7 @@ export async function ensureBoundedTaskBatches(record, limits) {
   record.batches = batches
   record.task.batchCount = batches.length
   record.task.activeBatchId = undefined
+  record.task.batchLeases = {}
   await writeJsonAtomic(record.paths.batches, batches)
   await saveTask(record.paths, record.task)
   return record

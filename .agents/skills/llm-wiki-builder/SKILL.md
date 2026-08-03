@@ -42,8 +42,22 @@ typed entity or any relation.
 2. Call `llm_wiki_import_files` with each Agent-visible local path and a safe
    display name. Let the tool initialize the current workspace.
 3. Record the returned task ID in working context.
-4. Repeat until `llm_wiki_get_batch` reports `completed: true`:
-   1. Get the next batch.
+4. Use background parallel extraction by default when
+   `parallel_extraction.enabled` is true. Start exactly
+   `parallel_extraction.recommended_workers` background subagents (currently
+   capped at four), using the project `llm-wiki-extractor` subagent when it is
+   available. Assign stable IDs `extractor-1` through `extractor-N`, and keep
+   the main Agent as a responsive coordinator. Give each worker only the task
+   ID, its worker ID, this Skill path, and the batch-worker loop below.
+   Start them with the host's background/run-in-background option so the user
+   can keep asking the main Agent questions while extraction continues. Never
+   create more workers than recommended and never let a worker import files,
+   plan pages, commit pages, finalize, or answer the user.
+5. Each background worker repeats until `llm_wiki_get_batch` returns
+   `completed: true` or `waiting: true`:
+   1. Call `llm_wiki_get_batch` with the task ID and its unchanged
+      `worker_id`. The lease prevents two workers from receiving the same
+      batch. Pass the same `worker_id` to `llm_wiki_commit_analysis`.
       Treat the returned batch as complete and indivisible. `batch_limits`
       reports its bounded character and payload sizes; never discard chunks
       based on the legacy `max_chars` hint.
@@ -53,12 +67,16 @@ typed entity or any relation.
       null, and reconstruct the complete ordered Schema before extraction.
       Never infer omitted types or properties from the batch summary.
    3. Form a small set of focused queries from important names and concepts.
-   4. Call `llm_wiki_retrieve_context` for that batch with BM25, embedding, and
-      Wiki channels. Inspect `channel_status` and `corpus.truncated`; an
-      embedding fallback is a usable result, not a reason to restart MCP.
+   4. Call `llm_wiki_retrieve_context` without an explicit `channels` value.
+      During construction this intentionally uses BM25 + embedding with RRF;
+      after Finalize it automatically adds the Wiki channel. Inspect
+      `retrieval_phase`, `channel_status`, and `corpus.truncated`; an embedding
+      fallback is a usable result, not a reason to restart MCP.
    5. Analyze the chunks under the supplied AnalysisEnvelope schema. When a
-      domain Schema is present, emit typed entities with canonical IDs and
-      Schema-conforming properties. Emit typed relations only when
+      domain Schema is present, choose a canonical `entityTypeId` before
+      creating each entity, then extract only its allowed properties and
+      evidence-backed required values. Do not generate a candidate first and
+      rely on the validator to drop it later. Emit typed relations only when
       `relationTypes` is non-empty; an empty array leaves general relation
       extraction unconstrained by the domain Schema. Do not invent required
       values.
@@ -74,10 +92,12 @@ typed entity or any relation.
       quote that contains its identifying terms. Never use one document-title
       reference as evidence for an entire table; split references by row or
       coherent topic.
-   7. Call `llm_wiki_commit_analysis` with a unique idempotency key.
-      Inspect `domain_validation` even when `accepted` is true. Under
-      `drop-invalid`, report dropped candidates to the user and do not silently
-      recreate them without new source evidence.
+   7. Call `llm_wiki_commit_analysis` with its `worker_id` and a unique
+      idempotency key. Never set `accept_dropped_candidates` in the normal
+      workflow. Even when the Schema policy says `drop-invalid`, the Core's
+      Schema-first preflight rejects the batch before persistence so the worker
+      can correct it. Only set that destructive opt-in after an explicit user
+      request to accept candidate loss.
    8. Correct every validation error before requesting another batch. Keep the
       same task and batch and use a new idempotency key for a changed payload.
       If a response contains many validation errors, rebuild a small valid
@@ -88,25 +108,62 @@ typed entity or any relation.
       The same rule applies to every tool: `ok: false` or `accepted: false`
       with `mcp_connection_usable: true` is a normal tool result. Follow its
       `next_action`; do not run `/mcp` merely because an operation was rejected.
-5. Call `llm_wiki_get_page_plan_context` with cursor `0`. While
-   `next_cursor` is not null, repeat with that cursor and accumulate every
-   returned context category. All pages must report the same
-   `based_on_wiki_revision`; restart page-plan collection if it changes.
-6. Plan canonical pages from the complete accumulated context. Prefer useful existing pages, avoid duplicates, retain
-   grounded existing content, and surface unresolved contradictions as review
-   items.
-7. Generate PagePatch objects under the returned schema. For `replace` or
-   `merge`, use the exact current `file_hash` as `expectedFileHash`.
-8. Call `llm_wiki_commit_pages` with `based_on_wiki_revision` from the page-plan
-   response and a unique idempotency key.
-9. Call `llm_wiki_finalize`.
-10. If Finalize reports repairable validation problems, repair only what the
+   9. When `waiting: true`, stop this worker normally; other leased workers are
+      still processing the remaining batches. Do not poll in a tight loop.
+6. Keep the coordinator responsive while extraction runs. After every worker
+   completion notification, call `llm_wiki_status`. If batches remain
+   unleased after a worker failure or lease expiry, start only enough
+   replacement extractors to reach the recommended count.
+7. Inspect `wiki_projection` in every analysis commit report and status result.
+   When `ready: true` and `in_progress: false`, start exactly one background
+   project `llm-wiki-writer` with task ID and stable writer ID
+   `wiki-writer-1`. Never run two Wiki writers for one task. The Core normally
+   opens a projection after four new batches, after the 30-second debounce, or
+   immediately for final reconciliation when all batches finish.
+8. The Wiki writer performs one projection:
+   1. Call `llm_wiki_get_page_plan_context` with task ID, writer ID, and cursor
+      `0`. If it returns `waiting: true`, report normally and stop.
+   2. Record the returned `projection.projection_id`, `projection.mode`, and
+      `based_on_wiki_revision`. Follow `next_cursor` to null, passing the same
+      writer and projection IDs on every page, and accumulate all categories.
+      If any revision changes, discard the plan and acquire a fresh projection.
+   3. For `incremental` mode, update only pages affected by the projection's
+      batch IDs. Reuse canonical paths, merge with existing grounded content,
+      and avoid speculative or duplicate pages. For `final` mode, inspect all
+      batch analyses, reconcile cross-batch duplicates and contradictions, and
+      explicitly review every existing page marked `provisional: true`.
+   4. Generate PagePatch objects under the returned schema. Use the exact
+      `file_hash` as `expectedFileHash` for `replace` or `merge`.
+   5. Submit at most 50 patches per `llm_wiki_commit_pages` call. Pass task ID,
+      writer ID, projection ID, current Wiki revision, and a unique idempotency
+      key. Set `projection_complete: false` while more bounded commits remain;
+      use each response's new `wiki_revision` for the next commit. On the last
+      call omit `projection_complete` or set it true. Submit an empty final
+      patch array when the projection needs no page changes.
+   6. Treat incremental writes and incomplete multipart writes as provisional.
+      They are deliberately excluded from retrieval. Only a completed `final`
+      projection clears provisional state.
+9. Continue extraction and Wiki projections as a pipeline. A Wiki writer may
+   run while extractors process later batches; task locks and the single writer
+   lease serialize state and page transactions without blocking retrieval.
+10. When completed batches equal total batches, ensure a `final` projection
+    completes and `wiki_projection.final_completed` is true. Then call
+    `llm_wiki_finalize`. Never Finalize while provisional pages remain.
+11. If Finalize reports repairable validation problems, repair only what the
     evidence supports and retry.
-11. Report processed and rejected attachments, duplicates, task ID, created and
+12. Report processed and rejected attachments, duplicates, task ID, created and
     updated pages, review items, lint findings, and index status.
 
-For a large page plan, submit several bounded page commits. Refresh page-plan
-context before each later commit so revision and file hashes remain current.
+While background extraction is running, the coordinator may answer user
+questions by calling `llm_wiki_retrieve_context` against the active task and a
+user query without a `batch_id`. Clearly preserve `retrieval_phase: building`: those answers use
+BM25 + embedding over imported sources and completed analyses and may be
+incomplete. After Finalize, use the same call without channels; it becomes
+BM25 + embedding + Wiki multi-route RRF automatically.
+
+For a large page plan, keep the same projection lease and submit bounded page
+commits as described above. Do not recollect the plan between those commits;
+advance `based_on_wiki_revision` from each successful response.
 
 ## Recovery
 

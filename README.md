@@ -33,9 +33,10 @@ If `llm-wiki.domain-schema.json` exists at the workspace root, imports also
 snapshot and enforce it as the entity/property/relation extraction contract.
 You can instead pass `options.domain_schema_path` or `options.domain_schema` to
 `llm_wiki_import_files`. Compatible mode resolves names and aliases to stable
-IDs; `drop-invalid` safely removes nonconforming candidates and reports them in
-`domain_validation`, while `reject-batch` returns a recoverable
-`INVALID_DOMAIN_ANALYSIS` result.
+IDs. Extraction is Schema-first: invalid candidates are rejected before
+persistence even when the Schema says `drop-invalid`. Destructive dropping is
+available only through the explicit `accept_dropped_candidates` commit option;
+`reject-batch` always returns a recoverable `INVALID_DOMAIN_ANALYSIS` result.
 `relationTypes` may be an empty array; this disables domain-level relation
 constraints and keeps general relation extraction enabled. `entityTypes` must
 still contain at least one type.
@@ -50,6 +51,15 @@ all `llm-wiki` MCP tools for the main and background agents and uses `dontAsk`
 for unattended extraction. Unrelated shell, write, and network tools remain
 unapproved. Approve project trust on first use, then restart Claude Code after
 changing these files.
+
+For multi-batch imports, the Skill starts the Core-recommended number of
+background extraction agents (up to four). Stable worker leases keep batches
+distinct and task-level serialization prevents concurrent commits from losing
+state. The main Agent remains available for questions and coordinates page
+generation through exactly one background Wiki writer. After four new batches,
+or after a 30-second debounce, that writer incrementally updates affected
+pages while extractors continue. A final all-batch reconciliation stabilizes
+the pages before Finalize.
 
 ## Architecture
 
@@ -97,9 +107,17 @@ Large tables, code blocks, and legacy oversized chunks are split before
 `get_batch`. Batches are bounded by both text and serialized payload size and
 are always returned complete; `batch_limits` reports the actual size. Set
 `options.max_batch_chars` during import to request smaller batches.
+One chunk is bounded by the smaller of the chunk and batch limits, so legacy
+repair does not repeatedly rebuild the same batch or invalidate worker leases.
 Domain Schemas up to 5 MiB are accepted. Schemas larger than 64 KiB are
 summarized in batch and page-plan responses and exposed through bounded
 `llm_wiki_get_domain_schema` pages.
+
+Incremental page projection is single-writer and lease-based. Intermediate
+paths are persisted as provisional task state and excluded from retrieval
+across every active task. Large projections may use several commits of at most
+50 patches each; the lease is released only by the final commit. Finalize is
+blocked until one full reconciliation clears all provisional paths.
 
 ## Managed workspace
 
@@ -143,6 +161,12 @@ OCR is a future parser adapter and is not silently treated as trustworthy text.
 Retrieval recalls source chunks, committed analysis, and Wiki sections through
 BM25, configurable real embeddings, and Wiki title/path/link-graph ranking,
 then combines the independent rankings with reciprocal-rank fusion (RRF).
+While a task is building, the default channels are BM25 + embedding so the
+main Agent can answer early questions without waiting for page generation.
+After Finalize, the same call automatically enables BM25 + embedding + Wiki.
+The response exposes this as `retrieval_phase`.
+Stable Wiki pages from earlier completed work remain searchable during a new
+build, but pages produced by an incomplete projection are excluded.
 Corpora and responses have explicit limits; results report truncation and each
 channel's status. Embedding requests are batched, timed out, cached by content
 hash in sharded files, and automatically degrade to the local feature-hash

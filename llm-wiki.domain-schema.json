@@ -7,7 +7,7 @@
   "language": "zh-CN",
   "policy": {
     "extractionMode": "compatible",
-    "validationFailurePolicy": "drop-invalid",
+    "validationFailurePolicy": "reject-batch",
     "allowUnknownEntityTypes": false,
     "allowUnknownRelationTypes": false,
     "allowUnknownProperties": false

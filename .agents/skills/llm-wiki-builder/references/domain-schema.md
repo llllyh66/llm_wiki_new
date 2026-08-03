@@ -70,10 +70,12 @@ values and must use a defined relation type:
 - `compatible`: IDs, names, and aliases can resolve to canonical IDs.
 - `reject-batch`: any domain violation returns recoverable
   `INVALID_DOMAIN_ANALYSIS`; correct the payload and retry the same batch.
-- `drop-invalid`: invalid entities are removed. When `relationTypes` is
-  non-empty, relations pointing to removed or incompatible endpoints are also
-  removed. A successful commit returns `domain_validation` with violations and
-  dropped counts.
+- `drop-invalid`: normal Skill calls still use Schema-first preflight. If any
+  candidate is invalid, the Core rejects before persistence so the worker can
+  correct it. Only an explicit user-approved
+  `accept_dropped_candidates: true` commit removes invalid entities and, when
+  `relationTypes` is non-empty, dependent or incompatible relations. That
+  successful opt-in commit reports violations and dropped counts.
 - Unknown types and properties are allowed only when their matching policy flag
   is true.
 

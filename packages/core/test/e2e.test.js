@@ -185,9 +185,11 @@ test("domain schema is snapshotted, exposed to the Agent, and normalizes or drop
   t.after(() => rm(f.root, { recursive: true, force: true }))
   const domainSource = path.join(f.incoming, "domain-record.md")
   await writeFile(domainSource, "# 业务记录\n\n客户 C-001（张三）拥有产品 O-100（家庭宽带）。\n")
+  const domainSchema = JSON.parse(await readFile(domainSchemaPath, "utf8"))
+  domainSchema.policy.validationFailurePolicy = "drop-invalid"
   const imported = await f.core.importFiles({
     files: [{ path: domainSource }],
-    options: { domain_schema_path: domainSchemaPath },
+    options: { domain_schema: domainSchema },
   })
   assert.equal(imported.domain_schema.schema_id, "your-domain-schema")
   const batch = await f.core.getBatch({ task_id: imported.task_id })
@@ -241,10 +243,24 @@ test("domain schema is snapshotted, exposed to the Agent, and normalizes or drop
     batchSummary: "客户拥有家庭宽带产品。",
     unresolvedQuestions: [],
   }
+  await assert.rejects(
+    () => f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      analysis,
+      idempotency_key: "domain-schema-first-preflight-v1",
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "INVALID_DOMAIN_ANALYSIS"
+      && error.details.schema_first_preflight === true
+      && error.details.persisted === false,
+  )
+  assert.equal((await f.core.status({ task_id: imported.task_id })).completed_batches, 0)
   const committed = await f.core.commitAnalysis({
     task_id: imported.task_id,
     batch_id: batch.batch_id,
     analysis,
+    accept_dropped_candidates: true,
     idempotency_key: "domain-schema-drop-invalid-v1",
   })
   assert.equal(committed.accepted, true)
@@ -552,6 +568,9 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
   await rm(f.source)
 
   const sourceRef = await analyzeAll(f.core, imported)
+  const buildingRetrieval = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["Business Entity"] })
+  assert.equal(buildingRetrieval.retrieval_phase, "building")
+  assert.deepEqual(buildingRetrieval.available_channels, ["bm25", "embedding"])
   const retrieval = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: "batch-0001", queries: ["Business Entity"], channels: ["bm25", "vector", "graph"] })
   assert.deepEqual(retrieval.available_channels, ["bm25", "vector", "graph"])
   assert.deepEqual(retrieval.pending_channels, [])
@@ -585,8 +604,211 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
   assert.match(await readFile(path.join(f.workspace, "wiki", "index.md"), "utf8"), /Business Entity/)
   assert.match(await readFile(path.join(f.workspace, "wiki", "overview.md"), "utf8"), new RegExp(imported.task_id))
   assert.equal((await readFile(path.join(f.workspace, imported.sources[0].managed_path), "utf8")).includes("Product Model"), true)
+  const completedRetrieval = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["Business Entity"] })
+  assert.equal(completedRetrieval.retrieval_phase, "knowledge-base-complete")
+  assert.deepEqual(completedRetrieval.available_channels, ["bm25", "embedding", "wiki"])
   const again = await f.core.finalize({ task_id: imported.task_id })
   assert.deepEqual(again, result)
+})
+
+test("parallel workers lease distinct batches and concurrent commits preserve every result", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const files = []
+  for (let index = 0; index < 8; index += 1) {
+    const file = path.join(f.incoming, `parallel-${index}.md`)
+    await writeFile(file, `# Parallel ${index}\n\n${"Business Entity is the canonical business object. Context. ".repeat(60)}\n`)
+    files.push({ path: file })
+  }
+  const imported = await f.core.importFiles({ files, options: { max_batch_chars: 1_000 } })
+  assert.equal(imported.batch_count > 1, true)
+  assert.equal(imported.parallel_extraction.recommended_workers > 1, true)
+  const workerCount = imported.batch_count
+  const leased = await Promise.all(Array.from({ length: workerCount }, (_, index) => (
+    f.core.getBatch({ task_id: imported.task_id, worker_id: `worker-${index}` })
+  )))
+  assert.equal(new Set(leased.map((batch) => batch.batch_id)).size, workerCount)
+  const waiting = await f.core.getBatch({ task_id: imported.task_id, worker_id: "worker-overflow" })
+  assert.equal(waiting.waiting, true)
+  assert.equal(waiting.completed, false)
+
+  await Promise.all(leased.map((batch, index) => {
+    const chunk = batch.chunks.find((item) => item.text.includes("Business Entity is the canonical business object.")) ?? batch.chunks[0]
+    const sourceRef = {
+      sourceId: chunk.sourceId,
+      chunkId: chunk.chunkId,
+      quote: "Business Entity is the canonical business object.",
+      locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
+    }
+    return f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      worker_id: batch.worker_id,
+      idempotency_key: `parallel-analysis-${index}`,
+      analysis: {
+        schemaVersion: 1,
+        taskId: imported.task_id,
+        batchId: batch.batch_id,
+        sourceRefs: [sourceRef],
+        entities: [{ localId: `entity-${index}`, name: "Business Entity", sourceRefs: [0] }],
+        concepts: [], claims: [], relations: [], contradictions: [], candidatePages: [], reviewItems: [],
+        batchSummary: `Parallel batch ${index}.`,
+        unresolvedQuestions: [],
+      },
+    })
+  }))
+  const status = await f.core.status({ task_id: imported.task_id })
+  assert.equal(status.completed_batches, workerCount)
+  assert.equal(status.leased_batches, 0)
+  assert.equal(status.status, "planning")
+})
+
+test("micro-batch Wiki projection uses one writer, hides provisional pages, and requires final reconciliation", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const files = []
+  for (let index = 0; index < 6; index += 1) {
+    const file = path.join(f.incoming, `projection-${index}.md`)
+    await writeFile(file, `# Projection ${index}\n\nBusiness Entity is the canonical business object. ${"Context ".repeat(105)}\n`)
+    files.push({ path: file })
+  }
+  const imported = await f.core.importFiles({ files, options: { max_batch_chars: 1_000 } })
+  assert.equal(imported.batch_count, 6)
+  assert.equal(imported.wiki_projection.batch_threshold, 4)
+  const sourceRefs = []
+  const analyzeNext = async (index) => {
+    const batch = await f.core.getBatch({ task_id: imported.task_id, worker_id: `projector-extractor-${index}` })
+    const chunk = batch.chunks[0]
+    const sourceRef = {
+      sourceId: chunk.sourceId,
+      chunkId: chunk.chunkId,
+      quote: "Business Entity is the canonical business object.",
+      locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
+    }
+    sourceRefs.push(sourceRef)
+    const committed = await f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      worker_id: batch.worker_id,
+      idempotency_key: `projection-analysis-${index}`,
+      analysis: {
+        schemaVersion: 1,
+        taskId: imported.task_id,
+        batchId: batch.batch_id,
+        sourceRefs: [sourceRef],
+        entities: [{ localId: `projection-entity-${index}`, name: "Business Entity", sourceRefs: [0] }],
+        concepts: [], claims: [], relations: [], contradictions: [],
+        candidatePages: [{ localId: `projection-page-${index}`, title: "Projected Entity", sourceRefs: [0] }],
+        reviewItems: [],
+        batchSummary: `Projection batch ${index}.`,
+        unresolvedQuestions: [],
+      },
+    })
+    return committed
+  }
+
+  await analyzeNext(0)
+  assert.equal((await f.core.status({ task_id: imported.task_id })).wiki_projection.ready, false)
+  const taskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
+  const persistedTask = JSON.parse(await readFile(taskPath, "utf8"))
+  persistedTask.batchCompletedAt[persistedTask.completedBatchIds[0]] = new Date(Date.now() - 31_000).toISOString()
+  await writeFile(taskPath, JSON.stringify(persistedTask))
+  const debounceReady = await f.core.status({ task_id: imported.task_id })
+  assert.equal(debounceReady.wiki_projection.ready, true)
+  assert.equal(debounceReady.wiki_projection.mode, "incremental")
+  for (let index = 1; index < 4; index += 1) await analyzeNext(index)
+  const ready = await f.core.status({ task_id: imported.task_id })
+  assert.equal(ready.status, "extracting")
+  assert.equal(ready.wiki_projection.ready, true)
+  assert.equal(ready.wiki_projection.mode, "incremental")
+
+  const incrementalPlan = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1" })
+  assert.equal(incrementalPlan.waiting, undefined)
+  assert.equal(incrementalPlan.projection.mode, "incremental")
+  assert.equal(incrementalPlan.projection.batch_ids.length, 4)
+  const competingWriter = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-2" })
+  assert.equal(competingWriter.waiting, true)
+  assert.equal(competingWriter.projection.writer_busy, true)
+
+  const provisional = await f.core.commitPages({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: incrementalPlan.projection.projection_id,
+    based_on_wiki_revision: incrementalPlan.based_on_wiki_revision,
+    idempotency_key: "incremental-projection-pages-v1",
+    projection_complete: false,
+    patches: [{
+      patchId: "projected-entity-provisional-v1",
+      path: "wiki/topics/projected-entity.md",
+      operation: "create",
+      title: "Projected Entity",
+      pageKind: "topic",
+      content: "# Projected Entity\n\nProvisionalOnlyMarker",
+      sourceRefs: [sourceRefs[0]],
+      rationale: "Early micro-batch projection.",
+    }],
+  })
+  assert.equal(provisional.provisional, true)
+  assert.equal(provisional.projection_complete, false)
+  assert.deepEqual(provisional.provisional_pages, ["wiki/topics/projected-entity.md"])
+  assert.equal(provisional.wiki_projection.in_progress, true)
+  const hidden = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["ProvisionalOnlyMarker"] })
+  assert.equal(hidden.hits.some((hit) => hit.path === "wiki/topics/projected-entity.md"), false)
+  const acknowledged = await f.core.commitPages({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: incrementalPlan.projection.projection_id,
+    based_on_wiki_revision: provisional.wiki_revision,
+    idempotency_key: "incremental-projection-ack-v1",
+    patches: [],
+  })
+  assert.equal(acknowledged.projection_complete, true)
+  assert.equal(acknowledged.wiki_projection.in_progress, false)
+
+  await analyzeNext(4)
+  await analyzeNext(5)
+  const finalReady = await f.core.status({ task_id: imported.task_id })
+  assert.equal(finalReady.status, "planning")
+  assert.equal(finalReady.wiki_projection.ready, true)
+  assert.equal(finalReady.wiki_projection.mode, "final")
+  await assert.rejects(
+    () => f.core.finalize({ task_id: imported.task_id }),
+    (error) => error instanceof LlmWikiError && error.code === "FINAL_PROJECTION_REQUIRED",
+  )
+
+  const finalPlan = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1" })
+  assert.equal(finalPlan.projection.mode, "final")
+  assert.equal(finalPlan.projection.batch_ids.length, 6)
+  const existing = finalPlan.existing_pages.find((page) => page.path === "wiki/topics/projected-entity.md")
+  assert.equal(existing.provisional, true)
+  const stable = await f.core.commitPages({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: finalPlan.projection.projection_id,
+    based_on_wiki_revision: finalPlan.based_on_wiki_revision,
+    idempotency_key: "final-projection-pages-v1",
+    patches: [{
+      patchId: "projected-entity-final-v1",
+      path: "wiki/topics/projected-entity.md",
+      operation: "replace",
+      expectedFileHash: existing.file_hash,
+      title: "Projected Entity",
+      pageKind: "topic",
+      content: "# Projected Entity\n\nStableFinalMarker",
+      sourceRefs: [sourceRefs[0]],
+      rationale: "Final full reconciliation.",
+    }],
+  })
+  assert.equal(stable.provisional, false)
+  assert.deepEqual(stable.provisional_pages, [])
+  assert.equal(stable.wiki_projection.final_completed, true)
+  const finalized = await f.core.finalize({ task_id: imported.task_id })
+  assert.deepEqual(finalized.created_pages, ["wiki/topics/projected-entity.md"])
+  assert.deepEqual(finalized.updated_pages, [])
+  const completed = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["StableFinalMarker"] })
+  assert.equal(completed.retrieval_phase, "knowledge-base-complete")
+  assert.deepEqual(completed.available_channels, ["bm25", "embedding", "wiki"])
+  assert.equal(completed.hits.some((hit) => hit.path === "wiki/topics/projected-entity.md"), true)
 })
 
 test("duplicate content is reused and task recovery and abort stay workspace-scoped", async (t) => {

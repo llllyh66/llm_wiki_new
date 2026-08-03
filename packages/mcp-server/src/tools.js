@@ -7,6 +7,28 @@ const STRUCTURED_CONTENT_DUPLICATION_LIMIT = 128 * 1024
 const MAX_ERROR_MESSAGE_CHARS = 2_000
 const RECOVERABLE_ANALYSIS_CODES = new Set(["INVALID_ANALYSIS", "INVALID_DOMAIN_ANALYSIS", "INVALID_SOURCE_REF", "ANALYSIS_TOO_LARGE"])
 
+function emergencyMcpResult() {
+  const data = {
+    ok: false,
+    accepted: false,
+    rejected: true,
+    error: {
+      code: "MCP_INTERNAL_ERROR",
+      message: "The tool error response could not be serialized safely.",
+      retryable: true,
+      suggested_action: "Retry the tool with a smaller payload; the MCP connection remains usable.",
+    },
+    next_action: { tool: "llm_wiki_list_tasks", arguments: {} },
+    mcp_connection_usable: true,
+  }
+  const text = JSON.stringify(data)
+  return {
+    content: [{ type: "text", text }],
+    structuredContent: data,
+    _meta: { llmWikiStatus: "rejected" },
+  }
+}
+
 function serializeResult(data) {
   let text
   try {
@@ -106,7 +128,14 @@ export class HeadlessToolRouter {
       }
       return serializeResult(await this.call(name, args))
     } catch (error) {
-      return serializeResult(errorResult(error, { tool: name, args }))
+      try {
+        return serializeResult(errorResult(error, { tool: name, args }))
+      } catch {
+        // No tool-level error, including a serialization failure while
+        // reporting another error, is allowed to reject the MCP request and
+        // destabilize the long-lived STDIO transport.
+        return emergencyMcpResult()
+      }
     }
   }
 }

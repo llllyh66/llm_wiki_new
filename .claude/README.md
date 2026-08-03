@@ -42,4 +42,14 @@ reference documents, then ask:
 把这些文档构建成 llm_wiki 知识库。
 ```
 
+For imports with multiple batches, the Skill starts up to four background
+`llm-wiki-extractor` agents using distinct worker leases. That project agent is
+restricted to Read and `llm-wiki` MCP tools and runs in `dontAsk` mode. One
+`llm-wiki-writer` agent consumes leased micro-batch projections after four new
+batches or a 30-second debounce, while later extraction continues. Incremental
+pages remain provisional and excluded from retrieval until the writer completes
+the final all-batch reconciliation. The main Agent remains responsive for
+questions: retrieval defaults to BM25 + embedding while the task is building,
+then adds the Wiki channel automatically after Finalize.
+
 You may also explicitly invoke the workflow with `/llm-wiki-builder`.

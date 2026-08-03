@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises"
+import { readFile, readdir } from "node:fs/promises"
 import path from "node:path"
 import { embedQueryAndDocuments, warmEmbeddingCache } from "./embedding.js"
 import { listFilesRecursive, readJson, relativePosix, sha256, tokenize } from "./utils.js"
@@ -13,12 +13,13 @@ const MAX_QUERY_CHARS = 10_000
 export async function retrieveContext(workspace, taskRecord, queries, options = {}) {
   const limit = Math.min(Math.max(Number(options.limit) || 20, 1), 100)
   const maxChars = Math.min(Math.max(Number(options.maxChars) || 60_000, 1_000), 120_000)
-  const channelRequest = canonicalChannels(options.channels)
+  const completedKnowledgeBase = taskRecord.task.status === "completed"
+  const channelRequest = canonicalChannels(options.channels, completedKnowledgeBase)
   const requested = channelRequest.canonical
   const query = queries.join("\n")
   if (query.length > MAX_QUERY_CHARS) throw new TypeError(`Combined retrieval query exceeds ${MAX_QUERY_CHARS} characters.`)
   const queryTerms = [...new Set(lexicalTokens(query))]
-  const corpus = await retrievalDocuments(workspace, taskRecord)
+  const corpus = await retrievalDocuments(workspace, taskRecord, options.currentBatchId)
   const documents = corpus.documents
   const rankings = {}
   const channelStatus = {}
@@ -92,6 +93,7 @@ export async function retrieveContext(workspace, taskRecord, queries, options = 
   const availableLabels = channelRequest.labels.filter((label) => available.includes(channelAlias(label)))
   return {
     hits,
+    retrieval_phase: completedKnowledgeBase ? "knowledge-base-complete" : "building",
     fusion: "rrf",
     fusion_details: { k: Number(workspace.config.retrieval?.rrfK) || DEFAULT_RRF_K, channels: available },
     wiki_revision: workspace.revision,
@@ -103,9 +105,10 @@ export async function retrieveContext(workspace, taskRecord, queries, options = 
   }
 }
 
-async function retrievalDocuments(workspace, taskRecord) {
+async function retrievalDocuments(workspace, taskRecord, currentBatchId) {
   const maximumDocuments = clampInteger(workspace.config.retrieval?.maxDocuments, 100, MAX_RETRIEVAL_DOCUMENTS, MAX_RETRIEVAL_DOCUMENTS)
-  const wikiResult = await wikiDocuments(workspace, maximumDocuments)
+  const provisionalPaths = await workspaceProvisionalPaths(workspace, taskRecord.task)
+  const wikiResult = await wikiDocuments(workspace, maximumDocuments, provisionalPaths)
   const wiki = wikiResult.documents
   const analyses = []
   let analysisTruncated = false
@@ -138,7 +141,7 @@ async function retrievalDocuments(workspace, taskRecord) {
   let sourcesTotal = 0
   for (const batch of taskRecord.batches) {
     for (const chunk of batch.chunks) {
-      const isCurrent = batch.batchId === taskRecord.task.activeBatchId
+      const isCurrent = batch.batchId === (currentBatchId ?? taskRecord.task.activeBatchId)
       if (isCurrent) currentTotal += 1
       else sourcesTotal += 1
       const target = isCurrent ? current : sources
@@ -171,17 +174,40 @@ async function retrievalDocuments(workspace, taskRecord) {
   }
 }
 
-async function wikiDocuments(workspace, limit = MAX_RETRIEVAL_DOCUMENTS) {
+async function workspaceProvisionalPaths(workspace, currentTask) {
+  const paths = new Set(Array.isArray(currentTask.pageProjection?.provisionalPagePaths)
+    ? currentTask.pageProjection.provisionalPagePaths : [])
+  let entries = []
+  try {
+    entries = await readdir(workspace.paths.tasks, { withFileTypes: true })
+  } catch {
+    return paths
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("task-") || entry.name === currentTask.taskId) continue
+    try {
+      const task = await readJson(path.join(workspace.paths.tasks, entry.name, "task.json"))
+      for (const provisionalPath of task.pageProjection?.provisionalPagePaths ?? []) paths.add(provisionalPath)
+    } catch {
+      // A corrupt or concurrently replaced task record cannot make retrieval
+      // fail; its pages simply keep their normal deterministic ranking.
+    }
+  }
+  return paths
+}
+
+async function wikiDocuments(workspace, limit = MAX_RETRIEVAL_DOCUMENTS, excludedPaths = new Set()) {
   const documents = []
   const files = await listFilesRecursive(workspace.paths.wiki, (candidate) => candidate.endsWith(".md"))
   let truncated = false
   for (const [fileIndex, file] of files.entries()) {
+    const relative = `wiki/${relativePosix(workspace.paths.wiki, file)}`
+    if (excludedPaths.has(relative)) continue
     if (documents.length >= limit) {
       truncated = fileIndex < files.length
       break
     }
     const content = await readFile(file, "utf8")
-    const relative = `wiki/${relativePosix(workspace.paths.wiki, file)}`
     const title = extractTitle(content, path.basename(file, ".md"))
     const sections = splitSections(content, WIKI_SECTION_CHARS)
     for (const [index, section] of sections.entries()) {
@@ -418,8 +444,9 @@ function chunkLocator(chunk) {
   }
 }
 
-function canonicalChannels(value) {
-  const labels = [...new Set(Array.isArray(value) && value.length > 0 ? value : ["bm25", "embedding", "wiki"])]
+function canonicalChannels(value, completedKnowledgeBase) {
+  const defaults = completedKnowledgeBase ? ["bm25", "embedding", "wiki"] : ["bm25", "embedding"]
+  const labels = [...new Set(Array.isArray(value) && value.length > 0 ? value : defaults)]
   return { labels, canonical: new Set(labels.map(channelAlias)) }
 }
 
