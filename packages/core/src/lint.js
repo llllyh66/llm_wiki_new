@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { listFilesRecursive, relativePosix } from "./utils.js"
+import { extractWikiLinks, parseWikiPage } from "./wiki-page.js"
 
 export async function lintWiki(workspace, selectedPaths) {
   const allFiles = await listFilesRecursive(workspace.paths.wiki, (candidate) => candidate.endsWith(".md"))
@@ -12,9 +13,10 @@ export async function lintWiki(workspace, selectedPaths) {
     const relative = `wiki/${relativePosix(workspace.paths.wiki, file)}`
     if (selected && !selected.has(relative)) continue
     const content = await readFile(file, "utf8")
-    const title = content.match(/^#\s+(.+)$/m)?.[1]?.trim() || path.basename(file, ".md")
-    const links = [...content.matchAll(/\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g)].map((match) => normalizeLink(match[1]))
-    pages.push({ relative, slug: relative.replace(/^wiki\//, "").replace(/\.md$/i, ""), basename: path.basename(file, ".md"), title, links, content })
+    const parsed = parseWikiPage(content)
+    const title = parsed.title || path.basename(file, ".md")
+    const links = [...new Set([...parsed.related, ...extractWikiLinks(parsed.body)].map(normalizeLink))]
+    pages.push({ relative, slug: relative.replace(/^wiki\//, "").replace(/\.md$/i, ""), basename: path.basename(file, ".md"), title, links, content, parsed })
   }
   const lookup = new Map()
   pages.forEach((page, index) => {
@@ -33,6 +35,11 @@ export async function lintWiki(workspace, selectedPaths) {
     }
     if (page.links.length === 0 && !isAggregate(page.relative)) findings.push({ code: "NO_OUTLINKS", severity: "info", page: page.relative, detail: "Page has no wikilinks." })
     if (!/^#\s+/m.test(page.content)) findings.push({ code: "MISSING_TITLE", severity: "warning", page: page.relative, detail: "Page has no level-one heading." })
+    if (!isAggregate(page.relative)) {
+      const missingFields = ["type", "title", "created", "updated", "tags", "related", "sources", "covers", "summary"]
+        .filter((field) => page.parsed.fields[field] === undefined)
+      if (missingFields.length > 0) findings.push({ code: "INCOMPLETE_FRONTMATTER", severity: "warning", page: page.relative, detail: `Missing standard frontmatter fields: ${missingFields.join(", ")}` })
+    }
   })
   pages.forEach((page, index) => {
     if (inbound[index] === 0 && !isAggregate(page.relative)) findings.push({ code: "ORPHAN_PAGE", severity: "info", page: page.relative, detail: "No other page links to this page." })

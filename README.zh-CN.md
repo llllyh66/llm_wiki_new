@@ -21,11 +21,22 @@ wiki/
 ├── entities/                # 人物、组织、产品、系统等实体
 ├── concepts/                # 术语、定义、方法和业务概念
 ├── topics/                  # 跨来源的综合主题
-└── comparisons/             # 方案、版本和观点对比
+├── comparisons/             # 方案、版本和观点对比
+├── queries/                 # 待研究问题
+├── synthesis/               # 跨来源综述与结论
+└── ...                      # finding、methodology、project、chapter 等丰富页型
 ```
 
 Core 会同时创建 `.llm-wiki/` 运行状态目录，保存受管理的原文、任务、
 索引、锁和事务日志。
+
+页面规划会把每个重要实体、概念和 Agent 提议页转成
+`page_requirements`。Writer 完成投影前必须逐项覆盖，所以不会再因
+`candidatePages` 过少而静默丢失实体或概念页。Core 会统一补齐
+`type/title/tags/related/created/updated/sources/covers/summary` frontmatter，
+将可解析的 Related 关系变成双向链接，生成包含摘要、关键实体与
+来源诉源的丰富来源页，并按页面类型重建 `index.md` 和知识地图式
+`overview.md`。
 
 ## 支持的文件
 
@@ -125,6 +136,10 @@ Agent，当前最多 4 个。每个 Agent 使用固定 `worker_id` 租约不同�
 串行保护同一任务的状态提交，因此不会抢同一批次或覆盖其他 Agent 的结果。
 主 Agent 只负责协调和回答用户问题；唯一的后台 Wiki Writer 与抽取 Agent
 形成流水线，每新增 4 个 batch 或等待满 30 秒后增量更新受影响页面。
+任一 `commit_analysis` 使投影就绪时，该 extractor 会立即返回
+`writer_required: true`，而不是继续领取 batch；主 Agent 随即启动
+`wiki-writer-1`，再按需补充 extractor。`status.next_action` 也会在投影就绪时
+优先指向 `llm_wiki_get_page_plan_context`，因此不需要等用户追问才生成页面。
 项目级 `.claude/agents/llm-wiki-extractor.md` 会显式复用项目的
 `llm-wiki` MCP 连接，并通过 `disallowedTools` 禁用 Shell、任意写入、网络和
 嵌套 Agent。它不再用 `tools: Read, mcp__llm-wiki__*` 作为严格白名单，避免
@@ -133,6 +148,13 @@ Agent，当前最多 4 个。每个 Agent 使用固定 `worker_id` 租约不同�
 `general-purpose` Agent 反复尝试，而由主 Agent 继续当前任务。
 `.claude/agents/llm-wiki-writer.md` 使用同样的 MCP 复用方式，且每个任务同时
 只允许一个 `wiki-writer-1` 租约，避免页面冲突。
+
+新版 extractor 每次后台调用只处理一个 batch，提交落盘后立即返回；
+主 Agent 再用稳定 `worker_id` 启动下一个短任务，不依赖一个长时间跨
+turn 存活的子 Agent。后续 turn 先调用 `llm_wiki_status`，
+`worker_recovery.leases` 会返回已持久化的 worker 和 batch 租约。使用相同
+`worker_id` 启动新子 Agent，即可通过新 MCP 客户端继续同一 batch。
+因此旧后台 Agent 消失不等于 MCP 断开，也不会丢失进度。
 
 ### 3. 检查 Skill
 
@@ -373,6 +395,20 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
 Claude Code 并从项目根目录重新启动。新版会先做子代理能力探测；探测失败只
 回退一次到主 Agent，不会继续启动 `general-purpose` worker。
 
+### Agent 提示“MCP 工具在跨 turn 时不可靠”
+
+这不是 llm_wiki Core 或 MCP Server 返回的错误，不能仅因为旧后台
+Agent 没有继续运行就判定 MCP 断开。让主 Agent 先调用：
+
+```text
+请直接调用 llm_wiki_status 检查原任务，不要推测跨 turn 断连。
+按 worker_recovery.leases 使用相同 worker_id 恢复单 batch worker。
+```
+
+如果 `status` 成功，当前 turn 的 MCP 就是可用的。新 worker 使用相同
+`worker_id` 会继续原租约，不需要 `/mcp`。只有 `status` 本身出现真实
+transport/closed connection 错误时，才需要重连。
+
 ### 任何 llm_wiki 工具报错后 MCP 断开
 
 先确认另一台电脑没有继续运行旧的 `dist`。`dist/` 不提交到 Git，单独执行
@@ -394,6 +430,23 @@ npm test
 MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 `error`、`next_action` 和 `mcp_connection_usable: true`。Agent 应按
 `next_action` 修正或恢复，不需要执行 `/mcp`。
+
+### 已完成多个 batch，但没有生成 Wiki 页面
+
+运行 `llm_wiki_status`。当 `wiki_projection.ready` 为 `true` 时，最新版会让
+`next_action.tool` 直接返回 `llm_wiki_get_page_plan_context`，并带上固定的
+`writer_id: wiki-writer-1`。后台 extractor 也会停止并向主 Agent 返回
+`writer_required: true`，从而触发 Writer；不要继续等待更多 batch，也不要启动
+第二个 Writer。
+
+页面规划不需要重新读取抽取 Schema。即使领域 Schema 接近 5 MiB，
+`llm_wiki_get_page_plan_context` 也只返回 Schema ID、版本、哈希和大小元数据，
+并将页面规划正文按约 40K 字符分页。Writer 应沿 `next_cursor` 读取完所有页面，
+不能以“忽略 Schema”或“忽略截断响应”的方式继续。如果旧任务显示
+`wiki_projection.in_progress: true`，使用相同的 `wiki-writer-1` 恢复该租约。
+
+若行为仍与上述不符，说明另一台电脑还在运行旧的构建产物；执行
+`npm run build` 后完全退出并重新启动 Claude Code。
 
 ### 超大文件的 `llm_wiki_get_batch` 报错
 

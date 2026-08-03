@@ -26,6 +26,9 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.equal(settings.permissions.allow.includes("mcp__llm-wiki__*"), true)
   assert.match(skill, /mode=capability-probe/)
   assert.match(skill, /do not retry with a\s+`general-purpose`/)
+  assert.match(skill, /processes at most one batch/)
+  assert.match(skill, /same\s+`worker_id`/)
+  assert.match(skill, /Never claim that MCP is "unreliable across\s+turns"/)
 })
 
 test("MCP publishes the complete Agent-first tool contract without desktop tools", () => {

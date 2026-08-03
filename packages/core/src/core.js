@@ -33,6 +33,16 @@ import {
 } from "./validation.js"
 import { ensureWorkspace, resolveWorkspaceRoot } from "./workspace.js"
 import {
+  canonicalPageSlug,
+  extractWikiLinks,
+  normalizePageKind,
+  normalizeRelatedSlug,
+  parseWikiPage,
+  preferredPagePath,
+  prepareWikiPageContent,
+  setWikiPageRelated,
+} from "./wiki-page.js"
+import {
   hashDirectory,
   listFilesRecursive,
   newId,
@@ -277,6 +287,12 @@ export class LlmWikiCore {
       const remaining = record.task.batchCount - record.task.completedBatchIds.length
       record.task.status = remaining === 0 ? "planning" : "extracting"
       const wikiProjection = pageProjectionStatus(record.task)
+      const extractionNextAction = remaining > 0
+        ? { tool: "llm_wiki_get_batch", arguments: { task_id: record.task.taskId } }
+        : null
+      const projectionNextAction = wikiProjection.ready
+        ? { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: record.task.taskId, writer_id: "wiki-writer-1" } }
+        : null
       await saveTask(record.paths, record.task)
       return {
         accepted: true,
@@ -287,9 +303,8 @@ export class LlmWikiCore {
         normalized_source_ref_indexes: normalized.resolvedSourceRefIndexes,
         domain_validation: domainApplied.report,
         wiki_projection: wikiProjection,
-        next_action: remaining === 0
-          ? { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: record.task.taskId } }
-          : { tool: "llm_wiki_get_batch", arguments: { task_id: record.task.taskId } },
+        next_action: projectionNextAction ?? extractionNextAction,
+        worker_next_action: extractionNextAction,
       }
     })
     return { ...idempotent.response, idempotent_replay: idempotent.replayed }
@@ -368,9 +383,9 @@ export class LlmWikiCore {
       candidate_pages: deduplicateExact(analyses.flatMap((analysis) => analysis.candidatePages)),
       existing_pages: existingPages,
       conflicts: analyses.flatMap((analysis) => analysis.contradictions),
+      required_pages: derivePageRequirements(analyses),
     }
     const page = paginatePagePlan(context, input?.cursor, input?.max_chars, workspace.config.limits.maxPagePlanChars)
-    const schemaContext = domainSchemaContext(await loadTaskDomainSchema(record))
     return {
       task_id: record.task.taskId,
       analysis_summary: {
@@ -383,9 +398,12 @@ export class LlmWikiCore {
       candidate_pages: page.values.candidate_pages,
       existing_pages: page.values.existing_pages,
       conflicts: page.values.conflicts,
+      page_requirements: page.values.required_pages,
       page_patch_schema: pagePatchSchema,
-      domain_schema: schemaContext.value,
-      domain_schema_pagination: schemaContext.pagination,
+      // Extraction has already enforced the task Schema. Page planning needs
+      // only stable identity metadata, never the multi-megabyte definitions.
+      domain_schema: pagePlanDomainSchemaMetadata(record.task.domainSchema),
+      domain_schema_pagination: null,
       based_on_wiki_revision: revision,
       ...(projection ? {
         projection: publicProjection(projection),
@@ -449,6 +467,24 @@ export class LlmWikiCore {
           fail("PAGE_PROJECTION_REQUIRED", "This task requires its leased Wiki writer to commit pages.", { retryable: true })
         }
         assertTaskStatus(record.task, ["planning", "committing"])
+      }
+      if (projectionComplete) {
+        const batchIds = projection?.batchIds ?? record.task.completedBatchIds
+        const analyses = await loadAnalyses(record, batchIds)
+        const requirements = derivePageRequirements(analyses)
+        const missing = await missingPageRequirements(workspace.paths.wiki, requirements, input.patches)
+        if (missing.length > 0) {
+          fail("INCOMPLETE_PAGE_COVERAGE", `The Wiki projection does not materialize every required entity, concept, and candidate page. Missing: ${missing.slice(0, 5).map((item) => item.title).join(", ")}${missing.length > 5 ? ", ..." : ""}.`, {
+            retryable: true,
+            taskId: record.task.taskId,
+            details: {
+              missing_count: missing.length,
+              missing_page_requirements: missing.slice(0, 100),
+              truncated: missing.length > 100,
+            },
+            suggestedAction: "Create or update canonical pages for every missing requirement and set each patch.covers to the corresponding requirement_id before completing the projection.",
+          })
+        }
       }
       const journal = await commitPageTransaction(workspace, record.task, input.patches, input?.based_on_wiki_revision)
       const commits = await readJson(record.paths.commits, [])
@@ -534,9 +570,12 @@ export class LlmWikiCore {
     const commits = await readJson(record.paths.commits, [])
     const pageHistory = await committedPageRecords(workspace, commits)
     const pageRecords = latestPageRecords(pageHistory)
-    await this.#writeSourcePages(workspace, record)
+    const analyses = await loadAnalyses(record, record.task.completedBatchIds)
+    const requirements = derivePageRequirements(analyses)
+    await this.#writeSourcePages(workspace, record, analyses, pageRecords)
+    await enrichWikiRelations(workspace.paths.wiki, requirements)
     await writeTextAtomic(path.join(workspace.paths.wiki, "index.md"), await buildIndex(workspace.paths.wiki))
-    await writeTextAtomic(path.join(workspace.paths.wiki, "overview.md"), buildOverview(record.task, pageRecords))
+    await writeTextAtomic(path.join(workspace.paths.wiki, "overview.md"), await buildOverview(workspace.paths.wiki, record.task, pageRecords))
     await appendLog(path.join(workspace.paths.wiki, "log.md"), record.task, pageRecords)
     const pageSourceRefs = Object.fromEntries(pageRecords.map((page) => [page.path, page.sourceRefs]))
     await writeJsonAtomic(path.join(workspace.paths.indexes, "page-source-refs.json"), { schemaVersion: 1, pages: pageSourceRefs })
@@ -626,10 +665,48 @@ export class LlmWikiCore {
     return { scope: input.paths?.length ? "pages" : input.task_id ? "task" : "wiki", ...result }
   }
 
-  async #writeSourcePages(workspace, record) {
+  async #writeSourcePages(workspace, record, analyses, pageRecords) {
     for (const sourceId of record.task.sourceIds) {
       const manifest = await loadSourceManifest(workspace.paths, sourceId)
-      const content = `---\ntype: source\ntitle: ${yamlString(manifest.originalName)}\nsource_id: ${sourceId}\ncontent_hash: ${manifest.contentHash}\nmanaged_path: ${yamlString(manifest.managedRelativePath)}\n---\n\n# ${manifest.originalName}\n\nManaged source imported at ${manifest.importedAt}.\n`
+      const relatedPages = pageRecords
+        .filter((page) => page.sourceRefs.some((ref) => ref.sourceId === sourceId))
+        .map((page) => page.path.replace(/^wiki\//, "").replace(/\.md$/i, ""))
+      const summaries = uniqueStrings(analyses
+        .filter((analysis) => collectSourceRefs(analysis).some((ref) => ref.sourceId === sourceId))
+        .map((analysis) => analysis.batchSummary))
+      const names = uniqueStrings(analyses.flatMap((analysis) => [
+        ...analysis.entities,
+        ...analysis.concepts,
+      ]).filter((candidate) => candidate.sourceRefs?.some((ref) => ref.sourceId === sourceId))
+        .map(candidateTitle).filter(Boolean))
+      const body = [
+        `# ${manifest.originalName}`,
+        "",
+        "## Summary",
+        "",
+        ...(summaries.length > 0 ? summaries.map((summary) => `- ${summary}`) : ["- Imported source document."]),
+        "",
+        "## Key entities and concepts",
+        "",
+        ...(names.length > 0 ? names.map((name) => `- ${name}`) : ["- No named entity or concept was extracted."]),
+        "",
+        "## Provenance",
+        "",
+        `- Source ID: \`${sourceId}\``,
+        `- Imported: ${manifest.importedAt}`,
+        `- Content hash: \`${manifest.contentHash}\``,
+        `- Managed path: \`${manifest.managedRelativePath}\``,
+      ].join("\n")
+      const content = prepareWikiPageContent({
+        path: `wiki/sources/${sourceId}.md`,
+        pageKind: "source",
+        title: manifest.originalName,
+        content: body,
+        sourceRefs: [{ sourceId }],
+        related: relatedPages,
+        summary: summaries[0] ?? "Imported source document.",
+        covers: [],
+      })
       await writeTextAtomic(path.join(workspace.paths.wiki, "sources", `${sourceId}.md`), content)
     }
   }
@@ -839,6 +916,195 @@ function deduplicateExact(values) {
   })
 }
 
+async function loadAnalyses(record, batchIds) {
+  const analyses = []
+  for (const batchId of batchIds) analyses.push(await readJson(path.join(record.paths.analysis, `${batchId}.json`)))
+  return analyses
+}
+
+function derivePageRequirements(analyses) {
+  const requirements = new Map()
+  const localRequirements = new Map()
+  const ensureRequirement = (candidate, pageKind, collection, batchId, overrideKind = false) => {
+    if (!shouldMaterialize(candidate)) return null
+    const title = candidateTitle(candidate)
+    if (!title) return null
+    const normalizedTitle = canonicalPageSlug(title)
+    const requirementId = `page-${sha256(normalizedTitle).slice(0, 20)}`
+    const normalizedKind = normalizePageKind(pageKind) ?? "topic"
+    const previous = requirements.get(requirementId)
+    const requirement = previous ?? {
+      requirement_id: requirementId,
+      title,
+      page_kind: normalizedKind,
+      preferred_path: preferredPagePath(normalizedKind, title),
+      recommended_sections: recommendedSections(normalizedKind),
+      source_refs: [],
+      collections: [],
+      batch_ids: [],
+      related_requirement_ids: [],
+    }
+    if (overrideKind && requirement.page_kind !== normalizedKind) {
+      requirement.page_kind = normalizedKind
+      requirement.preferred_path = preferredPagePath(normalizedKind, title)
+      requirement.recommended_sections = recommendedSections(normalizedKind)
+    }
+    requirement.source_refs = uniqueByStable([...requirement.source_refs, ...(candidate.sourceRefs ?? [])])
+    requirement.collections = uniqueStrings([...requirement.collections, collection])
+    requirement.batch_ids = uniqueStrings([...requirement.batch_ids, batchId])
+    requirements.set(requirementId, requirement)
+    const localId = candidate.localId ?? candidate.local_id
+    if (typeof localId === "string" && localId) localRequirements.set(`${batchId}:${localId}`, requirementId)
+    return requirement
+  }
+
+  for (const analysis of analyses) {
+    for (const entity of analysis.entities ?? []) ensureRequirement(entity, "entity", "entities", analysis.batchId)
+    for (const concept of analysis.concepts ?? []) ensureRequirement(concept, "concept", "concepts", analysis.batchId)
+    for (const candidate of analysis.candidatePages ?? []) {
+      ensureRequirement(candidate, candidate.pageKind ?? candidate.page_kind ?? "topic", "candidatePages", analysis.batchId, true)
+    }
+  }
+
+  for (const analysis of analyses) {
+    for (const relation of analysis.relations ?? []) {
+      const sourceId = relation.sourceEntityLocalId ?? relation.source_entity_local_id ?? relation.sourceLocalId
+      const targetId = relation.targetEntityLocalId ?? relation.target_entity_local_id ?? relation.targetLocalId
+      const sourceRequirementId = sourceId ? localRequirements.get(`${analysis.batchId}:${sourceId}`) : requirementIdByName(requirements, relation.source ?? relation.from ?? relation.subject)
+      const targetRequirementId = targetId ? localRequirements.get(`${analysis.batchId}:${targetId}`) : requirementIdByName(requirements, relation.target ?? relation.to ?? relation.object)
+      if (!sourceRequirementId || !targetRequirementId || sourceRequirementId === targetRequirementId) continue
+      for (const [left, right] of [[sourceRequirementId, targetRequirementId], [targetRequirementId, sourceRequirementId]]) {
+        const requirement = requirements.get(left)
+        requirement.related_requirement_ids = uniqueStrings([...requirement.related_requirement_ids, right])
+      }
+    }
+  }
+  return [...requirements.values()].sort((left, right) => left.preferred_path.localeCompare(right.preferred_path))
+}
+
+function candidateTitle(candidate) {
+  return String(candidate?.title ?? candidate?.name ?? "").normalize("NFKC").trim()
+}
+
+function shouldMaterialize(candidate) {
+  if (!candidate || typeof candidate !== "object") return false
+  if (candidate.materialize === false) return false
+  if (["reference", "inline", "skip"].includes(String(candidate.pagePriority ?? candidate.page_priority ?? "").toLowerCase())) return false
+  return !(typeof candidate.confidence === "number" && candidate.confidence < 0.5)
+}
+
+function requirementIdByName(requirements, value) {
+  if (typeof value !== "string" || !value.trim()) return null
+  return requirements.get(`page-${sha256(canonicalPageSlug(value)).slice(0, 20)}`)?.requirement_id ?? null
+}
+
+function recommendedSections(pageKind) {
+  return ({
+    entity: ["Summary", "Key facts", "Relationships", "Sources", "Related"],
+    concept: ["Definition", "Key ideas", "Examples or implications", "Sources", "Related"],
+    topic: ["Overview", "Key points", "Sources", "Related"],
+    comparison: ["Scope", "Comparison", "Trade-offs", "Sources", "Related"],
+    query: ["Question", "Current evidence", "Open issues", "Sources", "Related"],
+    synthesis: ["Summary", "Contributing evidence", "Conclusions", "Sources", "Related"],
+    finding: ["Finding", "Evidence", "Confidence and limitations", "Sources", "Related"],
+    methodology: ["Purpose", "Method", "Rationale", "Limitations", "Related"],
+    thesis: ["Thesis", "Supporting evidence", "Refuting evidence", "Status", "Related"],
+    meeting: ["Summary", "Participants", "Decisions", "Action items", "Related"],
+    decision: ["Context", "Decision", "Consequences", "Alternatives", "Related"],
+    project: ["Overview", "Goals", "Status", "Decisions", "Related"],
+    stakeholder: ["Role", "Interests", "Relationships", "Related"],
+    goal: ["Outcome", "Motivation", "Progress", "Related"],
+    habit: ["Definition", "Tracking", "Observations", "Related"],
+    reflection: ["Context", "Observations", "Lessons", "Next steps", "Related"],
+    chapter: ["Summary", "Key events", "Characters and themes", "Related"],
+    character: ["Role", "Development", "Relationships", "Related"],
+    theme: ["Overview", "Occurrences", "Interpretation", "Related"],
+    "plot-thread": ["Overview", "Progression", "Turning points", "Related"],
+    journal: ["Entry", "Observations", "Related"],
+  })[pageKind] ?? ["Overview", "Key points", "Sources", "Related"]
+}
+
+async function missingPageRequirements(wikiRoot, requirements, patches) {
+  if (requirements.length === 0) return []
+  const coveredIds = new Set()
+  const coveredTitles = new Set()
+  for (const file of await listFilesRecursive(wikiRoot, (candidate) => candidate.endsWith(".md"))) {
+    const parsed = parseWikiPage(await readFile(file, "utf8"))
+    parsed.covers.forEach((id) => coveredIds.add(id))
+    if (parsed.title) coveredTitles.add(canonicalPageSlug(parsed.title))
+  }
+  for (const patch of patches) {
+    for (const id of patch.covers ?? []) coveredIds.add(id)
+    coveredTitles.add(canonicalPageSlug(patch.title))
+  }
+  return requirements.filter((requirement) => (
+    !coveredIds.has(requirement.requirement_id)
+    && !coveredTitles.has(canonicalPageSlug(requirement.title))
+  ))
+}
+
+async function enrichWikiRelations(wikiRoot, requirements) {
+  const pages = []
+  for (const file of await listFilesRecursive(wikiRoot, (candidate) => candidate.endsWith(".md"))) {
+    const relative = relativePosix(wikiRoot, file)
+    if (["index.md", "overview.md", "log.md"].includes(relative)) continue
+    const parsed = parseWikiPage(await readFile(file, "utf8"))
+    pages.push({ file, relative, slug: relative.replace(/\.md$/i, ""), parsed })
+  }
+  const aliases = new Map()
+  pages.forEach((page, index) => {
+    for (const alias of [page.slug, path.posix.basename(page.slug), page.parsed.title]) {
+      if (alias) aliases.set(canonicalPageSlug(alias), index)
+    }
+  })
+  const requirementPages = new Map()
+  for (const requirement of requirements) {
+    const covered = pages.findIndex((page) => page.parsed.covers.includes(requirement.requirement_id))
+    const byTitle = covered >= 0 ? covered : aliases.get(canonicalPageSlug(requirement.title))
+    if (byTitle !== undefined && byTitle >= 0) requirementPages.set(requirement.requirement_id, byTitle)
+  }
+  const edges = pages.map(() => new Set())
+  const resolvePage = (slug) => aliases.get(canonicalPageSlug(path.posix.basename(normalizeRelatedSlug(slug))))
+    ?? aliases.get(canonicalPageSlug(normalizeRelatedSlug(slug)))
+  pages.forEach((page, sourceIndex) => {
+    for (const link of uniqueStrings([...page.parsed.related, ...extractWikiLinks(page.parsed.body)])) {
+      const targetIndex = resolvePage(link)
+      if (targetIndex === undefined || targetIndex === sourceIndex) continue
+      edges[sourceIndex].add(targetIndex)
+      edges[targetIndex].add(sourceIndex)
+    }
+  })
+  for (const requirement of requirements) {
+    const sourceIndex = requirementPages.get(requirement.requirement_id)
+    if (sourceIndex === undefined) continue
+    for (const relatedId of requirement.related_requirement_ids) {
+      const targetIndex = requirementPages.get(relatedId)
+      if (targetIndex === undefined || targetIndex === sourceIndex) continue
+      edges[sourceIndex].add(targetIndex)
+      edges[targetIndex].add(sourceIndex)
+    }
+  }
+  await Promise.all(pages.map(async (page, index) => {
+    const related = [...edges[index]].map((target) => pages[target].slug).sort()
+    const next = setWikiPageRelated(page.parsed.raw, related)
+    if (next !== page.parsed.raw) await writeTextAtomic(page.file, next)
+  }))
+}
+
+function uniqueByStable(values) {
+  const seen = new Set()
+  return values.filter((value) => {
+    const key = stableStringify(value)
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values.map((value) => String(value ?? "").trim()).filter(Boolean))]
+}
+
 function latestPageRecords(history) {
   const byPath = new Map()
   for (const page of history) {
@@ -854,8 +1120,8 @@ function latestPageRecords(history) {
 function paginatePagePlan(context, requestedCursor, requestedMaxChars, configuredMaxChars) {
   const cursor = requestedCursor === undefined || requestedCursor === null ? 0 : Number(requestedCursor)
   if (!Number.isInteger(cursor) || cursor < 0) fail("INVALID_INPUT", "cursor must be a non-negative integer.")
-  const maxChars = Math.min(Math.max(Number(requestedMaxChars) || 120_000, 20_000), configuredMaxChars)
-  const categories = ["batches", "entities", "concepts", "claims", "relations", "candidate_pages", "existing_pages", "conflicts"]
+  const maxChars = Math.min(Math.max(Number(requestedMaxChars) || 40_000, 20_000), configuredMaxChars)
+  const categories = ["batches", "required_pages", "entities", "concepts", "claims", "relations", "candidate_pages", "existing_pages", "conflicts"]
   const records = categories.flatMap((category) => context[category].map((value) => ({ category, value })))
   if (cursor > records.length) fail("INVALID_INPUT", "cursor is beyond the available page-plan context.")
   const values = Object.fromEntries(categories.map((category) => [category, []]))
@@ -882,23 +1148,50 @@ function paginatePagePlan(context, requestedCursor, requestedMaxChars, configure
   }
 }
 
+function pagePlanDomainSchemaMetadata(metadata) {
+  if (!metadata) return null
+  return {
+    schemaId: metadata.schema_id,
+    schemaVersion: metadata.schema_version,
+    hash: metadata.hash,
+    sizeBytes: metadata.size_bytes,
+    included: false,
+    requiredForPagePlanning: false,
+  }
+}
+
 function statusResponse(task) {
   const wikiProjection = pageProjectionStatus(task)
+  const workerLeases = Object.entries(validBatchLeases(task)).map(([batchId, lease]) => ({
+    worker_id: lease.workerId,
+    batch_id: batchId,
+    leased_at: lease.leasedAt,
+    expires_at: lease.expiresAt,
+  })).sort((left, right) => left.worker_id.localeCompare(right.worker_id))
   return {
     task_id: task.taskId,
     status: task.status,
     completed_batches: task.completedBatchIds.length,
     total_batches: task.batchCount,
-    leased_batches: Object.keys(validBatchLeases(task)).length,
+    leased_batches: workerLeases.length,
+    worker_recovery: {
+      resumable: true,
+      strategy: "restart-same-worker-id",
+      leases: workerLeases,
+      note: "A new Agent invocation using the same worker_id resumes its existing batch lease; task state does not depend on an old MCP client connection.",
+    },
     updated_at: task.updatedAt,
     domain_schema: task.domainSchema ?? null,
     wiki_projection: wikiProjection,
     ...(task.lastError ? { last_error: task.lastError } : {}),
-    next_action: nextAction(task),
+    next_action: nextAction(task, wikiProjection),
   }
 }
 
-function nextAction(task) {
+function nextAction(task, wikiProjection = pageProjectionStatus(task)) {
+  if (wikiProjection.ready) {
+    return { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: task.taskId, writer_id: "wiki-writer-1" } }
+  }
   if (["prepared", "extracting"].includes(task.status)) return { tool: "llm_wiki_get_batch", arguments: { task_id: task.taskId } }
   if (task.status === "planning") return { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: task.taskId } }
   if (task.status === "committing") return { tool: "llm_wiki_finalize", arguments: { task_id: task.taskId } }
@@ -907,19 +1200,93 @@ function nextAction(task) {
 }
 
 async function buildIndex(wikiRoot) {
-  const lines = ["# Knowledge Base Index", ""]
+  const groups = new Map()
   for (const file of await listFilesRecursive(wikiRoot, (candidate) => candidate.endsWith(".md"))) {
     const relative = relativePosix(wikiRoot, file)
     if (["index.md", "overview.md", "log.md"].includes(relative)) continue
-    const content = await readFile(file, "utf8")
-    const title = content.match(/^#\s+(.+)$/m)?.[1]?.trim() || path.basename(file, ".md")
-    lines.push(`- [[${relative.replace(/\.md$/i, "")}|${title}]]`)
+    const parsed = parseWikiPage(await readFile(file, "utf8"))
+    const type = normalizePageKind(parsed.type) ?? "topic"
+    const entries = groups.get(type) ?? []
+    entries.push({
+      slug: relative.replace(/\.md$/i, ""),
+      title: parsed.title || path.basename(file, ".md"),
+      summary: parsed.summary,
+    })
+    groups.set(type, entries)
+  }
+  const lines = ["# Knowledge Base Index", "", "Pages are grouped by knowledge type and linked with canonical Wiki paths.", ""]
+  for (const [type, entries] of [...groups.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+    lines.push(`## ${displayPageKind(type)}`, "")
+    for (const entry of entries.sort((left, right) => left.title.localeCompare(right.title))) {
+      lines.push(`- [[${entry.slug}|${entry.title}]]${entry.summary ? ` — ${entry.summary}` : ""}`)
+    }
+    lines.push("")
   }
   return `${lines.join("\n")}\n`
 }
 
-function buildOverview(task, pageRecords) {
-  return `# Knowledge Base Overview\n\nLast finalized task: \`${task.taskId}\`\n\n- Sources: ${task.sourceIds.length}\n- Agent-authored pages committed: ${pageRecords.length}\n- Target language: ${task.options.targetLanguage}\n`
+async function buildOverview(wikiRoot, task, pageRecords) {
+  const groups = new Map()
+  let linkedPages = 0
+  for (const file of await listFilesRecursive(wikiRoot, (candidate) => candidate.endsWith(".md"))) {
+    const relative = relativePosix(wikiRoot, file)
+    if (["index.md", "overview.md", "log.md"].includes(relative)) continue
+    const parsed = parseWikiPage(await readFile(file, "utf8"))
+    const type = normalizePageKind(parsed.type) ?? "topic"
+    const entries = groups.get(type) ?? []
+    entries.push({ title: parsed.title || path.basename(file, ".md"), slug: relative.replace(/\.md$/i, "") })
+    groups.set(type, entries)
+    if (parsed.related.length > 0 || extractWikiLinks(parsed.body).length > 0) linkedPages += 1
+  }
+  const lines = [
+    "# Knowledge Base Overview",
+    "",
+    `Last finalized task: \`${task.taskId}\``,
+    "",
+    "## Coverage",
+    "",
+    `- Sources: ${task.sourceIds.length}`,
+    `- Agent-authored pages committed by this task: ${pageRecords.length}`,
+    `- Linked knowledge pages: ${linkedPages}`,
+    `- Target language: ${task.options.targetLanguage}`,
+    "",
+    "## Knowledge map",
+    "",
+  ]
+  for (const [type, entries] of [...groups.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+    lines.push(`### ${displayPageKind(type)} (${entries.length})`, "")
+    for (const entry of entries.slice(0, 20)) lines.push(`- [[${entry.slug}|${entry.title}]]`)
+    if (entries.length > 20) lines.push(`- …and ${entries.length - 20} more in [[index|the full index]]`)
+    lines.push("")
+  }
+  return `${lines.join("\n").trimEnd()}\n`
+}
+
+function displayPageKind(type) {
+  return ({
+    source: "Sources",
+    entity: "Entities",
+    concept: "Concepts",
+    topic: "Topics",
+    comparison: "Comparisons",
+    query: "Queries",
+    synthesis: "Synthesis",
+    finding: "Findings",
+    methodology: "Methodology",
+    thesis: "Theses",
+    meeting: "Meetings",
+    decision: "Decisions",
+    project: "Projects",
+    stakeholder: "Stakeholders",
+    goal: "Goals",
+    habit: "Habits",
+    reflection: "Reflections",
+    chapter: "Chapters",
+    character: "Characters",
+    theme: "Themes",
+    "plot-thread": "Plot Threads",
+    journal: "Journal",
+  })[type] ?? "Topics"
 }
 
 async function appendLog(filePath, task, pageRecords) {
@@ -945,8 +1312,4 @@ async function countReviewItems(record) {
   let count = 0
   for (const batchId of record.task.completedBatchIds) count += (await readJson(path.join(record.paths.analysis, `${batchId}.json`))).reviewItems.length
   return count
-}
-
-function yamlString(value) {
-  return JSON.stringify(String(value))
 }

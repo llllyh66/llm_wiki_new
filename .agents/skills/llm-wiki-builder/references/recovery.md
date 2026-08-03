@@ -6,6 +6,16 @@ Call `llm_wiki_status` with the known task ID and execute its `next_action`.
 When the ID is unknown, use `llm_wiki_list_tasks` with incomplete statuses and
 match source names and timestamps in the current workspace.
 
+Treat the returned `worker_recovery.leases` as authoritative. Restart one
+single-batch extractor invocation for each lease using the exact persisted
+`worker_id`; `get_batch` returns that same batch to the replacement invocation.
+Then use free worker slots for unleased work. Worker leases and committed
+analyses live in task files, not in a background Agent's MCP client connection,
+so a turn boundary does not imply lost work or require `/mcp`. Only report a
+connection failure when an actual coordinator tool call raises a transport
+exception. A successful `llm_wiki_status` call proves the current turn's MCP
+connection is usable.
+
 ## Validation failure
 
 All llm_wiki tool exceptions are returned as ordinary MCP tool results with

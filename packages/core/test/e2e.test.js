@@ -459,6 +459,36 @@ test("domain schema accepts bounded multi-megabyte input and rejects payloads ov
   assert.equal(batch.workspace_context.domain_schema.inline, false)
   assert.equal(batch.workspace_context.domain_schema.totalBytes >= acceptedBytes, true)
   assert.equal(batch.workspace_context.domain_schema.totalBytes < 5 * 1024 * 1024, true)
+  const chunk = batch.chunks[0]
+  const sourceRef = {
+    sourceId: chunk.sourceId,
+    chunkId: chunk.chunkId,
+    quote: "Business Entity is the canonical business object.",
+    locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
+  }
+  await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    idempotency_key: "large-domain-schema-analysis-v1",
+    analysis: {
+      schemaVersion: 1,
+      taskId: imported.task_id,
+      batchId: batch.batch_id,
+      sourceRefs: [sourceRef],
+      entities: [{ localId: "large-entity-1", name: "Business Entity", entityTypeId: "large_entity", properties: {}, sourceRefs: [0] }],
+      concepts: [], claims: [], relations: [], contradictions: [], candidatePages: [], reviewItems: [],
+      batchSummary: "Large domain Schema page-plan regression.",
+      unresolvedQuestions: [],
+    },
+  })
+  const plan = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 20_000 })
+  assert.equal(plan.domain_schema.schemaId, acceptedSchema.schemaId)
+  assert.equal(plan.domain_schema.sizeBytes >= acceptedBytes, true)
+  assert.equal(plan.domain_schema.included, false)
+  assert.equal(plan.domain_schema.requiredForPagePlanning, false)
+  assert.equal(plan.domain_schema.entityTypes, undefined)
+  assert.equal(plan.domain_schema_pagination, null)
+  assert.equal(Buffer.byteLength(JSON.stringify(plan)) < 40_000, true)
 
   const oversizedSchema = makeSchema(550, 10_000)
   assert.equal(Buffer.byteLength(JSON.stringify(oversizedSchema)) > 5 * 1024 * 1024, true)
@@ -578,6 +608,9 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
   const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
   assert.equal(plan.analysis_summary.claims.length, 1)
   assert.equal(plan.page_patch_schema.properties.path.type, "string")
+  assert.deepEqual(plan.page_requirements.map((requirement) => requirement.title).sort(), ["Aggregate", "Business Entity"])
+  const businessRequirement = plan.page_requirements.find((requirement) => requirement.title === "Business Entity")
+  const aggregateRequirement = plan.page_requirements.find((requirement) => requirement.title === "Aggregate")
   const committed = await f.core.commitPages({
     task_id: imported.task_id,
     based_on_wiki_revision: plan.based_on_wiki_revision,
@@ -589,8 +622,25 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
       title: "Business Entity",
       pageKind: "concept",
       content: "# Business Entity\n\nA canonical business object. See [[concepts/aggregate]].",
+      summary: "The canonical business object.",
+      tags: ["domain-model"],
+      related: ["concepts/aggregate"],
+      covers: [businessRequirement.requirement_id],
       sourceRefs: [sourceRef],
       rationale: "The source explicitly defines this concept.",
+    }, {
+      patchId: "aggregate-v1",
+      path: "wiki/concepts/aggregate.md",
+      operation: "create",
+      title: "Aggregate",
+      pageKind: "concept",
+      content: "# Aggregate\n\nAn Aggregate groups related [[concepts/business-entity|Business Entities]].",
+      summary: "Groups related Business Entities.",
+      tags: ["domain-model"],
+      related: ["concepts/business-entity"],
+      covers: [aggregateRequirement.requirement_id],
+      sourceRefs: [sourceRef],
+      rationale: "The source explicitly defines Aggregate.",
     }],
   })
   assert.equal(committed.accepted, true)
@@ -599,10 +649,16 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
   assert.equal(result.status, "completed")
   assert.equal(result.indexing.bm25, "completed")
   assert.equal(result.indexing.vector, "completed")
-  assert.deepEqual(result.created_pages, ["wiki/concepts/business-entity.md"])
+  assert.deepEqual(result.created_pages, ["wiki/concepts/business-entity.md", "wiki/concepts/aggregate.md"])
   assert.equal((await f.core.status({ task_id: imported.task_id })).status, "completed")
   assert.match(await readFile(path.join(f.workspace, "wiki", "index.md"), "utf8"), /Business Entity/)
+  assert.match(await readFile(path.join(f.workspace, "wiki", "index.md"), "utf8"), /## Concepts/)
   assert.match(await readFile(path.join(f.workspace, "wiki", "overview.md"), "utf8"), new RegExp(imported.task_id))
+  const businessPage = await readFile(path.join(f.workspace, "wiki", "concepts", "business-entity.md"), "utf8")
+  const aggregatePage = await readFile(path.join(f.workspace, "wiki", "concepts", "aggregate.md"), "utf8")
+  assert.match(businessPage, /related: \["concepts\/aggregate"/)
+  assert.match(businessPage, /covers: \["page-/)
+  assert.match(aggregatePage, /\[\[concepts\/business-entity\]\]/)
   assert.equal((await readFile(path.join(f.workspace, imported.sources[0].managed_path), "utf8")).includes("Product Model"), true)
   const completedRetrieval = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["Business Entity"] })
   assert.equal(completedRetrieval.retrieval_phase, "knowledge-base-complete")
@@ -660,7 +716,24 @@ test("parallel workers lease distinct batches and concurrent commits preserve ev
   const status = await f.core.status({ task_id: imported.task_id })
   assert.equal(status.completed_batches, workerCount)
   assert.equal(status.leased_batches, 0)
+  assert.equal(status.worker_recovery.resumable, true)
+  assert.equal(status.worker_recovery.strategy, "restart-same-worker-id")
   assert.equal(status.status, "planning")
+})
+
+test("a worker invocation can resume its leased batch by stable worker ID after a turn boundary", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const leased = await f.core.getBatch({ task_id: imported.task_id, worker_id: "extractor-resume-1" })
+  const status = await f.core.status({ task_id: imported.task_id })
+  assert.deepEqual(status.worker_recovery.leases.map(({ worker_id, batch_id }) => ({ worker_id, batch_id })), [{
+    worker_id: "extractor-resume-1",
+    batch_id: leased.batch_id,
+  }])
+  const resumed = await f.core.getBatch({ task_id: imported.task_id, worker_id: "extractor-resume-1" })
+  assert.equal(resumed.batch_id, leased.batch_id)
+  assert.deepEqual(resumed.chunks, leased.chunks)
 })
 
 test("micro-batch Wiki projection uses one writer, hides provisional pages, and requires final reconciliation", async (t) => {
@@ -716,11 +789,16 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   const debounceReady = await f.core.status({ task_id: imported.task_id })
   assert.equal(debounceReady.wiki_projection.ready, true)
   assert.equal(debounceReady.wiki_projection.mode, "incremental")
-  for (let index = 1; index < 4; index += 1) await analyzeNext(index)
+  let projectionSignal
+  for (let index = 1; index < 4; index += 1) projectionSignal = await analyzeNext(index)
   const ready = await f.core.status({ task_id: imported.task_id })
   assert.equal(ready.status, "extracting")
   assert.equal(ready.wiki_projection.ready, true)
   assert.equal(ready.wiki_projection.mode, "incremental")
+  assert.equal(ready.next_action.tool, "llm_wiki_get_page_plan_context")
+  assert.equal(ready.next_action.arguments.writer_id, "wiki-writer-1")
+  assert.equal(projectionSignal.next_action.tool, "llm_wiki_get_page_plan_context")
+  assert.equal(projectionSignal.worker_next_action.tool, "llm_wiki_get_batch")
 
   const incrementalPlan = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1" })
   assert.equal(incrementalPlan.waiting, undefined)
@@ -744,6 +822,7 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
       title: "Projected Entity",
       pageKind: "topic",
       content: "# Projected Entity\n\nProvisionalOnlyMarker",
+      covers: incrementalPlan.page_requirements.map((requirement) => requirement.requirement_id),
       sourceRefs: [sourceRefs[0]],
       rationale: "Early micro-batch projection.",
     }],
@@ -933,7 +1012,7 @@ test("invalid SourceRefs, page traversal, symlinks, and stale hashes are rejecte
     task_id: partial.task_id,
     based_on_wiki_revision: plan.based_on_wiki_revision,
     idempotency_key: "create-conflict-page",
-    patches: [{ patchId: "page-v1", path: "wiki/concepts/conflict.md", operation: "create", title: "Conflict", pageKind: "concept", content: "# Conflict\n\nVersion one.", sourceRefs: [sourceRef], rationale: "test" }],
+    patches: [{ patchId: "page-v1", path: "wiki/concepts/conflict.md", operation: "create", title: "Conflict", pageKind: "concept", content: "# Conflict\n\nVersion one.", covers: plan.page_requirements.map((requirement) => requirement.requirement_id), sourceRefs: [sourceRef], rationale: "test" }],
   })
   const oldHash = create.written_pages[0].file_hash
   const latestPlan = await f.core.getPagePlanContext({ task_id: partial.task_id })
@@ -944,7 +1023,7 @@ test("invalid SourceRefs, page traversal, symlinks, and stale hashes are rejecte
       task_id: partial.task_id,
       based_on_wiki_revision: rebasedPlan.based_on_wiki_revision,
       idempotency_key: "stale-file-hash",
-      patches: [{ patchId: "page-v2", path: "wiki/concepts/conflict.md", operation: "replace", expectedFileHash: oldHash, title: "Conflict", pageKind: "concept", content: "# Conflict\n\nVersion two.", sourceRefs: [sourceRef], rationale: "test" }],
+      patches: [{ patchId: "page-v2", path: "wiki/concepts/conflict.md", operation: "replace", expectedFileHash: oldHash, title: "Conflict", pageKind: "concept", content: "# Conflict\n\nVersion two.", covers: plan.page_requirements.map((requirement) => requirement.requirement_id), sourceRefs: [sourceRef], rationale: "test" }],
     }),
     (error) => error instanceof LlmWikiError && error.code === "FILE_HASH_CONFLICT",
   )
@@ -956,7 +1035,7 @@ test("invalid SourceRefs, page traversal, symlinks, and stale hashes are rejecte
     task_id: partial.task_id,
     based_on_wiki_revision: rebasedPlan.based_on_wiki_revision,
     idempotency_key: "successful-page-replace",
-    patches: [{ patchId: "page-v3", path: "wiki/concepts/conflict.md", operation: "replace", expectedFileHash: currentPage.file_hash, title: "Conflict", pageKind: "concept", content: "# Conflict\n\nRebased version.", sourceRefs: [sourceRef], rationale: "test successful optimistic replace" }],
+    patches: [{ patchId: "page-v3", path: "wiki/concepts/conflict.md", operation: "replace", expectedFileHash: currentPage.file_hash, title: "Conflict", pageKind: "concept", content: "# Conflict\n\nRebased version.", covers: plan.page_requirements.map((requirement) => requirement.requirement_id), sourceRefs: [sourceRef], rationale: "test successful optimistic replace" }],
   })
   assert.equal(replaced.accepted, true)
   assert.match(await readFile(path.join(f.workspace, "wiki", "concepts", "conflict.md"), "utf8"), /Rebased version/)

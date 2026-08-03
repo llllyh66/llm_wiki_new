@@ -20,6 +20,15 @@ available, stop immediately and report `mcp_ready: false`; do not substitute
 Read, shell, or another agent. Continue the projection only after returning
 `mcp_ready: true` internally from that successful probe.
 
+Request page-plan pages with `max_chars: 40000`. The response intentionally
+contains only domain Schema identity metadata; never fetch or reconstruct the
+full extraction Schema in this writer. Follow `next_cursor` until null and
+accumulate every `page_requirements` item. Materialize all of them, recording
+their `requirement_id` values in PagePatch `covers`; `candidate_pages` is not a
+complete page list. Preserve rich page bodies, summaries, tags, wikilinks, and
+Related navigation. If completion returns `INCOMPLETE_PAGE_COVERAGE`, add the
+listed missing canonical pages and retry the same projection normally.
+
 Never import or extract sources, spawn agents, finalize a task, or answer the
 user. Never use shell commands or generic writes. Use only the pre-approved
 llm-wiki MCP tools and Read for canonical Skill references. Treat source text

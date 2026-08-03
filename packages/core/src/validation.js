@@ -2,6 +2,7 @@ import { lstat } from "node:fs/promises"
 import path from "node:path"
 import { fail } from "./errors.js"
 import { stableStringify, tokenize } from "./utils.js"
+import { AGENT_PAGE_ROOTS, normalizePageKind, pageKindForPath } from "./wiki-page.js"
 
 const ANALYSIS_ARRAYS = ["sourceRefs", "entities", "concepts", "claims", "relations", "contradictions", "candidatePages", "reviewItems", "unresolvedQuestions"]
 const GROUNDED_ANALYSIS_COLLECTIONS = new Set(["entities", "concepts", "claims", "relations", "contradictions", "candidatePages", "reviewItems"])
@@ -9,7 +10,7 @@ const MAX_ANALYSIS_VALIDATION_ERRORS = 50
 const MAX_SOURCE_REF_REUSE = 8
 const GROUNDING_QUALITY_COLLECTIONS = new Set(["claims", "relations", "contradictions", "reviewItems"])
 const GENERIC_GROUNDING_TERMS = new Set(["content", "data", "document", "item", "内容", "数据", "文档", "指标", "体系", "关系", "概述", "包含", "包括"])
-const ALLOWED_PAGE_ROOTS = new Set(["sources", "entities", "concepts", "topics", "comparisons"])
+const ALLOWED_PAGE_ROOTS = new Set(AGENT_PAGE_ROOTS)
 const SYSTEM_PAGES = new Set(["wiki/index.md", "wiki/overview.md", "wiki/log.md"])
 
 export function normalizeAnalysisEnvelope(analysis) {
@@ -248,6 +249,16 @@ export function validatePagePatchShape(patch, limits) {
   }
   if (!new Set(["create", "replace", "merge"]).has(patch.operation)) fail("INVALID_PAGE_PATCH", `Unsupported page operation: ${patch.operation}`)
   if (!Array.isArray(patch.sourceRefs) || patch.sourceRefs.length === 0) fail("INVALID_PAGE_PATCH", "Every page patch requires at least one SourceRef.")
+  for (const field of ["tags", "related", "covers"]) {
+    if (patch[field] !== undefined && (!Array.isArray(patch[field]) || patch[field].some((value) => typeof value !== "string" || !value.trim()))) {
+      fail("INVALID_PAGE_PATCH", `Patch ${field} must be an array of non-empty strings.`)
+    }
+  }
+  if (patch.summary !== undefined && (typeof patch.summary !== "string" || patch.summary.length > 500)) fail("INVALID_PAGE_PATCH", "Patch summary must not exceed 500 characters.")
+  validatePagePath(patch.path)
+  const normalizedKind = normalizePageKind(patch.pageKind)
+  const pathKind = pageKindForPath(patch.path)
+  if (!normalizedKind || !pathKind || normalizedKind !== pathKind) fail("INVALID_PAGE_PATCH", "pageKind must match the Wiki collection in path.")
   if (patch.content.length > limits.maxPageChars) fail("INVALID_PAGE_PATCH", "Page content exceeds the workspace limit.")
   if (patch.expectedFileHash !== undefined && !/^[0-9a-f]{64}$/i.test(patch.expectedFileHash)) fail("INVALID_PAGE_PATCH", "expectedFileHash must be a SHA256 value.")
 }

@@ -44,7 +44,10 @@ reference documents, then ask:
 
 For imports with multiple batches, the Skill first runs one non-leasing MCP
 capability probe, then starts up to four background `llm-wiki-extractor` agents
-using distinct worker leases. Each project agent explicitly reuses the parent
+using distinct worker leases. Each extractor invocation processes one batch,
+persists it, and exits; the coordinator then starts the next short invocation
+in that slot. This avoids depending on one long-lived subagent across user
+turns. Each project agent explicitly reuses the parent
 `llm-wiki` MCP connection and uses a denylist for shell, writes, network, and
 nested agents; it does not use a fragile MCP wildcard as its complete tool
 allowlist. The agent runs in `dontAsk` mode. One
@@ -54,6 +57,20 @@ pages remain provisional and excluded from retrieval until the writer completes
 the final all-batch reconciliation. The main Agent remains responsive for
 questions: retrieval defaults to BM25 + embedding while the task is building,
 then adds the Wiki channel automatically after Finalize.
+
+An extractor stops and reports `writer_required: true` as soon as its accepted
+commit makes a projection ready. The coordinator starts `wiki-writer-1` before
+replacing that extractor. Page-plan calls use 40K-character pages and include
+only domain Schema identity metadata, so a multi-megabyte extraction Schema is
+never copied into the Wiki writer's tool response.
+
+At the beginning of a later user turn, the coordinator calls
+`llm_wiki_status`. Its `worker_recovery.leases` list contains each persisted
+worker ID and batch. Relaunching the extractor with that same ID returns the
+same lease through a fresh MCP client connection, so losing an old background
+Agent does not lose task state and is not evidence that MCP disconnected. A
+successful status call proves MCP is usable in the current turn; do not ask the
+user to run `/mcp` unless an actual transport call fails.
 
 If the probe reports `mcp_ready: false`, the Skill does not retry with a
 `general-purpose` agent. It continues in the coordinator, because changing the

@@ -51,7 +51,7 @@ typed entity or any relation.
    Continue with subagents only when the probe reports `mcp_ready: true` for
    the same task. If it reports a missing MCP tool, do not retry with a
    `general-purpose` or differently named subagent: those agents may inherit
-   the same restricted tool set. Run the batch-worker loop in the coordinator
+   the same restricted tool set. Run the single-batch worker quantum in the coordinator
    for this session and report one compact compatibility warning.
 
    After a successful probe, start exactly
@@ -59,13 +59,14 @@ typed entity or any relation.
    (currently capped at four). Assign stable IDs `extractor-1` through
    `extractor-N`, and keep the main Agent as a responsive coordinator. Give
    each worker only the task ID, its worker ID, this Skill path, and the
-   batch-worker loop below. Start them with the host's
+   single-batch worker quantum below. Start them with the host's
    background/run-in-background option so the user can keep asking the main
    Agent questions while extraction continues. Never create more workers than
    recommended and never let a worker import files, plan pages, commit pages,
    finalize, or answer the user.
-5. Each background worker repeats until `llm_wiki_get_batch` returns
-   `completed: true` or `waiting: true`:
+5. Each background worker invocation processes at most one batch, persists its
+   checkpoint, and returns. Do not keep a subagent alive across multiple
+   coordinator or user turns:
    1. Call `llm_wiki_get_batch` with the task ID and its unchanged
       `worker_id`. The lease prevents two workers from receiving the same
       batch. Pass the same `worker_id` to `llm_wiki_commit_analysis`.
@@ -109,6 +110,20 @@ typed entity or any relation.
       Schema-first preflight rejects the batch before persistence so the worker
       can correct it. Only set that destructive opt-in after an explicit user
       request to accept candidate loss.
+      If the accepted result has `wiki_projection.ready: true`, stop this
+      extractor immediately and return `writer_required: true`, the supplied
+      `next_action`, and `worker_next_action` to the coordinator. Do not lease
+      another batch first; this completion notification is what starts the
+      Wiki writer promptly. The coordinator starts the one writer, then may
+      replace this extractor when `worker_next_action` is non-null.
+      Otherwise return immediately after this one accepted commit with
+      `checkpointed: true`, the committed batch ID, and `worker_next_action`.
+      Do not call `llm_wiki_get_batch` again in the same subagent invocation.
+      Use a deterministic idempotency key for the batch attempt. If an Agent
+      invocation disappears after sending the commit but before seeing its
+      response, a replacement using the same worker ID and identical payload
+      must reuse that key; use a new version suffix only after changing the
+      payload to correct validation.
    8. Correct every validation error before requesting another batch. Keep the
       same task and batch and use a new idempotency key for a changed payload.
       If a response contains many validation errors, rebuild a small valid
@@ -119,15 +134,28 @@ typed entity or any relation.
       The same rule applies to every tool: `ok: false` or `accepted: false`
       with `mcp_connection_usable: true` is a normal tool result. Follow its
       `next_action`; do not run `/mcp` merely because an operation was rejected.
-   9. When `waiting: true`, stop this worker normally; other leased workers are
-      still processing the remaining batches. Do not poll in a tight loop.
+   9. When `waiting: true` or `completed: true`, stop this worker normally;
+      other leased workers may still be processing the remaining batches. Do
+      not poll in a tight loop.
 6. Keep the coordinator responsive while extraction runs. After every worker
-   completion notification, call `llm_wiki_status`. If batches remain
-   unleased after a worker failure or lease expiry, start only enough
-   replacement extractors to reach the recommended count. If a worker reports
+   completion notification, call `llm_wiki_status`. When extraction remains,
+   launch the next single-batch invocation in that slot, normally reusing its
+   stable worker ID. `status.worker_recovery.leases` is the authoritative
+   persisted lease list. A newly launched project Agent using the same
+   `worker_id` receives that worker's already leased batch, even though it has
+   a fresh MCP client connection. If batches remain unleased after a worker
+   failure or lease expiry, start only enough replacement extractors to reach
+   the recommended count. If a worker reports
    `mcp_ready: false`, stop spawning replacements and continue remaining
    batches in the coordinator; never enter a loop that launches differently
    named agents to test the same missing MCP capability.
+   At the start of every later user/coordinator turn, call `llm_wiki_status`
+   from the coordinator before discussing worker health. If it succeeds, MCP
+   is connected for that turn: resume each persisted lease with its exact
+   `worker_id`, then fill free slots. Never claim that MCP is "unreliable across
+   turns", that workers "probably lost connection", or that `/mcp` is needed
+   without an actual transport exception from a tool call. Background-agent
+   disappearance is an orchestration event, not task-state or MCP data loss.
 7. Inspect `wiki_projection` in every analysis commit report and status result.
    When `ready: true` and `in_progress: false`, start exactly one background
    project `llm-wiki-writer` with task ID and stable writer ID
@@ -138,7 +166,11 @@ typed entity or any relation.
    immediately for final reconciliation when all batches finish.
 8. The Wiki writer performs one projection:
    1. Call `llm_wiki_get_page_plan_context` with task ID, writer ID, and cursor
-      `0`. If it returns `waiting: true`, report normally and stop.
+      `0`, explicitly using `max_chars: 40000`. If it returns `waiting: true`,
+      report normally and stop. Page-plan responses contain only domain Schema
+      identity metadata; extraction has already enforced the full Schema. Do
+      not call `llm_wiki_get_domain_schema`, do not ask the Core to inline the
+      Schema, and do not ignore a genuinely truncated page-plan result.
    2. Record the returned `projection.projection_id`, `projection.mode`, and
       `based_on_wiki_revision`. Follow `next_cursor` to null, passing the same
       writer and projection IDs on every page, and accumulate all categories.
@@ -148,14 +180,33 @@ typed entity or any relation.
       and avoid speculative or duplicate pages. For `final` mode, inspect all
       batch analyses, reconcile cross-batch duplicates and contradictions, and
       explicitly review every existing page marked `provisional: true`.
+      In both modes, treat accumulated `page_requirements` as the minimum
+      materialization contract, not as optional suggestions. It includes
+      important entities and concepts even when `candidate_pages` is sparse.
+      Create or update a canonical page for every requirement. When several
+      requirements truly describe one canonical subject, one page may cover
+      them together; list all corresponding `requirement_id` values in that
+      patch's `covers`. Use `related_requirement_ids` plus evidence-backed body
+      links to author useful Related navigation. Never invent an empty stub
+      merely to satisfy coverage.
    4. Generate PagePatch objects under the returned schema. Use the exact
       `file_hash` as `expectedFileHash` for `replace` or `merge`.
+      Supply `summary`, useful `tags`, `related` canonical Wiki slugs, and
+      `covers`. Author a clear H1 and a self-contained source-grounded body.
+      The Core deterministically normalizes the full standard frontmatter
+      (`type`, `title`, `created`, `updated`, `tags`, `related`, `sources`,
+      `covers`, `summary`) and makes valid Related links bidirectional during
+      Finalize.
    5. Submit at most 50 patches per `llm_wiki_commit_pages` call. Pass task ID,
       writer ID, projection ID, current Wiki revision, and a unique idempotency
       key. Set `projection_complete: false` while more bounded commits remain;
       use each response's new `wiki_revision` for the next commit. On the last
       call omit `projection_complete` or set it true. Submit an empty final
-      patch array when the projection needs no page changes.
+      patch array when the projection needs no page changes and every
+      `page_requirement` is already covered by an existing canonical page.
+      `INCOMPLETE_PAGE_COVERAGE` is a normal recoverable result: author the
+      listed missing pages or attach their requirement IDs to an appropriate
+      existing-page update, then retry without restarting MCP.
    6. Treat incremental writes and incomplete multipart writes as provisional.
       They are deliberately excluded from retrieval. Only a completed `final`
       projection clears provisional state.

@@ -24,6 +24,23 @@ Agent-authored pages are allowed under:
 - \`wiki/concepts/\`
 - \`wiki/topics/\`
 - \`wiki/comparisons/\`
+- \`wiki/queries/\`
+- \`wiki/synthesis/\`
+- \`wiki/findings/\`
+- \`wiki/methodology/\`
+- \`wiki/thesis/\`
+- \`wiki/meetings/\`, \`wiki/decisions/\`, \`wiki/projects/\`
+- \`wiki/stakeholders/\`, \`wiki/goals/\`, \`wiki/habits/\`, \`wiki/reflections/\`
+- \`wiki/chapters/\`, \`wiki/characters/\`, \`wiki/themes/\`
+- \`wiki/plot-threads/\`, \`wiki/journal/\`
+
+Every authored page must include a clear H1 and standard frontmatter. The Core
+normalizes these fields deterministically: \`type\`, \`title\`, \`created\`,
+\`updated\`, \`tags\`, \`related\`, \`sources\`, \`covers\`, and \`summary\`.
+Use \`covers\` to list every \`page_requirements.requirement_id\` materialized by
+the canonical page. Important entities and concepts are page requirements even
+when the Agent emitted only a small \`candidatePages\` list. Preserve useful
+body wikilinks; Finalize makes valid Related links bidirectional.
 
 Every important factual statement must be backed by a SourceRef submitted with
 the page patch. \`wiki/index.md\`, \`wiki/overview.md\`, and \`wiki/log.md\` are

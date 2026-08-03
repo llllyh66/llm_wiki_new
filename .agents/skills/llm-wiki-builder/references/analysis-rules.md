@@ -42,6 +42,17 @@ Minimal shape:
 
 ## Page planning
 
+- Give every important reusable entity and concept a stable `localId`, a clear
+  name, and focused evidence. The Core converts these into mandatory
+  `page_requirements`; `candidatePages` supplements that set and never limits
+  it.
+- Set `materialize: false` or `pagePriority: "reference"` only for incidental
+  mentions that genuinely do not deserve a standalone page. Do not use these
+  flags to reduce work on a large document. Candidates below 0.5 confidence
+  are review material rather than mandatory pages.
+- Propose `candidatePages` for source-supported cross-cutting artifacts such as
+  comparisons, queries, syntheses, findings, methodologies, or theses when
+  they add navigation or understanding beyond one entity/concept page.
 - Prefer updating a canonical existing page when it already represents the same
   subject.
 - Split pages when concepts have distinct definitions or lifecycles; merge only
@@ -50,5 +61,13 @@ Minimal shape:
 - Record conflicting sourced claims without silently choosing a winner.
 - Create review items for contradictions that cannot be resolved from evidence.
 - Use only Agent-writable collections exposed by the PagePatch schema.
+- Use standard page types and their matching paths: source, entity, concept,
+  topic, comparison, query, synthesis, finding, methodology, thesis, meeting,
+  decision, project, stakeholder, goal, habit, reflection, chapter, character,
+  theme, plot-thread, or journal.
+- Every page must have useful outgoing links when supported. Relational entity
+  endpoints should link to each other, and pages derived from the same source
+  should link to the canonical source page when relevant. Finalize mirrors
+  resolvable links into both pages' Related navigation.
 - Submit complete rebased content for `merge`; the Core does not perform a model
   merge.

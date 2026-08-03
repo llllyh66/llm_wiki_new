@@ -58,11 +58,34 @@ distinct and task-level serialization prevents concurrent commits from losing
 state. A non-leasing status probe first verifies that the project subagent can
 call the explicitly inherited `llm-wiki` MCP server; if not, the workflow
 falls back once to the coordinator instead of relaunching a general-purpose
-agent with the same restricted tools. The main Agent remains available for questions and coordinates page
+agent with the same restricted tools. When a commit makes a Wiki projection
+ready, that extractor returns immediately with `writer_required: true` so the
+coordinator starts `wiki-writer-1` before leasing more work. Page-plan responses
+never include the full extraction Schema and default to roughly 40K-character
+pages, even when the task Schema is several MiB. The main Agent remains available for questions and coordinates page
 generation through exactly one background Wiki writer. After four new batches,
 or after a 30-second debounce, that writer incrementally updates affected
 pages while extractors continue. A final all-batch reconciliation stabilizes
 the pages before Finalize.
+
+Each extractor invocation handles one batch and exits after its persisted
+checkpoint. On a later turn, `llm_wiki_status` exposes
+`worker_recovery.leases`; relaunching a short-lived extractor with the same
+`worker_id` resumes the same batch using a fresh MCP client connection. The
+workflow therefore does not depend on background Agent or MCP-client lifetime
+across turns, and it does not infer a disconnect when a successful status call
+shows the current connection is usable.
+
+Page planning restores the original rich-Wiki behavior without restoring the
+desktop runtime. Every important extracted entity, concept, and explicit page
+candidate becomes a paginated `page_requirement`; a projection cannot complete
+until canonical pages cover all requirements. The Core normalizes full page
+frontmatter, preserves summaries, tags, and source coverage, creates
+bidirectional Related navigation, writes rich source summaries, and rebuilds
+grouped index and knowledge-map overview pages. Expanded page types include
+research, business, reading, and personal-knowledge variants such as query,
+synthesis, finding, methodology, thesis, project, decision, chapter,
+character, theme, plot-thread, reflection, and journal.
 
 ## Architecture
 

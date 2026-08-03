@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto"
 import { fail } from "./errors.js"
 import { assertNoSymlinkEscape, validatePagePath } from "./validation.js"
 import { ensureDir, hashDirectory, nowIso, pathExists, readJson, sha256, writeJsonAtomic, writeTextAtomic } from "./utils.js"
+import { prepareWikiPageContent } from "./wiki-page.js"
 
 export async function commitPageTransaction(workspace, task, patches, basedOnWikiRevision) {
   const lockPath = path.join(workspace.paths.locks, "write.lock")
@@ -39,10 +40,12 @@ export async function commitPageTransaction(workspace, task, patches, basedOnWik
       const target = await assertNoSymlinkEscape(workspace.paths.root, relative)
       const exists = await pathExists(target)
       let currentHash
+      let currentContent = ""
       if (exists) {
         const info = await lstat(target)
         if (!info.isFile() || info.isSymbolicLink()) fail("INVALID_PAGE_PATH", "Existing page target is not a regular file.")
-        currentHash = sha256(await readFile(target))
+        currentContent = await readFile(target, "utf8")
+        currentHash = sha256(currentContent)
       }
       if (patch.operation === "create" && exists) {
         fail("FILE_HASH_CONFLICT", `Page already exists: ${relative}`, {
@@ -61,8 +64,9 @@ export async function commitPageTransaction(workspace, task, patches, basedOnWik
         }
       }
       const staged = path.join(stagingRoot, relative)
-      await writeTextAtomic(staged, normalizePageContent(patch.content))
-      targets.push({ patch, relative, target, staged, existed: exists, previousHash: currentHash })
+      const preparedContent = prepareWikiPageContent(patch, currentContent)
+      await writeTextAtomic(staged, preparedContent)
+      targets.push({ patch, relative, target, staged, preparedContent, existed: exists, previousHash: currentHash })
     }
 
     for (const item of targets) {
@@ -93,10 +97,13 @@ export async function commitPageTransaction(workspace, task, patches, basedOnWik
         path: item.relative,
         operation: item.patch.operation,
         previousHash: item.previousHash ?? null,
-        fileHash: sha256(normalizePageContent(item.patch.content)),
+        fileHash: sha256(item.preparedContent),
         title: item.patch.title,
         pageKind: item.patch.pageKind,
         sourceRefs: item.patch.sourceRefs,
+        covers: item.patch.covers ?? [],
+        related: item.patch.related ?? [],
+        summary: item.patch.summary ?? "",
         rationale: item.patch.rationale,
       })),
     }
@@ -113,10 +120,6 @@ export async function commitPageTransaction(workspace, task, patches, basedOnWik
     await lock.close().catch(() => {})
     await rm(lockPath, { force: true }).catch(() => {})
   }
-}
-
-function normalizePageContent(content) {
-  return `${content.replace(/\r\n?/g, "\n").trimEnd()}\n`
 }
 
 export async function committedPageRecords(workspace, transactionIds) {

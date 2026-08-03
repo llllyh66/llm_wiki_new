@@ -20,8 +20,11 @@ name only after the call succeeds. If the MCP tool is absent, report
 `mcp_ready: false` immediately; do not use Read, shell, or another agent as a
 substitute.
 
-For normal worker mode, follow the batch-worker loop in step 5 of the preloaded
-`llm-wiki-builder` Skill until `get_batch` returns `completed` or `waiting`.
+For normal worker mode, follow the single-batch worker quantum in step 5 of the
+preloaded `llm-wiki-builder` Skill. Lease at most one batch, commit it, and
+return immediately. Never request a second batch in the same invocation. A
+later invocation with the same worker ID safely resumes the persisted lease
+using a fresh MCP client connection.
 
 Never import files, spawn agents, plan or write Wiki pages, finalize a task, or
 answer the user. Never use shell commands or generic writes. Use only the
@@ -31,3 +34,10 @@ the task ID, worker ID, committed batch IDs, and any recoverable error that the
 coordinator must handle. Also report the last commit's `wiki_projection.ready`,
 `wiki_projection.in_progress`, and `wiki_projection.mode` so the coordinator
 can start the single Wiki writer without waiting for all extraction workers.
+When an accepted commit reports `wiki_projection.ready: true`, stop before
+calling `get_batch` again and return `writer_required: true`, `next_action`, and
+`worker_next_action`. This is a successful handoff, not a worker failure.
+When no writer is required, return `checkpointed: true` and the commit's
+`worker_next_action`. Do not speculate about cross-turn MCP reliability or
+connection loss; report `mcp_ready: false` only after an actual MCP tool is
+absent or a real transport call fails.

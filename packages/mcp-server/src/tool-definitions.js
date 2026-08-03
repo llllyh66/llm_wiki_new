@@ -57,7 +57,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
   },
   {
     name: "llm_wiki_get_page_plan_context",
-    description: "Lease and return bounded page-planning context. With writer_id, supports one incremental Wiki writer while extraction continues and a final full reconciliation after all batches. Repeat with the returned projection_id and next_cursor.",
+    description: "Lease and return bounded page-planning context. Full domain Schema definitions are deliberately omitted because extraction already enforced them. With writer_id, supports one incremental Wiki writer while extraction continues and a final full reconciliation after all batches. Repeat with the returned projection_id and next_cursor.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
@@ -86,7 +86,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
   },
   {
     name: "llm_wiki_status",
-    description: "Return one current-workspace task's persisted status and next action for interruption recovery.",
+    description: "Return one current-workspace task's persisted status, next action, and resumable worker leases. A replacement Agent using the same worker_id resumes its leased batch with a fresh MCP client connection.",
     inputSchema: closedObject({ task_id: taskId }, ["task_id"]),
   },
   {
