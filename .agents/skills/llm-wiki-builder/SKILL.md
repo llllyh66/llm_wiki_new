@@ -54,7 +54,12 @@ typed entity or any relation.
 
    After a successful coordinator status call, start exactly
    `parallel_extraction.recommended_workers` background project subagents
-   (currently capped at four). Assign stable IDs `extractor-1` through
+   (currently capped at four) by invoking the project Agent type
+   `llm-wiki-extractor` explicitly for every initial and replacement worker.
+   Never launch these slots as `general-purpose`, a dynamically composed
+   "Worker N", or an Agent Team teammate: those invocations do not apply
+   `.claude/agents/llm-wiki-extractor.md` and therefore may not receive its
+   `mcpServers` declaration. Assign stable IDs `extractor-1` through
    `extractor-N`, and keep the main Agent as a responsive coordinator. Give
    each worker only the task ID, its worker ID, this Skill path, and the
    bounded worker quantum below. Also pass
@@ -202,9 +207,9 @@ typed entity or any relation.
    was imported:
    - If the completed worker ID still appears in
      `status.worker_recovery.leases`, its invocation ended without clearing the
-     reserved batch. Immediately launch a replacement with the same worker ID
-     and explicit leased batch ID. Do not wait for another worker or lease
-     expiry.
+     reserved batch. Immediately launch a replacement using project Agent type
+     `llm-wiki-extractor`, the same worker ID, and explicit leased batch ID. Do
+     not wait for another worker or lease expiry.
    - If its lease is gone and `completed_batches < total_batches`, launch the
      next bounded worker invocation in that freed slot with the same stable ID;
      `get_batch` will lease the next available batch or return `waiting` when

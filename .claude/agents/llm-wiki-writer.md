@@ -16,7 +16,8 @@ the stable writer ID `wiki-writer-1`. Follow the Wiki-writer loop in the
 preloaded `llm-wiki-builder` Skill exactly.
 
 First call `llm_wiki_status` with the supplied task ID. If that MCP tool is not
-available, stop immediately and report `mcp_ready: false`; do not substitute
+initially visible, use `ToolSearch` once for `llm_wiki_status`. If it remains
+unavailable, stop immediately and report `mcp_ready: false`; do not substitute
 Read, shell, or another agent. Continue the projection only after returning
 `mcp_ready: true` internally from that successful probe.
 

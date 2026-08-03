@@ -1,7 +1,7 @@
 const taskId = { type: "string", description: "Task ID in the current workspace." }
 const closedObject = (properties, required = []) => ({ type: "object", properties, required, additionalProperties: false })
 
-export const TOOL_DEFINITIONS = Object.freeze([
+const toolDefinitions = [
   {
     name: "llm_wiki_import_files",
     description: "Import Agent-visible supported documents, including XLSX workbooks, into the current workspace's managed source store, parse and batch them, and create a resumable task. Initializes the workspace automatically.",
@@ -109,4 +109,9 @@ export const TOOL_DEFINITIONS = Object.freeze([
     description: "Run deterministic structural lint for the current Wiki, a task, or selected Agent-writable Wiki paths. It does not generate semantic content.",
     inputSchema: closedObject({ task_id: taskId, paths: { type: "array", items: { type: "string" }, maxItems: 100 } }),
   },
-])
+]
+
+export const TOOL_DEFINITIONS = Object.freeze(toolDefinitions.map((tool) => Object.freeze({
+  ...tool,
+  _meta: { ...(tool._meta ?? {}), "anthropic/alwaysLoad": true },
+})))

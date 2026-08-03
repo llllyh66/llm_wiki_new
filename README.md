@@ -52,6 +52,14 @@ for unattended extraction. Unrelated shell, write, and network tools remain
 unapproved. Approve project trust on first use, then restart Claude Code after
 changing these files.
 
+Every initial and replacement extraction slot explicitly uses the named project
+Agent type `llm-wiki-extractor`. Generic "Worker N", `general-purpose`, and
+Agent Team teammates are not used because they do not apply that Agent file's
+`mcpServers` declaration. Permissions list all 12 MCP tools explicitly, every
+published tool carries `anthropic/alwaysLoad`, and ToolSearch provides a
+deferred-discovery fallback. Claude Code 2.1.121 or later is recommended for
+the documented always-load behavior.
+
 For multi-batch imports, the Skill starts the Core-recommended number of
 background extraction agents (up to four). Stable worker leases keep batches
 distinct and task-level serialization prevents concurrent commits from losing

@@ -149,6 +149,11 @@ Agent，当前最多 4 个；大型 Schema 也不再降为 2 个，因为每个 
 或 Team。Worker 的第一次 `get_batch` 同时验证它自身的 MCP 继承。Team 初始化
 警告不代表 MCP 成功或失败；如果宿主已明确返回 worker 启动成功，主 Agent 不会再
 在协调器中重复抽取。
+首次启动和补位都必须显式使用项目 Agent 类型 `llm-wiki-extractor`，不能改用
+`general-purpose`、动态“Worker N”或 Agent Team teammate，因为它们不会加载该
+Agent 文件的 `mcpServers` 配置。项目同时显式允许 12 个 MCP 工具名，每个工具
+都发布 `anthropic/alwaysLoad` 元数据；如果宿主仍延迟加载，Worker 会先使用
+ToolSearch 发现工具，而不是直接判定 MCP 不可用。
 `.claude/agents/llm-wiki-writer.md` 使用同样的 MCP 复用方式，且每个任务同时
 只允许一个 `wiki-writer-1` 租约，避免页面冲突。
 

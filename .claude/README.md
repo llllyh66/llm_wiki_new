@@ -7,7 +7,9 @@ directory or deferred tool discovery cannot detach the workflow. Claude Code
 asks for project-server trust the first time it reads this file.
 
 `.claude/settings.json` approves the project `llm-wiki` server, every tool from
-that server, the builder Skill, all subagents, and read-only repository tools.
+that server (both server-wide and all 12 explicit tool names), the builder
+Skill, the named extractor/writer Agents, ToolSearch, all subagents, and
+read-only repository tools.
 It uses `dontAsk`, so background agents never pause for permission: tools not
 needed by the extraction workflow are denied instead of prompting. It does not
 grant blanket Bash, arbitrary file-write, network, or bypass-permissions access
@@ -59,6 +61,13 @@ pages remain provisional and excluded from retrieval until the writer completes
 the final all-batch reconciliation. The main Agent remains responsive for
 questions: retrieval defaults to BM25 + embedding while the task is building,
 then adds the Wiki channel automatically after Finalize.
+
+Every initial and replacement slot must use the exact project Agent type
+`llm-wiki-extractor`; a generic "Worker N", `general-purpose` Agent, or Team
+teammate does not apply that file's `mcpServers` field. The MCP server and all
+12 tools are marked always-load, with ToolSearch as a deferred-discovery
+fallback. Claude Code 2.1.121 or later is recommended because that release adds
+the documented `alwaysLoad` behavior; fully restart Claude Code after updating.
 
 The extraction hot path does not invoke retrieval for every batch. `get_batch`
 automatically includes bounded domain-Schema definitions matched from canonical

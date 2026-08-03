@@ -20,15 +20,24 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
     assert.match(agent, /^disallowedTools:/m)
     assert.match(agent, /^mcpServers:\n  - llm-wiki$/m)
     assert.match(agent, /^permissionMode: dontAsk$/m)
+    assert.match(agent, /ToolSearch/)
   }
   assert.equal(settings.enableAllProjectMcpServers, true)
+  assert.equal(settings.permissions.allow.includes("Agent(llm-wiki-extractor)"), true)
+  assert.equal(settings.permissions.allow.includes("Agent(llm-wiki-writer)"), true)
+  assert.equal(settings.permissions.allow.includes("ToolSearch"), true)
   assert.equal(settings.permissions.allow.includes("mcp__llm-wiki"), true)
   assert.equal(settings.permissions.allow.includes("mcp__llm-wiki__*"), true)
+  for (const tool of TOOL_DEFINITIONS) {
+    assert.equal(settings.permissions.allow.includes(`mcp__llm-wiki__${tool.name}`), true)
+  }
   assert.doesNotMatch(skill, /mode=capability-probe/)
   assert.match(skill, /calling `llm_wiki_status` directly in the coordinator/)
   assert.match(skill, /Agent\/Team initialization errors do not prove MCP readiness/)
   assert.match(skill, /do not simultaneously run\s+the same extraction quantum in the coordinator/)
   assert.match(skill, /do not retry with a\s+`general-purpose`/)
+  assert.match(skill, /Agent type\s+`llm-wiki-extractor` explicitly/)
+  assert.match(skill, /Never launch these slots as `general-purpose`/)
   assert.match(skill, /worker_batch_quantum/)
   assert.match(skill, /never more than three/)
   assert.match(skill, /commits a durable checkpoint after every batch/)
@@ -70,6 +79,7 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
     assert.equal(tool.inputSchema.type, "object")
     assert.equal(tool.inputSchema.additionalProperties, false)
     assert.equal(Array.isArray(tool.inputSchema.required), true)
+    assert.equal(tool._meta["anthropic/alwaysLoad"], true)
   }
 })
 

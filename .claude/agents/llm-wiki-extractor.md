@@ -23,8 +23,11 @@ process no more than the supplied quantum. A
 later invocation with the same worker ID safely resumes the persisted lease
 using a fresh MCP client connection.
 The first `llm_wiki_get_batch` call is also this worker's MCP capability check.
-Report `mcp_ready: false` only when that concrete tool is absent or raises a
-real transport error; ordinary `ok: false` results keep MCP usable.
+If that exact tool is not initially visible, use `ToolSearch` once for
+`llm_wiki_get_batch` before reporting failure; MCP tools may be deferred by the
+host. Report `mcp_ready: false` only when ToolSearch confirms it is absent or
+the concrete call raises a real transport error. Ordinary `ok: false` results
+keep MCP usable.
 Always pass `max_chars: 12000` to `llm_wiki_get_batch`; this is a safe persisted
 repartition, not response truncation.
 
