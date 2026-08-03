@@ -143,9 +143,11 @@ Agent，当前最多 4 个。每个 Agent 使用固定 `worker_id` 租约不同�
 项目级 `.claude/agents/llm-wiki-extractor.md` 会显式复用项目的
 `llm-wiki` MCP 连接，并通过 `disallowedTools` 禁用 Shell、任意写入、网络和
 嵌套 Agent。它不再用 `tools: Read, mcp__llm-wiki__*` 作为严格白名单，避免
-某些 Claude Code 版本未展开 MCP 通配符后只剩 Read 工具。启动 worker 池前
-会先运行一个不领取 batch 的 `llm_wiki_status` 能力探测；失败时不会再改用
-`general-purpose` Agent 反复尝试，而由主 Agent 继续当前任务。
+某些 Claude Code 版本未展开 MCP 通配符后只剩 Read 工具。启动 worker 池前，
+主 Agent 在协调器中直接调用一次 `llm_wiki_status`，不再为探测创建临时子 Agent
+或 Team。Worker 的第一次 `get_batch` 同时验证它自身的 MCP 继承。Team 初始化
+警告不代表 MCP 成功或失败；如果宿主已明确返回 worker 启动成功，主 Agent 不会再
+在协调器中重复抽取。
 `.claude/agents/llm-wiki-writer.md` 使用同样的 MCP 复用方式，且每个任务同时
 只允许一个 `wiki-writer-1` 租约，避免页面冲突。
 
@@ -468,6 +470,7 @@ MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 
 - 把所有超大文本块拆分到 Agent 传输硬上限 6,000 字符以内；
 - 即使工作区或旧任务把限制改得更大，每个 batch 也不会超过 24,000 字符；
+- 每个 batch 的序列化 chunk 载荷不超过 64 KiB，避免“文本不大但表格元数据很大”；
 - 同时按文字数和序列化字节数限制 batch；
 - 压缩包含超长单元格/表格字符串的 `structuredData`，避免 MCP JSON 出现 81K 单行；
 - 单个 chunk 同时服从 chunk 上限和 batch 上限，不会在每次调用时重复拆分；

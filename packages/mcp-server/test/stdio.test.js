@@ -314,6 +314,8 @@ test("built MCP server survives errors and completes the full workflow over one 
   assert.equal(largeBatch.isError, undefined)
   assert.equal(largeBatch.structuredContent.batch_limits.complete, true)
   assert.equal(largeBatch.structuredContent.batch_limits.char_count <= 12_000, true)
+  assert.equal(largeBatch.structuredContent.batch_limits.payload_bytes <= 64 * 1024, true)
+  assert.equal(largeBatch.structuredContent.batch_limits.agent_payload_ceiling_bytes, 64 * 1024)
   assert.equal(largeBatch.structuredContent.chunks.every((chunk) => chunk.text.length <= 6_000), true)
   assert.equal(Math.max(...largeBatch.content[0].text.split("\n").map((line) => line.length)) <= 7_000, true)
   const secondLargeBatch = await client.callTool({

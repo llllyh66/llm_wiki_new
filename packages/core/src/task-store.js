@@ -3,8 +3,9 @@ import { fail } from "./errors.js"
 import { ensureDir, newId, nowIso, pathExists, readJson, sha256, stableStringify, writeJsonAtomic } from "./utils.js"
 
 export const ACTIVE_TASK_STATUSES = ["importing", "parsing", "prepared", "extracting", "planning", "committing", "finalizing", "failed"]
-const MAX_TASK_CHUNK_PAYLOAD_BYTES = 96 * 1024
-const MIN_BATCH_PAYLOAD_BYTES = 128 * 1024
+const MAX_TASK_CHUNK_PAYLOAD_BYTES = 32 * 1024
+const MIN_BATCH_PAYLOAD_BYTES = 24 * 1024
+const MAX_AGENT_BATCH_PAYLOAD_BYTES = 64 * 1024
 // These are transport-safety ceilings, not tuning defaults. Claude may persist
 // a large MCP result as pretty JSON and read it line by line; one JSON string
 // must therefore never contain an 80K source line even when workspace limits
@@ -39,9 +40,11 @@ export async function createTask(workspace, sources, options = {}) {
   // A single chunk must fit both the chunk and batch limits. Otherwise a
   // one-chunk batch can remain oversized forever and be rebuilt on every
   // get_batch call, which also invalidates parallel worker leases.
+  const maxBatchPayloadBytes = batchPayloadLimit(maxBatchChars)
   const allChunks = boundTaskChunks(
     sources.flatMap((source) => source.chunks),
     Math.min(maxChunkChars, maxBatchChars),
+    Math.min(MAX_TASK_CHUNK_PAYLOAD_BYTES, maxBatchPayloadBytes),
   )
   const batches = makeBatches(taskId, allChunks, maxBatchChars)
   const timestamp = nowIso()
@@ -96,7 +99,7 @@ function makeBatches(taskId, chunks, maxChars) {
   let current = []
   let chars = 0
   let payloadBytes = 0
-  const maxPayloadBytes = Math.max(MIN_BATCH_PAYLOAD_BYTES, maxChars * 8)
+  const maxPayloadBytes = batchPayloadLimit(maxChars)
   const emit = () => {
     if (current.length === 0) return
     batches.push({ taskId, batchId: `batch-${String(batches.length + 1).padStart(4, "0")}`, chunks: current, charCount: chars, payloadBytes })
@@ -135,16 +138,18 @@ export async function ensureBoundedTaskBatches(record, limits) {
       batches.push(batch)
       continue
     }
+    const maxBatchPayloadBytes = batchPayloadLimit(maxBatchChars)
     const bounded = boundTaskChunks(
       batch.chunks,
       maxChunkChars,
+      Math.min(MAX_TASK_CHUNK_PAYLOAD_BYTES, maxBatchPayloadBytes),
     )
     const rebuilt = makeBatches(record.task.taskId, bounded, maxBatchChars)
     const originalBytes = batch.chunks.reduce((sum, chunk) => sum + Buffer.byteLength(JSON.stringify(chunk)), 0)
     const needsRebuild = bounded.length !== batch.chunks.length
       || bounded.some((chunk, index) => chunk.chunkId !== batch.chunks[index]?.chunkId)
       || batch.charCount > maxBatchChars
-      || originalBytes > Math.max(MIN_BATCH_PAYLOAD_BYTES, maxBatchChars * 8)
+      || originalBytes > maxBatchPayloadBytes
     if (!needsRebuild) {
       batches.push(batch)
       continue
@@ -170,13 +175,13 @@ export async function ensureBoundedTaskBatches(record, limits) {
   return record
 }
 
-function boundTaskChunks(chunks, maxChars) {
+function boundTaskChunks(chunks, maxChars, maxPayloadBytes = MAX_TASK_CHUNK_PAYLOAD_BYTES) {
   return chunks.flatMap((chunk) => {
     const text = typeof chunk?.text === "string" ? chunk.text : ""
     const payloadBytes = Buffer.byteLength(JSON.stringify(chunk))
     const nestedStringChars = maxNestedStringChars(chunk?.structuredData)
     if (text.length <= maxChars
-      && payloadBytes <= MAX_TASK_CHUNK_PAYLOAD_BYTES
+      && payloadBytes <= maxPayloadBytes
       && nestedStringChars <= MAX_AGENT_NESTED_STRING_CHARS) return [chunk]
     const pieces = splitChunkText(text, maxChars)
     return pieces.map((piece, index) => {
@@ -194,6 +199,13 @@ function boundTaskChunks(chunks, maxChars) {
       }
     })
   })
+}
+
+function batchPayloadLimit(maxChars) {
+  return Math.min(
+    MAX_AGENT_BATCH_PAYLOAD_BYTES,
+    Math.max(MIN_BATCH_PAYLOAD_BYTES, Math.ceil(maxChars * 4)),
+  )
 }
 
 function maxNestedStringChars(value) {

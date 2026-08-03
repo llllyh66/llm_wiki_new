@@ -43,18 +43,16 @@ typed entity or any relation.
    display name. Let the tool initialize the current workspace.
 3. Record the returned task ID in working context.
 4. Use background parallel extraction by default when
-   `parallel_extraction.enabled` is true. Before leasing any batch, start one
-   project `llm-wiki-extractor` with the task ID and
-   `mode=capability-probe`; wait for its single `llm_wiki_status` result. The
-   project agent explicitly reuses the configured `llm-wiki` MCP server and
-   denies unrelated built-in tools instead of allowlisting an MCP wildcard.
-   Continue with subagents only when the probe reports `mcp_ready: true` for
-   the same task. If it reports a missing MCP tool, do not retry with a
-   `general-purpose` or differently named subagent: those agents may inherit
-   the same restricted tool set. Run the single-batch worker quantum in the coordinator
-   for this session and report one compact compatibility warning.
+   `parallel_extraction.enabled` is true. After import, verify the task once by
+   calling `llm_wiki_status` directly in the coordinator. Do not create a
+   throwaway project Agent, Team, or capability-probe worker. The successful
+   import plus a structured status result proves the coordinator's MCP
+   connection; only that actual tool result may be described as "MCP ready".
+   Agent/Team initialization errors do not prove MCP readiness. Do not call
+   `spawnTeam`, `TeamCreate`, or `TeamDelete` for this workflow, and do not try
+   to repair a stale host Team before extraction.
 
-   After a successful probe, start exactly
+   After a successful coordinator status call, start exactly
    `parallel_extraction.recommended_workers` background project subagents
    (currently capped at four). Assign stable IDs `extractor-1` through
    `extractor-N`, and keep the main Agent as a responsive coordinator. Give
@@ -64,6 +62,13 @@ typed entity or any relation.
    Agent questions while extraction continues. Never create more workers than
    recommended and never let a worker import files, plan pages, commit pages,
    finalize, or answer the user.
+   Treat a host response that says the requested background agents were
+   launched as success even if it also contains an unrelated Team warning.
+   Add those worker IDs to `running_worker_ids` and do not simultaneously run
+   the same extraction quantum in the coordinator. Fall back to coordinator
+   extraction only when no worker was created, or when a created worker itself
+   reports that an `llm_wiki_*` tool is absent or raises a real transport error.
+   Never infer worker failure merely from Team lifecycle text.
    The coordinator must maintain a local `running_worker_ids` set. Add an ID
    when its subagent invocation starts and remove it immediately when that
    invocation sends any completion notification, before interpreting Core
@@ -210,8 +215,9 @@ typed entity or any relation.
    recovery. If batches remain unleased after a worker failure or lease expiry,
    start only enough replacement extractors to reach the recommended count. If
    a worker reports
-   `mcp_ready: false`, stop spawning replacements and continue remaining
-   batches in the coordinator; never enter a loop that launches differently
+   `mcp_ready: false` after an actual worker MCP call, do not retry with a
+   `general-purpose` Agent; stop spawning replacements and continue remaining
+   batches in the coordinator. Never enter a loop that launches differently
    named agents to test the same missing MCP capability.
    At the start of every later user/coordinator turn, call `llm_wiki_status`
    from the coordinator before discussing worker health. If it succeeds, MCP

@@ -42,9 +42,10 @@ reference documents, then ask:
 把这些文档构建成 llm_wiki 知识库。
 ```
 
-For imports with multiple batches, the Skill first runs one non-leasing MCP
-capability probe, then starts up to four background `llm-wiki-extractor` agents
-using distinct worker leases. Each extractor invocation processes one batch,
+For imports with multiple batches, the coordinator verifies the imported task
+with one direct `llm_wiki_status` call, then starts up to four background
+`llm-wiki-extractor` agents using distinct worker leases. It does not create a
+throwaway probe Agent or manage a Team. Each extractor invocation processes one batch,
 persists it, and exits; the coordinator then starts the next short invocation
 in that slot. This avoids depending on one long-lived subagent across user
 turns. Each project agent explicitly reuses the parent
@@ -79,9 +80,12 @@ still owns a lease, the same ID resumes that batch; otherwise it requests the
 next available batch. It never waits for a different extractor merely because
 both reservations were present before the completion notification.
 
-If the probe reports `mcp_ready: false`, the Skill does not retry with a
-`general-purpose` agent. It continues in the coordinator, because changing the
-agent name cannot repair an MCP server that was not inherited by subagents.
+If a worker's concrete MCP call reports `mcp_ready: false`, the Skill does not
+retry with a `general-purpose` agent. It continues in the coordinator, because
+changing the agent name cannot repair an MCP server that was not inherited by
+subagents. A Team initialization warning is not an MCP probe result. When the
+host confirms workers were launched, the coordinator tracks those workers and
+does not duplicate their work locally.
 After pulling this configuration change, fully restart Claude Code so existing
 subagent definitions are not reused from the prior session.
 

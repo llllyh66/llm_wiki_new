@@ -201,6 +201,7 @@ export class LlmWikiCore {
         complete: true,
         char_count: batch.charCount,
         payload_bytes: batch.payloadBytes ?? Buffer.byteLength(JSON.stringify(batch.chunks)),
+        agent_payload_ceiling_bytes: 64 * 1024,
         configured_max_chars: record.task.options.maxBatchChars,
         ...(requestedBatchChars !== null ? { requested_max_chars: requestedBatchChars, safely_repartitioned: true } : {}),
       },

@@ -12,19 +12,18 @@ background: true
 ---
 
 Act only as one background extraction worker. The coordinator must provide a
-task ID and either an unchanged worker ID or `mode=capability-probe`.
-
-For `mode=capability-probe`, call `llm_wiki_status` once with the supplied task
-ID. Do not lease a batch. Return `mcp_ready: true`, the task ID, and the tool
-name only after the call succeeds. If the MCP tool is absent, report
-`mcp_ready: false` immediately; do not use Read, shell, or another agent as a
-substitute.
+task ID and an unchanged worker ID. There is no capability-probe mode: the
+coordinator verifies task status directly before launching workers. Do not
+create, delete, or repair a Team.
 
 For normal worker mode, follow the single-batch worker quantum in step 5 of the
 preloaded `llm-wiki-builder` Skill. Lease at most one batch, commit it, and
 return immediately. Never request a second batch in the same invocation. A
 later invocation with the same worker ID safely resumes the persisted lease
 using a fresh MCP client connection.
+The first `llm_wiki_get_batch` call is also this worker's MCP capability check.
+Report `mcp_ready: false` only when that concrete tool is absent or raises a
+real transport error; ordinary `ok: false` results keep MCP usable.
 Always pass `max_chars: 12000` to `llm_wiki_get_batch`; this is a safe persisted
 repartition, not response truncation.
 

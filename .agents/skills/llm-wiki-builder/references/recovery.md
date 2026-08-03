@@ -27,10 +27,17 @@ completed worker's slot.
 If a worker reports that the saved MCP result contains one source/JSON line too
 large for the host reader, resume that lease with the same worker and batch IDs
 after rebuilding the current server. `get_batch` enforces hard Agent-facing
-ceilings (6K per chunk, 24K per batch), compacts oversized structured table
+ceilings (6K text per chunk, 24K text per batch, and 64 KiB serialized chunk
+payload per batch), compacts oversized structured table
 metadata, and repairs unfinished legacy batches without discarding the lease.
 Do not wait for expiry or send another worker to repeat the same unreadable
 response.
+
+Team lifecycle errors are host orchestration errors, not MCP results. If a host
+launch response confirms that worker IDs were created, track and wait for those
+workers; do not also extract in the coordinator. If no worker was created,
+continue one batch at a time in the coordinator without creating or deleting a
+Team. Never report MCP ready unless a real `llm_wiki_*` call succeeded.
 
 ## Validation failure
 

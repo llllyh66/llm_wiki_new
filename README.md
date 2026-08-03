@@ -55,10 +55,11 @@ changing these files.
 For multi-batch imports, the Skill starts the Core-recommended number of
 background extraction agents (up to four). Stable worker leases keep batches
 distinct and task-level serialization prevents concurrent commits from losing
-state. A non-leasing status probe first verifies that the project subagent can
-call the explicitly inherited `llm-wiki` MCP server; if not, the workflow
-falls back once to the coordinator instead of relaunching a general-purpose
-agent with the same restricted tools. When a commit makes a Wiki projection
+state. The coordinator verifies MCP with one direct task-status call; it does
+not create a throwaway probe Agent or a Team. A worker's first batch call checks
+its inherited MCP capability. Team lifecycle warnings are never treated as MCP
+success or failure, and successfully launched workers are not duplicated by
+coordinator extraction. When a commit makes a Wiki projection
 ready, that extractor returns immediately with `writer_required: true` so the
 coordinator starts `wiki-writer-1` before leasing more work. Page-plan responses
 never include the full extraction Schema and default to roughly 40K-character
@@ -137,7 +138,8 @@ also pass `max_chars: 12000` to `get_batch`; this safely persists smaller parts
 for every unfinished batch without truncating content, while preserving each
 original batch ID and reservation on its first repaired part.
 Agent transport ceilings are fixed at 6,000 characters per chunk and 24,000
-characters per batch, even when an old workspace requested larger values.
+characters per batch, with a 64 KiB serialized chunk-payload ceiling per batch,
+even when an old workspace requested larger values.
 Oversized structured table fields are compacted so pretty-printed MCP JSON does
 not contain an unreadable 80K single line. An unfinished legacy batch is
 repaired in place while preserving its original batch ID and worker lease.
