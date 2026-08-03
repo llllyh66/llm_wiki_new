@@ -259,8 +259,13 @@ typed entity or any relation.
    `mcp_ready: false`, perform the same writer loop in the coordinator instead
    of launching a general-purpose replacement. The Core normally opens a
    projection after four new batches, after the 30-second debounce, or
-   immediately for final reconciliation when all batches finish.
-8. The Wiki writer performs one projection:
+   immediately for final reconciliation when all batches finish. Each
+   incremental projection leases at most four batches, so an accumulated
+   backlog is checkpointed in bounded slices rather than becoming one giant
+   Writer prompt.
+8. One Wiki-writer invocation processes up to
+   `wiki_projection.writer_projection_quantum` projections (currently three),
+   committing each projection independently:
    1. Call `llm_wiki_get_page_plan_context` with task ID, writer ID, and cursor
       `0`, explicitly using `max_chars: 40000`. If it returns `waiting: true`,
       report normally and stop. Page-plan responses contain only domain Schema
@@ -271,6 +276,12 @@ typed entity or any relation.
       `based_on_wiki_revision`. Follow `next_cursor` to null, passing the same
       writer and projection IDs on every page, and accumulate all categories.
       If any revision changes, discard the plan and acquire a fresh projection.
+      `existing_pages` contains full content only for pages affected by this
+      projection (matching path, title, coverage, or provisional ownership).
+      `existing_page_catalog` contains compact metadata for unrelated pages;
+      use it to avoid duplicates, but never replace a catalog-only page without
+      receiving its full content and current hash in `existing_pages`. The page
+      patch Schema and domain metadata appear only on cursor zero.
    3. For `incremental` mode, update only pages affected by the projection's
       batch IDs. Reuse canonical paths, merge with existing grounded content,
       and avoid speculative or duplicate pages. For `final` mode, inspect all
@@ -306,6 +317,14 @@ typed entity or any relation.
    6. Treat incremental writes and incomplete multipart writes as provisional.
       They are deliberately excluded from retrieval. Only a completed `final`
       projection clears provisional state.
+   7. After a completed incremental commit, inspect `writer_next_action`. When
+      it requests `llm_wiki_get_page_plan_context` and the Writer quantum still
+      has capacity, immediately start the next projection with cursor zero and
+      the same writer ID; do not call status or wait for the 30-second debounce.
+      Return after three projections, when no backlog is ready, after a final
+      projection, or on a recoverable error. The coordinator then calls status
+      and immediately starts another bounded Writer invocation if backlog
+      remains ready.
 9. Continue extraction and Wiki projections as a pipeline. A Wiki writer may
    run while extractors process later batches; task locks and the single writer
    lease serialize state and page transactions without blocking retrieval.

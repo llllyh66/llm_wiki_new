@@ -137,6 +137,9 @@ Agent，当前最多 4 个；大型 Schema 也不再降为 2 个，因为每个 
 串行保护同一任务的状态提交，因此不会抢同一批次或覆盖其他 Agent 的结果。
 主 Agent 只负责协调和回答用户问题；唯一的后台 Wiki Writer 与抽取 Agent
 形成流水线，每新增 4 个 batch 或等待满 30 秒后增量更新受影响页面。
+每个增量投影最多租用 4 个 batch，一次 Writer 后台调用最多连续处理 3 个
+已就绪投影。当积压达到 4 个 batch 时不再强制等待冷却时间，但每次提交仍独立
+检查点化，不会把全部积压塞进一个超大提示。
 任一 `commit_analysis` 使投影就绪时，该 extractor 会立即返回
 `writer_required: true`，而不是继续领取 batch；主 Agent 随即启动
 `wiki-writer-1`，再按需补充 extractor。`status.next_action` 也会在投影就绪时
@@ -310,7 +313,10 @@ Skill 会先调用 `llm_wiki_list_tasks` 和 `llm_wiki_status`，然后按 `next
 
 - 新增 4 个已抽取 batch、最旧未投影 batch 等待超过 30 秒，或全部 batch
   完成时，Core 会开放一个 Wiki 投影窗口。
+- 每个增量窗口最多包含 4 个 batch；积压时 Writer 一次最多连续消化 3 个窗口。
 - 增量投影只更新受当前 batch 影响的页面，并标记为 provisional。
+- 受影响页面传输全文；无关旧页面只传输路径、标题、摘要和哈希等紧凑目录，
+  避免 Writer 成本随 Wiki 总文本量线性增长。
 - provisional 页面在所有未完成任务的检索中都被排除，不会污染用户问答。
 - 超大页面计划可在同一租约下分多次提交，每次最多 50 个 PagePatch。
 - 全部抽取完成后必须进行一次全局去重、矛盾合并和 provisional 复核；
@@ -472,6 +478,8 @@ MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 并将页面规划正文按约 40K 字符分页。Writer 应沿 `next_cursor` 读取完所有页面，
 不能以“忽略 Schema”或“忽略截断响应”的方式继续。如果旧任务显示
 `wiki_projection.in_progress: true`，使用相同的 `wiki-writer-1` 恢复该租约。
+已有积压时，每次提交返回的 `writer_next_action` 会直接指向下一个页面规划，
+Writer 在自己的有界 quantum 内直接继续，不需要等待主 Agent 再次询问状态。
 
 若行为仍与上述不符，说明另一台电脑还在运行旧的构建产物；执行
 `npm run build` 后完全退出并重新启动 Claude Code。

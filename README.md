@@ -74,7 +74,10 @@ never include the full extraction Schema and default to roughly 40K-character
 pages, even when the task Schema is several MiB. The main Agent remains available for questions and coordinates page
 generation through exactly one background Wiki writer. After four new batches,
 or after a 30-second debounce, that writer incrementally updates affected
-pages while extractors continue. A final all-batch reconciliation stabilizes
+pages while extractors continue. Each projection is capped at four batches;
+one Writer invocation drains up to three ready projections immediately when a
+backlog exists. Incremental plans include full content only for affected pages
+and compact catalog metadata for unrelated pages. A final all-batch reconciliation stabilizes
 the pages before Finalize.
 
 Each extractor invocation handles a bounded quantum of up to three batches,
@@ -179,7 +182,9 @@ default multi-route path for user questions.
 Incremental page projection is single-writer and lease-based. Intermediate
 paths are persisted as provisional task state and excluded from retrieval
 across every active task. Large projections may use several commits of at most
-50 patches each; the lease is released only by the final commit. Finalize is
+50 patches each; the lease is released only by the final commit. Backlogs
+bypass the normal cooldown while at least four unprojected batches remain, but
+each projection stays bounded and independently checkpointed. Finalize is
 blocked until one full reconciliation clears all provisional paths.
 
 ## Managed workspace

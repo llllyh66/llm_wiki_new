@@ -62,7 +62,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_page_plan_context",
-    description: "Lease and return bounded page-planning context. Full domain Schema definitions are deliberately omitted because extraction already enforced them. With writer_id, supports one incremental Wiki writer while extraction continues and a final full reconciliation after all batches. Repeat with the returned projection_id and next_cursor.",
+    description: "Lease and return bounded page-planning context. Incremental leases contain at most four batches, affected page bodies, and a compact unrelated-page catalog. Full domain Schema definitions are omitted because extraction already enforced them. Repeat with the returned projection_id and next_cursor.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },

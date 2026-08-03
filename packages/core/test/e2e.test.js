@@ -951,6 +951,78 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(completed.hits.some((hit) => hit.path === "wiki/topics/projected-entity.md"), true)
 })
 
+test("Wiki writer drains a backlog in bounded projections without resending unrelated page bodies", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const files = []
+  for (let index = 0; index < 12; index += 1) {
+    const file = path.join(f.incoming, `writer-backlog-${index}.md`)
+    await writeFile(file, `# Writer Backlog ${index}\n\nBusiness Entity is the canonical business object.\n\n## Aggregate\n\nAn Aggregate groups related Business Entities. ${"Context ".repeat(105)}\n`)
+    files.push({ path: file })
+  }
+  const imported = await f.core.importFiles({ files, options: { max_batch_chars: 1_000 } })
+  assert.equal(imported.batch_count, 12)
+  assert.equal(imported.wiki_projection.batch_limit, 4)
+  assert.equal(imported.wiki_projection.writer_projection_quantum, 3)
+
+  const refs = []
+  for (let index = 0; index < 8; index += 1) {
+    const batch = await f.core.getBatch({ task_id: imported.task_id, worker_id: `backlog-extractor-${index}` })
+    const { sourceRef, analysis } = analysisFor(imported.task_id, batch)
+    refs.push(sourceRef)
+    const committed = await f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      worker_id: batch.worker_id,
+      analysis,
+      idempotency_key: `writer-backlog-analysis-${index}`,
+    })
+    assert.equal(committed.accepted, true)
+  }
+
+  const concepts = path.join(f.workspace, "wiki", "concepts")
+  await mkdir(concepts, { recursive: true })
+  await writeFile(path.join(concepts, "unrelated-large.md"), `# Unrelated Large\n\n${"Unrelated content. ".repeat(2_000)}\n`)
+
+  const first = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 40_000 })
+  assert.equal(first.projection.mode, "incremental")
+  assert.equal(first.projection.batch_ids.length, 4)
+  assert.equal(first.existing_pages.some((page) => page.path === "wiki/concepts/unrelated-large.md"), false)
+  const catalogEntry = first.existing_page_catalog.find((page) => page.path === "wiki/concepts/unrelated-large.md")
+  assert.equal(catalogEntry.content_included, false)
+  assert.equal(catalogEntry.content, undefined)
+
+  const committed = await f.core.commitPages({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: first.projection.projection_id,
+    based_on_wiki_revision: first.based_on_wiki_revision,
+    idempotency_key: "writer-backlog-pages-1",
+    patches: [{
+      patchId: "writer-backlog-page-1",
+      path: "wiki/concepts/business-entity.md",
+      operation: "create",
+      title: "Business Entity",
+      pageKind: "concept",
+      content: "# Business Entity\n\nA canonical business object with Aggregate context.",
+      covers: first.page_requirements.map((requirement) => requirement.requirement_id),
+      sourceRefs: [refs[0]],
+      rationale: "Materialize the bounded backlog projection.",
+    }],
+  })
+  assert.equal(committed.wiki_projection.ready, true)
+  assert.equal(committed.wiki_projection.unprojected_batches, 4)
+  assert.equal(committed.next_action.tool, "llm_wiki_get_page_plan_context")
+  assert.equal(committed.writer_next_action.tool, "llm_wiki_get_page_plan_context")
+
+  const second = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 40_000 })
+  assert.equal(second.projection.batch_ids.length, 4)
+  assert.equal(second.projection.batch_ids.some((batchId) => first.projection.batch_ids.includes(batchId)), false)
+  const affected = second.existing_pages.find((page) => page.path === "wiki/concepts/business-entity.md")
+  assert.equal(typeof affected.content, "string")
+  assert.equal(second.existing_page_catalog.some((page) => page.path === "wiki/concepts/unrelated-large.md"), true)
+})
+
 test("duplicate content is reused and task recovery and abort stay workspace-scoped", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))

@@ -64,6 +64,8 @@ export async function createTask(workspace, sources, options = {}) {
     batchCompletedAt: {},
     pageProjection: {
       batchThreshold: 4,
+      batchLimit: 4,
+      writerProjectionQuantum: 3,
       debounceMs: 30_000,
       projectedBatchIds: [],
       revision: 0,

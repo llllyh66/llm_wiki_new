@@ -55,8 +55,10 @@ one long-lived subagent across user turns. Each project agent explicitly reuses 
 `llm-wiki` MCP connection and uses a denylist for shell, writes, network, and
 nested agents; it does not use a fragile MCP wildcard as its complete tool
 allowlist. The agent runs in `dontAsk` mode. One
-`llm-wiki-writer` agent consumes leased micro-batch projections after four new
-batches or a 30-second debounce, while later extraction continues. Incremental
+`llm-wiki-writer` agent consumes projections of at most four batches after four
+new batches or a 30-second debounce, while later extraction continues. One
+Writer invocation drains up to three ready projections without an intermediate
+status call or cooldown. Incremental
 pages remain provisional and excluded from retrieval until the writer completes
 the final all-batch reconciliation. The main Agent remains responsive for
 questions: retrieval defaults to BM25 + embedding while the task is building,
@@ -81,6 +83,9 @@ commit makes a projection ready. The coordinator starts `wiki-writer-1` before
 replacing that extractor. Page-plan calls use 40K-character pages and include
 only domain Schema identity metadata, so a multi-megabyte extraction Schema is
 never copied into the Wiki writer's tool response.
+Incremental page plans include full text only for pages affected by the current
+projection. Unrelated pages are represented by compact catalog entries, so
+Writer cost no longer grows with the total byte size of the existing Wiki.
 
 At the beginning of a later user turn, the coordinator calls
 `llm_wiki_status`. Its `worker_recovery.leases` list contains each persisted

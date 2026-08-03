@@ -58,7 +58,7 @@ import {
 } from "./utils.js"
 
 const BATCH_LEASE_MS = 30 * 60 * 1_000
-const PAGE_PROJECTION_LEASE_MS = 30 * 60 * 1_000
+const PAGE_PROJECTION_LEASE_MS = 60 * 60 * 1_000
 
 export class LlmWikiCore {
   static async open(workspaceRoot = process.cwd()) {
@@ -121,6 +121,8 @@ export class LlmWikiCore {
       wiki_projection: {
         enabled: true,
         batch_threshold: task.pageProjection.batchThreshold,
+        batch_limit: task.pageProjection.batchLimit,
+        writer_projection_quantum: task.pageProjection.writerProjectionQuantum,
         debounce_ms: task.pageProjection.debounceMs,
         writer_count: 1,
       },
@@ -417,19 +419,37 @@ export class LlmWikiCore {
     const analysisBatchIds = projection?.batchIds ?? record.batches.map((batch) => batch.batchId)
     const analyses = []
     for (const batchId of analysisBatchIds) analyses.push(await readJson(path.join(record.paths.analysis, `${batchId}.json`)))
+    const requirements = derivePageRequirements(analyses)
+    const requirementIds = new Set(requirements.map((item) => item.requirement_id))
+    const requirementTitles = new Set(requirements.map((item) => canonicalPageSlug(item.title)))
+    const preferredPaths = new Set(requirements.map((item) => item.preferred_path))
     const provisionalOwners = await workspaceProvisionalPageOwners(workspace, record.task)
     const existingPages = []
+    const existingPageCatalog = []
     for (const file of await listFilesRecursive(workspace.paths.wiki, (candidate) => candidate.endsWith(".md"))) {
       const content = await readFile(file, "utf8")
       const relative = `wiki/${relativePosix(workspace.paths.wiki, file)}`
-      existingPages.push({
+      const parsed = parseWikiPage(content)
+      const metadata = {
         path: relative,
-        title: content.match(/^#\s+(.+)$/m)?.[1]?.trim() || path.basename(file, ".md"),
-        content,
+        title: parsed.title || path.basename(file, ".md"),
+        page_kind: parsed.type || null,
+        summary: parsed.summary,
+        covers: parsed.covers,
         file_hash: sha256(content),
         provisional: provisionalOwners.has(relative),
         ...(provisionalOwners.has(relative) ? { provisional_task_id: provisionalOwners.get(relative) } : {}),
-      })
+      }
+      const affected = !projection
+        || preferredPaths.has(relative)
+        || requirementTitles.has(canonicalPageSlug(metadata.title))
+        || parsed.covers.some((requirementId) => requirementIds.has(requirementId))
+        || provisionalOwners.get(relative) === record.task.taskId
+      if (affected) existingPages.push({ ...metadata, content })
+      else {
+        const { covers, ...catalogMetadata } = metadata
+        existingPageCatalog.push({ ...catalogMetadata, covers_count: covers.length, content_included: false })
+      }
     }
     const revision = await hashDirectory(workspace.paths.wiki)
     if (projection?.wikiRevision && projection.wikiRevision !== revision) {
@@ -454,8 +474,9 @@ export class LlmWikiCore {
       relations: deduplicateExact(analyses.flatMap((analysis) => analysis.relations)),
       candidate_pages: deduplicateExact(analyses.flatMap((analysis) => analysis.candidatePages)),
       existing_pages: existingPages,
+      existing_page_catalog: existingPageCatalog,
       conflicts: analyses.flatMap((analysis) => analysis.contradictions),
-      required_pages: derivePageRequirements(analyses),
+      required_pages: requirements,
     }
     const page = paginatePagePlan(context, input?.cursor, input?.max_chars, workspace.config.limits.maxPagePlanChars)
     return {
@@ -469,13 +490,16 @@ export class LlmWikiCore {
       },
       candidate_pages: page.values.candidate_pages,
       existing_pages: page.values.existing_pages,
+      existing_page_catalog: page.values.existing_page_catalog,
       conflicts: page.values.conflicts,
       page_requirements: page.values.required_pages,
-      page_patch_schema: pagePatchSchema,
-      // Extraction has already enforced the task Schema. Page planning needs
-      // only stable identity metadata, never the multi-megabyte definitions.
-      domain_schema: pagePlanDomainSchemaMetadata(record.task.domainSchema),
-      domain_schema_pagination: null,
+      ...(page.pagination.cursor === 0 ? {
+        page_patch_schema: pagePatchSchema,
+        // Extraction has already enforced the task Schema. Page planning needs
+        // only stable identity metadata, never the multi-megabyte definitions.
+        domain_schema: pagePlanDomainSchemaMetadata(record.task.domainSchema),
+        domain_schema_pagination: null,
+      } : {}),
       based_on_wiki_revision: revision,
       ...(projection ? {
         projection: publicProjection(projection),
@@ -614,9 +638,14 @@ export class LlmWikiCore {
                 based_on_wiki_revision: journal.wikiRevision,
               },
             }
+          : projection?.mode === "incremental" && wikiProjection?.ready
+          ? { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: record.task.taskId, writer_id: projection.writerId } }
           : projection?.mode === "incremental"
           ? { tool: "llm_wiki_status", arguments: { task_id: record.task.taskId } }
           : { tool: "llm_wiki_finalize", arguments: { task_id: record.task.taskId } },
+        writer_next_action: projection?.mode === "incremental" && wikiProjection?.ready
+          ? { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: record.task.taskId, writer_id: projection.writerId } }
+          : null,
       }
     })
     return { ...idempotent.response, idempotent_replay: idempotent.replayed }
@@ -838,6 +867,8 @@ function projectionState(task) {
   const current = task.pageProjection && typeof task.pageProjection === "object" ? task.pageProjection : {}
   Object.assign(current, {
     batchThreshold: Number.isInteger(current.batchThreshold) && current.batchThreshold > 0 ? current.batchThreshold : 4,
+    batchLimit: Number.isInteger(current.batchLimit) && current.batchLimit > 0 ? current.batchLimit : 4,
+    writerProjectionQuantum: Number.isInteger(current.writerProjectionQuantum) && current.writerProjectionQuantum > 0 ? current.writerProjectionQuantum : 3,
     debounceMs: Number.isInteger(current.debounceMs) && current.debounceMs >= 0 ? current.debounceMs : 30_000,
     projectedBatchIds: Array.isArray(current.projectedBatchIds) ? current.projectedBatchIds : [],
     revision: Number.isInteger(current.revision) && current.revision >= 0 ? current.revision : 0,
@@ -869,7 +900,10 @@ function pageProjectionStatus(task) {
   const ageReady = unprojected.length > 0 && now - oldestUnprojectedAt >= state.debounceMs
   const cooldownReady = lastCommittedAt === null || now - lastCommittedAt >= state.debounceMs
   const finalReady = allComplete && !state.finalCompleted
-  const incrementalReady = !allComplete && unprojected.length > 0 && cooldownReady && (countReady || ageReady)
+  // A real backlog bypasses the debounce/cooldown. The lease itself is capped,
+  // so the writer checkpoints frequently instead of swallowing the backlog in
+  // one unbounded projection.
+  const incrementalReady = !allComplete && unprojected.length > 0 && (countReady || (cooldownReady && ageReady))
   const ready = !state.lease && (finalReady || incrementalReady)
   let nextReadyAt = null
   if (!ready && !state.lease && !allComplete && unprojected.length > 0) {
@@ -882,6 +916,8 @@ function pageProjectionStatus(task) {
     ready,
     mode: finalReady ? "final" : incrementalReady ? "incremental" : null,
     batch_threshold: state.batchThreshold,
+    projection_batch_limit: state.batchLimit,
+    writer_projection_quantum: state.writerProjectionQuantum,
     debounce_ms: state.debounceMs,
     projected_batches: state.projectedBatchIds.length,
     unprojected_batches: unprojected.length,
@@ -917,7 +953,7 @@ function acquirePageProjection(task, input) {
   const projected = new Set(state.projectedBatchIds)
   const batchIds = mode === "final"
     ? [...task.completedBatchIds].sort()
-    : task.completedBatchIds.filter((batchId) => !projected.has(batchId)).sort()
+    : task.completedBatchIds.filter((batchId) => !projected.has(batchId)).sort().slice(0, state.batchLimit)
   const timestamp = nowIso()
   state.lease = {
     projectionId: newId("projection"),
@@ -1200,7 +1236,7 @@ function paginatePagePlan(context, requestedCursor, requestedMaxChars, configure
   const cursor = requestedCursor === undefined || requestedCursor === null ? 0 : Number(requestedCursor)
   if (!Number.isInteger(cursor) || cursor < 0) fail("INVALID_INPUT", "cursor must be a non-negative integer.")
   const maxChars = Math.min(Math.max(Number(requestedMaxChars) || 40_000, 20_000), configuredMaxChars)
-  const categories = ["batches", "required_pages", "entities", "concepts", "claims", "relations", "candidate_pages", "existing_pages", "conflicts"]
+  const categories = ["batches", "required_pages", "entities", "concepts", "claims", "relations", "candidate_pages", "existing_pages", "existing_page_catalog", "conflicts"]
   const records = categories.flatMap((category) => context[category].map((value) => ({ category, value })))
   if (cursor > records.length) fail("INVALID_INPUT", "cursor is beyond the available page-plan context.")
   const values = Object.fromEntries(categories.map((category) => [category, []]))

@@ -77,6 +77,10 @@ If a multipart projection worker stops, inspect `wiki_projection` in status.
 While `in_progress` remains true, do not compete for its lease. After expiry,
 the same stable writer ID can acquire a replacement projection. Paths written
 by an incomplete projection remain provisional and excluded from retrieval.
+If the Writer returns normally after reaching its projection quantum and
+status still reports `ready: true`, immediately launch another bounded
+`wiki-writer-1` invocation. A ready backlog of at least four batches bypasses
+the normal debounce, and each new lease remains capped at four batches.
 
 ## Failed Finalize
 
