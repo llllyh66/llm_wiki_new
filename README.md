@@ -55,7 +55,7 @@ changing these files.
 Every initial and replacement extraction slot explicitly uses the named project
 Agent type `llm-wiki-extractor`. Generic "Worker N", `general-purpose`, and
 Agent Team teammates are not used because they do not apply that Agent file's
-`mcpServers` declaration. Permissions list all 12 MCP tools explicitly, every
+`mcpServers` declaration. Permissions list all 13 MCP tools explicitly, every
 published tool carries `anthropic/alwaysLoad`, and ToolSearch provides a
 deferred-discovery fallback. Claude Code 2.1.121 or later is recommended for
 the documented always-load behavior.
@@ -119,9 +119,11 @@ Codex / OpenCode / Claude Code current model
   -> wiki/ and .llm-wiki/ in the current workspace
 ```
 
-The host Agent owns semantic analysis, canonical page planning, contradiction
-resolution, and prose generation. The Core owns deterministic operations and
-never launches a model, `codex`, `claude`, or arbitrary shell command.
+The host Agent owns semantic extraction and contradiction resolution. The Core
+owns deterministic validation, canonical projection of those validated facts,
+transactions, and indexes; it never launches a model, `codex`, `claude`, or an
+arbitrary shell command. Legacy Agent-authored page planning remains available
+for custom prose workflows, but is no longer on the default ingestion path.
 
 ## MCP tools
 
@@ -130,6 +132,7 @@ never launches a model, `codex`, `claude`, or arbitrary shell command.
 - `llm_wiki_get_domain_schema`
 - `llm_wiki_retrieve_context`
 - `llm_wiki_commit_analysis`
+- `llm_wiki_apply_projection` (fast default Writer path)
 - `llm_wiki_get_page_plan_context`
 - `llm_wiki_commit_pages`
 - `llm_wiki_finalize`
@@ -144,7 +147,7 @@ opens are files explicitly passed to `llm_wiki_import_files`; after a safe,
 streaming import, all later work uses the managed copy.
 
 The Claude Code registration uses `CLAUDE_PROJECT_DIR` rather than a mutable
-shell working directory and keeps this bounded 12-tool server loaded for the
+shell working directory and keeps this bounded 13-tool server loaded for the
 session. MCP input/output budgets and paginated page-plan context prevent a
 single oversized request or response from closing the STDIO transport.
 Every tool exception is returned as a normal result (`ok: false`,

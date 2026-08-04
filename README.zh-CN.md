@@ -97,7 +97,7 @@ claude
 ```
 
 根目录的 `.mcp.json` 会使用 `CLAUDE_PROJECT_DIR` 锁定服务器脚本和工作区路径，
-并让这个 12 工具的服务器在会话期间保持加载。第一次打开项目时，Claude Code
+并让这个 13 工具的服务器在会话期间保持加载。第一次打开项目时，Claude Code
 会请求批准项目 MCP，请确认批准。
 
 ### 2. 检查 MCP
@@ -120,7 +120,7 @@ llm-wiki: node packages/mcp-server/dist/index.js --workspace . - Connected
 /mcp
 ```
 
-`llm-wiki` 应显示 `Connected` 和 12 个工具。
+`llm-wiki` 应显示 `Connected` 和 13 个工具。
 
 页面规划上下文会自动分页，Skill 会持续读取到 `next_cursor` 为空；大请求和大结果
 也有明确预算，超过限制时会返回可恢复错误，而不是关闭 MCP 连接。
@@ -137,13 +137,13 @@ Agent，当前最多 4 个；大型 Schema 也不再降为 2 个，因为每个 
 串行保护同一任务的状态提交，因此不会抢同一批次或覆盖其他 Agent 的结果。
 主 Agent 只负责协调和回答用户问题；唯一的后台 Wiki Writer 与抽取 Agent
 形成流水线，每新增 4 个 batch 或等待满 30 秒后增量更新受影响页面。
-每个增量投影最多租用 8 个 batch，一次 Writer 后台调用最多连续处理 6 个
-已就绪投影。当积压达到 4 个 batch 时不再强制等待冷却时间，但每次提交仍独立
-检查点化，不会把全部积压塞进一个超大提示。
+默认快速投影每次最多处理 32 个 batch，一次 Writer 后台调用最多连续处理 6 个
+已就绪投影。Core 直接把已验证的实体、属性、事实、关系和证据渲染成页面，
+无需 Agent 逐页写作、分页收集 page plan 或复制 quote。
 任一 `commit_analysis` 使投影就绪时，该 extractor 会立即返回
 `writer_required: true`，而不是继续领取 batch；主 Agent 随即启动
 `wiki-writer-1`，再按需补充 extractor。`status.next_action` 也会在投影就绪时
-优先指向 `llm_wiki_get_page_plan_context`，因此不需要等用户追问才生成页面。
+优先指向 `llm_wiki_apply_projection`，因此不需要等用户追问才生成页面。
 项目级 `.claude/agents/llm-wiki-extractor.md` 会显式复用项目的
 `llm-wiki` MCP 连接，并通过 `disallowedTools` 禁用 Shell、任意写入、网络和
 嵌套 Agent。它不再用 `tools: Read, mcp__llm-wiki__*` 作为严格白名单，避免
@@ -154,7 +154,7 @@ Agent，当前最多 4 个；大型 Schema 也不再降为 2 个，因为每个 
 在协调器中重复抽取。
 首次启动和补位都必须显式使用项目 Agent 类型 `llm-wiki-extractor`，不能改用
 `general-purpose`、动态“Worker N”或 Agent Team teammate，因为它们不会加载该
-Agent 文件的 `mcpServers` 配置。项目同时显式允许 12 个 MCP 工具名，每个工具
+Agent 文件的 `mcpServers` 配置。项目同时显式允许 13 个 MCP 工具名，每个工具
 都发布 `anthropic/alwaysLoad` 元数据；如果宿主仍延迟加载，Worker 会先使用
 ToolSearch 发现工具，而不是直接判定 MCP 不可用。
 `.claude/agents/llm-wiki-writer.md` 使用同样的 MCP 复用方式，且每个任务同时
@@ -316,13 +316,11 @@ Skill 会先调用 `llm_wiki_list_tasks` 和 `llm_wiki_status`，然后按 `next
 
 - 新增 4 个已抽取 batch、最旧未投影 batch 等待超过 30 秒，或全部 batch
   完成时，Core 会开放一个 Wiki 投影窗口。
-- 每个增量窗口最多包含 8 个 batch；积压时 Writer 一次最多连续消化 6 个窗口。
+- 默认快速投影窗口最多包含 32 个 batch；积压时 Writer 一次最多连续消化 6 个窗口。
 - 增量投影只更新受当前 batch 影响的页面，并标记为 provisional。
-- 受影响页面传输全文；无关旧页面只传输路径、标题、摘要和哈希等紧凑目录，
-  避免 Writer 成本随 Wiki 总文本量线性增长。
-- 每个 `page_requirement` 都带有服务端生成的 `patch_scaffold`；Writer 只需
-  添加页面正文，SourceRef 用 requirement ID 表示，由 Core 解析成精确引用。
-- 页面计划的后续分页直接读取稳定快照，不再重新读取全部分析和 Wiki 页面。
+- Core 使用已验证分析和服务端保存的精确 SourceRef 生成页面，不把大型
+  Schema、旧页全文或页面补丁发给 Agent。
+- 传统 `page_requirement + patch_scaffold` 流程仅作为自定义散文和旧服务兼容路径。
 - provisional 页面在所有未完成任务的检索中都被排除，不会污染用户问答。
 - 超大页面计划可在同一租约下分多次提交，每次最多 50 个 PagePatch。
 - 全部抽取完成后必须进行一次全局去重、矛盾合并和 provisional 复核；
@@ -419,7 +417,7 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
 
 ### MCP 已连接，但工具无法调用
 
-1. 在 Claude Code 中运行 `/mcp`，确认已批准且工具数为 12。
+1. 在 Claude Code 中运行 `/mcp`，确认已批准且工具数为 13。
 2. 运行 `npm run build`，然后重启 Claude Code。
 3. 确保是从项目根目录启动。
 4. 显式测试：
@@ -464,9 +462,9 @@ npm test
 ```
 
 然后完全退出 Claude Code，从该项目根目录重新运行 `claude`，批准项目 MCP，
-并用 `/mcp` 确认 `llm-wiki` 为 `Connected` 且有 12 个工具。最新版包含连续
+并用 `/mcp` 确认 `llm-wiki` 为 `Connected` 且有 13 个工具。最新版包含连续
 `INVALID_ANALYSIS`、错误 SourceRef 和畸形重试后保持同一 STDIO 连接存活的
-回归测试。现在 12 个工具的所有异常都作为普通工具结果返回，不再进入
+回归测试。现在 13 个工具的所有异常都作为普通工具结果返回，不再进入
 MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 `error`、`next_action` 和 `mcp_connection_usable: true`。Agent 应按
 `next_action` 修正或恢复，不需要执行 `/mcp`。
@@ -474,17 +472,19 @@ MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 ### 已完成多个 batch，但没有生成 Wiki 页面
 
 运行 `llm_wiki_status`。当 `wiki_projection.ready` 为 `true` 时，最新版会让
-`next_action.tool` 直接返回 `llm_wiki_get_page_plan_context`，并带上固定的
-`writer_id: wiki-writer-1`。后台 extractor 也会停止并向主 Agent 返回
+`next_action.tool` 直接返回 `llm_wiki_apply_projection`，并带上固定的
+`writer_id: wiki-writer-1`。它会由服务端确定性生成和提交页面，不再让 Agent 逐页写作。
+后台 extractor 也会停止并向主 Agent 返回
 `writer_required: true`，从而触发 Writer；不要继续等待更多 batch，也不要启动
 第二个 Writer。
 
-页面规划不需要重新读取抽取 Schema。即使领域 Schema 接近 5 MiB，
-`llm_wiki_get_page_plan_context` 也只返回 Schema ID、版本、哈希和大小元数据，
+默认快速投影不会把 Schema 或页面正文发给 Agent。仅在兼容旧服务或显式要求
+自定义页面散文时才走传统页面规划。即使领域 Schema 接近 5 MiB，
+传统 `llm_wiki_get_page_plan_context` 也只返回 Schema ID、版本、哈希和大小元数据，
 并将页面规划正文按约 40K 字符分页。Writer 应沿 `next_cursor` 读取完所有页面，
 不能以“忽略 Schema”或“忽略截断响应”的方式继续。如果旧任务显示
 `wiki_projection.in_progress: true`，使用相同的 `wiki-writer-1` 恢复该租约。
-已有积压时，每次提交返回的 `writer_next_action` 会直接指向下一个页面规划，
+传统 Writer 流程已有积压时，每次提交返回的 `writer_next_action` 会直接指向下一个页面规划，
 Writer 在自己的有界 quantum 内直接继续，不需要等待主 Agent 再次询问状态。
 
 若行为仍与上述不符，说明另一台电脑还在运行旧的构建产物；执行

@@ -72,6 +72,16 @@ const toolDefinitions = [
     }, ["task_id"]),
   },
   {
+    name: "llm_wiki_apply_projection",
+    description: "Fast default Wiki writer path. Deterministically render validated entities, properties, claims, relations, exact evidence, and Related links into canonical pages, atomically commit bounded transactions, and drain multiple queued projections without per-page Agent drafting or quote transcription.",
+    inputSchema: closedObject({
+      task_id: taskId,
+      writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
+      projection_id: { type: "string", minLength: 1, maxLength: 100, description: "Resume an existing projection lease. Omit to acquire the next ready projection." },
+      max_projections: { type: "integer", minimum: 1, maximum: 24, description: "Maximum bounded projections to drain in this call. Defaults to six." },
+    }, ["task_id"]),
+  },
+  {
     name: "llm_wiki_commit_pages",
     description: "Atomically commit one fully collected leased Wiki projection. Read all page-plan cursors before the first commit, then use projection_complete:false only to split the accumulated patches into bounded transactions. A rejected atomic call stores none of its patches and returns the complete retry scope; correct all listed errors and resubmit that entire rejected subset. Transactions use target-page create/hash checks, so unrelated task writes do not invalidate the plan.",
     inputSchema: closedObject({

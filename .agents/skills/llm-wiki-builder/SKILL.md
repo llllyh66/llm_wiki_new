@@ -292,15 +292,32 @@ typed entity or any relation.
    of launching a general-purpose replacement. The Core normally opens a
    projection after four new batches, after the 30-second debounce, or
    immediately for final reconciliation when all batches finish. Each
-   incremental projection leases at most eight batches, so an accumulated
-   backlog is amortized across fewer canonical-page updates without becoming
-   one giant Writer prompt. If extraction finishes with unprojected batches,
+   default fast projection leases at most 32 batches. The legacy Agent-authored
+   projection path remains capped at eight batches. Thus an accumulated backlog
+   is amortized across fewer canonical-page updates without becoming one giant
+   Writer prompt. If extraction finishes with unprojected batches,
    Core drains those bounded incremental catch-up projections before opening
    final reconciliation; it never turns the entire task into one premature
    final projection.
-8. One Wiki-writer invocation processes up to
-   `wiki_projection.writer_projection_quantum` projections (currently six),
-   committing each projection independently:
+8. The default Writer hot path is `llm_wiki_apply_projection`. Call the exact
+   action supplied by status or `commit_analysis`, with stable Writer ID
+   `wiki-writer-1` and `max_projections` set to
+   `wiki_projection.writer_projection_quantum` (currently six). The Core
+   deterministically renders already validated entities, allowed properties,
+   claims, typed relations, exact evidence, and Related links; splits page
+   writes into bounded atomic transactions; and drains up to 32 extraction
+   batches per incremental projection. It never invents semantic facts. This
+   eliminates per-page Agent drafting, quote transcription, page-plan
+   pagination, and validation retry loops from the normal pipeline. Return the
+   compact projection report after that call; if its next action is another
+   `llm_wiki_apply_projection` and the invocation quantum still has capacity,
+   follow it directly. The tool itself normally consumes that complete quantum
+   in one call.
+
+   Use the following legacy manual Writer loop only when a current server
+   explicitly returns `llm_wiki_get_page_plan_context` or does not publish
+   `llm_wiki_apply_projection`. One legacy Wiki-writer invocation processes up
+   to six projections, committing each projection independently:
    1. Call `llm_wiki_get_page_plan_context` with task ID, writer ID, and cursor
       `0`, explicitly using `max_chars: 40000`. If it returns `waiting: true`,
       report normally and stop. Page-plan responses contain only domain Schema

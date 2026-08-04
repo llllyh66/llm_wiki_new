@@ -32,7 +32,7 @@ An Aggregate groups related Business Entities.
 }
 
 function analysisFor(taskId, batch) {
-  const chunk = batch.chunks[0]
+  const chunk = batch.chunks.find((item) => item.text.includes("Business Entity is the canonical business object."))
   const sourceRef = {
     sourceId: chunk.sourceId,
     chunkId: chunk.chunkId,
@@ -1039,9 +1039,9 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(ready.status, "extracting")
   assert.equal(ready.wiki_projection.ready, true)
   assert.equal(ready.wiki_projection.mode, "incremental")
-  assert.equal(ready.next_action.tool, "llm_wiki_get_page_plan_context")
+  assert.equal(ready.next_action.tool, "llm_wiki_apply_projection")
   assert.equal(ready.next_action.arguments.writer_id, "wiki-writer-1")
-  assert.equal(projectionSignal.next_action.tool, "llm_wiki_get_page_plan_context")
+  assert.equal(projectionSignal.next_action.tool, "llm_wiki_apply_projection")
   assert.equal(projectionSignal.worker_next_action.tool, "llm_wiki_get_batch")
 
   const incrementalPlan = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1" })
@@ -1057,13 +1057,12 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(leasedStatus.wiki_projection.page_plan_complete, true)
   assert.equal(leasedStatus.wiki_projection.page_plan_next_cursor, null)
   assert.deepEqual(leasedStatus.next_action, {
-    tool: "llm_wiki_get_page_plan_context",
+    tool: "llm_wiki_apply_projection",
     arguments: {
       task_id: imported.task_id,
       writer_id: "wiki-writer-1",
       projection_id: incrementalPlan.projection.projection_id,
-      cursor: 0,
-      max_chars: 40_000,
+      max_projections: 6,
     },
   })
 
@@ -1221,6 +1220,7 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
   const imported = await f.core.importFiles({ files, options: { max_batch_chars: 1_000 } })
   assert.equal(imported.batch_count, 16)
   assert.equal(imported.wiki_projection.batch_limit, 8)
+  assert.equal(imported.wiki_projection.fast_projection_batch_limit, 32)
   assert.equal(imported.wiki_projection.writer_projection_quantum, 6)
 
   const refs = []
@@ -1312,6 +1312,123 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
   const affected = second.existing_pages.find((page) => page.path === "wiki/concepts/business-entity.md")
   assert.equal(typeof affected.content, "string")
   assert.equal(second.existing_page_catalog.some((page) => page.path === "wiki/concepts/unrelated-large.md"), true)
+})
+
+test("fast projection renders grounded pages and drains incremental plus final work without Agent page drafting", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const batch = await f.core.getBatch({ task_id: imported.task_id, worker_id: "fast-projector-extractor" })
+  const chunk = batch.chunks.find((item) => item.text.includes("Business Entity is the canonical business object."))
+  const aggregateChunk = batch.chunks.find((item) => item.text.includes("An Aggregate groups related Business Entities."))
+  const businessRef = {
+    sourceId: chunk.sourceId,
+    chunkId: chunk.chunkId,
+    quote: "Business Entity is the canonical business object.",
+    locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
+  }
+  const aggregateRef = {
+    sourceId: aggregateChunk.sourceId,
+    chunkId: aggregateChunk.chunkId,
+    quote: "An Aggregate groups related Business Entities.",
+    locator: { headingPath: aggregateChunk.headingPath, startOffset: aggregateChunk.startOffset, endOffset: aggregateChunk.endOffset },
+  }
+  await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    worker_id: batch.worker_id,
+    idempotency_key: "fast-projection-analysis-v1",
+    analysis: {
+      schemaVersion: 1,
+      taskId: imported.task_id,
+      batchId: batch.batch_id,
+      sourceRefs: [businessRef, aggregateRef],
+      entities: [{ localId: "entity-business", name: "Business Entity", properties: { id: "Stable identifier" }, sourceRefs: [0] }],
+      concepts: [{ localId: "concept-aggregate", name: "Aggregate", sourceRefs: [1] }],
+      claims: [{ localId: "claim-business", content: businessRef.quote, sourceRefs: [0] }],
+      relations: [{
+        localId: "relation-aggregate-business",
+        content: aggregateRef.quote,
+        sourceEntityLocalId: "concept-aggregate",
+        targetEntityLocalId: "entity-business",
+        sourceRefs: [1],
+      }],
+      contradictions: [],
+      candidatePages: [],
+      reviewItems: [],
+      batchSummary: "Business Entity and Aggregate.",
+      unresolvedQuestions: [],
+    },
+  })
+
+  const before = await f.core.status({ task_id: imported.task_id })
+  assert.equal(before.next_action.tool, "llm_wiki_apply_projection")
+  const projected = await f.core.applyWikiProjection({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    max_projections: 6,
+  })
+  assert.equal(projected.accepted, true)
+  assert.equal(projected.automated, true)
+  assert.deepEqual(projected.projection_runs.map((run) => run.mode), ["incremental", "final"])
+  assert.equal(projected.projection_runs[0].patch_count, 2)
+  assert.equal(projected.projection_runs[1].fast_finalization, true)
+  assert.equal(projected.wiki_projection.final_completed, true)
+  assert.equal(projected.next_action.tool, "llm_wiki_finalize")
+
+  const businessPage = await readFile(path.join(f.workspace, "wiki", "entities", "business-entity.md"), "utf8")
+  const aggregatePage = await readFile(path.join(f.workspace, "wiki", "concepts", "aggregate.md"), "utf8")
+  assert.match(businessPage, /Stable identifier/)
+  assert.match(businessPage, /aggregate/)
+  assert.match(aggregatePage, /Business Entities/)
+  assert.match(aggregatePage, /business-entity/)
+})
+
+test("fast projection stays ahead of extractors by leasing more than the legacy eight-batch window", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const files = []
+  for (let index = 0; index < 12; index += 1) {
+    const file = path.join(f.incoming, `fast-backlog-${index}.md`)
+    await writeFile(file, `# Fast backlog ${index}\n\nBusiness Entity ${index} is documented here. ${"Context ".repeat(105)}\n`)
+    files.push({ path: file })
+  }
+  const imported = await f.core.importFiles({ files, options: { max_batch_chars: 1_000 } })
+  assert.equal(imported.batch_count >= 12, true)
+  let analyzed = 0
+  while (true) {
+    const batch = await f.core.getBatch({ task_id: imported.task_id, worker_id: "fast-backlog-extractor" })
+    if (batch.completed) break
+    const sourceRef = batch.chunks[0].source_ref_templates[0]
+    await f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      worker_id: batch.worker_id,
+      idempotency_key: `fast-backlog-analysis-${batch.batch_id}`,
+      analysis: {
+        schemaVersion: 1,
+        taskId: imported.task_id,
+        batchId: batch.batch_id,
+        sourceRefs: [sourceRef],
+        entities: [{ localId: `entity-${analyzed}`, name: `Business Entity ${analyzed}`, sourceRefs: [0] }],
+        concepts: [], claims: [], relations: [], contradictions: [], candidatePages: [], reviewItems: [],
+        batchSummary: `Fast backlog ${analyzed}.`,
+        unresolvedQuestions: [],
+      },
+    })
+    analyzed += 1
+  }
+  assert.equal(analyzed > 8, true)
+
+  const projected = await f.core.applyWikiProjection({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    max_projections: 1,
+  })
+  assert.equal(projected.processed_projection_count, 1)
+  assert.equal(projected.projection_runs[0].mode, "incremental")
+  assert.equal(projected.projection_runs[0].batch_count, Math.min(analyzed, 32))
+  assert.equal(projected.projection_runs[0].batch_count > 8, true)
 })
 
 test("concurrent task writers serialize transactions and accept stale global revisions for different pages", async (t) => {

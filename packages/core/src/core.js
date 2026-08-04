@@ -12,6 +12,7 @@ import {
 import { lintWiki } from "./lint.js"
 import { batchEvidenceCatalog, compactEvidenceCatalog } from "./evidence.js"
 import { buildBm25Index, buildEmbeddingIndex, buildVectorIndex, retrieveContext } from "./retrieval.js"
+import { buildGroundedProjectionPatches, partitionProjectionPatches } from "./projection-renderer.js"
 import { pagePatchSchema } from "./schemas.js"
 import { importSources, loadSourceManifest } from "./source-store.js"
 import {
@@ -64,6 +65,7 @@ import {
 
 const BATCH_LEASE_MS = 30 * 60 * 1_000
 const PAGE_PROJECTION_LEASE_MS = 60 * 60 * 1_000
+const FAST_PAGE_PROJECTION_BATCH_LIMIT = 32
 
 export class LlmWikiCore {
   static async open(workspaceRoot = process.cwd()) {
@@ -78,6 +80,7 @@ export class LlmWikiCore {
     this.domainSchemaCache = new Map()
     this.domainSchemaSelectionCache = new Map()
     this.taskChunkIndexCache = new Map()
+    this.taskAnalysisCache = new Map()
   }
 
   async workspace(options = {}) {
@@ -130,6 +133,19 @@ export class LlmWikiCore {
     return index
   }
 
+  async #taskAnalyses(record) {
+    const cacheKey = `${record.task.taskId}:${record.task.analysisRevision}:${record.task.completedBatchIds.length}`
+    if (this.taskAnalysisCache.has(cacheKey)) return this.taskAnalysisCache.get(cacheKey)
+    const analyses = await Promise.all(record.task.completedBatchIds.map((batchId) => (
+      readJson(path.join(record.paths.analysis, `${batchId}.json`))
+    )))
+    this.taskAnalysisCache.set(cacheKey, analyses)
+    while (this.taskAnalysisCache.size > 4) {
+      this.taskAnalysisCache.delete(this.taskAnalysisCache.keys().next().value)
+    }
+    return analyses
+  }
+
   async importFiles(input) {
     const targetLanguage = input?.options?.target_language ?? input?.options?.targetLanguage
     const workspace = await this.workspace({ targetLanguage })
@@ -169,6 +185,7 @@ export class LlmWikiCore {
         batch_threshold: task.pageProjection.batchThreshold,
         batch_limit: task.pageProjection.batchLimit,
         writer_projection_quantum: task.pageProjection.writerProjectionQuantum,
+        fast_projection_batch_limit: FAST_PAGE_PROJECTION_BATCH_LIMIT,
         debounce_ms: task.pageProjection.debounceMs,
         writer_count: 1,
       },
@@ -197,7 +214,7 @@ export class LlmWikiCore {
     )
     if (["planning", "committing", "finalizing", "completed"].includes(record.task.status)
       && record.task.completedBatchIds.length === record.task.batchCount) {
-      return { task_id: record.task.taskId, completed: true, chunks: [], next_action: { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: record.task.taskId } } }
+      return { task_id: record.task.taskId, completed: true, chunks: [], next_action: nextAction(record.task) }
     }
     assertTaskStatus(record.task, ["prepared", "extracting"])
     const workerId = normalizeWorkerId(input?.worker_id)
@@ -234,7 +251,7 @@ export class LlmWikiCore {
           next_action: { tool: "llm_wiki_get_batch", arguments: { task_id: record.task.taskId, worker_id: workerId } },
         }
       }
-      return { task_id: record.task.taskId, completed: true, chunks: [], next_action: { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: record.task.taskId } } }
+      return { task_id: record.task.taskId, completed: true, chunks: [], next_action: nextAction(record.task) }
     }
     const leasedAt = nowIso()
     const expiresAt = new Date(Date.now() + BATCH_LEASE_MS).toISOString()
@@ -441,7 +458,7 @@ export class LlmWikiCore {
         ? { tool: "llm_wiki_get_batch", arguments: { task_id: record.task.taskId } }
         : null
       const projectionNextAction = wikiProjection.ready
-        ? { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: record.task.taskId, writer_id: "wiki-writer-1" } }
+        ? projectionAction(record.task, wikiProjection)
         : null
       await saveTask(record.paths, record.task)
       return {
@@ -739,6 +756,170 @@ export class LlmWikiCore {
 
   async commitPages(input) {
     return this.#withWorkspaceWriteLock(() => this.#withTaskLock(input?.task_id, () => this.#commitPages(input)))
+  }
+
+  async applyWikiProjection(input) {
+    return this.#withWorkspaceWriteLock(() => this.#withTaskLock(input?.task_id, () => this.#applyWikiProjection(input)))
+  }
+
+  async #applyWikiProjection(input) {
+    const requestedMaximum = input?.max_projections === undefined ? 6 : Number(input.max_projections)
+    if (!Number.isInteger(requestedMaximum) || requestedMaximum < 1 || requestedMaximum > 24) {
+      fail("INVALID_INPUT", "max_projections must be an integer from 1 to 24.")
+    }
+    const writerId = normalizeWorkerId(input?.writer_id ?? "wiki-writer-1")
+    const projectionRuns = []
+    const writtenPages = []
+    let writtenPageCount = 0
+    let latestWikiRevision = null
+
+    for (let index = 0; index < requestedMaximum; index += 1) {
+      const run = await this.#applySingleWikiProjection({
+        task_id: input?.task_id,
+        writer_id: writerId,
+        ...(index === 0 && input?.projection_id ? { projection_id: input.projection_id } : {}),
+        fast_path: true,
+      })
+      if (run.waiting) break
+      projectionRuns.push(run.projection_run)
+      writtenPageCount += run.written_pages.length
+      if (writtenPages.length < 500) writtenPages.push(...run.written_pages.slice(0, 500 - writtenPages.length))
+      latestWikiRevision = run.wiki_revision
+      if (run.projection_run.mode === "final") break
+
+      const workspace = await this.workspace({ skipWikiRevision: true })
+      const record = await loadTask(workspace.paths, input?.task_id)
+      if (!pageProjectionStatus(record.task).ready) break
+    }
+
+    const workspace = await this.workspace({ skipWikiRevision: true })
+    const record = await loadTask(workspace.paths, input?.task_id)
+    const wikiProjection = pageProjectionStatus(record.task)
+    await saveTask(record.paths, record.task)
+    return {
+      accepted: true,
+      automated: true,
+      renderer: "deterministic-grounded-v1",
+      processed_projection_count: projectionRuns.length,
+      projection_runs: projectionRuns,
+      written_page_count: writtenPageCount,
+      written_pages: writtenPages,
+      written_pages_truncated: writtenPageCount > writtenPages.length,
+      ...(latestWikiRevision ? { wiki_revision: latestWikiRevision } : {}),
+      wiki_projection: wikiProjection,
+      waiting: projectionRuns.length === 0,
+      next_action: nextAction(record.task, wikiProjection),
+    }
+  }
+
+  async #applySingleWikiProjection(input) {
+    const workspace = await this.workspace()
+    const record = await loadTask(workspace.paths, input?.task_id)
+    assertTaskStatus(record.task, ["extracting", "planning", "committing"])
+    const acquired = acquirePageProjection(record.task, input)
+    await saveTask(record.paths, record.task)
+    if (!acquired.lease) return { waiting: true, written_pages: [] }
+
+    const projection = acquired.lease
+    const allAnalyses = await this.#taskAnalyses(record)
+    const projectionBatchIds = new Set(projection.batchIds)
+    const projectionAnalyses = allAnalyses.filter((analysis) => projectionBatchIds.has(analysis.batchId))
+    const projectionRequirements = derivePageRequirements(projectionAnalyses)
+    const globalRequirements = derivePageRequirements(allAnalyses)
+    const globalById = new Map(globalRequirements.map((requirement) => [requirement.requirement_id, requirement]))
+    const activeIds = new Set(projectionRequirements.map((requirement) => requirement.requirement_id))
+
+    const existingPages = []
+    for (const file of await listFilesRecursive(workspace.paths.wiki, (candidate) => candidate.endsWith(".md"))) {
+      const content = await readFile(file, "utf8")
+      const relative = `wiki/${relativePosix(workspace.paths.wiki, file)}`
+      const parsed = parseWikiPage(content)
+      existingPages.push({
+        path: relative,
+        title: parsed.title || path.basename(file, ".md"),
+        page_kind: parsed.type || null,
+        summary: parsed.summary,
+        covers: parsed.covers,
+        file_hash: sha256(content),
+        content,
+      })
+    }
+
+    const globalPlanned = pageRequirementsWithPatchScaffolds(globalRequirements, existingPages)
+    const globalPlannedById = new Map(globalPlanned.map((requirement) => [requirement.requirement_id, requirement]))
+    const activeRequirements = [...activeIds]
+      .map((requirementId) => globalPlannedById.get(requirementId)
+        ?? pageRequirementsWithPatchScaffolds([globalById.get(requirementId)], existingPages)[0])
+      .filter(Boolean)
+      .map((requirement) => ({
+        ...requirement,
+        related_requirements: requirement.related_requirement_ids.map((requirementId) => {
+          const related = globalPlannedById.get(requirementId)
+          if (!related) return null
+          return {
+            requirement_id: requirementId,
+            title: related.title,
+            slug: related.patch_scaffold.path.replace(/^wiki\//, "").replace(/\.md$/i, ""),
+          }
+        }).filter(Boolean),
+      }))
+
+    const finalizationHint = fastFinalizationEligibility(record.task, projection, globalRequirements, existingPages, allAnalyses)
+    const fastFinal = projection.mode === "final" && finalizationHint.fast_path_eligible
+    const patches = fastFinal ? [] : buildGroundedProjectionPatches({
+      requirements: activeRequirements,
+      existingPages,
+      analyses: allAnalyses,
+      targetLanguage: record.task.options?.targetLanguage,
+      maxPageChars: workspace.config.limits.maxPageChars,
+    })
+    const groups = patches.length > 0
+      ? partitionProjectionPatches(patches, workspace.config.limits.maxPatchesPerCommit, workspace.config.limits.maxCommitChars)
+      : [[]]
+
+    projection.wikiRevision = projection.wikiRevision ?? workspace.revision
+    projection.pagePlanTraversal = {
+      projectionId: projection.projectionId,
+      nextCursor: null,
+      complete: true,
+      totalItems: activeRequirements.length,
+      collectedItems: activeRequirements.length,
+      automated: true,
+    }
+    projection.expiresAt = new Date(Date.now() + PAGE_PROJECTION_LEASE_MS).toISOString()
+    await saveTask(record.paths, record.task)
+
+    let basedOnWikiRevision = projection.wikiRevision
+    const writtenPages = []
+    let finalResponse
+    for (const [groupIndex, group] of groups.entries()) {
+      finalResponse = await this.#commitPages({
+        task_id: record.task.taskId,
+        writer_id: projection.writerId,
+        projection_id: projection.projectionId,
+        projection_complete: groupIndex === groups.length - 1,
+        based_on_wiki_revision: basedOnWikiRevision,
+        patches: group,
+        idempotency_key: `auto-${projection.projectionId}-${String(groupIndex + 1).padStart(3, "0")}`,
+      })
+      basedOnWikiRevision = finalResponse.wiki_revision
+      writtenPages.push(...finalResponse.written_pages)
+    }
+    return {
+      waiting: false,
+      written_pages: writtenPages,
+      wiki_revision: finalResponse.wiki_revision,
+      projection_run: {
+        projection_id: projection.projectionId,
+        mode: projection.mode,
+        batch_count: projection.batchIds.length,
+        requirement_count: activeRequirements.length,
+        patch_count: patches.length,
+        transaction_count: groups.length,
+        fast_finalization: fastFinal,
+        completed: true,
+      },
+    }
   }
 
   async #commitPages(input) {
@@ -1313,6 +1494,7 @@ function pageProjectionStatus(task) {
     batch_threshold: state.batchThreshold,
     projection_batch_limit: state.batchLimit,
     writer_projection_quantum: state.writerProjectionQuantum,
+    fast_projection_batch_limit: FAST_PAGE_PROJECTION_BATCH_LIMIT,
     debounce_ms: state.debounceMs,
     projected_batches: state.projectedBatchIds.length,
     unprojected_batches: unprojected.length,
@@ -1340,6 +1522,7 @@ function acquirePageProjection(task, input) {
   // restarted writer always recollects from cursor zero, so safely shrink that
   // legacy lease in place and leave the remainder queued for later projections.
   if (state.lease?.mode === "incremental"
+    && input?.fast_path !== true
     && Array.isArray(state.lease.batchIds)
     && state.lease.batchIds.length > state.batchLimit
     && (input?.cursor === undefined || input?.cursor === null || Number(input.cursor) === 0)) {
@@ -1361,9 +1544,12 @@ function acquirePageProjection(task, input) {
   if (!status.ready) return { lease: null, status }
   const mode = status.mode
   const projected = new Set(state.projectedBatchIds)
+  const projectionBatchLimit = input?.fast_path === true
+    ? Math.max(state.batchLimit, FAST_PAGE_PROJECTION_BATCH_LIMIT)
+    : state.batchLimit
   const batchIds = mode === "final"
     ? [...task.completedBatchIds].sort()
-    : task.completedBatchIds.filter((batchId) => !projected.has(batchId)).sort().slice(0, state.batchLimit)
+    : task.completedBatchIds.filter((batchId) => !projected.has(batchId)).sort().slice(0, projectionBatchLimit)
   const timestamp = nowIso()
   state.lease = {
     projectionId: newId("projection"),
@@ -1833,29 +2019,24 @@ function statusResponse(task) {
 }
 
 function nextAction(task, wikiProjection = pageProjectionStatus(task)) {
-  if (wikiProjection.in_progress) {
-    return {
-      tool: "llm_wiki_get_page_plan_context",
-      arguments: {
-        task_id: task.taskId,
-        writer_id: wikiProjection.writer_id,
-        projection_id: wikiProjection.projection_id,
-        // Status cannot know whether the previous Writer process retained its
-        // accumulated context. Cursor zero safely rebuilds the same lease's
-        // stable snapshot for a replacement invocation.
-        cursor: 0,
-        max_chars: 40_000,
-      },
-    }
-  }
-  if (wikiProjection.ready) {
-    return { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: task.taskId, writer_id: "wiki-writer-1" } }
-  }
+  if (wikiProjection.in_progress || wikiProjection.ready) return projectionAction(task, wikiProjection)
   if (["prepared", "extracting"].includes(task.status)) return { tool: "llm_wiki_get_batch", arguments: { task_id: task.taskId } }
-  if (task.status === "planning") return { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: task.taskId } }
+  if (task.status === "planning") return projectionAction(task, wikiProjection)
   if (task.status === "committing") return { tool: "llm_wiki_finalize", arguments: { task_id: task.taskId } }
   if (task.status === "finalizing" || task.status === "failed") return { tool: "llm_wiki_finalize", arguments: { task_id: task.taskId } }
   return null
+}
+
+function projectionAction(task, wikiProjection = pageProjectionStatus(task)) {
+  return {
+    tool: "llm_wiki_apply_projection",
+    arguments: {
+      task_id: task.taskId,
+      writer_id: wikiProjection.writer_id ?? "wiki-writer-1",
+      ...(wikiProjection.projection_id ? { projection_id: wikiProjection.projection_id } : {}),
+      max_projections: wikiProjection.writer_projection_quantum ?? projectionState(task).writerProjectionQuantum,
+    },
+  }
 }
 
 async function buildIndex(wikiRoot) {

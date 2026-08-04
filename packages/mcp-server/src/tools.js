@@ -197,6 +197,7 @@ export class HeadlessToolRouter {
       case "llm_wiki_retrieve_context": return this.core.retrieveContext(args)
       case "llm_wiki_commit_analysis": return this.core.commitAnalysis(args)
       case "llm_wiki_get_page_plan_context": return this.core.getPagePlanContext(args)
+      case "llm_wiki_apply_projection": return this.core.applyWikiProjection(args)
       case "llm_wiki_commit_pages": return this.core.commitPages(args)
       case "llm_wiki_finalize": return this.core.finalize(args)
       case "llm_wiki_status": return this.core.status(args)

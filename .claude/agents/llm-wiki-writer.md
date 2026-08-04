@@ -28,8 +28,16 @@ that the lease is unavailable or switch to extraction work.
 
 Use the coordinator-supplied `writer_projection_quantum`, or read it from
 status on the recovery path, and process no more than that many projections in
-this invocation (currently six). Request
-page-plan pages with `max_chars: 40000`. The response intentionally
+this invocation (currently six). The normal action is
+`llm_wiki_apply_projection`: call it once with the task ID, stable Writer ID,
+any supplied projection ID, and that quantum as `max_projections`. It
+deterministically turns the already validated analysis into grounded pages and
+drains the backlog without per-page drafting. Return its compact projection
+report; do not call page-plan tools first.
+
+Only for compatibility when a current server explicitly returns
+`llm_wiki_get_page_plan_context` or does not publish the fast tool, request
+legacy page-plan pages with `max_chars: 40000`. The response intentionally
 contains only domain Schema identity metadata; never fetch or reconstruct the
 full extraction Schema in this writer. Follow the response's `next_action` and
 request every `next_cursor` sequentially until `page_plan_complete: true` and
@@ -71,7 +79,7 @@ complete local patch subset and its
 `projection_complete` value, then resubmit that entire rejected subset with a
 new idempotency key. Never retry only the bad patch. Previously accepted
 partial commits are durable and must not be resubmitted.
-After each completed incremental commit, immediately follow
+In the legacy loop, after each completed incremental commit, immediately follow
 `writer_next_action: llm_wiki_get_page_plan_context` with cursor zero while the
 projection quantum has capacity. Do not call status between these backlog
 projections. Every projection is independently committed and checkpointed.

@@ -2,12 +2,12 @@
 
 The project root `.mcp.json` starts the Headless `llm-wiki` STDIO MCP server.
 It resolves the executable and workspace from `CLAUDE_PROJECT_DIR` and marks
-the small 12-tool server as `alwaysLoad`, so changing the shell working
+the small 13-tool server as `alwaysLoad`, so changing the shell working
 directory or deferred tool discovery cannot detach the workflow. Claude Code
 asks for project-server trust the first time it reads this file.
 
 `.claude/settings.json` approves the project `llm-wiki` server, every tool from
-that server (both server-wide and all 12 explicit tool names), the builder
+that server (both server-wide and all 13 explicit tool names), the builder
 Skill, the named extractor/writer Agents, ToolSearch, all subagents, and
 read-only repository tools.
 It uses `dontAsk`, so background agents never pause for permission: tools not
@@ -37,7 +37,7 @@ llm-wiki: node packages/mcp-server/dist/index.js --workspace . - Connected
 ```
 
 Start Claude Code from the repository root, approve the project MCP server if
-prompted, and confirm `/mcp` reports `Connected` with 12 tools. Attach or
+prompted, and confirm `/mcp` reports `Connected` with 13 tools. Attach or
 reference documents, then ask:
 
 ```text
@@ -55,10 +55,11 @@ one long-lived subagent across user turns. Each project agent explicitly reuses 
 `llm-wiki` MCP connection and uses a denylist for shell, writes, network, and
 nested agents; it does not use a fragile MCP wildcard as its complete tool
 allowlist. The agent runs in `dontAsk` mode. One
-`llm-wiki-writer` agent consumes projections of at most eight batches after four
-new batches or a 30-second debounce, while later extraction continues. One
-Writer invocation drains up to six ready projections without an intermediate
-status call or cooldown. Incremental
+`llm-wiki-writer` agent calls the deterministic fast projection tool after four
+new batches or a 30-second debounce, while later extraction continues. A fast
+projection consumes up to 32 batches and one Writer invocation drains up to six
+ready projections without per-page Agent drafting, page-plan pagination, an
+intermediate status call, or cooldown. Incremental
 pages remain provisional and excluded from retrieval until the writer completes
 the final all-batch reconciliation. The main Agent remains responsive for
 questions: retrieval defaults to BM25 + embedding while the task is building,
@@ -71,7 +72,7 @@ stabilization commit instead of regenerating the entire Wiki.
 Every initial and replacement slot must use the exact project Agent type
 `llm-wiki-extractor`; a generic "Worker N", `general-purpose` Agent, or Team
 teammate does not apply that file's `mcpServers` field. The MCP server and all
-12 tools are marked always-load, with ToolSearch as a deferred-discovery
+13 tools are marked always-load, with ToolSearch as a deferred-discovery
 fallback. Claude Code 2.1.121 or later is recommended because that release adds
 the documented `alwaysLoad` behavior; fully restart Claude Code after updating.
 
@@ -84,10 +85,12 @@ multi-route retrieval defaults.
 
 An extractor stops and reports `writer_required: true` as soon as its accepted
 commit makes a projection ready. The coordinator starts `wiki-writer-1` before
-replacing that extractor. Page-plan calls use 40K-character pages and include
+replacing that extractor. The default `llm_wiki_apply_projection` call renders
+only facts already validated during extraction and commits them in bounded
+transactions. Legacy page-plan calls use 40K-character pages and include
 only domain Schema identity metadata, so a multi-megabyte extraction Schema is
 never copied into the Wiki writer's tool response.
-Incremental page plans include full text only for pages affected by the current
+Legacy incremental page plans include full text only for pages affected by the current
 projection. Unrelated pages are represented by compact catalog entries, so
 Writer cost no longer grows with the total byte size of the existing Wiki.
 The Writer must collect every sequential page-plan cursor before its first
