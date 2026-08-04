@@ -106,15 +106,14 @@ While `in_progress` remains true, do not compete for its lease. After expiry,
 the same stable writer ID can acquire a replacement projection. Paths written
 by an incomplete projection remain provisional and excluded from retrieval.
 After upgrading from an older server, resume that same writer from cursor zero;
-Core automatically shrinks an oversized legacy incremental lease to four
+Core automatically shrinks an oversized legacy incremental lease to eight
 batches and reports `projection.safely_repartitioned: true`. Remaining batches
 stay queued and are not discarded.
 If the Writer returns normally after reaching its projection quantum and
 status still reports `ready: true`, immediately launch another bounded
-`wiki-writer-1` invocation. The current quantum is six projections, so one
-invocation can drain up to 24 queued batches. A ready backlog of at least four
-batches bypasses the normal debounce, and each new lease remains capped at four
-batches.
+`wiki-writer-1` invocation. The current quantum is six projections and each
+lease is capped at eight batches, so one invocation can drain up to 48 queued
+batches. A ready backlog of at least four batches bypasses the normal debounce.
 
 ## Failed Finalize
 

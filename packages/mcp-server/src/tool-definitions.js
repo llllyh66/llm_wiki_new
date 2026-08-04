@@ -62,7 +62,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_page_plan_context",
-    description: "Lease and return bounded page-planning context. Read every cursor sequentially until page_plan_complete and next_cursor:null before committing; returned_items counts all context categories, not page requirements. Incremental leases contain at most four batches, affected page bodies, and a compact unrelated-page catalog. Pagination uses a stable projection snapshot and tolerates concurrent changes to unrelated Wiki paths; target-page hashes remain authoritative.",
+    description: "Lease and return bounded page-planning context. Read every cursor sequentially until page_plan_complete and next_cursor:null before committing; returned_items counts all context categories, not page requirements. Incremental leases contain at most eight batches and concise-draft guidance. A deterministically verified final projection may recommend an empty stabilization commit. Pagination uses a stable snapshot; target-page hashes remain authoritative.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },

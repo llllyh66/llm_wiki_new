@@ -464,7 +464,7 @@ export class LlmWikiCore {
     record.task.pagePlanRevision += 1
     record.task.wikiRevision = revision
     await saveTask(record.paths, record.task)
-    const freshContext = {
+    const fullContext = {
       batches: analyses.map((analysis) => ({ batch_id: analysis.batchId, summary: analysis.batchSummary, unresolved_questions: analysis.unresolvedQuestions })),
       entities: analyses.flatMap((analysis) => analysis.entities),
       concepts: analyses.flatMap((analysis) => analysis.concepts),
@@ -476,6 +476,10 @@ export class LlmWikiCore {
       conflicts: analyses.flatMap((analysis) => analysis.contradictions),
       required_pages: requirements,
     }
+    const finalizationHint = fastFinalizationEligibility(record.task, projection, requirements, existingPages, analyses)
+    const freshContext = finalizationHint.fast_path_eligible
+      ? emptyPagePlanContext()
+      : fullContext
     let context = freshContext
     if (projection) {
       if (requestedCursor === 0) {
@@ -551,6 +555,14 @@ export class LlmWikiCore {
       concurrent_wiki_changes_detected: concurrentWikiChangesDetected,
       page_plan_complete: pagePlanComplete,
       commit_ready: pagePlanComplete,
+      ...(projection?.mode === "incremental" ? {
+        writer_guidance: {
+          mode: "concise-incremental-draft",
+          recommended_body_chars: { min: 300, max: 1_200 },
+          instruction: "Write only grounded facts newly required by these batches. Avoid generic filler and defer broad cross-batch synthesis to final reconciliation.",
+        },
+      } : {}),
+      ...(projection?.mode === "final" ? { finalization_hint: finalizationHint } : {}),
       ...(projection ? {
         projection: publicProjection(projection),
         provisional: projection.mode === "incremental",
@@ -1025,9 +1037,16 @@ function projectionState(task) {
   const current = task.pageProjection && typeof task.pageProjection === "object" ? task.pageProjection : {}
   Object.assign(current, {
     batchThreshold: Number.isInteger(current.batchThreshold) && current.batchThreshold > 0 ? current.batchThreshold : 4,
-    batchLimit: Number.isInteger(current.batchLimit) && current.batchLimit > 0 ? current.batchLimit : 4,
+    // Eight batches amortize page planning and repeated canonical-page updates
+    // while keeping one projection small enough for bounded MCP pagination and
+    // 50-patch transactions. Upgrade the earlier four-batch default in place.
+    batchLimit: current.batchLimit === 4
+      ? 8
+      : Number.isInteger(current.batchLimit) && current.batchLimit > 0
+        ? current.batchLimit
+        : 8,
     // Upgrade the earlier three-projection default in persisted tasks too. Six
-    // bounded projections can drain 24 queued batches without turning one
+    // bounded projections can drain 48 queued batches without turning one
     // projection into an oversized prompt.
     writerProjectionQuantum: current.writerProjectionQuantum === 3
       ? 6
@@ -1064,11 +1083,16 @@ function pageProjectionStatus(task) {
   const countReady = unprojected.length >= state.batchThreshold
   const ageReady = unprojected.length > 0 && now - oldestUnprojectedAt >= state.debounceMs
   const cooldownReady = lastCommittedAt === null || now - lastCommittedAt >= state.debounceMs
-  const finalReady = allComplete && !state.finalCompleted
+  // Finish projecting any extraction backlog in bounded incremental windows
+  // before opening final reconciliation. The old behavior put every batch in
+  // one giant final projection as soon as extraction happened to finish.
+  const catchupReady = allComplete && unprojected.length > 0
+  const finalReady = allComplete && unprojected.length === 0 && !state.finalCompleted
   // A real backlog bypasses the debounce/cooldown. The lease itself is capped,
   // so the writer checkpoints frequently instead of swallowing the backlog in
   // one unbounded projection.
-  const incrementalReady = !allComplete && unprojected.length > 0 && (countReady || (cooldownReady && ageReady))
+  const incrementalReady = catchupReady
+    || (!allComplete && unprojected.length > 0 && (countReady || (cooldownReady && ageReady)))
   const ready = !state.lease && (finalReady || incrementalReady)
   let nextReadyAt = null
   if (!ready && !state.lease && !allComplete && unprojected.length > 0) {
@@ -1198,6 +1222,68 @@ async function workspaceProvisionalPageOwners(workspace, currentTask) {
     }
   }
   return owners
+}
+
+function emptyPagePlanContext() {
+  return {
+    batches: [],
+    entities: [],
+    concepts: [],
+    claims: [],
+    relations: [],
+    candidate_pages: [],
+    existing_pages: [],
+    existing_page_catalog: [],
+    conflicts: [],
+    required_pages: [],
+  }
+}
+
+function fastFinalizationEligibility(task, projection, requirements, existingPages, analyses) {
+  const result = {
+    fast_path_eligible: false,
+    recommended_action: "full-reconciliation",
+    verified_requirement_count: requirements.length,
+    provisional_page_count: projectionState(task).provisionalPagePaths.length,
+    projected_batch_count: projectionState(task).projectedBatchIds.length,
+    contradiction_count: analyses.reduce((sum, analysis) => sum + (analysis.contradictions?.length ?? 0), 0),
+  }
+  if (projection?.mode !== "final") return result
+  const state = projectionState(task)
+  const projected = new Set(state.projectedBatchIds)
+  const allBatchesProjected = task.completedBatchIds.every((batchId) => projected.has(batchId))
+  const requirementIds = new Set(requirements.map((requirement) => requirement.requirement_id))
+  const coverageOwners = new Map([...requirementIds].map((requirementId) => [requirementId, []]))
+  for (const page of existingPages) {
+    for (const requirementId of page.covers ?? []) {
+      if (coverageOwners.has(requirementId)) coverageOwners.get(requirementId).push(page.path)
+    }
+  }
+  const missingRequirementIds = [...coverageOwners]
+    .filter(([, paths]) => paths.length === 0)
+    .map(([requirementId]) => requirementId)
+  const duplicateRequirementIds = [...coverageOwners]
+    .filter(([, paths]) => new Set(paths).size > 1)
+    .map(([requirementId]) => requirementId)
+  const existingPaths = new Set(existingPages.map((page) => page.path))
+  const missingProvisionalPaths = state.provisionalPagePaths.filter((pagePath) => !existingPaths.has(pagePath))
+  const eligible = allBatchesProjected
+    && result.contradiction_count === 0
+    && missingRequirementIds.length === 0
+    && duplicateRequirementIds.length === 0
+    && missingProvisionalPaths.length === 0
+  return {
+    ...result,
+    fast_path_eligible: eligible,
+    recommended_action: eligible ? "submit-empty-final-commit" : "full-reconciliation",
+    all_batches_projected: allBatchesProjected,
+    missing_requirement_count: missingRequirementIds.length,
+    duplicate_requirement_coverage_count: duplicateRequirementIds.length,
+    missing_provisional_page_count: missingProvisionalPaths.length,
+    ...(eligible ? {
+      instruction: "All batches were incrementally projected, every requirement has exactly one explicit page cover, every provisional page exists, and no contradiction was extracted. Submit an empty final commit to stabilize pages without rewriting them.",
+    } : {}),
+  }
 }
 
 function stripInternalSource(source) {

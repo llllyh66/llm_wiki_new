@@ -267,9 +267,12 @@ typed entity or any relation.
    of launching a general-purpose replacement. The Core normally opens a
    projection after four new batches, after the 30-second debounce, or
    immediately for final reconciliation when all batches finish. Each
-   incremental projection leases at most four batches, so an accumulated
-   backlog is checkpointed in bounded slices rather than becoming one giant
-   Writer prompt.
+   incremental projection leases at most eight batches, so an accumulated
+   backlog is amortized across fewer canonical-page updates without becoming
+   one giant Writer prompt. If extraction finishes with unprojected batches,
+   Core drains those bounded incremental catch-up projections before opening
+   final reconciliation; it never turns the entire task into one premature
+   final projection.
 8. One Wiki-writer invocation processes up to
    `wiki_projection.writer_projection_quantum` projections (currently six),
    committing each projection independently:
@@ -302,9 +305,18 @@ typed entity or any relation.
       patch Schema and domain metadata appear only on cursor zero.
    3. For `incremental` mode, update only pages affected by the projection's
       batch IDs. Reuse canonical paths, merge with existing grounded content,
-      and avoid speculative or duplicate pages. For `final` mode, inspect all
+      and avoid speculative or duplicate pages. Follow `writer_guidance`: keep
+      an incremental page to a concise grounded draft (normally 300–1,200 body
+      characters), add only facts introduced by the leased batches, and omit
+      generic filler. Rich cross-batch synthesis belongs in final mode, not in
+      every repeated incremental update. For `final` mode, inspect all
       batch analyses, reconcile cross-batch duplicates and contradictions, and
       explicitly review every existing page marked `provisional: true`.
+      When `finalization_hint.fast_path_eligible: true`, Core has verified that
+      all batches were incrementally projected, every requirement has exactly
+      one explicit page cover, all provisional paths exist, and no extracted
+      contradiction remains. Submit the recommended empty final commit
+      immediately; do not regenerate already complete pages.
       In both modes, treat accumulated `page_requirements` as the minimum
       materialization contract, not as optional suggestions. It includes
       important entities and concepts even when `candidate_pages` is sparse.

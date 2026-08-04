@@ -74,14 +74,19 @@ never include the full extraction Schema and default to roughly 40K-character
 pages, even when the task Schema is several MiB. The main Agent remains available for questions and coordinates page
 generation through exactly one background Wiki writer. After four new batches,
 or after a 30-second debounce, that writer incrementally updates affected
-pages while extractors continue. Each projection is capped at four batches;
-one Writer invocation drains up to six ready projections (24 batches) immediately when a
+pages while extractors continue. Each projection is capped at eight batches;
+one Writer invocation drains up to six ready projections (48 batches) immediately when a
 backlog exists. Incremental plans include full content only for affected pages
 and compact catalog metadata for unrelated pages. A final all-batch reconciliation stabilizes
 the pages before Finalize.
 Writers collect every page-plan cursor from a stable server-side snapshot
 before committing. The Core rejects premature commits with the exact next
 cursor, so later-page provisional hashes cannot be missed or guessed.
+Incremental pages use concise grounded drafts. When extraction finishes, Core
+first drains any remaining bounded projections instead of creating one giant
+all-batch final prompt. If all requirements then have unique explicit coverage
+and no contradiction exists, final reconciliation becomes a verified empty
+stabilization commit rather than a full page rewrite.
 
 Each extractor invocation handles a bounded quantum of up to three batches,
 persisting an independent checkpoint after every batch. This amortizes Agent

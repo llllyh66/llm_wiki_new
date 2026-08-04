@@ -54,6 +54,10 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(writer, /returned_items.*all context categories/)
   assert.match(writer, /Never commit while.*next_cursor.*non-null/s)
   assert.match(writer, /currently six/)
+  assert.match(writer, /300–1,200 body characters/)
+  assert.match(writer, /finalization_hint\.fast_path_eligible/)
+  assert.match(skill, /incremental projection leases at most eight batches/)
+  assert.match(skill, /submit the recommended empty\s+final commit/i)
 })
 
 test("MCP publishes the complete Agent-first tool contract without desktop tools", () => {

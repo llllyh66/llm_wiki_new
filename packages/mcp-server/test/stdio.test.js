@@ -201,7 +201,7 @@ test("built MCP server survives errors and completes the full workflow over one 
     arguments: { task_id: taskId, writer_id: "stdio-wiki-writer", cursor: 0 },
   })
   assert.equal(plan.structuredContent.next_cursor, null)
-  assert.equal(plan.structuredContent.projection.mode, "final")
+  assert.equal(plan.structuredContent.projection.mode, "incremental")
   const competingProjection = await client.callTool({
     name: "llm_wiki_get_page_plan_context",
     arguments: { task_id: taskId, writer_id: "stdio-competing-writer", cursor: 0 },
@@ -224,13 +224,33 @@ test("built MCP server survives errors and completes the full workflow over one 
         title: "Business Entity",
         pageKind: "concept",
         content: "# Business Entity\n\nA canonical business object.",
+        covers: plan.structuredContent.page_requirements.map((requirement) => requirement.requirement_id),
         sourceRefs: [sourceRef],
         rationale: "The source defines this concept.",
       }],
     },
   })
   assert.equal(pages.isError, undefined)
-  assert.equal(pages.structuredContent.wiki_projection.final_completed, true)
+  assert.equal(pages.structuredContent.wiki_projection.final_completed, false)
+  assert.equal(pages.structuredContent.wiki_projection.mode, "final")
+  const finalPlan = await client.callTool({
+    name: "llm_wiki_get_page_plan_context",
+    arguments: { task_id: taskId, writer_id: "stdio-wiki-writer", cursor: 0 },
+  })
+  assert.equal(finalPlan.structuredContent.projection.mode, "final")
+  assert.equal(finalPlan.structuredContent.finalization_hint.fast_path_eligible, true)
+  const stabilized = await client.callTool({
+    name: "llm_wiki_commit_pages",
+    arguments: {
+      task_id: taskId,
+      writer_id: "stdio-wiki-writer",
+      projection_id: finalPlan.structuredContent.projection.projection_id,
+      based_on_wiki_revision: finalPlan.structuredContent.based_on_wiki_revision,
+      idempotency_key: "stdio-final-stabilization-v1",
+      patches: [],
+    },
+  })
+  assert.equal(stabilized.structuredContent.wiki_projection.final_completed, true)
   const finalized = await client.callTool({ name: "llm_wiki_finalize", arguments: { task_id: taskId } })
   assert.equal(finalized.structuredContent.status, "completed")
   const status = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: taskId } })

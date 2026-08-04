@@ -55,7 +55,7 @@ one long-lived subagent across user turns. Each project agent explicitly reuses 
 `llm-wiki` MCP connection and uses a denylist for shell, writes, network, and
 nested agents; it does not use a fragile MCP wildcard as its complete tool
 allowlist. The agent runs in `dontAsk` mode. One
-`llm-wiki-writer` agent consumes projections of at most four batches after four
+`llm-wiki-writer` agent consumes projections of at most eight batches after four
 new batches or a 30-second debounce, while later extraction continues. One
 Writer invocation drains up to six ready projections without an intermediate
 status call or cooldown. Incremental
@@ -63,6 +63,10 @@ pages remain provisional and excluded from retrieval until the writer completes
 the final all-batch reconciliation. The main Agent remains responsive for
 questions: retrieval defaults to BM25 + embedding while the task is building,
 then adds the Wiki channel automatically after Finalize.
+Incremental pages are concise grounded drafts. Completed extraction drains any
+remaining incremental backlog before final mode; when explicit page coverage
+is complete and unique with no contradictions, Core recommends an empty final
+stabilization commit instead of regenerating the entire Wiki.
 
 Every initial and replacement slot must use the exact project Agent type
 `llm-wiki-extractor`; a generic "Worker N", `general-purpose` Agent, or Team

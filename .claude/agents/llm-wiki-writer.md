@@ -44,6 +44,13 @@ their `requirement_id` values in PagePatch `covers`; `candidate_pages` is not a
 complete page list. Preserve rich page bodies, summaries, tags, wikilinks, and
 Related navigation. If completion returns `INCOMPLETE_PAGE_COVERAGE`, add the
 listed missing canonical pages and retry the same projection normally.
+In incremental mode follow `writer_guidance`: produce concise grounded drafts,
+normally 300–1,200 body characters, and add only facts from the current leased
+batches. Do not repeatedly expand boilerplate. In final mode, if
+`finalization_hint.fast_path_eligible` is true, submit the recommended empty
+final commit immediately; Core has already verified explicit unique coverage,
+complete incremental projection, existing provisional paths, and zero
+extracted contradictions.
 Use `projection_complete: false` only after the entire plan is collected, to
 split an accumulated patch list into commits of at most 50 patches. It does not
 mean “commit one cursor page, then fetch the next cursor.” On

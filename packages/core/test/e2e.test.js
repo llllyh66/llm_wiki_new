@@ -973,38 +973,44 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
 
   await analyzeNext(4)
   await analyzeNext(5)
-  const finalReady = await f.core.status({ task_id: imported.task_id })
-  assert.equal(finalReady.status, "planning")
-  assert.equal(finalReady.wiki_projection.ready, true)
-  assert.equal(finalReady.wiki_projection.mode, "final")
+  const catchupReady = await f.core.status({ task_id: imported.task_id })
+  assert.equal(catchupReady.status, "planning")
+  assert.equal(catchupReady.wiki_projection.ready, true)
+  assert.equal(catchupReady.wiki_projection.mode, "incremental")
   await assert.rejects(
     () => f.core.finalize({ task_id: imported.task_id }),
     (error) => error instanceof LlmWikiError && error.code === "FINAL_PROJECTION_REQUIRED",
   )
 
+  const catchupPlan = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 100_000 })
+  assert.equal(catchupPlan.projection.mode, "incremental")
+  assert.equal(catchupPlan.projection.batch_ids.length, 2)
+  const caughtUp = await f.core.commitPages({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: catchupPlan.projection.projection_id,
+    based_on_wiki_revision: catchupPlan.based_on_wiki_revision,
+    idempotency_key: "catchup-projection-ack-v1",
+    patches: [],
+  })
+  assert.equal(caughtUp.projection_complete, true)
+  assert.equal(caughtUp.wiki_projection.mode, "final")
+  assert.equal(caughtUp.wiki_projection.ready, true)
+
   const finalPlan = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 100_000 })
   assert.equal(finalPlan.page_plan_complete, true)
   assert.equal(finalPlan.projection.mode, "final")
   assert.equal(finalPlan.projection.batch_ids.length, 6)
-  const existing = finalPlan.existing_pages.find((page) => page.path === "wiki/topics/projected-entity.md")
-  assert.equal(existing.provisional, true)
+  assert.equal(finalPlan.finalization_hint.fast_path_eligible, true)
+  assert.equal(finalPlan.finalization_hint.recommended_action, "submit-empty-final-commit")
+  assert.equal(finalPlan.pagination.total_items, 0)
   const stable = await f.core.commitPages({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
     projection_id: finalPlan.projection.projection_id,
     based_on_wiki_revision: finalPlan.based_on_wiki_revision,
     idempotency_key: "final-projection-pages-v1",
-    patches: [{
-      patchId: "projected-entity-final-v1",
-      path: "wiki/topics/projected-entity.md",
-      operation: "replace",
-      expectedFileHash: existing.file_hash,
-      title: "Projected Entity",
-      pageKind: "topic",
-      content: "# Projected Entity\n\nStableFinalMarker",
-      sourceRefs: [sourceRefs[0]],
-      rationale: "Final full reconciliation.",
-    }],
+    patches: [],
   })
   assert.equal(stable.provisional, false)
   assert.deepEqual(stable.provisional_pages, [])
@@ -1012,7 +1018,7 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   const finalized = await f.core.finalize({ task_id: imported.task_id })
   assert.deepEqual(finalized.created_pages, ["wiki/topics/projected-entity.md"])
   assert.deepEqual(finalized.updated_pages, [])
-  const completed = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["StableFinalMarker"] })
+  const completed = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["ProvisionalOnlyMarker"] })
   assert.equal(completed.retrieval_phase, "knowledge-base-complete")
   assert.deepEqual(completed.available_channels, ["bm25", "embedding", "wiki"])
   assert.equal(completed.hits.some((hit) => hit.path === "wiki/topics/projected-entity.md"), true)
@@ -1022,18 +1028,18 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
   const files = []
-  for (let index = 0; index < 12; index += 1) {
+  for (let index = 0; index < 16; index += 1) {
     const file = path.join(f.incoming, `writer-backlog-${index}.md`)
     await writeFile(file, `# Writer Backlog ${index}\n\nBusiness Entity is the canonical business object.\n\n## Aggregate\n\nAn Aggregate groups related Business Entities. ${"Context ".repeat(105)}\n`)
     files.push({ path: file })
   }
   const imported = await f.core.importFiles({ files, options: { max_batch_chars: 1_000 } })
-  assert.equal(imported.batch_count, 12)
-  assert.equal(imported.wiki_projection.batch_limit, 4)
+  assert.equal(imported.batch_count, 16)
+  assert.equal(imported.wiki_projection.batch_limit, 8)
   assert.equal(imported.wiki_projection.writer_projection_quantum, 6)
 
   const refs = []
-  for (let index = 0; index < 8; index += 1) {
+  for (let index = 0; index < 12; index += 1) {
     const batch = await f.core.getBatch({ task_id: imported.task_id, worker_id: `backlog-extractor-${index}` })
     const { sourceRef, analysis } = analysisFor(imported.task_id, batch)
     refs.push(sourceRef)
@@ -1068,9 +1074,9 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
 
   const first = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 40_000 })
   assert.equal(first.projection.mode, "incremental")
-  assert.equal(first.projection.batch_ids.length, 4)
+  assert.equal(first.projection.batch_ids.length, 8)
   assert.equal(first.projection.safely_repartitioned, true)
-  assert.equal(first.projection.repartitioned_from_batch_count, 8)
+  assert.equal(first.projection.repartitioned_from_batch_count, 12)
   assert.equal(first.existing_pages.some((page) => page.path === "wiki/concepts/unrelated-large.md"), false)
   const catalogEntry = first.existing_page_catalog.find((page) => page.path === "wiki/concepts/unrelated-large.md")
   assert.equal(catalogEntry.content_included, false)
