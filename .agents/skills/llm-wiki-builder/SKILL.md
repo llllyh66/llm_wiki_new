@@ -174,6 +174,11 @@ typed entity or any relation.
       old server does not return `evidence_catalog`. Put a concern in
       `reviewItems` only when a selected evidence quote directly supports it;
       otherwise put the question in `unresolvedQuestions`.
+      For typed relations, the canonical Schema relation name or ID is a
+      classification label and need not occur in the source prose. Write the
+      directly evidenced relationship in `content` and cite the evidence entry
+      containing that statement; do not search for a longer quote merely to
+      repeat the canonical label.
       For a domain-Schema batch, keep the hot-path payload focused: emit typed
       entities and typed relations first, and do not duplicate the same facts
       into concepts, claims, or candidate pages unless they add distinct,

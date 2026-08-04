@@ -320,6 +320,7 @@ export class LlmWikiCore {
         source_ref_templates: "Use the prefilled batch-evidence indexes. Legacy manual SourceRefs must copy chunk.source_ref_templates exactly; never reconstruct sheetName or cellRange.",
         nested_source_refs: "In batch-evidence-index mode, use evidence_catalog.evidence_index values directly in candidate sourceRefs and leave the scaffold catalog unchanged.",
         evidence: "Do not retype quotes or read the source file. The server generated every evidence_catalog quote as an exact contiguous batch substring.",
+        typed_relation_grounding: "A canonical relation type label need not occur in source prose. Put the directly supported statement in relation.content and cite the evidence entry containing it.",
         review_items: "Use {content, sourceRefs} objects only when a batch quote directly supports the concern; otherwise use unresolvedQuestions.",
       },
       extraction_context_policy: {

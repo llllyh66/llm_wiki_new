@@ -23,6 +23,10 @@
   relations, contradictions, and review items must cite quotes containing their
   identifying terms. Split table evidence by row or coherent topic; a single
   SourceRef may ground at most eight candidates.
+- A canonical Schema relation name or ID does not need to appear in the source
+  prose. Put the directly supported statement in `content`; when that statement
+  is contained in the selected server evidence quote, use that evidence index
+  directly and do not replace it merely to find the Schema label in a quote.
 - Use conservative confidence values between 0 and 1.
 - Put uncertainty in `unresolvedQuestions` instead of guessing.
 - Keep sourced facts separate from inference.

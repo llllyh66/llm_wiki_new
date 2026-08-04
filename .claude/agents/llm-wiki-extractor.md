@@ -46,6 +46,9 @@ candidate `sourceRefs`. Do not retype quotes or use Read on the original source;
 the server already produced exact quotes and spreadsheet locators. Use
 `chunk.source_ref_templates` only as a legacy fallback when the evidence
 catalog is absent. Never reconstruct spreadsheet `sheetName` or `cellRange`.
+For a typed relation, place the directly evidenced statement in `content` and
+cite the evidence entry containing it. The canonical Schema relation name or
+ID is only a classification label and does not need to occur in the quote.
 For domain-Schema extraction, do not repeat the same typed facts in concepts,
 claims, and candidate pages unless they add distinct reusable knowledge;
 entity requirements are derived automatically.

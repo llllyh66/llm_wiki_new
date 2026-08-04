@@ -231,17 +231,56 @@ function candidateSemanticText(item) {
 }
 
 function evidenceSupportsCandidate(semanticText, evidenceText, item) {
-  const normalizedEvidence = evidenceText.normalize("NFKC").toLowerCase()
+  const normalizedEvidence = normalizeGroundingText(evidenceText)
+  const evidenceTerms = new Set(groundingTerms(evidenceText))
+  // Schema relation names can be long canonical identifiers which are not
+  // expected to occur verbatim in source prose. Judge the actual assertion
+  // independently first so a directly quoted fact cannot be diluted by its
+  // classification label (for example, a billing-account relation type).
+  for (const assertion of candidateAssertionTexts(item)) {
+    const normalizedAssertion = normalizeGroundingText(assertion)
+    if (normalizedAssertion.length >= 3 && normalizedEvidence.includes(normalizedAssertion)) return true
+    if (groundingTermsSupported(assertion, evidenceTerms)) return true
+  }
   for (const label of [item.name, item.title, item.text]) {
     if (typeof label !== "string") continue
-    const normalizedLabel = label.normalize("NFKC").toLowerCase().trim()
+    const normalizedLabel = normalizeGroundingText(label)
     if (normalizedLabel.length >= 3 && normalizedEvidence.includes(normalizedLabel)) return true
   }
-  const semanticTerms = tokenize(semanticText).filter((term) => !GENERIC_GROUNDING_TERMS.has(term))
-  const evidenceTerms = new Set(tokenize(evidenceText).filter((term) => !GENERIC_GROUNDING_TERMS.has(term)))
+  const semanticTerms = groundingTerms(semanticText)
   if (semanticTerms.length === 0 || evidenceTerms.size === 0) return false
   const overlap = semanticTerms.filter((term) => evidenceTerms.has(term)).length
   return overlap >= 2 && overlap / semanticTerms.length >= 0.5
+}
+
+function candidateAssertionTexts(item) {
+  const values = [item.content, item.text]
+  const relationTuple = [item.subject, item.predicate, item.object]
+    .filter((value) => typeof value === "string" && value.trim())
+    .join(" ")
+  if (relationTuple) values.push(relationTuple)
+  return [...new Set(values.filter((value) => typeof value === "string" && value.trim()))]
+}
+
+function groundingTerms(value) {
+  return tokenize(value).filter((term) => !GENERIC_GROUNDING_TERMS.has(term))
+}
+
+function groundingTermsSupported(value, evidenceTerms) {
+  const terms = groundingTerms(value)
+  if (terms.length < 2 || evidenceTerms.size === 0) return false
+  const overlap = terms.filter((term) => evidenceTerms.has(term)).length
+  return overlap >= 2 && overlap / terms.length >= 0.5
+}
+
+function normalizeGroundingText(value) {
+  return value.normalize("NFKC")
+    .toLowerCase()
+    .replace(/[\*`~]/gu, "")
+    .replace(/[“”„‟＂]/gu, '"')
+    .replace(/[‘’‚‛]/gu, "'")
+    .replace(/\s+/gu, " ")
+    .trim()
 }
 
 function isSourceRefObject(ref) {

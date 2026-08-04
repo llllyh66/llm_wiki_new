@@ -238,6 +238,43 @@ test("grounding quality gate rejects a title-only SourceRef reused for many unre
   assert.equal((await f.core.status({ task_id: imported.task_id })).status, "prepared")
 })
 
+test("grounding accepts exact relation content from server evidence without label dilution", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  await writeFile(f.source, "# 关系\n\n6. B4001 为 S3001 付费。\n7. A2001 登录并访问 S3001。\n")
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  const paysEvidence = batch.evidence_catalog.find((entry) => entry.quote.includes("B4001 为 S3001 付费"))
+  const accessesEvidence = batch.evidence_catalog.find((entry) => entry.quote.includes("A2001 登录并访问 S3001"))
+  assert.ok(paysEvidence)
+  assert.ok(accessesEvidence)
+
+  const committed = await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    idempotency_key: "exact-relation-evidence-v1",
+    analysis: {
+      ...batch.analysis_scaffold,
+      relations: [
+        {
+          localId: "b4001-pays-s3001",
+          name: "billing_account_pays_for_subscription 账务账户为订购实例付费",
+          content: "B4001 为 S3001 付费。",
+          sourceRefs: [paysEvidence.evidence_index],
+        },
+        {
+          localId: "a2001-accesses-s3001",
+          name: "service_account_accesses_subscription 业务账户访问订购实例",
+          content: "A2001 登录并访问 S3001。",
+          sourceRefs: [accessesEvidence.evidence_index],
+        },
+      ],
+      batchSummary: "账户与订购实例的关系。",
+    },
+  })
+  assert.equal(committed.accepted, true)
+})
+
 test("domain schema is snapshotted, exposed to the Agent, and normalizes or drops typed candidates", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
