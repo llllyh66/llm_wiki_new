@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
@@ -1307,6 +1307,26 @@ test("invalid SourceRefs, page traversal, symlinks, and stale hashes are rejecte
 
   const sourceRef = await analyzeAll(f.core, partial)
   const plan = await f.core.getPagePlanContext({ task_id: partial.task_id })
+  const invalidQuote = (suffix) => ({ ...sourceRef, quote: `This quote is not present in the source: ${suffix}` })
+  await assert.rejects(
+    () => f.core.commitPages({
+      task_id: partial.task_id,
+      based_on_wiki_revision: plan.based_on_wiki_revision,
+      idempotency_key: "multi-patch-source-ref-validation",
+      patches: [
+        { patchId: "invalid-quote-1", path: "wiki/concepts/invalid-quote-1.md", operation: "create", title: "Invalid Quote One", pageKind: "concept", content: "# Invalid Quote One", sourceRefs: [invalidQuote("one")], rationale: "test" },
+        { patchId: "invalid-quote-2", path: "wiki/concepts/invalid-quote-2.md", operation: "create", title: "Invalid Quote Two", pageKind: "concept", content: "# Invalid Quote Two", sourceRefs: [invalidQuote("two")], rationale: "test" },
+      ],
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "INVALID_SOURCE_REF"
+      && error.details.atomic_commit_applied === false
+      && error.details.retry_scope === "entire_rejected_patch_set"
+      && error.details.validation_errors.length === 2
+      && error.details.validation_errors[0].patch_id === "invalid-quote-1"
+      && error.details.validation_errors[1].patch_id === "invalid-quote-2",
+  )
+  assert.equal(await access(path.join(f.workspace, "wiki", "concepts", "invalid-quote-1.md")).then(() => true, () => false), false)
   await assert.rejects(
     () => f.core.commitPages({
       task_id: partial.task_id,

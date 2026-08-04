@@ -6,6 +6,17 @@ const MAX_MCP_OUTPUT_BYTES = 6 * 1024 * 1024
 const STRUCTURED_CONTENT_DUPLICATION_LIMIT = 128 * 1024
 const MAX_ERROR_MESSAGE_CHARS = 2_000
 const RECOVERABLE_ANALYSIS_CODES = new Set(["INVALID_ANALYSIS", "INVALID_DOMAIN_ANALYSIS", "INVALID_SOURCE_REF", "ANALYSIS_TOO_LARGE"])
+const ATOMIC_PAGE_REJECTION_CODES = new Set([
+  "INVALID_PAGE_PATCH",
+  "INVALID_PAGE_PATH",
+  "INVALID_SOURCE_REF",
+  "PAGE_COMMIT_TOO_LARGE",
+  "PAGE_PLAN_INCOMPLETE",
+  "INCOMPLETE_PAGE_COVERAGE",
+  "FILE_HASH_CONFLICT",
+  "PROVISIONAL_PAGE_CONFLICT",
+  "WORKSPACE_LOCKED",
+])
 
 function emergencyMcpResult() {
   const data = {
@@ -66,6 +77,7 @@ function serializeResult(data) {
 function errorResult(error, context = {}) {
   const normalized = asLlmWikiError(error)
   const analysisRetry = context.tool === "llm_wiki_commit_analysis" && RECOVERABLE_ANALYSIS_CODES.has(normalized.code)
+  const atomicPageRejection = context.tool === "llm_wiki_commit_pages" && ATOMIC_PAGE_REJECTION_CODES.has(normalized.code)
   const errorData = { ...normalized.toJSON(), retryable: normalized.retryable || analysisRetry }
   return {
     ok: false,
@@ -75,9 +87,36 @@ function errorResult(error, context = {}) {
     ...(Array.isArray(normalized.details?.validation_errors)
       ? { validation_errors: normalized.details.validation_errors }
       : analysisRetry ? { validation_errors: [normalized.message] } : {}),
+    ...(atomicPageRejection ? {
+      atomic_commit_applied: false,
+      page_commit_recovery: {
+        changes_applied: false,
+        retry_scope: pageCommitRetryScope(normalized.code),
+        submitted_patch_count: Array.isArray(context.args?.patches) ? context.args.patches.length : 0,
+        submitted_patch_ids: Array.isArray(context.args?.patches)
+          ? context.args.patches.map((patch) => patch?.patchId).filter((value) => typeof value === "string").slice(0, 50)
+          : [],
+        preserve_projection_complete: context.args?.projection_complete !== false,
+        instruction: pageCommitRetryInstruction(normalized.code),
+      },
+    } : {}),
     next_action: recoveryAction(context.tool, context.args, normalized),
     mcp_connection_usable: true,
   }
+}
+
+function pageCommitRetryScope(code) {
+  if (code === "PAGE_PLAN_INCOMPLETE") return "collect_full_plan_then_submit_entire_intended_patch_set"
+  if (code === "INCOMPLETE_PAGE_COVERAGE") return "entire_rejected_patch_set_plus_missing_coverage"
+  if (["FILE_HASH_CONFLICT", "PROVISIONAL_PAGE_CONFLICT"].includes(code)) return "entire_rejected_patch_set_after_rebase"
+  return "entire_rejected_patch_set"
+}
+
+function pageCommitRetryInstruction(code) {
+  if (code === "PAGE_PLAN_INCOMPLETE") return "Collect every remaining page-plan cursor before generating or submitting patches."
+  if (code === "INCOMPLETE_PAGE_COVERAGE") return "Add the reported missing coverage to the rejected set and resubmit it; no patch from the rejected call was stored."
+  if (["FILE_HASH_CONFLICT", "PROVISIONAL_PAGE_CONFLICT"].includes(code)) return "Rebase the conflicting target, then resubmit the whole rejected atomic patch set; do not retry only one patch."
+  return "Correct every reported invalid patch and resubmit the whole rejected atomic patch set with a new idempotency key; do not retry only the failing patch."
 }
 
 function recoveryAction(tool, args, error) {
@@ -108,6 +147,18 @@ function recoveryAction(tool, args, error) {
         projection_id: args?.projection_id,
         cursor: 0,
         max_chars: 40_000,
+      },
+    }
+  }
+  if (tool === "llm_wiki_commit_pages" && ["INVALID_PAGE_PATCH", "INVALID_PAGE_PATH", "INVALID_SOURCE_REF", "INCOMPLETE_PAGE_COVERAGE", "PAGE_COMMIT_TOO_LARGE"].includes(error.code)) {
+    return {
+      tool,
+      arguments: {
+        task_id: args?.task_id,
+        writer_id: args?.writer_id,
+        projection_id: args?.projection_id,
+        based_on_wiki_revision: args?.based_on_wiki_revision,
+        projection_complete: args?.projection_complete !== false,
       },
     }
   }

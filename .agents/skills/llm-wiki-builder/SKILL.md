@@ -334,6 +334,13 @@ typed entity or any relation.
       existing-page update, then retry without restarting MCP.
       Partial commits split the patch list accumulated after full page-plan
       traversal; they never alternate “read one cursor, commit its items.”
+      A rejected page commit with `atomic_commit_applied: false` stored none of
+      the submitted patches. Inspect every entry in `validation_errors`, fix
+      the local patch objects (copy requirement SourceRefs and quotes exactly),
+      and resubmit the entire rejected subset with a new idempotency key and
+      the same `projection_complete` value. Never submit only the one corrected
+      patch: the other valid patches from that rejected call were not retained.
+      Do not resubmit subsets from earlier calls that returned `accepted: true`.
    6. Treat incremental writes and incomplete multipart writes as provisional.
       They are deliberately excluded from retrieval. Only a completed `final`
       projection clears provisional state.

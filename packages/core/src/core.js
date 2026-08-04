@@ -595,20 +595,49 @@ export class LlmWikiCore {
       fail("PAGE_COMMIT_TOO_LARGE", `Page content exceeds the ${workspace.config.limits.maxCommitChars}-character commit limit. Submit smaller commits.`)
     }
     const patchIds = new Set()
+    const patchValidationErrors = []
     const provisionalOwners = await workspaceProvisionalPageOwners(workspace, record.task)
-    for (const patch of input.patches) {
-      validatePagePatchShape(patch, workspace.config.limits)
-      if (patchIds.has(patch.patchId)) fail("INVALID_PAGE_PATCH", `Duplicate patchId: ${patch.patchId}`)
-      patchIds.add(patch.patchId)
-      validateSourceRefs(patch.sourceRefs, record.task, record.batches, workspace.config.limits)
-      const provisionalOwner = provisionalOwners.get(patch.path)
-      if (provisionalOwner && provisionalOwner !== record.task.taskId) {
-        fail("PROVISIONAL_PAGE_CONFLICT", `Page is provisional in another task: ${patch.path}`, {
-          retryable: true,
-          details: { path: patch.path, provisional_task_id: provisionalOwner },
-          suggestedAction: "Finish or reconcile the owning task before updating this page.",
+    for (const [patchIndex, patch] of input.patches.entries()) {
+      try {
+        validatePagePatchShape(patch, workspace.config.limits)
+        if (patchIds.has(patch.patchId)) fail("INVALID_PAGE_PATCH", `Duplicate patchId: ${patch.patchId}`)
+        patchIds.add(patch.patchId)
+        validateSourceRefs(patch.sourceRefs, record.task, record.batches, workspace.config.limits)
+        const provisionalOwner = provisionalOwners.get(patch.path)
+        if (provisionalOwner && provisionalOwner !== record.task.taskId) {
+          fail("PROVISIONAL_PAGE_CONFLICT", `Page is provisional in another task: ${patch.path}`, {
+            retryable: true,
+            details: { path: patch.path, provisional_task_id: provisionalOwner },
+            suggestedAction: "Finish or reconcile the owning task before updating this page.",
+          })
+        }
+      } catch (error) {
+        const normalized = asLlmWikiError(error)
+        if (!["INVALID_PAGE_PATCH", "INVALID_PAGE_PATH", "INVALID_SOURCE_REF"].includes(normalized.code)) throw error
+        patchValidationErrors.push({
+          patch_index: patchIndex,
+          patch_id: typeof patch?.patchId === "string" ? patch.patchId : null,
+          path: typeof patch?.path === "string" ? patch.path : null,
+          code: normalized.code,
+          message: normalized.message,
+          ...(normalized.details ? { details: normalized.details } : {}),
         })
       }
+    }
+    if (patchValidationErrors.length > 0) {
+      const first = patchValidationErrors[0]
+      fail(first.code, `Page patch validation failed for ${patchValidationErrors.length} of ${input.patches.length} submitted patches.`, {
+        retryable: true,
+        taskId: record.task.taskId,
+        details: {
+          validation_errors: patchValidationErrors,
+          invalid_patch_count: patchValidationErrors.length,
+          submitted_patch_count: input.patches.length,
+          atomic_commit_applied: false,
+          retry_scope: "entire_rejected_patch_set",
+        },
+        suggestedAction: "Correct every listed patch, then resubmit the entire patch set from this rejected atomic call with a new idempotency key.",
+      })
     }
     const idempotent = await withIdempotency(record.paths, input?.idempotency_key, {
       operation: "commit_pages",

@@ -220,7 +220,16 @@ export function validateSourceRefs(refs, task, batches, limits) {
       if (typeof ref.quote !== "string" || ref.quote.length > limits.maxQuoteChars) fail("INVALID_SOURCE_REF", "SourceRef quote is invalid or too long.")
       const quote = normalizeQuote(ref.quote)
       const source = normalizeQuote(chunk.text)
-      if (quote && !source.includes(quote)) fail("INVALID_SOURCE_REF", `Quote does not match chunk ${ref.chunkId}.`)
+      if (quote && !source.includes(quote)) {
+        fail("INVALID_SOURCE_REF", `Quote does not match chunk ${ref.chunkId}.`, {
+          retryable: true,
+          details: {
+            chunk_id: ref.chunkId,
+            rejected_quote: ref.quote.slice(0, 200),
+            repair: "Copy an exact SourceRef object from the page requirement or leased batch; do not retype or paraphrase its quote.",
+          },
+        })
+      }
     }
     if (ref.locator !== undefined) {
       if (!ref.locator || typeof ref.locator !== "object" || Array.isArray(ref.locator)) fail("INVALID_SOURCE_REF", "SourceRef locator must be an object.")

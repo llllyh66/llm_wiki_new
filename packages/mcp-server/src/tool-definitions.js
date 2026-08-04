@@ -73,7 +73,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_commit_pages",
-    description: "Atomically commit one fully collected leased Wiki projection. Read all page-plan cursors before the first commit, then use projection_complete:false only to split the accumulated patches into bounded transactions. Transactions are workspace-serialized and use target-page create/hash checks, so unrelated task writes do not invalidate the plan. Incremental commits remain provisional; the final full reconciliation stabilizes them.",
+    description: "Atomically commit one fully collected leased Wiki projection. Read all page-plan cursors before the first commit, then use projection_complete:false only to split the accumulated patches into bounded transactions. A rejected atomic call stores none of its patches and returns the complete retry scope; correct all listed errors and resubmit that entire rejected subset. Transactions use target-page create/hash checks, so unrelated task writes do not invalidate the plan.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },

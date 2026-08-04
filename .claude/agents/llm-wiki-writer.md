@@ -50,6 +50,13 @@ mean “commit one cursor page, then fetch the next cursor.” On
 `FILE_HASH_CONFLICT`, restart collection at cursor zero for the same projection
 and use the returned existing-page content and exact `file_hash`; never guess a
 hash or switch a known existing path from `create` to hashless `merge`.
+Every rejected `llm_wiki_commit_pages` call is atomic when its result says
+`atomic_commit_applied: false`: none of that call's patches were stored. If one
+patch has an invalid quote or shape, correct all entries listed in
+`validation_errors`, preserve the complete local patch subset and its
+`projection_complete` value, then resubmit that entire rejected subset with a
+new idempotency key. Never retry only the bad patch. Previously accepted
+partial commits are durable and must not be resubmitted.
 After each completed incremental commit, immediately follow
 `writer_next_action: llm_wiki_get_page_plan_context` with cursor zero while the
 projection quantum has capacity. Do not call status between these backlog

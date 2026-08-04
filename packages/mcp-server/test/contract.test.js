@@ -150,6 +150,53 @@ test("premature page commits return the exact next page-plan cursor without disc
   })
 })
 
+test("page validation rejection reports atomic whole-subset retry semantics", async () => {
+  const router = new HeadlessToolRouter({
+    commitPages: async () => {
+      throw new LlmWikiError("INVALID_SOURCE_REF", "Two page patches have invalid quotes.", {
+        retryable: true,
+        details: {
+          validation_errors: [
+            { patch_id: "patch-035", code: "INVALID_SOURCE_REF" },
+            { patch_id: "patch-041", code: "INVALID_SOURCE_REF" },
+          ],
+        },
+      })
+    },
+  })
+  const response = await router.callMcp("llm_wiki_commit_pages", {
+    task_id: "task-example",
+    writer_id: "wiki-writer-1",
+    projection_id: "projection-example",
+    based_on_wiki_revision: "b".repeat(64),
+    projection_complete: true,
+    patches: [{ patchId: "patch-035" }, { patchId: "patch-041" }, { patchId: "patch-042" }],
+    idempotency_key: "page-validation-retry-v1",
+  })
+  assert.equal(response.isError, undefined)
+  assert.equal(response.structuredContent.error.code, "INVALID_SOURCE_REF")
+  assert.equal(response.structuredContent.atomic_commit_applied, false)
+  assert.deepEqual(response.structuredContent.page_commit_recovery, {
+    changes_applied: false,
+    retry_scope: "entire_rejected_patch_set",
+    submitted_patch_count: 3,
+    submitted_patch_ids: ["patch-035", "patch-041", "patch-042"],
+    preserve_projection_complete: true,
+    instruction: "Correct every reported invalid patch and resubmit the whole rejected atomic patch set with a new idempotency key; do not retry only the failing patch.",
+  })
+  assert.deepEqual(response.structuredContent.next_action, {
+    tool: "llm_wiki_commit_pages",
+    arguments: {
+      task_id: "task-example",
+      writer_id: "wiki-writer-1",
+      projection_id: "projection-example",
+      based_on_wiki_revision: "b".repeat(64),
+      projection_complete: true,
+    },
+  })
+  assert.equal(response.structuredContent.mcp_connection_usable, true)
+})
+
 test("every registered MCP tool routes errors without terminating the router", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-mcp-routes-"))
   t.after(() => rm(root, { recursive: true, force: true }))

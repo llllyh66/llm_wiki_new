@@ -92,6 +92,15 @@ whole bounded plan. Follow the returned `next_action` cursor exactly until
 snapshot. Only then generate patches. `projection_complete: false` splits more
 than 50 accumulated patches and does not authorize per-cursor commits.
 
+For page-patch validation errors such as `INVALID_SOURCE_REF`, use the returned
+`validation_errors` entries to repair every identified patch. When
+`atomic_commit_applied: false`, none of the submitted patches were persisted:
+resubmit the entire rejected patch subset, not only the invalid patch. Preserve
+its `projection_complete` value and use a new idempotency key after editing.
+Copy `sourceRefs` verbatim from the accumulated page requirements; do not
+retype quotes. Patches from an earlier `accepted: true` partial commit remain
+durable and are not part of this retry.
+
 If a multipart projection worker stops, inspect `wiki_projection` in status.
 While `in_progress` remains true, do not compete for its lease. After expiry,
 the same stable writer ID can acquire a replacement projection. Paths written
