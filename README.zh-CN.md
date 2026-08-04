@@ -97,7 +97,7 @@ claude
 ```
 
 根目录的 `.mcp.json` 会使用 `CLAUDE_PROJECT_DIR` 锁定服务器脚本和工作区路径，
-并让这个 13 工具的服务器在会话期间保持加载。第一次打开项目时，Claude Code
+并让这个 14 工具的服务器在会话期间保持加载。第一次打开项目时，Claude Code
 会请求批准项目 MCP，请确认批准。
 
 ### 2. 检查 MCP
@@ -120,7 +120,7 @@ llm-wiki: node packages/mcp-server/dist/index.js --workspace . - Connected
 /mcp
 ```
 
-`llm-wiki` 应显示 `Connected` 和 13 个工具。
+`llm-wiki` 应显示 `Connected` 和 14 个工具。
 
 页面规划上下文会自动分页，Skill 会持续读取到 `next_cursor` 为空；大请求和大结果
 也有明确预算，超过限制时会返回可恢复错误，而不是关闭 MCP 连接。
@@ -154,7 +154,7 @@ Agent，当前最多 4 个；大型 Schema 也不再降为 2 个，因为每个 
 在协调器中重复抽取。
 首次启动和补位都必须显式使用项目 Agent 类型 `llm-wiki-extractor`，不能改用
 `general-purpose`、动态“Worker N”或 Agent Team teammate，因为它们不会加载该
-Agent 文件的 `mcpServers` 配置。项目同时显式允许 13 个 MCP 工具名，每个工具
+Agent 文件的 `mcpServers` 配置。项目同时显式允许 14 个 MCP 工具名，每个工具
 都发布 `anthropic/alwaysLoad` 元数据；如果宿主仍延迟加载，Worker 会先使用
 ToolSearch 发现工具，而不是直接判定 MCP 不可用。
 `.claude/agents/llm-wiki-writer.md` 使用同样的 MCP 复用方式，且每个任务同时
@@ -369,10 +369,17 @@ npm run cli -- status --workspace .
 npm run cli -- status <task-id> --workspace .
 npm run cli -- lint --workspace .
 npm run cli -- abort <task-id> --workspace .
+npm run cli -- delete wiki --confirm-delete-knowledge-base --workspace .
+npm run cli -- delete knowledge_base --confirm-delete-knowledge-base --workspace .
 npm run cli -- migrate-legacy raw/sources --workspace .
 ```
 
 `import` 只创建待 Agent 分析的持久化任务，不会自动调用模型完成页面生成。
+
+### 删除知识库
+
+MCP 工具 `llm_wiki_delete_knowledge_base` 和 CLI 都要求显式确认标识
+`DELETE KNOWLEDGE BASE`。`wiki` 只删除 Wiki 页面和检索索引，保留原始来源与任务历史；`knowledge_base` 还会删除托管原文、任务状态、事务日志和导入暂存，但保留工作区配置与 Schema。有活跃任务时必须先完成或取消。
 
 ## 迁移现有知识库
 
@@ -417,7 +424,7 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
 
 ### MCP 已连接，但工具无法调用
 
-1. 在 Claude Code 中运行 `/mcp`，确认已批准且工具数为 13。
+1. 在 Claude Code 中运行 `/mcp`，确认已批准且工具数为 14。
 2. 运行 `npm run build`，然后重启 Claude Code。
 3. 确保是从项目根目录启动。
 4. 显式测试：
@@ -462,9 +469,9 @@ npm test
 ```
 
 然后完全退出 Claude Code，从该项目根目录重新运行 `claude`，批准项目 MCP，
-并用 `/mcp` 确认 `llm-wiki` 为 `Connected` 且有 13 个工具。最新版包含连续
+并用 `/mcp` 确认 `llm-wiki` 为 `Connected` 且有 14 个工具。最新版包含连续
 `INVALID_ANALYSIS`、错误 SourceRef 和畸形重试后保持同一 STDIO 连接存活的
-回归测试。现在 13 个工具的所有异常都作为普通工具结果返回，不再进入
+回归测试。现在 14 个工具的所有异常都作为普通工具结果返回，不再进入
 MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 `error`、`next_action` 和 `mcp_connection_usable: true`。Agent 应按
 `next_action` 修正或恢复，不需要执行 `/mcp`。

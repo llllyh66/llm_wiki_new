@@ -1227,6 +1227,68 @@ export class LlmWikiCore {
     return { task_id: record.task.taskId, status: "cancelled", changed: true, committed_changes: record.task.commitRevision > 0 }
   }
 
+  async deleteKnowledgeBase(input) {
+    return this.#withWorkspaceWriteLock(() => this.#deleteKnowledgeBase(input))
+  }
+
+  async #deleteKnowledgeBase(input) {
+    const confirmation = String(input?.confirmation ?? "")
+    if (confirmation !== "DELETE KNOWLEDGE BASE") {
+      fail("DELETE_CONFIRMATION_REQUIRED", "Deletion requires confirmation: DELETE KNOWLEDGE BASE.", {
+        retryable: false,
+        suggestedAction: "Call llm_wiki_delete_knowledge_base again with the exact confirmation string.",
+      })
+    }
+    const scope = String(input?.scope ?? "")
+    if (!["wiki", "knowledge_base"].includes(scope)) {
+      fail("INVALID_INPUT", "scope must be either wiki or knowledge_base.")
+    }
+    const workspace = await this.workspace({ skipWikiRevision: true })
+    const tasks = await workspaceTaskRecords(workspace.paths.tasks)
+    const activeTasks = tasks.filter((task) => task.status === "corrupt" || ACTIVE_TASK_STATUSES.includes(task.status))
+    if (activeTasks.length > 0) {
+      fail("KNOWLEDGE_BASE_BUSY", "Cannot delete while an extraction or Wiki task is active.", {
+        retryable: true,
+        details: { active_task_count: activeTasks.length },
+        suggestedAction: "Finish or abort active tasks, then retry the deletion.",
+      })
+    }
+
+    const deleted = []
+    const clear = async (target, label) => {
+      const files = await listFilesRecursive(target)
+      await rm(target, { recursive: true, force: true })
+      await ensureDir(target)
+      deleted.push({ area: label, file_count: files.length })
+    }
+
+    await clear(workspace.paths.wiki, "wiki")
+    await clear(workspace.paths.indexes, "indexes")
+    await rm(path.join(workspace.paths.state, "lint.json"), { force: true })
+    if (scope === "knowledge_base") {
+      await clear(workspace.paths.tasks, "tasks")
+      await clear(workspace.paths.sources, "sources")
+      await ensureDir(workspace.paths.sourceObjects)
+      await ensureDir(workspace.paths.sourceManifests)
+      await clear(workspace.paths.importStaging, "import_staging")
+      await clear(workspace.paths.journal, "journal")
+      this.domainSchemaCache.clear()
+      this.domainSchemaSelectionCache.clear()
+      this.taskChunkIndexCache.clear()
+      this.taskAnalysisCache.clear()
+    }
+    return {
+      accepted: true,
+      deleted: true,
+      scope,
+      deleted_areas: deleted,
+      retained: scope === "wiki"
+        ? [".llm-wiki/sources", ".llm-wiki/tasks", ".llm-wiki/config.json", ".llm-wiki/workspace.json"]
+        : [".llm-wiki/config.json", ".llm-wiki/workspace.json", "llm-wiki.schema.md"],
+      wiki_revision: await hashDirectory(workspace.paths.wiki),
+    }
+  }
+
   async lint(input = {}) {
     const workspace = await this.workspace({ skipWikiRevision: true })
     if (input.task_id) await loadTask(workspace.paths, input.task_id)
@@ -1681,6 +1743,27 @@ function fastFinalizationEligibility(task, projection, requirements, existingPag
 function stripInternalSource(source) {
   const { manifest: _manifest, chunks: _chunks, ...publicSource } = source
   return publicSource
+}
+
+async function workspaceTaskRecords(tasksRoot) {
+  const records = []
+  let entries = []
+  try {
+    entries = await readdir(tasksRoot, { withFileTypes: true })
+  } catch {
+    return records
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("task-")) continue
+    try {
+      const task = await readJson(path.join(tasksRoot, entry.name, "task.json"))
+      if (task && typeof task.status === "string") records.push(task)
+    } catch {
+      // Do not destructively clear a workspace containing unreadable task state.
+      records.push({ status: "corrupt" })
+    }
+  }
+  return records
 }
 
 function deduplicateExact(values) {

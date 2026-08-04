@@ -80,6 +80,7 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
     "llm_wiki_finalize",
     "llm_wiki_status",
     "llm_wiki_list_tasks",
+    "llm_wiki_delete_knowledge_base",
     "llm_wiki_abort",
     "llm_wiki_lint",
   ])
@@ -235,6 +236,7 @@ test("every registered MCP tool routes errors without terminating the router", a
     finalize: failing,
     status: failing,
     listTasks: failing,
+    deleteKnowledgeBase: failing,
     abort: failing,
     lint: failing,
   })

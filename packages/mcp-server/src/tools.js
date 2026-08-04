@@ -202,6 +202,7 @@ export class HeadlessToolRouter {
       case "llm_wiki_finalize": return this.core.finalize(args)
       case "llm_wiki_status": return this.core.status(args)
       case "llm_wiki_list_tasks": return this.core.listTasks(args)
+      case "llm_wiki_delete_knowledge_base": return this.core.deleteKnowledgeBase(args)
       case "llm_wiki_abort": return this.core.abort(args)
       case "llm_wiki_lint": return this.core.lint(args)
       default: throw new LlmWikiError("TOOL_NOT_FOUND", `Unknown llm_wiki tool: ${name}`)

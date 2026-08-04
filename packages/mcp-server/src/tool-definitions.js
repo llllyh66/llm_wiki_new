@@ -110,6 +110,14 @@ const toolDefinitions = [
     inputSchema: closedObject({ status: { type: "array", items: { type: "string" } }, limit: { type: "number", minimum: 1, maximum: 100 } }),
   },
   {
+    name: "llm_wiki_delete_knowledge_base",
+    description: "Destructively clear the current Wiki knowledge base after an exact confirmation. scope=wiki removes generated pages and retrieval indexes while retaining imported sources and task history; scope=knowledge_base also removes managed sources, tasks, journals, and staging while preserving workspace configuration and schema.",
+    inputSchema: closedObject({
+      scope: { enum: ["wiki", "knowledge_base"], description: "wiki keeps sources and task history; knowledge_base clears all managed knowledge data." },
+      confirmation: { type: "string", enum: ["DELETE KNOWLEDGE BASE"], description: "Required explicit confirmation for this destructive operation." },
+    }, ["scope", "confirmation"]),
+  },
+  {
     name: "llm_wiki_abort",
     description: "Cancel an unfinished task and clean uncommitted staging without deleting already committed Wiki pages.",
     inputSchema: closedObject({ task_id: taskId, reason: { type: "string", maxLength: 2000 } }, ["task_id"]),

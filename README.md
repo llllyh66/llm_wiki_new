@@ -55,7 +55,7 @@ changing these files.
 Every initial and replacement extraction slot explicitly uses the named project
 Agent type `llm-wiki-extractor`. Generic "Worker N", `general-purpose`, and
 Agent Team teammates are not used because they do not apply that Agent file's
-`mcpServers` declaration. Permissions list all 13 MCP tools explicitly, every
+`mcpServers` declaration. Permissions list all 14 MCP tools explicitly, every
 published tool carries `anthropic/alwaysLoad`, and ToolSearch provides a
 deferred-discovery fallback. Claude Code 2.1.121 or later is recommended for
 the documented always-load behavior.
@@ -138,6 +138,7 @@ for custom prose workflows, but is no longer on the default ingestion path.
 - `llm_wiki_finalize`
 - `llm_wiki_status`
 - `llm_wiki_list_tasks`
+- `llm_wiki_delete_knowledge_base`
 - `llm_wiki_abort`
 - `llm_wiki_lint`
 
@@ -147,7 +148,7 @@ opens are files explicitly passed to `llm_wiki_import_files`; after a safe,
 streaming import, all later work uses the managed copy.
 
 The Claude Code registration uses `CLAUDE_PROJECT_DIR` rather than a mutable
-shell working directory and keeps this bounded 13-tool server loaded for the
+shell working directory and keeps this bounded 14-tool server loaded for the
 session. MCP input/output budgets and paginated page-plan context prevent a
 single oversized request or response from closing the STDIO transport.
 Every tool exception is returned as a normal result (`ok: false`,
@@ -319,8 +320,16 @@ npm run cli -- import ./document.md --domain-schema ./schemas/domain.json --work
 npm run cli -- status <task-id> --workspace .
 npm run cli -- lint --workspace .
 npm run cli -- abort <task-id> --workspace .
+npm run cli -- delete wiki --confirm-delete-knowledge-base --workspace .
+npm run cli -- delete knowledge_base --confirm-delete-knowledge-base --workspace .
 npm run cli -- migrate-legacy raw/sources --workspace .
 ```
+
+Deletion is deliberately explicit. `wiki` removes generated Wiki pages and
+retrieval indexes but keeps imported sources and task history. `knowledge_base`
+also removes managed sources, task state, journals, and staging while retaining
+workspace configuration and the schema. Active tasks must be finished or
+aborted first.
 
 `migrate-legacy` is an explicit, one-time bridge for an existing desktop-era
 source tree. It imports supported files into content-addressed managed storage

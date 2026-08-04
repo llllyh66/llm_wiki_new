@@ -1431,6 +1431,37 @@ test("fast projection stays ahead of extractors by leasing more than the legacy 
   assert.equal(projected.projection_runs[0].batch_count > 8, true)
 })
 
+test("knowledge-base deletion requires confirmation, blocks active tasks, and preserves configuration by scope", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  await assert.rejects(
+    () => f.core.deleteKnowledgeBase({ scope: "wiki", confirmation: "DELETE" }),
+    (error) => error instanceof LlmWikiError && error.code === "DELETE_CONFIRMATION_REQUIRED",
+  )
+  await assert.rejects(
+    () => f.core.deleteKnowledgeBase({ scope: "wiki", confirmation: "DELETE KNOWLEDGE BASE" }),
+    (error) => error instanceof LlmWikiError && error.code === "KNOWLEDGE_BASE_BUSY",
+  )
+  await f.core.abort({ task_id: imported.task_id, reason: "Deletion test" })
+  await mkdir(path.join(f.workspace, "wiki", "topics"), { recursive: true })
+  await writeFile(path.join(f.workspace, "wiki", "topics", "manual.md"), "# Manual\n\nKeep this only until deletion.\n")
+
+  const wikiOnly = await f.core.deleteKnowledgeBase({ scope: "wiki", confirmation: "DELETE KNOWLEDGE BASE" })
+  assert.equal(wikiOnly.accepted, true)
+  assert.equal(wikiOnly.scope, "wiki")
+  assert.equal((await readdir(path.join(f.workspace, "wiki"))).length, 0)
+  assert.equal((await readdir(path.join(f.workspace, ".llm-wiki", "sources", "objects"))).length > 0, true)
+  await access(path.join(f.workspace, ".llm-wiki", "config.json"))
+
+  const everything = await f.core.deleteKnowledgeBase({ scope: "knowledge_base", confirmation: "DELETE KNOWLEDGE BASE" })
+  assert.equal(everything.accepted, true)
+  assert.equal((await readdir(path.join(f.workspace, ".llm-wiki", "sources", "objects"))).length, 0)
+  assert.equal((await readdir(path.join(f.workspace, ".llm-wiki", "tasks"))).length, 0)
+  await access(path.join(f.workspace, ".llm-wiki", "config.json"))
+  await access(path.join(f.workspace, "llm-wiki.schema.md"))
+})
+
 test("concurrent task writers serialize transactions and accept stale global revisions for different pages", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))

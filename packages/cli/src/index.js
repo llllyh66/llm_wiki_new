@@ -23,6 +23,11 @@ try {
     result = argv[0] ? await core.status({ task_id: argv[0] }) : await core.listTasks()
   } else if (command === "lint") result = await core.lint()
   else if (command === "abort") result = await core.abort({ task_id: argv[0], reason: "Cancelled from CLI" })
+  else if (command === "delete") {
+    const scope = argv[0]
+    const confirmed = argv.includes("--confirm-delete-knowledge-base")
+    result = await core.deleteKnowledgeBase({ scope, confirmation: confirmed ? "DELETE KNOWLEDGE BASE" : "" })
+  }
   else if (command === "migrate-legacy") {
     const legacyRoot = path.resolve(core.workspaceRoot, argv[0] || "raw/sources")
     const files = await collectSupportedFiles(legacyRoot)
@@ -30,7 +35,7 @@ try {
     result = await core.importFiles({ files: files.map((file) => ({ path: file })), options: { domain_schema_path: domainSchemaPath } })
   }
   else {
-    process.stderr.write("Usage: llm-wiki <init|import|status|lint|abort|migrate-legacy> [arguments] [--workspace DIR] [--domain-schema FILE]\n")
+    process.stderr.write("Usage: llm-wiki <init|import|status|lint|abort|delete|migrate-legacy> [arguments] [--workspace DIR] [--domain-schema FILE]\n")
     process.exitCode = 2
     process.exit()
   }
