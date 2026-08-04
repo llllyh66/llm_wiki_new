@@ -87,6 +87,42 @@ function recoveryAction(tool, args, error) {
   if (tool === "llm_wiki_get_batch" && error.code === "MCP_OUTPUT_TOO_LARGE") {
     return { tool, arguments: { task_id: args?.task_id, batch_id: args?.batch_id } }
   }
+  if (tool === "llm_wiki_commit_pages" && error.code === "PAGE_PLAN_INCOMPLETE") {
+    return {
+      tool: "llm_wiki_get_page_plan_context",
+      arguments: {
+        task_id: args?.task_id,
+        writer_id: args?.writer_id,
+        projection_id: args?.projection_id,
+        cursor: error.details?.expected_cursor ?? 0,
+        max_chars: 40_000,
+      },
+    }
+  }
+  if (tool === "llm_wiki_commit_pages" && error.code === "FILE_HASH_CONFLICT") {
+    return {
+      tool: "llm_wiki_get_page_plan_context",
+      arguments: {
+        task_id: args?.task_id,
+        writer_id: args?.writer_id,
+        projection_id: args?.projection_id,
+        cursor: 0,
+        max_chars: 40_000,
+      },
+    }
+  }
+  if (tool === "llm_wiki_get_page_plan_context" && ["PAGE_PLAN_CURSOR_MISMATCH", "PAGE_PLAN_SNAPSHOT_MISSING"].includes(error.code)) {
+    return {
+      tool,
+      arguments: {
+        task_id: args?.task_id,
+        writer_id: args?.writer_id,
+        projection_id: args?.projection_id,
+        cursor: error.details?.expected_cursor ?? 0,
+        max_chars: 40_000,
+      },
+    }
+  }
   if (typeof args?.task_id === "string" && tool !== "llm_wiki_status") {
     return { tool: "llm_wiki_status", arguments: { task_id: args.task_id } }
   }

@@ -25,6 +25,7 @@ export function taskPaths(workspacePaths, taskId) {
     commits: path.join(root, "commits.json"),
     result: path.join(root, "result.json"),
     domainSchema: path.join(root, "domain-schema.json"),
+    pagePlan: path.join(root, "page-plan.json"),
   }
 }
 

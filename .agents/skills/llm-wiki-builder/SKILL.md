@@ -282,6 +282,13 @@ typed entity or any relation.
    2. Record the returned `projection.projection_id`, `projection.mode`, and
       `based_on_wiki_revision`. Follow `next_cursor` to null, passing the same
       writer and projection IDs on every page, and accumulate all categories.
+      Do not generate or submit any patch until `page_plan_complete: true` and
+      `next_cursor: null`. Core enforces sequential traversal and returns
+      `PAGE_PLAN_INCOMPLETE` with the exact required cursor if this rule is
+      violated. `pagination.returned_items` counts records across every context
+      category; it is never the number of page requirements. An empty
+      `page_requirements` array on a later cursor does not mean traversal is
+      complete because that cursor may contain existing-page hashes or claims.
       Revision validation is target-page scoped. Keep the projection's original
       `based_on_wiki_revision` while paginating even when
       `current_wiki_revision` changes or
@@ -325,6 +332,8 @@ typed entity or any relation.
       `INCOMPLETE_PAGE_COVERAGE` is a normal recoverable result: author the
       listed missing pages or attach their requirement IDs to an appropriate
       existing-page update, then retry without restarting MCP.
+      Partial commits split the patch list accumulated after full page-plan
+      traversal; they never alternate “read one cursor, commit its items.”
    6. Treat incremental writes and incomplete multipart writes as provisional.
       They are deliberately excluded from retrieval. Only a completed `final`
       projection clears provisional state.

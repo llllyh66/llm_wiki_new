@@ -57,7 +57,7 @@ nested agents; it does not use a fragile MCP wildcard as its complete tool
 allowlist. The agent runs in `dontAsk` mode. One
 `llm-wiki-writer` agent consumes projections of at most four batches after four
 new batches or a 30-second debounce, while later extraction continues. One
-Writer invocation drains up to three ready projections without an intermediate
+Writer invocation drains up to six ready projections without an intermediate
 status call or cooldown. Incremental
 pages remain provisional and excluded from retrieval until the writer completes
 the final all-batch reconciliation. The main Agent remains responsive for
@@ -86,6 +86,10 @@ never copied into the Wiki writer's tool response.
 Incremental page plans include full text only for pages affected by the current
 projection. Unrelated pages are represented by compact catalog entries, so
 Writer cost no longer grows with the total byte size of the existing Wiki.
+The Writer must collect every sequential page-plan cursor before its first
+commit. Core persists a stable projection snapshot and rejects premature
+commits with the exact next cursor, preventing provisional pages hidden on a
+later cursor from being recreated without their current hashes.
 
 At the beginning of a later user turn, the coordinator calls
 `llm_wiki_status`. Its `worker_recovery.leases` list contains each persisted

@@ -79,6 +79,9 @@ one Writer invocation drains up to six ready projections (24 batches) immediatel
 backlog exists. Incremental plans include full content only for affected pages
 and compact catalog metadata for unrelated pages. A final all-batch reconciliation stabilizes
 the pages before Finalize.
+Writers collect every page-plan cursor from a stable server-side snapshot
+before committing. The Core rejects premature commits with the exact next
+cursor, so later-page provisional hashes cannot be missed or guessed.
 
 Each extractor invocation handles a bounded quantum of up to three batches,
 persisting an independent checkpoint after every batch. This amortizes Agent

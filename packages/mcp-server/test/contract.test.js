@@ -51,6 +51,9 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(skill, /do not call `llm_wiki_status` inside this\s+worker/)
   assert.match(skill, /Start by copying `analysis_scaffold`/)
   assert.match(skill, /at most two `commit_analysis` attempts for each batch/)
+  assert.match(writer, /returned_items.*all context categories/)
+  assert.match(writer, /Never commit while.*next_cursor.*non-null/s)
+  assert.match(writer, /currently six/)
 })
 
 test("MCP publishes the complete Agent-first tool contract without desktop tools", () => {
@@ -113,6 +116,38 @@ test("commit_analysis validation failures are recoverable business results, not 
     assert.deepEqual(response.structuredContent.validation_errors, ["fix this field"])
     assert.equal(response.structuredContent.next_action.tool, "llm_wiki_commit_analysis")
   }
+})
+
+test("premature page commits return the exact next page-plan cursor without disconnecting MCP", async () => {
+  const router = new HeadlessToolRouter({
+    commitPages: async () => {
+      throw new LlmWikiError("PAGE_PLAN_INCOMPLETE", "Collect all cursors first.", {
+        retryable: true,
+        details: { expected_cursor: 63 },
+      })
+    },
+  })
+  const response = await router.callMcp("llm_wiki_commit_pages", {
+    task_id: "task-example",
+    writer_id: "wiki-writer-1",
+    projection_id: "projection-example",
+    based_on_wiki_revision: "a".repeat(64),
+    patches: [],
+    idempotency_key: "premature-page-plan-v1",
+  })
+  assert.equal(response.isError, undefined)
+  assert.equal(response.structuredContent.error.code, "PAGE_PLAN_INCOMPLETE")
+  assert.equal(response.structuredContent.mcp_connection_usable, true)
+  assert.deepEqual(response.structuredContent.next_action, {
+    tool: "llm_wiki_get_page_plan_context",
+    arguments: {
+      task_id: "task-example",
+      writer_id: "wiki-writer-1",
+      projection_id: "projection-example",
+      cursor: 63,
+      max_chars: 40_000,
+    },
+  })
 })
 
 test("every registered MCP tool routes errors without terminating the router", async (t) => {

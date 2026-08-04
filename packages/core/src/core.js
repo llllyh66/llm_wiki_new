@@ -393,6 +393,7 @@ export class LlmWikiCore {
   async #getPagePlanContext(input) {
     const workspace = await this.workspace()
     const record = await loadTask(workspace.paths, input?.task_id)
+    const requestedCursor = normalizePagePlanCursor(input?.cursor)
     const projectionRequested = input?.writer_id !== undefined || input?.projection_id !== undefined
     let projection
     if (projectionRequested) {
@@ -463,7 +464,7 @@ export class LlmWikiCore {
     record.task.pagePlanRevision += 1
     record.task.wikiRevision = revision
     await saveTask(record.paths, record.task)
-    const context = {
+    const freshContext = {
       batches: analyses.map((analysis) => ({ batch_id: analysis.batchId, summary: analysis.batchSummary, unresolved_questions: analysis.unresolvedQuestions })),
       entities: analyses.flatMap((analysis) => analysis.entities),
       concepts: analyses.flatMap((analysis) => analysis.concepts),
@@ -475,7 +476,54 @@ export class LlmWikiCore {
       conflicts: analyses.flatMap((analysis) => analysis.contradictions),
       required_pages: requirements,
     }
-    const page = paginatePagePlan(context, input?.cursor, input?.max_chars, workspace.config.limits.maxPagePlanChars)
+    let context = freshContext
+    if (projection) {
+      if (requestedCursor === 0) {
+        await writeJsonAtomic(record.paths.pagePlan, {
+          schemaVersion: 1,
+          projectionId: projection.projectionId,
+          basedOnWikiRevision: planRevision,
+          createdAt: nowIso(),
+          context,
+        })
+        projection.pagePlanTraversal = {
+          projectionId: projection.projectionId,
+          nextCursor: 0,
+          complete: false,
+        }
+      } else {
+        const traversal = projection.pagePlanTraversal
+        const expectedCursor = traversal?.nextCursor
+        if (!traversal || traversal.projectionId !== projection.projectionId || expectedCursor !== requestedCursor) {
+          fail("PAGE_PLAN_CURSOR_MISMATCH", "Page-plan cursors must be requested sequentially before committing pages.", {
+            retryable: true,
+            taskId: record.task.taskId,
+            details: { requested_cursor: requestedCursor, expected_cursor: expectedCursor ?? 0, projection_id: projection.projectionId },
+            suggestedAction: `Continue the same projection with cursor ${expectedCursor ?? 0}; use cursor 0 only to deliberately restart page-plan collection.`,
+          })
+        }
+        const snapshot = await readJson(record.paths.pagePlan, null)
+        if (!snapshot || snapshot.projectionId !== projection.projectionId || !snapshot.context) {
+          fail("PAGE_PLAN_SNAPSHOT_MISSING", "The stable page-plan snapshot is missing.", {
+            retryable: true,
+            taskId: record.task.taskId,
+            details: { expected_cursor: 0, projection_id: projection.projectionId },
+            suggestedAction: "Restart page-plan collection for the same projection at cursor 0.",
+          })
+        }
+        context = snapshot.context
+      }
+    }
+    const page = paginatePagePlan(context, requestedCursor, input?.max_chars, workspace.config.limits.maxPagePlanChars)
+    if (projection) {
+      projection.pagePlanTraversal.nextCursor = page.pagination.next_cursor
+      projection.pagePlanTraversal.complete = page.pagination.next_cursor === null
+      projection.pagePlanTraversal.totalItems = page.pagination.total_items
+      projection.pagePlanTraversal.collectedItems = page.pagination.next_cursor ?? page.pagination.total_items
+      projection.expiresAt = new Date(Date.now() + PAGE_PROJECTION_LEASE_MS).toISOString()
+      await saveTask(record.paths, record.task)
+    }
+    const pagePlanComplete = projection ? projection.pagePlanTraversal.complete : page.pagination.next_cursor === null
     return {
       task_id: record.task.taskId,
       analysis_summary: {
@@ -501,12 +549,32 @@ export class LlmWikiCore {
       current_wiki_revision: revision,
       revision_scope: "target-pages",
       concurrent_wiki_changes_detected: concurrentWikiChangesDetected,
+      page_plan_complete: pagePlanComplete,
+      commit_ready: pagePlanComplete,
       ...(projection ? {
         projection: publicProjection(projection),
         provisional: projection.mode === "incremental",
       } : {}),
       pagination: page.pagination,
       next_cursor: page.pagination.next_cursor,
+      next_action: page.pagination.next_cursor !== null
+        ? {
+            tool: "llm_wiki_get_page_plan_context",
+            arguments: {
+              task_id: record.task.taskId,
+              ...(projection ? { writer_id: projection.writerId, projection_id: projection.projectionId } : {}),
+              cursor: page.pagination.next_cursor,
+              max_chars: Math.min(Math.max(Number(input?.max_chars) || 40_000, 20_000), workspace.config.limits.maxPagePlanChars),
+            },
+          }
+        : {
+            tool: "llm_wiki_commit_pages",
+            arguments: {
+              task_id: record.task.taskId,
+              ...(projection ? { writer_id: projection.writerId, projection_id: projection.projectionId } : {}),
+              based_on_wiki_revision: planRevision,
+            },
+          },
     }
   }
 
@@ -554,6 +622,19 @@ export class LlmWikiCore {
       const projectionComplete = input?.projection_complete !== false
       if (projectionCommit) {
         projection = requirePageProjectionLease(record.task, input)
+        if (projection.pagePlanTraversal?.complete !== true) {
+          fail("PAGE_PLAN_INCOMPLETE", "Collect every page-plan cursor before committing any page patches.", {
+            retryable: true,
+            taskId: record.task.taskId,
+            details: {
+              projection_id: projection.projectionId,
+              expected_cursor: projection.pagePlanTraversal?.nextCursor ?? 0,
+              collected_items: projection.pagePlanTraversal?.collectedItems ?? 0,
+              total_items: projection.pagePlanTraversal?.totalItems ?? null,
+            },
+            suggestedAction: "Call llm_wiki_get_page_plan_context with the returned expected cursor until next_cursor is null; then split the accumulated patches into partial commits.",
+          })
+        }
         if (projection.mode === "final" && record.task.completedBatchIds.length !== record.task.batchCount) {
           fail("INVALID_TASK_STATE", "Final page reconciliation requires every batch analysis.")
         }
@@ -599,6 +680,7 @@ export class LlmWikiCore {
           state.revision += 1
           state.lastCommittedAt = nowIso()
           state.lease = null
+          await rm(record.paths.pagePlan, { force: true }).catch(() => {})
           if (projection.mode === "incremental") {
             record.task.status = record.task.completedBatchIds.length === record.task.batchCount ? "planning" : "extracting"
           } else {
@@ -982,6 +1064,10 @@ function pageProjectionStatus(task) {
       projection_id: state.lease.projectionId,
       writer_id: state.lease.writerId,
       lease_expires_at: state.lease.expiresAt,
+      page_plan_complete: state.lease.pagePlanTraversal?.complete === true,
+      page_plan_next_cursor: state.lease.pagePlanTraversal
+        ? state.lease.pagePlanTraversal.nextCursor
+        : 0,
     } : {}),
     ...(nextReadyAt ? { next_ready_at: nextReadyAt } : {}),
   }
@@ -1302,8 +1388,7 @@ function latestPageRecords(history) {
 }
 
 function paginatePagePlan(context, requestedCursor, requestedMaxChars, configuredMaxChars) {
-  const cursor = requestedCursor === undefined || requestedCursor === null ? 0 : Number(requestedCursor)
-  if (!Number.isInteger(cursor) || cursor < 0) fail("INVALID_INPUT", "cursor must be a non-negative integer.")
+  const cursor = normalizePagePlanCursor(requestedCursor)
   const maxChars = Math.min(Math.max(Number(requestedMaxChars) || 40_000, 20_000), configuredMaxChars)
   const categories = ["batches", "required_pages", "entities", "concepts", "claims", "relations", "candidate_pages", "existing_pages", "existing_page_catalog", "conflicts"]
   const records = categories.flatMap((category) => context[category].map((value) => ({ category, value })))
@@ -1328,8 +1413,16 @@ function paginatePagePlan(context, requestedCursor, requestedMaxChars, configure
       returned_items: index - cursor,
       approximate_chars: usedChars,
       truncated: index < records.length,
+      returned_by_category: Object.fromEntries(categories.map((category) => [category, values[category].length])),
+      total_by_category: Object.fromEntries(categories.map((category) => [category, context[category].length])),
     },
   }
+}
+
+function normalizePagePlanCursor(value) {
+  const cursor = value === undefined || value === null ? 0 : Number(value)
+  if (!Number.isInteger(cursor) || cursor < 0) fail("INVALID_INPUT", "cursor must be a non-negative integer.")
+  return cursor
 }
 
 function pagePlanDomainSchemaMetadata(metadata) {
@@ -1385,6 +1478,21 @@ function statusResponse(task) {
 }
 
 function nextAction(task, wikiProjection = pageProjectionStatus(task)) {
+  if (wikiProjection.in_progress) {
+    return {
+      tool: "llm_wiki_get_page_plan_context",
+      arguments: {
+        task_id: task.taskId,
+        writer_id: wikiProjection.writer_id,
+        projection_id: wikiProjection.projection_id,
+        // Status cannot know whether the previous Writer process retained its
+        // accumulated context. Cursor zero safely rebuilds the same lease's
+        // stable snapshot for a replacement invocation.
+        cursor: 0,
+        max_chars: 40_000,
+      },
+    }
+  }
   if (wikiProjection.ready) {
     return { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: task.taskId, writer_id: "wiki-writer-1" } }
   }

@@ -79,11 +79,18 @@ onto that newer workspace state.
 
 On `FILE_HASH_CONFLICT`, no patches in that atomic commit were applied. Call
 `llm_wiki_get_page_plan_context` with the same task, Writer, and projection IDs,
-read the newest content/hash for the reported target path, semantically rebase
+restart at cursor zero, follow every returned cursor to null, read the newest
+content/hash for the reported target path, semantically rebase
 that page, and retry. Never force an overwrite or start a second Writer for the
 same task. A `WIKI_REVISION_CONFLICT` from an unrelated-path change indicates
 an older Core process is still running; restart that process on the updated
 build, then resume the existing task and lease instead of creating a new task.
+
+`PAGE_PLAN_INCOMPLETE` means the Writer tried to commit before collecting the
+whole bounded plan. Follow the returned `next_action` cursor exactly until
+`page_plan_complete: true`; Core serves those pages from a stable projection
+snapshot. Only then generate patches. `projection_complete: false` splits more
+than 50 accumulated patches and does not authorize per-cursor commits.
 
 If a multipart projection worker stops, inspect `wiki_projection` in status.
 While `in_progress` remains true, do not compete for its lease. After expiry,

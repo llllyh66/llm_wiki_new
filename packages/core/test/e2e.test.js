@@ -865,9 +865,24 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(incrementalPlan.waiting, undefined)
   assert.equal(incrementalPlan.projection.mode, "incremental")
   assert.equal(incrementalPlan.projection.batch_ids.length, 4)
+  assert.equal(incrementalPlan.page_plan_complete, true)
+  assert.equal(incrementalPlan.commit_ready, true)
   const competingWriter = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-2" })
   assert.equal(competingWriter.waiting, true)
   assert.equal(competingWriter.projection.writer_busy, true)
+  const leasedStatus = await f.core.status({ task_id: imported.task_id })
+  assert.equal(leasedStatus.wiki_projection.page_plan_complete, true)
+  assert.equal(leasedStatus.wiki_projection.page_plan_next_cursor, null)
+  assert.deepEqual(leasedStatus.next_action, {
+    tool: "llm_wiki_get_page_plan_context",
+    arguments: {
+      task_id: imported.task_id,
+      writer_id: "wiki-writer-1",
+      projection_id: incrementalPlan.projection.projection_id,
+      cursor: 0,
+      max_chars: 40_000,
+    },
+  })
 
   const provisional = await f.core.commitPages({
     task_id: imported.task_id,
@@ -882,7 +897,7 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
       operation: "create",
       title: "Projected Entity",
       pageKind: "topic",
-      content: "# Projected Entity\n\nProvisionalOnlyMarker",
+      content: `# Projected Entity\n\nProvisionalOnlyMarker\n\n${"Large provisional context. ".repeat(1_100)}`,
       covers: incrementalPlan.page_requirements.map((requirement) => requirement.requirement_id),
       sourceRefs: [sourceRefs[0]],
       rationale: "Early micro-batch projection.",
@@ -894,6 +909,57 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(provisional.wiki_projection.in_progress, true)
   const hidden = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["ProvisionalOnlyMarker"] })
   assert.equal(hidden.hits.some((hit) => hit.path === "wiki/topics/projected-entity.md"), false)
+
+  const restartedPlan = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: incrementalPlan.projection.projection_id,
+    cursor: 0,
+    max_chars: 20_000,
+  })
+  assert.equal(restartedPlan.page_plan_complete, false)
+  assert.equal(restartedPlan.commit_ready, false)
+  assert.equal(restartedPlan.existing_pages.length, 0)
+  assert.equal(restartedPlan.pagination.total_by_category.existing_pages, 1)
+  await assert.rejects(
+    () => f.core.commitPages({
+      task_id: imported.task_id,
+      writer_id: "wiki-writer-1",
+      projection_id: incrementalPlan.projection.projection_id,
+      based_on_wiki_revision: provisional.wiki_revision,
+      idempotency_key: "premature-incremental-projection-ack-v1",
+      projection_complete: false,
+      patches: [],
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "PAGE_PLAN_INCOMPLETE"
+      && error.details.expected_cursor === restartedPlan.next_cursor,
+  )
+  await assert.rejects(
+    () => f.core.getPagePlanContext({
+      task_id: imported.task_id,
+      writer_id: "wiki-writer-1",
+      projection_id: incrementalPlan.projection.projection_id,
+      cursor: restartedPlan.next_cursor + 1,
+      max_chars: 20_000,
+    }),
+    (error) => error instanceof LlmWikiError && error.code === "PAGE_PLAN_CURSOR_MISMATCH",
+  )
+  let continuationCursor = restartedPlan.next_cursor
+  const recoveredExistingPages = []
+  while (continuationCursor !== null) {
+    const continuation = await f.core.getPagePlanContext({
+      task_id: imported.task_id,
+      writer_id: "wiki-writer-1",
+      projection_id: incrementalPlan.projection.projection_id,
+      cursor: continuationCursor,
+      max_chars: 20_000,
+    })
+    recoveredExistingPages.push(...continuation.existing_pages)
+    continuationCursor = continuation.next_cursor
+  }
+  assert.equal(recoveredExistingPages.length, 1)
+  assert.equal(typeof recoveredExistingPages[0].file_hash, "string")
   const acknowledged = await f.core.commitPages({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
@@ -916,7 +982,8 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
     (error) => error instanceof LlmWikiError && error.code === "FINAL_PROJECTION_REQUIRED",
   )
 
-  const finalPlan = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1" })
+  const finalPlan = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 100_000 })
+  assert.equal(finalPlan.page_plan_complete, true)
   assert.equal(finalPlan.projection.mode, "final")
   assert.equal(finalPlan.projection.batch_ids.length, 6)
   const existing = finalPlan.existing_pages.find((page) => page.path === "wiki/topics/projected-entity.md")
