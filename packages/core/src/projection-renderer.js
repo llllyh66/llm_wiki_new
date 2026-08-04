@@ -32,14 +32,23 @@ export function buildGroundedProjectionPatches({ requirements, existingPages, an
       claims: uniqueObjects(grouped.flatMap((item) => facts.get(item.requirement_id)?.claims ?? [])),
       relations: uniqueObjects(grouped.flatMap((item) => facts.get(item.requirement_id)?.relations ?? [])),
     }
-    const rendered = renderRequirementPage(requirement, pageFacts, targetLanguage, maxPageChars)
+    const groundedRequirement = {
+      ...requirement,
+      source_refs: uniqueSourceRefs([
+        ...requirement.source_refs,
+        ...pageFacts.candidates.flatMap((candidate) => candidate.sourceRefs ?? []),
+        ...pageFacts.claims.flatMap((claim) => claim.sourceRefs ?? []),
+        ...pageFacts.relations.flatMap(({ relation }) => relation.sourceRefs ?? []),
+      ]),
+    }
+    const rendered = renderRequirementPage(groundedRequirement, pageFacts, targetLanguage, maxPageChars)
     return {
-      ...requirement.patch_scaffold,
+      ...groundedRequirement.patch_scaffold,
       content: rendered.content,
       summary: rendered.summary,
       tags: rendered.tags,
       // Complete, server-validated references avoid any Agent quote copying.
-      sourceRefs: requirement.source_refs,
+      sourceRefs: groundedRequirement.source_refs,
       rationale: `Deterministically project grounded analysis for ${requirement.requirement_id}.`,
     }
   })

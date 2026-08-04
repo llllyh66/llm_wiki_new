@@ -197,61 +197,15 @@ test("built MCP server survives errors and completes the full workflow over one 
   })
   assert.equal(analyzed.isError, undefined)
   assert.equal(analyzed.structuredContent.normalized_source_ref_indexes, 3)
-  const plan = await client.callTool({
-    name: "llm_wiki_get_page_plan_context",
-    arguments: { task_id: taskId, writer_id: "stdio-wiki-writer", cursor: 0 },
+  assert.equal(analyzed.structuredContent.next_action.tool, "llm_wiki_apply_projection")
+  const projected = await client.callTool({
+    name: "llm_wiki_apply_projection",
+    arguments: { task_id: taskId, writer_id: "stdio-wiki-writer", max_projections: 6 },
   })
-  assert.equal(plan.structuredContent.next_cursor, null)
-  assert.equal(plan.structuredContent.projection.mode, "incremental")
-  const competingProjection = await client.callTool({
-    name: "llm_wiki_get_page_plan_context",
-    arguments: { task_id: taskId, writer_id: "stdio-competing-writer", cursor: 0 },
-  })
-  assert.equal(competingProjection.isError, undefined)
-  assert.equal(competingProjection.structuredContent.waiting, true)
-  assert.equal(competingProjection.structuredContent.projection.writer_busy, true)
-  const pages = await client.callTool({
-    name: "llm_wiki_commit_pages",
-    arguments: {
-      task_id: taskId,
-      writer_id: "stdio-wiki-writer",
-      projection_id: plan.structuredContent.projection.projection_id,
-      based_on_wiki_revision: plan.structuredContent.based_on_wiki_revision,
-      idempotency_key: "stdio-pages-v1",
-      patches: [{
-        patchId: "business-v1",
-        path: "wiki/concepts/business-entity.md",
-        operation: "create",
-        title: "Business Entity",
-        pageKind: "concept",
-        content: "# Business Entity\n\nA canonical business object.",
-        covers: plan.structuredContent.page_requirements.map((requirement) => requirement.requirement_id),
-        sourceRefs: [sourceRef],
-        rationale: "The source defines this concept.",
-      }],
-    },
-  })
-  assert.equal(pages.isError, undefined)
-  assert.equal(pages.structuredContent.wiki_projection.final_completed, false)
-  assert.equal(pages.structuredContent.wiki_projection.mode, "final")
-  const finalPlan = await client.callTool({
-    name: "llm_wiki_get_page_plan_context",
-    arguments: { task_id: taskId, writer_id: "stdio-wiki-writer", cursor: 0 },
-  })
-  assert.equal(finalPlan.structuredContent.projection.mode, "final")
-  assert.equal(finalPlan.structuredContent.finalization_hint.fast_path_eligible, true)
-  const stabilized = await client.callTool({
-    name: "llm_wiki_commit_pages",
-    arguments: {
-      task_id: taskId,
-      writer_id: "stdio-wiki-writer",
-      projection_id: finalPlan.structuredContent.projection.projection_id,
-      based_on_wiki_revision: finalPlan.structuredContent.based_on_wiki_revision,
-      idempotency_key: "stdio-final-stabilization-v1",
-      patches: [],
-    },
-  })
-  assert.equal(stabilized.structuredContent.wiki_projection.final_completed, true)
+  assert.equal(projected.isError, undefined)
+  assert.equal(projected.structuredContent.automated, true)
+  assert.deepEqual(projected.structuredContent.projection_runs.map((run) => run.mode), ["incremental", "final"])
+  assert.equal(projected.structuredContent.wiki_projection.final_completed, true)
   const finalized = await client.callTool({ name: "llm_wiki_finalize", arguments: { task_id: taskId } })
   assert.equal(finalized.structuredContent.status, "completed")
   const status = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: taskId } })
