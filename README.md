@@ -88,7 +88,7 @@ all-batch final prompt. If all requirements then have unique explicit coverage
 and no contradiction exists, final reconciliation becomes a verified empty
 stabilization commit rather than a full page rewrite.
 
-Each extractor invocation handles a bounded quantum of up to three batches,
+Each extractor invocation handles a bounded quantum of up to six batches,
 persisting an independent checkpoint after every batch. This amortizes Agent
 startup and Skill-loading time while preserving recovery. On a later turn,
 `llm_wiki_status` exposes
@@ -155,12 +155,12 @@ Large tables, code blocks, and legacy oversized chunks are split before
 `get_batch`. Batches are bounded by both text and serialized payload size and
 are always returned complete; `batch_limits` reports the actual size. Set
 `options.max_batch_chars` during import to request smaller batches. Extractors
-also pass `max_chars: 6000` to `get_batch`; this safely persists smaller parts
-for every unfinished batch without truncating content, while preserving each
-original batch ID and reservation on its first repaired part.
-Agent transport ceilings are fixed at 3,000 characters per chunk and 6,000
-source characters per batch, with a 24 KiB serialized chunk-payload ceiling per batch,
-even when an old workspace requested larger values.
+pass the server's `recommended_batch_chars` to `get_batch`: 6,000 for small
+tasks and 9,000 for large tasks. Repartitioning never truncates content and
+preserves each original batch ID and reservation on its first repaired part.
+Agent transport ceilings remain fixed at 3,000 characters per chunk, at most
+9,000 source characters per batch, and 24 KiB of serialized chunk payload even
+when an old workspace requested larger values.
 The full `get_batch` result is also budgeted: the unrelated Wiki page schema is
 omitted, the Analysis schema is represented by a compact contract, and a large
 domain Schema contributes only a compact batch-matched slice. `batch_limits`
@@ -191,6 +191,16 @@ Schema call. Extraction also skips BM25/embedding retrieval by default because
 the leased batch is complete evidence and final projection reconciles batches;
 retrieval remains available for explicit cross-batch ambiguity and remains the
 default multi-route path for user questions.
+
+Large-task storage and coordination are also bounded. Task batches retain only
+the table locator metadata needed for extraction instead of duplicating complete
+structured tables. Verified batch bounds and parsed `batches.json` files are
+cached across a worker quantum. Large-Schema selection uses one cached
+multi-pattern matcher instead of scanning every type, property, and alias for
+every batch. Idempotency results are stored in per-key shards, avoiding repeated
+rewrites of one ever-growing JSON file. A short cross-process task lock protects
+leases and commits when independent MCP clients work on the same task, while
+semantic analysis remains outside the lock and can still run in parallel.
 
 Incremental page projection is single-writer and lease-based. Intermediate
 paths are persisted as provisional task state and excluded from retrieval

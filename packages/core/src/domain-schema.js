@@ -9,6 +9,9 @@ const EXTRACTION_MODES = new Set(["strict", "compatible"])
 const FAILURE_POLICIES = new Set(["reject-batch", "drop-invalid"])
 const INLINE_DOMAIN_SCHEMA_BYTES = 64 * 1024
 const MAX_DOMAIN_SCHEMA_ITEM_BYTES = 80 * 1024
+const domainSchemaMatchIndexCache = new WeakMap()
+const domainSchemaRuntimeCache = new WeakMap()
+const propertyLookupCache = new WeakMap()
 
 export async function resolveDomainSchema(workspace, options = {}) {
   options = options ?? {}
@@ -142,6 +145,7 @@ export function compactDomainSchemaSelectionForText(schema, text, maxBytes = 6 *
   return {
     ready: complete,
     mode: "batch-text-compact",
+    matcher: matched.matcher,
     matched_terms: matched.matchedTerms,
     selection: {
       mode: "types",
@@ -160,48 +164,36 @@ export function compactDomainSchemaSelectionForText(schema, text, maxBytes = 6 *
 
 export function matchDomainSchemaTypesForText(schema, text, maxMatches = 12) {
   if (!schema || typeof text !== "string" || !text.trim()) {
-    return { entityTypeIds: [], relationTypeIds: [], matchedTerms: [] }
+    return { entityTypeIds: [], relationTypeIds: [], matchedTerms: [], matcher: "cached-multi-pattern" }
   }
   const haystack = text.normalize("NFKC").toLowerCase()
   const limit = Math.min(Math.max(Number(maxMatches) || 12, 1), 50)
-  const rank = (type, relation = false) => {
-    const matches = []
-    let score = 0
-    let identityScore = 0
-    let propertyMatches = 0
-    for (const [value, weight] of [
-      [type.id, 60],
-      [type.name, 50],
-      ...type.aliases.map((alias) => [alias, 40]),
-    ]) {
-      const key = usefulSchemaMatchKey(value)
-      if (!key || !haystack.includes(key)) continue
-      score += weight
-      identityScore += weight
-      matches.push(value)
+  const matchIndex = domainSchemaMatchIndex(schema)
+  const ranked = new Map()
+  for (const term of scanSchemaTerms(matchIndex.automaton, haystack)) {
+    for (const entry of matchIndex.entries.get(term) ?? []) {
+      const key = `${entry.kind}:${entry.typeId}`
+      const current = ranked.get(key) ?? { id: entry.typeId, score: 0, identityScore: 0, propertyMatches: 0, matches: [] }
+      current.score += entry.weight
+      if (entry.identity) current.identityScore += entry.weight
+      else current.propertyMatches += 1
+      current.matches.push(entry.value)
+      ranked.set(key, current)
     }
-    for (const [value, weight] of type.properties.flatMap((property) => [
-        [property.id, 8],
-        [property.name, 6],
-        ...property.aliases.map((alias) => [alias, 5]),
-      ])) {
-      const key = usefulSchemaMatchKey(value)
-      if (!key || !haystack.includes(key)) continue
-      score += weight
-      propertyMatches += 1
-      matches.push(value)
-    }
-    const sufficientlySpecific = identityScore > 0 || propertyMatches >= 2
-    if (!sufficientlySpecific || (relation && score === 0)) return { id: type.id, score: 0, matches: [] }
-    return { id: type.id, score, matches }
   }
-  const entities = schema.entityTypes.map((type) => rank(type))
+  const resultFor = (kind, id) => {
+    const result = ranked.get(`${kind}:${id}`) ?? { id, score: 0, identityScore: 0, propertyMatches: 0, matches: [] }
+    return result.identityScore > 0 || result.propertyMatches >= 2
+      ? { id, score: result.score, matches: result.matches }
+      : { id, score: 0, matches: [] }
+  }
+  const entities = schema.entityTypes.map((type) => resultFor("entity", type.id))
     .filter((item) => item.score > 0)
     .sort((left, right) => right.score - left.score || left.id.localeCompare(right.id))
     .slice(0, limit)
   const entityIds = new Set(entities.map((item) => item.id))
   const relations = schema.relationTypes.map((type) => {
-    const result = rank(type, true)
+    const result = resultFor("relation", type.id)
     const connectsSelectedTypes = type.sourceEntityTypeIds.some((id) => entityIds.has(id))
       && type.targetEntityTypeIds.some((id) => entityIds.has(id))
     return { ...result, score: result.score + (connectsSelectedTypes ? 2 : 0) }
@@ -212,7 +204,78 @@ export function matchDomainSchemaTypesForText(schema, text, maxMatches = 12) {
     entityTypeIds: entities.map((item) => item.id),
     relationTypeIds: relations.map((item) => item.id),
     matchedTerms: [...new Set([...entities, ...relations].flatMap((item) => item.matches))].slice(0, 50),
+    matcher: "cached-multi-pattern",
   }
+}
+
+function domainSchemaMatchIndex(schema) {
+  const cached = domainSchemaMatchIndexCache.get(schema)
+  if (cached) return cached
+  const entries = new Map()
+  const add = (kind, typeId, value, weight, identity) => {
+    const term = usefulSchemaMatchKey(value)
+    if (!term) return
+    const values = entries.get(term) ?? []
+    values.push({ kind, typeId, value, weight, identity })
+    entries.set(term, values)
+  }
+  for (const [kind, types] of [["entity", schema.entityTypes], ["relation", schema.relationTypes]]) {
+    for (const type of types) {
+      add(kind, type.id, type.id, 60, true)
+      add(kind, type.id, type.name, 50, true)
+      type.aliases.forEach((alias) => add(kind, type.id, alias, 40, true))
+      for (const property of type.properties) {
+        add(kind, type.id, property.id, 8, false)
+        add(kind, type.id, property.name, 6, false)
+        property.aliases.forEach((alias) => add(kind, type.id, alias, 5, false))
+      }
+    }
+  }
+  const index = { entries, automaton: buildSchemaTermAutomaton(entries.keys()) }
+  domainSchemaMatchIndexCache.set(schema, index)
+  return index
+}
+
+function buildSchemaTermAutomaton(terms) {
+  const nodes = [{ next: new Map(), fail: 0, outputs: [] }]
+  for (const term of terms) {
+    let state = 0
+    for (const character of term) {
+      let next = nodes[state].next.get(character)
+      if (next === undefined) {
+        next = nodes.length
+        nodes[state].next.set(character, next)
+        nodes.push({ next: new Map(), fail: 0, outputs: [] })
+      }
+      state = next
+    }
+    nodes[state].outputs.push(term)
+  }
+  const queue = []
+  for (const next of nodes[0].next.values()) queue.push(next)
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const state = queue[cursor]
+    for (const [character, next] of nodes[state].next) {
+      queue.push(next)
+      let fallback = nodes[state].fail
+      while (fallback !== 0 && !nodes[fallback].next.has(character)) fallback = nodes[fallback].fail
+      if (nodes[fallback].next.has(character)) fallback = nodes[fallback].next.get(character)
+      nodes[next].fail = fallback
+      nodes[next].outputs.push(...nodes[fallback].outputs)
+    }
+  }
+  return nodes
+}
+
+function scanSchemaTerms(nodes, text) {
+  const matched = new Set()
+  let state = 0
+  for (const character of text) {
+    while (state !== 0 && !nodes[state].next.has(character)) state = nodes[state].fail
+    if (nodes[state].next.has(character)) state = nodes[state].next.get(character)
+    for (const term of nodes[state].outputs) matched.add(term)
+  }
+  return matched
 }
 
 export function paginateDomainSchema(schema, requestedCursor, requestedMaxChars, selection = {}) {
@@ -307,8 +370,9 @@ export function validateDomainSchema(input) {
 export function applyDomainSchema(analysis, schema) {
   if (!schema) return { analysis, report: null }
   const mode = schema.policy.extractionMode
-  const entityLookup = typeLookup(schema.entityTypes, mode)
-  const relationLookup = typeLookup(schema.relationTypes, mode)
+  const runtime = domainSchemaRuntime(schema)
+  const entityLookup = runtime.entityLookup
+  const relationLookup = runtime.relationLookup
   const violations = []
   const entityTypesByLocalId = new Map()
   const uniqueValues = new Map()
@@ -679,6 +743,17 @@ function typeLookup(types, mode) {
   return lookup
 }
 
+function domainSchemaRuntime(schema) {
+  const cached = domainSchemaRuntimeCache.get(schema)
+  if (cached) return cached
+  const runtime = {
+    entityLookup: typeLookup(schema.entityTypes, schema.policy.extractionMode),
+    relationLookup: typeLookup(schema.relationTypes, schema.policy.extractionMode),
+  }
+  domainSchemaRuntimeCache.set(schema, runtime)
+  return runtime
+}
+
 function resolveType(value, lookup, mode) {
   if (typeof value !== "string") return undefined
   return lookup.get(value) ?? (mode === "compatible" ? lookup.get(value.normalize("NFKC").toLowerCase()) : undefined)
@@ -737,8 +812,7 @@ function normalizeCandidateProperties(value, type, field, policy, uniqueValues) 
   const uniqueKeys = []
   if (!value || typeof value !== "object" || Array.isArray(value)) return { properties: {}, errors: [`${field} must be an object`], uniqueKeys }
   if (!type) return { properties: { ...value }, errors, uniqueKeys }
-  const lookup = new Map(type.properties.map((property) => [property.id, property]))
-  if (policy.extractionMode === "compatible") for (const property of type.properties) for (const key of [property.id, property.name, ...property.aliases]) lookup.set(key.normalize("NFKC").toLowerCase(), property)
+  const lookup = candidatePropertyLookup(type, policy.extractionMode)
   const properties = {}
   for (const [rawKey, propertyValue] of Object.entries(value)) {
     const property = lookup.get(rawKey) ?? (policy.extractionMode === "compatible" ? lookup.get(rawKey.normalize("NFKC").toLowerCase()) : undefined)
@@ -762,6 +836,25 @@ function normalizeCandidateProperties(value, type, field, policy, uniqueValues) 
     else uniqueKeys.push(key)
   }
   return { properties, errors, uniqueKeys }
+}
+
+function candidatePropertyLookup(type, mode) {
+  let byMode = propertyLookupCache.get(type)
+  if (!byMode) {
+    byMode = new Map()
+    propertyLookupCache.set(type, byMode)
+  }
+  if (byMode.has(mode)) return byMode.get(mode)
+  const lookup = new Map(type.properties.map((property) => [property.id, property]))
+  if (mode === "compatible") {
+    for (const property of type.properties) {
+      for (const key of [property.id, property.name, ...property.aliases]) {
+        lookup.set(key.normalize("NFKC").toLowerCase(), property)
+      }
+    }
+  }
+  byMode.set(mode, lookup)
+  return lookup
 }
 
 function valueMatchesType(value, type) {

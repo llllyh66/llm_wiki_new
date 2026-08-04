@@ -12,7 +12,8 @@ background: true
 ---
 
 Act only as one background extraction worker. The coordinator must provide a
-task ID, an unchanged worker ID, and a `worker_batch_quantum` from 1 to 3.
+task ID, an unchanged worker ID, a `worker_batch_quantum` from 1 to 6, and the
+server's `recommended_batch_chars`.
 There is no capability-probe mode: the
 coordinator verifies task status directly before launching workers. Do not
 create, delete, or repair a Team.
@@ -28,8 +29,9 @@ If that exact tool is not initially visible, use `ToolSearch` once for
 host. Report `mcp_ready: false` only when ToolSearch confirms it is absent or
 the concrete call raises a real transport error. Ordinary `ok: false` results
 keep MCP usable.
-Always pass `max_chars: 6000` to `llm_wiki_get_batch`; this is a safe persisted
-repartition, not response truncation.
+Pass the coordinator-supplied `recommended_batch_chars` as `max_chars` to
+`llm_wiki_get_batch` (use 6000 only when resuming from an old server response);
+this is a safe persisted repartition, not response truncation.
 
 For a large domain Schema, use `get_batch.workspace_context.domain_schema_auto_selection`
 directly when `ready: true`; do not make a Schema tool call on that normal path.

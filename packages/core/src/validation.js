@@ -270,10 +270,12 @@ export function collectSourceRefs(value) {
   return refs
 }
 
-export function canonicalizeAnalysisSourceRefQuotes(analysis, batches) {
-  const chunks = new Map((Array.isArray(batches) ? batches : [])
-    .flatMap((batch) => Array.isArray(batch?.chunks) ? batch.chunks : [])
-    .map((chunk) => [chunk.chunkId, chunk]))
+export function canonicalizeAnalysisSourceRefQuotes(analysis, batches, chunkIndex) {
+  const chunks = chunkIndex instanceof Map
+    ? chunkIndex
+    : new Map((Array.isArray(batches) ? batches : [])
+      .flatMap((batch) => Array.isArray(batch?.chunks) ? batch.chunks : [])
+      .map((chunk) => [chunk.chunkId, chunk]))
   const visited = new WeakSet()
   let repaired = 0
   function visit(current, key) {
@@ -347,10 +349,12 @@ function normalizedEvidenceWithOffsets(value, relaxed) {
   return { text: text.trim(), starts, ends }
 }
 
-export function validateSourceRefs(refs, task, batches, limits) {
+export function validateSourceRefs(refs, task, batches, limits, chunkIndex) {
   if (!Array.isArray(refs)) fail("INVALID_SOURCE_REF", "sourceRefs must be an array.")
   const sourceIds = new Set(task.sourceIds)
-  const chunks = new Map(batches.flatMap((batch) => batch.chunks).map((chunk) => [chunk.chunkId, chunk]))
+  const chunks = chunkIndex instanceof Map
+    ? chunkIndex
+    : new Map(batches.flatMap((batch) => batch.chunks).map((chunk) => [chunk.chunkId, chunk]))
   for (const ref of refs) {
     if (!ref || typeof ref !== "object" || typeof ref.sourceId !== "string" || typeof ref.chunkId !== "string") {
       fail("INVALID_SOURCE_REF", "Every SourceRef requires sourceId and chunkId.")

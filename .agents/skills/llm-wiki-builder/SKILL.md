@@ -63,7 +63,8 @@ typed entity or any relation.
    `extractor-N`, and keep the main Agent as a responsive coordinator. Give
    each worker only the task ID, its worker ID, this Skill path, and the
    bounded worker quantum below. Also pass
-   `parallel_extraction.worker_batch_quantum` from the import result. Start them with the host's
+   `parallel_extraction.worker_batch_quantum` and
+   `parallel_extraction.recommended_batch_chars` from the import result. Start them with the host's
    background/run-in-background option so the user can keep asking the main
    Agent questions while extraction continues. Never create more workers than
    recommended and never let a worker import files, plan pages, commit pages,
@@ -81,21 +82,25 @@ typed entity or any relation.
    status. A Core lease is only a persisted batch reservation; it is never
    evidence that a SubAgent process is still running.
 5. Each background worker invocation processes up to
-   `parallel_extraction.worker_batch_quantum` batches (never more than three),
+   `parallel_extraction.worker_batch_quantum` batches (never more than six),
    commits a durable checkpoint after every batch, and then returns. This
    amortizes Agent startup and Skill-loading overhead without combining batch
    commits or risking already accepted work. Do not keep a subagent alive
    across coordinator or user turns after this bounded quantum:
    1. Call `llm_wiki_get_batch` with the task ID, its unchanged `worker_id`,
-      and `max_chars: 6000`. The lease prevents two workers from receiving the same
+      and `max_chars` set to `parallel_extraction.recommended_batch_chars`
+      supplied by the coordinator (fall back to 6000 only for an old server).
+      The lease prevents two workers from receiving the same
       batch. Pass the same `worker_id` to `llm_wiki_commit_analysis`.
       Treat the returned batch as complete and indivisible. `batch_limits`
       reports its bounded character and payload sizes. `max_chars` safely
       repartitions every unfinished oversized batch and persists the smaller
       parts; it never truncates or discards chunks.
-      Agent-facing transport ceilings are 3,000 characters per chunk, 6,000
+      Agent-facing transport ceilings are 3,000 characters per chunk, 9,000
       source characters per batch, and 24 KiB of serialized chunk payload even
-      if an old workspace configured larger values. `get_batch` also omits the
+      if an old workspace configured larger values. Small tasks normally use
+      6,000 characters; large tasks use the bounded 9,000-character throughput
+      profile to reduce batch count. `get_batch` also omits the
       unrelated Wiki page schema and returns a compact Analysis contract and
       batch-matched domain-Schema slice, keeping the complete tool response
       near its reported 40 KiB target. It repairs an unfinished oversized legacy batch in

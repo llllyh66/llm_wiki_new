@@ -137,7 +137,7 @@ Agent，当前最多 4 个；大型 Schema 也不再降为 2 个，因为每个 
 串行保护同一任务的状态提交，因此不会抢同一批次或覆盖其他 Agent 的结果。
 主 Agent 只负责协调和回答用户问题；唯一的后台 Wiki Writer 与抽取 Agent
 形成流水线，每新增 4 个 batch 或等待满 30 秒后增量更新受影响页面。
-每个增量投影最多租用 4 个 batch，一次 Writer 后台调用最多连续处理 3 个
+每个增量投影最多租用 8 个 batch，一次 Writer 后台调用最多连续处理 6 个
 已就绪投影。当积压达到 4 个 batch 时不再强制等待冷却时间，但每次提交仍独立
 检查点化，不会把全部积压塞进一个超大提示。
 任一 `commit_analysis` 使投影就绪时，该 extractor 会立即返回
@@ -160,7 +160,7 @@ ToolSearch 发现工具，而不是直接判定 MCP 不可用。
 `.claude/agents/llm-wiki-writer.md` 使用同样的 MCP 复用方式，且每个任务同时
 只允许一个 `wiki-writer-1` 租约，避免页面冲突。
 
-新版 extractor 每次后台调用最多连续处理 3 个 batch，但每个 batch 都单独提交落盘；
+新版 extractor 每次后台调用最多连续处理 6 个 batch，但每个 batch 都单独提交落盘；
 主 Agent 再用稳定 `worker_id` 启动下一个有界任务。这样减少反复启动 Agent 和加载 Skill
 的开销，同时不依赖长时间跨 turn 存活的子 Agent。后续 turn 先调用 `llm_wiki_status`，
 `worker_recovery.leases` 会返回已持久化的 worker 和 batch 租约。使用相同
@@ -316,7 +316,7 @@ Skill 会先调用 `llm_wiki_list_tasks` 和 `llm_wiki_status`，然后按 `next
 
 - 新增 4 个已抽取 batch、最旧未投影 batch 等待超过 30 秒，或全部 batch
   完成时，Core 会开放一个 Wiki 投影窗口。
-- 每个增量窗口最多包含 4 个 batch；积压时 Writer 一次最多连续消化 3 个窗口。
+- 每个增量窗口最多包含 8 个 batch；积压时 Writer 一次最多连续消化 6 个窗口。
 - 增量投影只更新受当前 batch 影响的页面，并标记为 provisional。
 - 受影响页面传输全文；无关旧页面只传输路径、标题、摘要和哈希等紧凑目录，
   避免 Writer 成本随 Wiki 总文本量线性增长。
@@ -493,7 +493,7 @@ Writer 在自己的有界 quantum 内直接继续，不需要等待主 Agent 再
 突破 batch 和 MCP 输出限制。新版本会：
 
 - 把所有超大文本块拆分到 Agent 传输硬上限 3,000 字符以内；
-- 即使工作区或旧任务把限制改得更大，每个 batch 也不会超过 6,000 正文字符；
+- 即使工作区或旧任务把限制改得更大，每个 batch 也不会超过 9,000 正文字符；
 - 每个 batch 的序列化 chunk 载荷不超过 24 KiB，避免“文本不大但表格元数据很大”；
 - 同时按文字数和序列化字节数限制 batch；
 - 压缩包含超长单元格/表格字符串的 `structuredData`，避免 MCP JSON 出现 81K 单行；
@@ -506,13 +506,22 @@ Writer 在自己的有界 quantum 内直接继续，不需要等待主 Agent 再
 使用原 `task_id + batch_id + worker_id` 再调用一次 `get_batch` 即会修复并继续。
 
 `max_chars` 现在是安全的未完成批次重分片目标，不会截断或丢弃内容；
-原 batch 的第一个分片保留 batch ID 和 worker 租约。Builder 默认使用
-`max_chars: 6000`，以降低复杂领域 Schema 下每个 Worker 的单次上下文负担。
+原 batch 的第一个分片保留 batch ID 和 worker 租约。Builder 使用服务端返回的
+`recommended_batch_chars`：小任务为 6,000，大任务为 9,000；单 chunk 仍不超过
+3,000 字符，序列化 chunk 载荷仍不超过 24 KiB。
 
 `get_batch` 现在还约束完整工具响应，不再只统计正文：它不向抽取
 Worker 重复传输 Wiki 页面 Schema，Analysis Schema 改为紧凑契约，大型领域
 Schema 只返回当前 batch 命中的紧凑定义。`batch_limits` 会同时报告 chunk
 载荷和完整响应字节数，目标上限为 40 KiB。
+
+大文件的内部处理也做了专项优化：任务 batch 只保留抽取必需的表格定位
+元数据，不再重复保存整份表格结构；已验证的 batch 边界和 `batches.json`
+会被缓存，同一 Worker 连续处理时不会反复扫描和重写全部 batch。大型
+Schema 匹配使用一次构建的多模式索引，不再对每个类型、属性和别名逐个
+扫描 batch 文本。每次提交的幂等结果按 key 分片保存，避免 batch 越多时
+反复读写一个持续膨胀的 JSON。同一任务还有跨 MCP 进程的短时文件锁，
+多个后台 Worker 可以并行分析，又不会在租约或提交状态上互相覆盖。
 
 ### `sourceRefs` 或 `reviewItems` 校验失败
 

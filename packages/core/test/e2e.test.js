@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
+import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
@@ -255,6 +255,7 @@ test("domain schema is snapshotted, exposed to the Agent, and normalizes or drop
   assert.equal(batch.workspace_context.domain_schema.inline, false)
   assert.equal(batch.workspace_context.domain_schema.entityTypeCount, 3)
   assert.equal(batch.workspace_context.domain_schema_auto_selection.ready, true)
+  assert.equal(batch.workspace_context.domain_schema_auto_selection.matcher, "cached-multi-pattern")
   assert.equal(batch.workspace_context.domain_schema_auto_selection.items.some((item) => item.kind === "entity_type" && item.entity_type.id === "business_subject"), true)
   const chunk = batch.chunks[0]
   const sourceRef = {
@@ -792,11 +793,12 @@ test("parallel workers lease distinct batches and concurrent commits preserve ev
   const imported = await f.core.importFiles({ files, options: { max_batch_chars: 1_000 } })
   assert.equal(imported.batch_count > 1, true)
   assert.equal(imported.parallel_extraction.recommended_workers, Math.min(4, imported.batch_count))
-  assert.equal(imported.parallel_extraction.worker_batch_quantum, Math.min(3, Math.ceil(imported.batch_count / imported.parallel_extraction.recommended_workers)))
+  assert.equal(imported.parallel_extraction.worker_batch_quantum, Math.min(6, Math.ceil(imported.batch_count / imported.parallel_extraction.recommended_workers)))
   assert.equal(imported.parallel_extraction.checkpoint_each_batch, true)
   const workerCount = imported.batch_count
+  const workerCores = await Promise.all(Array.from({ length: workerCount }, () => LlmWikiCore.open(f.workspace)))
   const leased = await Promise.all(Array.from({ length: workerCount }, (_, index) => (
-    f.core.getBatch({ task_id: imported.task_id, worker_id: `worker-${index}` })
+    workerCores[index].getBatch({ task_id: imported.task_id, worker_id: `worker-${index}` })
   )))
   assert.equal(new Set(leased.map((batch) => batch.batch_id)).size, workerCount)
   const waiting = await f.core.getBatch({ task_id: imported.task_id, worker_id: "worker-overflow" })
@@ -815,7 +817,7 @@ test("parallel workers lease distinct batches and concurrent commits preserve ev
       quote: "Business Entity is the canonical business object.",
       locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
     }
-    return f.core.commitAnalysis({
+    return workerCores[index].commitAnalysis({
       task_id: imported.task_id,
       batch_id: batch.batch_id,
       worker_id: batch.worker_id,
@@ -841,6 +843,46 @@ test("parallel workers lease distinct batches and concurrent commits preserve ev
   assert.equal(status.worker_recovery.process_liveness_known, false)
   assert.equal(status.worker_recovery.leases_are_live_agents, false)
   assert.equal(status.status, "planning")
+  const idempotencyFiles = await readdir(path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "idempotency"))
+  assert.equal(idempotencyFiles.filter((name) => /^[0-9a-f]{64}\.json$/.test(name)).length, workerCount)
+  assert.equal(idempotencyFiles.includes("version.json"), true)
+  assert.deepEqual(JSON.parse(await readFile(path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "idempotency.json"), "utf8")), {})
+})
+
+test("large tasks use compact 9K batches, cached bounds, and longer worker quanta", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const source = path.join(f.incoming, "large-throughput.md")
+  const rows = Array.from({ length: 4_000 }, (_, index) => `| customer-${index} | account-${index} | product-${index} |`)
+  await writeFile(source, `# Large throughput\n\n| Customer | Account | Product |\n| --- | --- | --- |\n${rows.join("\n")}\n`)
+  const imported = await f.core.importFiles({ files: [{ path: source }] })
+  assert.equal(imported.parallel_extraction.recommended_batch_chars, 9_000)
+  assert.equal(imported.parallel_extraction.worker_batch_quantum, 6)
+
+  const batchesPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "batches.json")
+  const persisted = JSON.parse(await readFile(batchesPath, "utf8"))
+  assert.equal(persisted.every((batch) => batch.charCount <= 9_000 && batch.payloadBytes <= 24 * 1024), true)
+  assert.equal(persisted.flatMap((batch) => batch.chunks).every((chunk) => chunk.taskPayloadVersion === 2), true)
+  assert.equal(persisted.flatMap((batch) => batch.chunks).flatMap((chunk) => chunk.structuredData ?? [])
+    .every((table) => table.compacted === true && table.markdown === undefined && table.rows === undefined), true)
+
+  const before = await stat(batchesPath, { bigint: true })
+  const first = await f.core.getBatch({
+    task_id: imported.task_id,
+    worker_id: "large-throughput-worker",
+    max_chars: imported.parallel_extraction.recommended_batch_chars,
+  })
+  const second = await f.core.getBatch({
+    task_id: imported.task_id,
+    worker_id: "large-throughput-worker",
+    max_chars: imported.parallel_extraction.recommended_batch_chars,
+  })
+  const after = await stat(batchesPath, { bigint: true })
+  assert.equal(first.batch_id, second.batch_id)
+  assert.equal(first.batch_limits.char_count <= 9_000, true)
+  assert.equal(first.batch_limits.payload_bytes <= 24 * 1024, true)
+  assert.equal(first.batch_limits.complete_response_bytes < 40 * 1024, true)
+  assert.equal(before.mtimeNs, after.mtimeNs)
 })
 
 test("a worker invocation can resume its leased batch by stable worker ID after a turn boundary", async (t) => {

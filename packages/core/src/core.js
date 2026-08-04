@@ -1,4 +1,4 @@
-import { readFile, readdir, rm } from "node:fs/promises"
+import { lstat, open, readFile, readdir, rm } from "node:fs/promises"
 import path from "node:path"
 import { LlmWikiError, asLlmWikiError, fail } from "./errors.js"
 import {
@@ -47,6 +47,7 @@ import {
 } from "./wiki-page.js"
 import {
   hashDirectory,
+  ensureDir,
   listFilesRecursive,
   newId,
   nowIso,
@@ -74,6 +75,7 @@ export class LlmWikiCore {
     this.workspaceWriteTail = Promise.resolve()
     this.domainSchemaCache = new Map()
     this.domainSchemaSelectionCache = new Map()
+    this.taskChunkIndexCache = new Map()
   }
 
   async workspace(options = {}) {
@@ -115,6 +117,17 @@ export class LlmWikiCore {
     return selection
   }
 
+  #taskChunkIndex(record) {
+    const cacheKey = `${record.task.taskId}:${record.task.batchLayoutRevision ?? 0}:${record.task.batchCount}`
+    if (this.taskChunkIndexCache.has(cacheKey)) return this.taskChunkIndexCache.get(cacheKey)
+    const index = new Map(record.batches.flatMap((batch) => batch.chunks).map((chunk) => [chunk.chunkId, chunk]))
+    this.taskChunkIndexCache.set(cacheKey, index)
+    while (this.taskChunkIndexCache.size > 8) {
+      this.taskChunkIndexCache.delete(this.taskChunkIndexCache.keys().next().value)
+    }
+    return index
+  }
+
   async importFiles(input) {
     const targetLanguage = input?.options?.target_language ?? input?.options?.targetLanguage
     const workspace = await this.workspace({ targetLanguage })
@@ -144,6 +157,7 @@ export class LlmWikiCore {
         recommended_workers: recommendedWorkers,
         max_workers: 4,
         worker_batch_quantum: workerBatchQuantum,
+        recommended_batch_chars: task.options.maxBatchChars,
         checkpoint_each_batch: true,
         ...(task.domainSchema?.size_bytes ? { domain_schema_bytes: task.domainSchema.size_bytes } : {}),
         lease_minutes: BATCH_LEASE_MS / 60_000,
@@ -386,7 +400,8 @@ export class LlmWikiCore {
     const agentChunks = batch.chunks.map(agentChunkWithSourceRefTemplates)
     const evidenceCatalog = batchEvidenceCatalog(agentChunks).map((entry) => entry.sourceRef)
     const normalized = normalizeAnalysisEnvelope(input?.analysis, { evidenceCatalog })
-    const normalizedSourceRefQuotes = canonicalizeAnalysisSourceRefQuotes(normalized.analysis, record.batches)
+    const chunkIndex = this.#taskChunkIndex(record)
+    const normalizedSourceRefQuotes = canonicalizeAnalysisSourceRefQuotes(normalized.analysis, record.batches, chunkIndex)
     const analysisBytes = Buffer.byteLength(JSON.stringify(normalized.analysis ?? null))
     if (analysisBytes > workspace.config.limits.maxAnalysisBytes) {
       fail("ANALYSIS_TOO_LARGE", `Analysis exceeds the ${workspace.config.limits.maxAnalysisBytes}-byte workspace limit.`)
@@ -404,7 +419,7 @@ export class LlmWikiCore {
         suggestedAction: "Regenerate only Schema-conforming candidates, or explicitly set accept_dropped_candidates=true if intentional loss is acceptable.",
       })
     }
-    validateSourceRefs(collectSourceRefs(domainApplied.analysis), record.task, record.batches, workspace.config.limits)
+    validateSourceRefs(collectSourceRefs(domainApplied.analysis), record.task, record.batches, workspace.config.limits, chunkIndex)
     validateGroundingQuality(domainApplied.analysis)
     const idempotent = await withIdempotency(record.paths, input?.idempotency_key, { operation: "commit_analysis", batchId: batch.batchId, analysis: normalized.analysis, acceptDroppedCandidates: input?.accept_dropped_candidates === true }, async () => {
       if (record.task.completedBatchIds.includes(batch.batchId)) fail("BATCH_ALREADY_COMPLETED", `Batch is already completed: ${batch.batchId}`)
@@ -672,7 +687,7 @@ export class LlmWikiCore {
         validatePagePatchShape(patch, workspace.config.limits)
         if (patchIds.has(patch.patchId)) fail("INVALID_PAGE_PATCH", `Duplicate patchId: ${patch.patchId}`)
         patchIds.add(patch.patchId)
-        validateSourceRefs(patch.sourceRefs, record.task, record.batches, workspace.config.limits)
+        validateSourceRefs(patch.sourceRefs, record.task, record.batches, workspace.config.limits, this.#taskChunkIndex(record))
         const provisionalOwner = provisionalOwners.get(patch.path)
         if (provisionalOwner && provisionalOwner !== record.task.taskId) {
           fail("PROVISIONAL_PAGE_CONFLICT", `Page is provisional in another task: ${patch.path}`, {
@@ -1002,13 +1017,58 @@ export class LlmWikiCore {
   async #withTaskLock(taskId, operation) {
     const key = typeof taskId === "string" ? taskId : "invalid-task"
     const previous = this.taskLocks.get(key) ?? Promise.resolve()
-    const run = previous.then(operation, operation)
+    const guardedOperation = async () => {
+      const release = await this.#acquireTaskFileLock(key)
+      try {
+        return await operation()
+      } finally {
+        await release()
+      }
+    }
+    const run = previous.then(guardedOperation, guardedOperation)
     const tail = run.then(() => undefined, () => undefined)
     this.taskLocks.set(key, tail)
     try {
       return await run
     } finally {
       if (this.taskLocks.get(key) === tail) this.taskLocks.delete(key)
+    }
+  }
+
+  async #acquireTaskFileLock(taskId) {
+    const safeTaskId = String(taskId).replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120)
+    const lockPath = path.join(this.workspaceRoot, ".llm-wiki", "locks", `task-${safeTaskId}.lock`)
+    await ensureDir(path.dirname(lockPath))
+    const startedAt = Date.now()
+    while (true) {
+      let handle
+      try {
+        const lockId = newId("task-lock")
+        handle = await open(lockPath, "wx", 0o600)
+        await handle.writeFile(`${JSON.stringify({ lockId, taskId, pid: process.pid, createdAt: nowIso() })}\n`)
+        await handle.sync()
+        return async () => {
+          await handle.close().catch(() => {})
+          const current = await readFile(lockPath, "utf8").catch(() => "")
+          if (current.includes(`"lockId":"${lockId}"`)) await rm(lockPath, { force: true }).catch(() => {})
+        }
+      } catch (error) {
+        await handle?.close().catch(() => {})
+        if (error?.code !== "EEXIST") throw error
+        const info = await lstat(lockPath).catch(() => null)
+        if (info && Date.now() - info.mtimeMs > 120_000) {
+          await rm(lockPath, { force: true }).catch(() => {})
+          continue
+        }
+        if (Date.now() - startedAt > 10_000) {
+          fail("TASK_BUSY", `Task ${taskId} is busy in another MCP process.`, {
+            retryable: true,
+            taskId,
+            suggestedAction: "Retry the same tool call with the same worker_id and idempotency key.",
+          })
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
     }
   }
 
@@ -1038,7 +1098,10 @@ function recommendedWorkerCount(batchCount) {
 
 function recommendedWorkerBatchQuantum(batchCount, workerCount) {
   if (batchCount <= 0 || workerCount <= 0) return 1
-  return Math.min(3, Math.max(1, Math.ceil(batchCount / workerCount)))
+  // Large tasks amortize subagent startup and Skill loading across more
+  // independently checkpointed commits. Six bounded 9K batches stay within a
+  // typical worker context while cutting coordinator relaunch churn in half.
+  return Math.min(6, Math.max(1, Math.ceil(batchCount / workerCount)))
 }
 
 function automaticBatchDomainSchemaSelection(domainSchema, batch) {
@@ -1632,6 +1695,7 @@ function statusResponse(task) {
       recommended_workers: recommendedWorkers,
       max_workers: 4,
       worker_batch_quantum: recommendedWorkerBatchQuantum(remainingBatches, recommendedWorkers),
+      recommended_batch_chars: Math.min(Number(task.options?.maxBatchChars) || 6_000, 9_000),
       checkpoint_each_batch: true,
     },
     worker_recovery: {

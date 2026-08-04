@@ -39,7 +39,7 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(skill, /Agent type\s+`llm-wiki-extractor` explicitly/)
   assert.match(skill, /Never launch these slots as `general-purpose`/)
   assert.match(skill, /worker_batch_quantum/)
-  assert.match(skill, /never more than three/)
+  assert.match(skill, /never more than six/)
   assert.match(skill, /commits a durable checkpoint after every batch/)
   assert.match(skill, /same\s+`worker_id`/)
   assert.match(skill, /Never claim that MCP is "unreliable across\s+turns"/)
