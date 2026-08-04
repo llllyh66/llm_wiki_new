@@ -21,7 +21,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_batch",
-    description: "Lease and return one complete, stable, Agent-readable batch to an extraction worker, including automatic bounded domain-Schema type selection and a retrieval-optional extraction policy. Hard transport ceilings prevent oversized JSON lines; legacy oversized batches are repaired in place while preserving the same worker_id lease and original batch ID.",
+    description: "Lease and return one complete, stable, Agent-readable batch with a server-generated exact evidence catalog, automatic bounded domain-Schema type selection, and a retrieval-optional extraction policy. Candidates cite evidence indexes, avoiding quote transcription and source rereads. Hard transport ceilings repair legacy oversized batches in place.",
     inputSchema: closedObject({
       task_id: taskId,
       batch_id: { type: ["string", "null"] },
@@ -57,7 +57,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_commit_analysis",
-    description: "Normalize SourceRefs, enforce Schema-first extraction, and persist one worker's analysis. Invalid domain candidates are rejected before persistence even under drop-invalid unless accept_dropped_candidates is explicitly true.",
+    description: "Resolve server-generated evidence indexes, safely canonicalize uniquely matched legacy quotes, enforce Schema-first extraction, and persist one worker's analysis. Invalid domain candidates are rejected before persistence even under drop-invalid unless accept_dropped_candidates is explicitly true.",
     inputSchema: closedObject({ task_id: taskId, batch_id: { type: "string" }, worker_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" }, analysis: { type: "object" }, accept_dropped_candidates: { type: "boolean", description: "Explicit opt-in to destructive drop-invalid behavior. Omit or false for Schema-first rejection and correction." }, idempotency_key: { type: "string", minLength: 8, maxLength: 200 } }, ["task_id", "batch_id", "analysis", "idempotency_key"]),
   },
   {

@@ -131,6 +131,64 @@ test("analysis normalizer resolves SourceRef indexes and rejects out-of-range in
   assert.deepEqual(plan.analysis_summary.entities[0].sourceRefs, [sourceRef])
 })
 
+test("server-generated evidence indexes avoid quote transcription and persist compact exact SourceRefs", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  const evidenceIndex = batch.evidence_catalog.findIndex((entry) => entry.quote === "Business Entity is the canonical business object.")
+  assert.equal(evidenceIndex >= 0, true)
+  assert.equal(batch.analysis_scaffold.sourceRefMode, "batch-evidence-index")
+  assert.deepEqual(batch.analysis_scaffold.sourceRefs, batch.evidence_catalog.map((entry) => entry.evidence_index))
+
+  const committed = await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    idempotency_key: "server-evidence-index-v1",
+    analysis: {
+      ...batch.analysis_scaffold,
+      entities: [{ localId: "entity-business", name: "Business Entity", sourceRefs: [evidenceIndex] }],
+      batchSummary: "Defines Business Entity.",
+    },
+  })
+  assert.equal(committed.accepted, true)
+  assert.equal(committed.normalized_source_ref_indexes, 1)
+  const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
+  assert.equal(plan.analysis_summary.entities[0].sourceRefs[0].quote, "Business Entity is the canonical business object.")
+})
+
+test("legacy hand-written quotes are canonicalized only after a unique safe match", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  await writeFile(f.source, "# 客户\n\n客户张三的客户编号为 **C1001**，客户类别为“个人客户”。\n")
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  const chunk = batch.chunks[0]
+  const sourceRef = {
+    ...chunk.source_ref_templates[0],
+    quote: '客户张三的客户编号为 C1001，客户类别为"个人客户"。',
+  }
+  const committed = await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    idempotency_key: "canonical-legacy-quote-v1",
+    analysis: {
+      schemaVersion: 1,
+      taskId: imported.task_id,
+      batchId: batch.batch_id,
+      sourceRefs: [sourceRef],
+      entities: [{ localId: "customer-1", name: "张三", sourceRefs: [0] }],
+      concepts: [], claims: [], relations: [], contradictions: [], candidatePages: [], reviewItems: [],
+      batchSummary: "客户资料。",
+      unresolvedQuestions: [],
+    },
+  })
+  assert.equal(committed.accepted, true)
+  assert.equal(committed.normalized_source_ref_quotes, 1)
+  const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
+  assert.equal(plan.analysis_summary.entities[0].sourceRefs[0].quote, "客户张三的客户编号为 **C1001**，客户类别为“个人客户”。")
+})
+
 test("grounding quality gate rejects a title-only SourceRef reused for many unrelated claims", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
@@ -194,7 +252,10 @@ test("domain schema is snapshotted, exposed to the Agent, and normalizes or drop
   assert.equal(imported.domain_schema.schema_id, "your-domain-schema")
   const batch = await f.core.getBatch({ task_id: imported.task_id })
   assert.equal(batch.workspace_context.domain_schema.policy.validationFailurePolicy, "drop-invalid")
-  assert.equal(batch.workspace_context.domain_schema.entityTypes.length, 3)
+  assert.equal(batch.workspace_context.domain_schema.inline, false)
+  assert.equal(batch.workspace_context.domain_schema.entityTypeCount, 3)
+  assert.equal(batch.workspace_context.domain_schema_auto_selection.ready, true)
+  assert.equal(batch.workspace_context.domain_schema_auto_selection.items.some((item) => item.kind === "entity_type" && item.entity_type.id === "business_subject"), true)
   const chunk = batch.chunks[0]
   const sourceRef = {
     sourceId: chunk.sourceId,
@@ -419,6 +480,7 @@ test("domain schema allows an empty relationTypes array", async (t) => {
   const batch = await f.core.getBatch({ task_id: imported.task_id })
   assert.deepEqual(batch.workspace_context.domain_schema.relationTypes, [])
   assert.equal(batch.workspace_context.domain_schema.entityTypes.length, 1)
+  assert.equal(batch.workspace_context.domain_schema_auto_selection.ready, false)
   const chunk = batch.chunks[0]
   const sourceRef = {
     sourceId: chunk.sourceId,

@@ -13,9 +13,12 @@ const GENERIC_GROUNDING_TERMS = new Set(["content", "data", "document", "item", 
 const ALLOWED_PAGE_ROOTS = new Set(AGENT_PAGE_ROOTS)
 const SYSTEM_PAGES = new Set(["wiki/index.md", "wiki/overview.md", "wiki/log.md"])
 
-export function normalizeAnalysisEnvelope(analysis) {
+export function normalizeAnalysisEnvelope(analysis, options = {}) {
   if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) {
     return { analysis, resolvedSourceRefIndexes: 0 }
+  }
+  if (analysis.sourceRefMode === "batch-evidence-index") {
+    return normalizeBatchEvidenceEnvelope(analysis, options.evidenceCatalog)
   }
   const catalog = Array.isArray(analysis.sourceRefs) ? analysis.sourceRefs : []
   const errors = []
@@ -44,6 +47,68 @@ export function normalizeAnalysisEnvelope(analysis) {
   }
   if (errors.length > 0) {
     fail("INVALID_ANALYSIS", "Analysis SourceRef normalization failed.", {
+      details: { validation_errors: errors.slice(0, MAX_ANALYSIS_VALIDATION_ERRORS), validation_error_count: errors.length },
+    })
+  }
+  return { analysis: normalized, resolvedSourceRefIndexes }
+}
+
+function normalizeBatchEvidenceEnvelope(analysis, evidenceCatalog) {
+  const available = Array.isArray(evidenceCatalog) ? evidenceCatalog : []
+  const errors = []
+  const used = []
+  const seen = new Set()
+  let resolvedSourceRefIndexes = 0
+  const addUsed = (ref) => {
+    const signature = stableStringify(ref)
+    if (!seen.has(signature)) {
+      seen.add(signature)
+      used.push(ref)
+    }
+    return ref
+  }
+  const resolveEvidenceIndex = (ref, field) => {
+    if (typeof ref !== "number") return isSourceRefObject(ref) ? addUsed(ref) : ref
+    if (!Number.isInteger(ref) || ref < 0 || ref >= available.length) {
+      errors.push(`${field} evidence index ${ref} is out of range for evidence_catalog length ${available.length}`)
+      return ref
+    }
+    resolvedSourceRefIndexes += 1
+    return addUsed(available[ref])
+  }
+  if (!Array.isArray(analysis.sourceRefs)) {
+    errors.push("sourceRefs must be the numeric catalog copied from analysis_scaffold")
+  } else {
+    analysis.sourceRefs.forEach((ref, index) => {
+      if (typeof ref !== "number" && !isSourceRefObject(ref)) {
+        errors.push(`sourceRefs[${index}] must be an evidence index or a complete SourceRef object`)
+      } else if (typeof ref === "number" && (!Number.isInteger(ref) || ref < 0 || ref >= available.length)) {
+        errors.push(`sourceRefs[${index}] evidence index ${ref} is out of range for evidence_catalog length ${available.length}`)
+      }
+    })
+  }
+  const normalized = { ...analysis }
+  delete normalized.sourceRefMode
+  for (const collection of GROUNDED_ANALYSIS_COLLECTIONS) {
+    if (!Array.isArray(analysis[collection])) continue
+    normalized[collection] = analysis[collection].map((item, itemIndex) => {
+      if (!item || typeof item !== "object" || Array.isArray(item) || !Array.isArray(item.sourceRefs)) return item
+      return {
+        ...item,
+        sourceRefs: item.sourceRefs.map((ref, refIndex) => resolveEvidenceIndex(
+          ref,
+          `${collection}[${itemIndex}].sourceRefs[${refIndex}]`,
+        )),
+      }
+    })
+  }
+  if (used.length === 0 && Array.isArray(analysis.sourceRefs) && analysis.sourceRefs.length > 0) {
+    const fallback = resolveEvidenceIndex(analysis.sourceRefs[0], "sourceRefs[0]")
+    if (isSourceRefObject(fallback)) addUsed(fallback)
+  }
+  normalized.sourceRefs = used
+  if (errors.length > 0) {
+    fail("INVALID_ANALYSIS", "Analysis batch evidence normalization failed.", {
       details: { validation_errors: errors.slice(0, MAX_ANALYSIS_VALIDATION_ERRORS), validation_error_count: errors.length },
     })
   }
@@ -203,6 +268,83 @@ export function collectSourceRefs(value) {
   }
   visit(value)
   return refs
+}
+
+export function canonicalizeAnalysisSourceRefQuotes(analysis, batches) {
+  const chunks = new Map((Array.isArray(batches) ? batches : [])
+    .flatMap((batch) => Array.isArray(batch?.chunks) ? batch.chunks : [])
+    .map((chunk) => [chunk.chunkId, chunk]))
+  const visited = new WeakSet()
+  let repaired = 0
+  function visit(current, key) {
+    if (!current || typeof current !== "object") return
+    if (Array.isArray(current)) {
+      if (key === "sourceRefs") {
+        for (const ref of current) {
+          if (!isSourceRefObject(ref) || visited.has(ref) || typeof ref.quote !== "string" || !ref.quote) continue
+          visited.add(ref)
+          const source = chunks.get(ref.chunkId)?.text
+          if (typeof source !== "string" || source.includes(ref.quote)) continue
+          const canonical = uniquelyMatchedOriginalQuote(source, ref.quote)
+          if (canonical && canonical !== ref.quote) {
+            ref.quote = canonical
+            repaired += 1
+          }
+        }
+        return
+      }
+      current.forEach((item) => visit(item))
+      return
+    }
+    Object.entries(current).forEach(([childKey, item]) => visit(item, childKey))
+  }
+  visit(analysis)
+  return repaired
+}
+
+function uniquelyMatchedOriginalQuote(source, quote) {
+  for (const relaxed of [false, true]) {
+    const sourceIndex = normalizedEvidenceWithOffsets(source, relaxed)
+    const needle = normalizedEvidenceWithOffsets(quote, relaxed).text
+    if (!needle) continue
+    const first = sourceIndex.text.indexOf(needle)
+    if (first < 0 || sourceIndex.text.indexOf(needle, first + 1) >= 0) continue
+    const start = sourceIndex.starts[first]
+    const end = sourceIndex.ends[first + needle.length - 1]
+    if (Number.isInteger(start) && Number.isInteger(end) && end > start) return source.slice(start, end)
+  }
+  return null
+}
+
+function normalizedEvidenceWithOffsets(value, relaxed) {
+  let text = ""
+  const starts = []
+  const ends = []
+  let pendingWhitespace = null
+  const append = (character, start, end) => {
+    text += character
+    starts.push(start)
+    ends.push(end)
+  }
+  for (let index = 0; index < value.length;) {
+    const codePoint = String.fromCodePoint(value.codePointAt(index))
+    const end = index + codePoint.length
+    for (let character of codePoint.normalize("NFKC")) {
+      if (/\s/u.test(character)) {
+        pendingWhitespace ??= { start: index, end }
+        pendingWhitespace.end = end
+        continue
+      }
+      if (pendingWhitespace && text && !text.endsWith(" ")) append(" ", pendingWhitespace.start, pendingWhitespace.end)
+      pendingWhitespace = null
+      if (relaxed && (character === "*" || character === "`")) continue
+      if (relaxed && /[“”„‟＂]/u.test(character)) character = '"'
+      if (relaxed && /[‘’‚‛]/u.test(character)) character = "'"
+      append(character, index, end)
+    }
+    index = end
+  }
+  return { text: text.trim(), starts, ends }
 }
 
 export function validateSourceRefs(refs, task, batches, limits) {

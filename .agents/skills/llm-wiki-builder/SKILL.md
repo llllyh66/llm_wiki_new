@@ -115,11 +115,13 @@ typed entity or any relation.
       normal batch path. The Core matched canonical IDs, names, aliases, and
       property labels against the leased source text and included the complete
       bounded extraction constraints without verbose descriptions. If
-      auto-selection is absent/false or classification
-      remains genuinely ambiguous, call `llm_wiki_get_domain_schema` in
-      `mode: "search"` with 3 to 8 focused terms and `max_matches` no greater
-      than 12. Follow `next_cursor` with identical inputs. Use `mode: "catalog"`
-      then `mode: "types"` only when search is insufficient.
+      auto-selection is absent/false and
+      `domain_schema_pagination.required` is true, or classification remains
+      genuinely ambiguous, call `llm_wiki_get_domain_schema` in mode
+      `"search"` with 3 to 8 focused terms and `max_matches` no greater than
+      12. When the complete small Schema is already inline, use it directly and
+      do not make that extra call. Follow `next_cursor` with identical inputs.
+      Use mode `"catalog"` then mode `"types"` only when search is insufficient.
       Do not reconstruct a multi-megabyte Schema in Agent context, search
       memories for its definitions, read the original Schema file, or infer
       omitted properties from a batch/retrieval summary.
@@ -155,15 +157,22 @@ typed entity or any relation.
       reference as evidence for an entire table; split references by row or
       coherent topic.
       Start by copying `analysis_scaffold` from `get_batch` exactly, preserving
-      numeric `schemaVersion: 1`, `taskId`, `batchId`, and every empty required
+      numeric `schemaVersion: 1`, `taskId`, `batchId`, `sourceRefMode`, the
+      prefilled numeric `sourceRefs` catalog, and every empty required
       collection; only then fill extracted values. Do not recreate the envelope
-      from memory. For each top-level SourceRef, copy one exact
-      `chunk.source_ref_templates` object and then add its quote. If a spreadsheet
-      chunk exposes multiple templates, select the one for the cited table;
-      never type, normalize, or infer `sheetName` or `cellRange`. Copy every
-      quote as a short exact contiguous substring of a
-      returned batch chunk. Put a concern in `reviewItems` only when that exact
-      quote supports it; otherwise put the question in `unresolvedQuestions`.
+      from memory. The server has already generated exact quotes and spreadsheet
+      locators in `evidence_catalog`. Cite its zero-based `evidence_index`
+      directly in each candidate's `sourceRefs`; never retype a quote, read the
+      original source file, or reconstruct `sheetName`/`cellRange`. The Core
+      resolves indexes to complete SourceRefs and persists only those actually
+      used. `chunk.source_ref_templates` remains a legacy fallback only when an
+      old server does not return `evidence_catalog`. Put a concern in
+      `reviewItems` only when a selected evidence quote directly supports it;
+      otherwise put the question in `unresolvedQuestions`.
+      For a domain-Schema batch, keep the hot-path payload focused: emit typed
+      entities and typed relations first, and do not duplicate the same facts
+      into concepts, claims, or candidate pages unless they add distinct,
+      reusable knowledge. Entity page requirements are derived automatically.
    6. Call `llm_wiki_commit_analysis` with its `worker_id` and a unique
       idempotency key. Never set `accept_dropped_candidates` in the normal
       workflow. Even when the Schema policy says `drop-invalid`, the Core's
@@ -207,7 +216,9 @@ typed entity or any relation.
       directly from the returned validation list. If the second is rejected,
       return a compact recoverable report with the exact errors instead of
       continuing a speculative retry loop.
-      For `INVALID_SOURCE_REF` locator failures, rebuild the reference from the
+      On a current server, an `INVALID_SOURCE_REF` normally means an invalid
+      evidence index; correct it from `evidence_catalog` without reading the
+      original file. For legacy locator failures, rebuild the reference from the
       returned chunk template. Error details include `allowed_sheet_names` or
       `allowed_cell_ranges`; do not patch the rejected spelling manually.
    8. When `waiting: true` or `completed: true`, stop this worker normally;

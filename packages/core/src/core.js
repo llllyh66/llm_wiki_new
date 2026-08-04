@@ -10,6 +10,7 @@ import {
   resolveDomainSchema,
 } from "./domain-schema.js"
 import { lintWiki } from "./lint.js"
+import { batchEvidenceCatalog, compactEvidenceCatalog } from "./evidence.js"
 import { buildBm25Index, buildEmbeddingIndex, buildVectorIndex, retrieveContext } from "./retrieval.js"
 import { pagePatchSchema } from "./schemas.js"
 import { importSources, loadSourceManifest } from "./source-store.js"
@@ -25,6 +26,7 @@ import {
 } from "./task-store.js"
 import { commitPageTransaction, committedPageRecords } from "./transaction.js"
 import {
+  canonicalizeAnalysisSourceRefQuotes,
   collectSourceRefs,
   normalizeAnalysisEnvelope,
   validateAnalysisShape,
@@ -70,6 +72,8 @@ export class LlmWikiCore {
     this.workspaceRoot = workspaceRoot
     this.taskLocks = new Map()
     this.workspaceWriteTail = Promise.resolve()
+    this.domainSchemaCache = new Map()
+    this.domainSchemaSelectionCache = new Map()
   }
 
   async workspace(options = {}) {
@@ -84,6 +88,31 @@ export class LlmWikiCore {
       wiki_revision: workspace.revision,
       target_language: workspace.config.targetLanguage,
     }
+  }
+
+  async #taskDomainSchema(record) {
+    if (!record.task.domainSchema) return null
+    const cacheKey = `${record.task.taskId}:${record.task.domainSchema.hash ?? "unknown"}`
+    if (this.domainSchemaCache.has(cacheKey)) return this.domainSchemaCache.get(cacheKey)
+    const schema = await loadTaskDomainSchema(record)
+    this.domainSchemaCache.set(cacheKey, schema)
+    while (this.domainSchemaCache.size > 8) {
+      this.domainSchemaCache.delete(this.domainSchemaCache.keys().next().value)
+    }
+    return schema
+  }
+
+  #batchDomainSchemaSelection(record, schema, batch) {
+    if (!schema) return null
+    const chunkKey = batch.chunks.map((chunk) => chunk.contentHash ?? chunk.chunkId).join(":")
+    const cacheKey = `${record.task.taskId}:${record.task.domainSchema?.hash ?? "unknown"}:${batch.batchId}:${chunkKey}`
+    if (this.domainSchemaSelectionCache.has(cacheKey)) return this.domainSchemaSelectionCache.get(cacheKey)
+    const selection = automaticBatchDomainSchemaSelection(schema, batch)
+    this.domainSchemaSelectionCache.set(cacheKey, selection)
+    while (this.domainSchemaSelectionCache.size > 64) {
+      this.domainSchemaSelectionCache.delete(this.domainSchemaSelectionCache.keys().next().value)
+    }
+    return selection
   }
 
   async importFiles(input) {
@@ -196,20 +225,27 @@ export class LlmWikiCore {
     record.task.batchLeases[batch.batchId] = { workerId, leasedAt, expiresAt }
     record.task.activeBatchId = batch.batchId
     await saveTask(record.paths, record.task)
-    const domainSchema = await loadTaskDomainSchema(record)
+    const domainSchema = await this.#taskDomainSchema(record)
     // get_batch is the extraction hot path. Keep its complete MCP response
     // below the host's tool-output warning threshold; larger Schemas are
     // represented by identity metadata plus a compact batch-specific slice.
-    const schemaContext = domainSchemaContext(domainSchema, 8 * 1024)
-    const automaticSchemaSelection = domainSchema && schemaContext.pagination
-      ? automaticBatchDomainSchemaSelection(domainSchema, batch)
-      : null
+    const knownSchemaBytes = record.task.domainSchema?.size_bytes
+    const fullSchemaContext = domainSchemaContext(domainSchema, 8 * 1024, knownSchemaBytes)
+    const automaticSchemaSelection = this.#batchDomainSchemaSelection(record, domainSchema, batch)
+    const schemaContext = automaticSchemaSelection?.ready
+      ? {
+          value: domainSchemaContext(domainSchema, 0, knownSchemaBytes).value,
+          pagination: fullSchemaContext.pagination,
+        }
+      : fullSchemaContext
+    const agentChunks = batch.chunks.map(agentChunkWithSourceRefTemplates)
+    const evidenceCatalog = batchEvidenceCatalog(agentChunks)
     const response = {
       task_id: record.task.taskId,
       batch_id: batch.batchId,
       worker_id: workerId,
       lease_expires_at: expiresAt,
-      chunks: batch.chunks.map(agentChunkWithSourceRefTemplates),
+      chunks: agentChunks,
       batch_limits: {
         complete: true,
         char_count: batch.charCount,
@@ -243,7 +279,7 @@ export class LlmWikiCore {
           "batchSummary", "unresolvedQuestions",
         ],
         top_level_additional_properties: false,
-        source_refs: "Top-level complete SourceRef catalog; nested candidates use checked zero-based indexes.",
+        source_refs: "In batch-evidence-index mode, the scaffold's numeric catalog selects server-generated evidence and every nested candidate uses the same evidence_index. Legacy complete SourceRef objects remain accepted.",
         grounded_candidates_require_source_refs: true,
         review_item_shape: { content: "string", sourceRefs: [0] },
         max_quote_chars: 1000,
@@ -252,7 +288,8 @@ export class LlmWikiCore {
         schemaVersion: 1,
         taskId: record.task.taskId,
         batchId: batch.batchId,
-        sourceRefs: [],
+        sourceRefMode: "batch-evidence-index",
+        sourceRefs: evidenceCatalog.map((_, index) => index),
         entities: [],
         concepts: [],
         claims: [],
@@ -266,9 +303,9 @@ export class LlmWikiCore {
       analysis_preflight: {
         start_from_scaffold: true,
         schema_version_type: "number",
-        source_ref_templates: "Copy one chunk.source_ref_templates entry exactly, then add a short exact quote. Never reconstruct sheetName or cellRange.",
-        nested_source_refs: "Use checked zero-based indexes into top-level sourceRefs.",
-        evidence: "Copy short exact contiguous quotes from returned batch chunks only; do not use ellipsized retrieval snippets as evidence.",
+        source_ref_templates: "Use the prefilled batch-evidence indexes. Legacy manual SourceRefs must copy chunk.source_ref_templates exactly; never reconstruct sheetName or cellRange.",
+        nested_source_refs: "In batch-evidence-index mode, use evidence_catalog.evidence_index values directly in candidate sourceRefs and leave the scaffold catalog unchanged.",
+        evidence: "Do not retype quotes or read the source file. The server generated every evidence_catalog quote as an exact contiguous batch substring.",
         review_items: "Use {content, sourceRefs} objects only when a batch quote directly supports the concern; otherwise use unresolvedQuestions.",
       },
       extraction_context_policy: {
@@ -276,6 +313,23 @@ export class LlmWikiCore {
         default: "skip_retrieve_context",
         use_retrieval_only_for: ["explicit cross-batch reference", "unresolved alias or duplicate ambiguity", "user-requested cross-source reconciliation"],
         rationale: "The leased batch is complete evidence; final Wiki reconciliation handles cross-batch canonicalization.",
+      },
+      extraction_hot_path: {
+        expected_worker_tool_calls: ["llm_wiki_get_batch", "llm_wiki_commit_analysis"],
+        source_file_read_required: false,
+        status_call_required: false,
+        retrieval_call_required: false,
+        schema_call_required: automaticSchemaSelection?.ready !== true && schemaContext.pagination !== null,
+        output_policy: domainSchema
+          ? "Prefer typed entities and typed relations. Omit redundant concepts, claims, and candidatePages when they repeat the same facts."
+          : "Extract only reusable grounded knowledge; omit redundant restatements.",
+      },
+      evidence_catalog: compactEvidenceCatalog(evidenceCatalog),
+      evidence_catalog_contract: {
+        mode: "batch-evidence-index",
+        zero_based: true,
+        exact_quotes_server_generated: true,
+        instruction: "Copy analysis_scaffold unchanged. Cite evidence_catalog entries by evidence_index in each candidate.sourceRefs; never retype quote text or read the original file.",
       },
       completed: false,
     }
@@ -286,7 +340,7 @@ export class LlmWikiCore {
   async getDomainSchema(input) {
     const workspace = await this.workspace()
     const record = await loadTask(workspace.paths, input?.task_id)
-    const domainSchema = await loadTaskDomainSchema(record)
+    const domainSchema = await this.#taskDomainSchema(record)
     if (!domainSchema) fail("DOMAIN_SCHEMA_NOT_CONFIGURED", "This task does not have a domain Schema.")
     return {
       task_id: record.task.taskId,
@@ -329,13 +383,16 @@ export class LlmWikiCore {
       const lease = validBatchLeases(record.task)[batch.batchId]
       if (lease && lease.workerId !== workerId) fail("BATCH_LEASED", `Batch ${batch.batchId} is leased by another extraction worker.`, { retryable: true })
     }
-    const normalized = normalizeAnalysisEnvelope(input?.analysis)
+    const agentChunks = batch.chunks.map(agentChunkWithSourceRefTemplates)
+    const evidenceCatalog = batchEvidenceCatalog(agentChunks).map((entry) => entry.sourceRef)
+    const normalized = normalizeAnalysisEnvelope(input?.analysis, { evidenceCatalog })
+    const normalizedSourceRefQuotes = canonicalizeAnalysisSourceRefQuotes(normalized.analysis, record.batches)
     const analysisBytes = Buffer.byteLength(JSON.stringify(normalized.analysis ?? null))
     if (analysisBytes > workspace.config.limits.maxAnalysisBytes) {
       fail("ANALYSIS_TOO_LARGE", `Analysis exceeds the ${workspace.config.limits.maxAnalysisBytes}-byte workspace limit.`)
     }
     validateAnalysisShape(normalized.analysis, record.task.taskId, batch.batchId)
-    const domainSchema = await loadTaskDomainSchema(record)
+    const domainSchema = await this.#taskDomainSchema(record)
     const domainApplied = applyDomainSchema(normalized.analysis, domainSchema)
     if (domainApplied.report?.validation_error_count > 0
       && domainApplied.report.policy === "drop-invalid"
@@ -377,6 +434,7 @@ export class LlmWikiCore {
         remaining_batches: remaining,
         validation_errors: [],
         normalized_source_ref_indexes: normalized.resolvedSourceRefIndexes,
+        normalized_source_ref_quotes: normalizedSourceRefQuotes,
         domain_validation: domainApplied.report,
         wiki_projection: wikiProjection,
         next_action: projectionNextAction ?? extractionNextAction,

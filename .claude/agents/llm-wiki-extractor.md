@@ -33,14 +33,20 @@ repartition, not response truncation.
 
 For a large domain Schema, use `get_batch.workspace_context.domain_schema_auto_selection`
 directly when `ready: true`; do not make a Schema tool call on that normal path.
-Use `llm_wiki_get_domain_schema` search only when auto-selection is not ready or
-classification remains ambiguous. Never load the full Schema or search memories.
+Use `llm_wiki_get_domain_schema` search only when auto-selection is not ready
+and `domain_schema_pagination.required` is true, or classification remains
+ambiguous. If a complete small Schema is already inline, use it directly.
+Never load a paginated full Schema or search memories.
 Build the payload by copying `get_batch.analysis_scaffold`, not from memory.
-Build each SourceRef by copying one exact `chunk.source_ref_templates` entry
-and adding a quote. Never reconstruct spreadsheet `sheetName` or `cellRange`;
-choose the matching template when several are present. Use only exact
-contiguous batch-chunk text for SourceRef quotes; retrieval
-snippets are supplemental and must not become evidence.
+When `evidence_catalog` is present, leave the scaffold's `sourceRefMode` and
+numeric source catalog unchanged and cite `evidence_index` values directly in
+candidate `sourceRefs`. Do not retype quotes or use Read on the original source;
+the server already produced exact quotes and spreadsheet locators. Use
+`chunk.source_ref_templates` only as a legacy fallback when the evidence
+catalog is absent. Never reconstruct spreadsheet `sheetName` or `cellRange`.
+For domain-Schema extraction, do not repeat the same typed facts in concepts,
+claims, and candidate pages unless they add distinct reusable knowledge;
+entity requirements are derived automatically.
 After `get_batch` succeeds, do not call status. Skip retrieval by default; the
 batch is complete evidence and final projection performs cross-batch
 reconciliation. Only for explicit cross-batch or unresolved alias ambiguity,

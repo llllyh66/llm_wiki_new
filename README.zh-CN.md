@@ -240,12 +240,12 @@ Schema 最大可为 5 MiB。抽取热路径上超过 8 KiB 时不会塞进 `get_
 `types` 精确查询；不再让 Agent 逐页重建数 MiB Schema。Core 仍使用任务的完整
 Schema 快照校验，因此不会降低约束强度。
 
-`get_batch` 还会返回可直接填充的 `analysis_scaffold`，固定数字型
-`schemaVersion` 、正确的 `taskId` / `batchId` 和所有必需数组，减少反复的
-AnalysisEnvelope 格式修补。
-每个 chunk 还会返回 Core 生成的 `source_ref_templates`。Worker 只需复制模板并
-添加精确 quote，不再自行拼写 Excel 的 `sheetName` 和 `cellRange`。如果仍校验
-失败，错误结果会返回该 chunk 允许的精确工作表名和区域值。
+`get_batch` 还会返回可直接填充的 `analysis_scaffold` 和服务端生成的
+`evidence_catalog`。后者已经包含逐行或逐段的精确 quote 以及正确的 Excel
+定位信息；Worker 只需在实体和关系中填写 `evidence_index`，不再复制 quote、
+读取原文件或拼写 `sheetName` / `cellRange`。Core 会在提交时解析索引、只保存
+实际使用的完整 SourceRef。旧式完整 SourceRef 仍兼容；弯引号、Markdown 强调
+标记等轻微差异仅在能唯一匹配原文时自动还原为精确 quote。
 
 为了降低每个 batch 的延迟，`get_batch` 会直接用 batch 原文匹配 Schema 中的类型 ID、
 名称、别名和属性名，并内联少量相关类型的完整抽取约束（省略冗长描述）。大多数 batch 不再需要
@@ -516,21 +516,23 @@ Schema 只返回当前 batch 命中的紧凑定义。`batch_limits` 会同时报
 
 ### `sourceRefs` 或 `reviewItems` 校验失败
 
-顶层 `sourceRefs` 保存本批分析使用的完整引用。实体、概念、声明、关系、
-矛盾、候选页面和 review item 推荐使用指向该目录的零起始整数索引。Core
-会在校验前把索引解析为完整对象，并只保存规范化结果：
+新任务直接复制 `analysis_scaffold`：其中 `sourceRefMode` 为
+`batch-evidence-index`，顶层 `sourceRefs` 已预填证据目录编号。实体、概念、
+声明、关系、矛盾、候选页面和 review item 直接引用 `evidence_catalog` 中的
+`evidence_index`，Core 会解析并压缩成实际使用的完整 SourceRef：
 
 ```json
 {
-  "sourceRefs": [{ "sourceId": "source-...", "chunkId": "chunk-...", "quote": "原文", "locator": {} }],
-  "entities": [{ "name": "Ping时延", "sourceRefs": [0] }],
-  "reviewItems": [{ "content": "部分指标计算公式为空", "sourceRefs": [0] }]
+  "sourceRefMode": "batch-evidence-index",
+  "sourceRefs": [0, 1, 2],
+  "entities": [{ "name": "Ping时延", "sourceRefs": [1] }],
+  "reviewItems": [{ "content": "部分指标计算公式为空", "sourceRefs": [2] }]
 }
 ```
 
-所有索引必须小于顶层 `sourceRefs.length`。完整对象形式仍向后兼容；不要把
-`reviewItems` 写成字符串数组。无法从原文引用的问题应放入
-`unresolvedQuestions`。
+所有索引必须来自当前 batch 的 `evidence_catalog`。完整对象形式仍向后兼容；
+不要把 `reviewItems` 写成字符串数组。无法从目录中的精确证据支持的问题应放入
+`unresolvedQuestions`，不要重新读取源文件猜 quote。
 
 标题引用不能支撑整张表的详细结论。`claims`、`relations`、
 `contradictions` 和 `reviewItems` 的 quote 必须包含该条目的关键术语；大型

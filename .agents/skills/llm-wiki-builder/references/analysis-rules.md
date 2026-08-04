@@ -6,15 +6,19 @@
 - Distinguish entities, concepts, processes, metrics, claims, and relations.
 - Do not create an entity for every noun.
 - Ground each important fact in at least one SourceRef from the current task.
-- Treat top-level `sourceRefs` as the catalog of unique references used in the
-  envelope. Prefer zero-based integer catalog indexes in nested `sourceRefs`;
-  verify every index is smaller than the catalog length. The Core accepts full
-  objects for compatibility and always persists resolved complete objects.
+- When `get_batch` returns `evidence_catalog`, copy its `analysis_scaffold`
+  unchanged and cite `evidence_index` integers in candidate `sourceRefs`. The
+  Core resolves them to exact complete SourceRefs and compacts the persisted
+  top-level catalog. Never retype the supplied quotes. On an older server
+  without this catalog, treat top-level `sourceRefs` as the catalog of unique
+  complete references and use checked zero-based indexes in nested candidates.
 - Write `reviewItems` as objects with non-empty `content` and indexed or
   complete `sourceRefs`; put unsourced questions in `unresolvedQuestions`.
-- Keep quotes short and verbatim. Start each top-level SourceRef by copying one
-  exact `chunk.source_ref_templates` entry, then add `quote`; never reconstruct
-  or normalize locator fields yourself.
+- Evidence-catalog quotes are already short, exact, and verbatim. Select their
+  indexes without reading the original source file. Only on a legacy server,
+  start each top-level SourceRef by copying one exact
+  `chunk.source_ref_templates` entry and add a contiguous batch quote; never
+  reconstruct or normalize locator fields yourself.
 - A title-only quote does not support detailed facts from a table. Claims,
   relations, contradictions, and review items must cite quotes containing their
   identifying terms. Split table evidence by row or coherent topic; a single

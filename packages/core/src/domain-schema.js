@@ -40,9 +40,11 @@ export async function loadTaskDomainSchema(record) {
   return readJson(record.paths.domainSchema)
 }
 
-export function domainSchemaContext(schema, inlineBytes = INLINE_DOMAIN_SCHEMA_BYTES) {
+export function domainSchemaContext(schema, inlineBytes = INLINE_DOMAIN_SCHEMA_BYTES, knownBytes) {
   if (!schema) return { value: null, pagination: null }
-  const bytes = Buffer.byteLength(JSON.stringify(schema))
+  const bytes = Number.isInteger(knownBytes) && knownBytes >= 0
+    ? knownBytes
+    : Buffer.byteLength(JSON.stringify(schema))
   if (bytes <= inlineBytes) return { value: schema, pagination: null }
   return {
     value: {

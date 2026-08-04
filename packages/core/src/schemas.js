@@ -12,11 +12,17 @@ export const analysisSchema = Object.freeze({
     batchId: { type: "string" },
     sourceRefs: {
       type: "array",
-      description: "Catalog of every unique complete SourceRef used by this envelope. Nested sourceRefs may use zero-based indexes into this catalog or repeat complete objects.",
-      items: { $ref: "#/$defs/sourceRef" },
+      description: "Catalog of every unique complete SourceRef used by this envelope. With sourceRefMode=batch-evidence-index, copy the numeric scaffold catalog and use evidence_catalog indexes in nested candidates; Core persists resolved complete references.",
+      items: {
+        oneOf: [
+          { type: "integer", minimum: 0 },
+          { $ref: "#/$defs/sourceRef" },
+        ],
+      },
       minItems: 1,
       maxItems: 500,
     },
+    sourceRefMode: { enum: ["batch-evidence-index"], description: "Optional fast path for server-generated evidence indexes returned by get_batch." },
     entities: {
       type: "array",
       description: "When workspace_context.domain_schema is present, each entity must also provide localId, entityTypeId, and properties conforming to that type.",
