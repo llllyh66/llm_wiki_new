@@ -283,7 +283,11 @@ typed entity or any relation.
 7. Inspect `wiki_projection` in every analysis commit report and status result.
    When `ready: true` and `in_progress: false`, start exactly one background
    project `llm-wiki-writer` with task ID and stable writer ID
-   `wiki-writer-1`. Never run two Wiki writers for one task. If it reports
+   `wiki-writer-1`. Also pass the exact Writer `next_action` just returned by
+   status or `commit_analysis` and the current `writer_projection_quantum`.
+   The new Writer follows that action directly and does not spend another MCP
+   call rechecking status; status is only its fallback for a resumed lease when
+   no current action was supplied. Never run two Wiki writers for one task. If it reports
    `mcp_ready: false`, perform the same writer loop in the coordinator instead
    of launching a general-purpose replacement. The Core normally opens a
    projection after four new batches, after the 30-second debounce, or
@@ -349,6 +353,14 @@ typed entity or any relation.
       merely to satisfy coverage.
    4. Generate PagePatch objects under the returned schema. Use the exact
       `file_hash` as `expectedFileHash` for `replace` or `merge`.
+      Every `page_requirement` now contains a server-generated
+      `patch_scaffold`. Copy that object, add `content`, and keep its path,
+      operation, optional `expectedFileHash`, covers, related links, and
+      requirement-ID `sourceRefs`. Core resolves those IDs to the exact
+      complete SourceRefs, so the Writer must not copy, normalize, or retype
+      quotes and locators. When deliberately merging several requirements into
+      one canonical page, union their scaffold `covers`, `sourceRefs`, and
+      related values before adding content.
       Supply `summary`, useful `tags`, `related` canonical Wiki slugs, and
       `covers`. Author a clear H1 and a self-contained source-grounded body.
       The Core deterministically normalizes the full standard frontmatter
@@ -369,7 +381,8 @@ typed entity or any relation.
       traversal; they never alternate “read one cursor, commit its items.”
       A rejected page commit with `atomic_commit_applied: false` stored none of
       the submitted patches. Inspect every entry in `validation_errors`, fix
-      the local patch objects (copy requirement SourceRefs and quotes exactly),
+      the local patch objects (restore the affected requirement's
+      `patch_scaffold` fields instead of reconstructing a SourceRef),
       and resubmit the entire rejected subset with a new idempotency key and
       the same `projection_complete` value. Never submit only the one corrected
       patch: the other valid patches from that rejected call were not retained.

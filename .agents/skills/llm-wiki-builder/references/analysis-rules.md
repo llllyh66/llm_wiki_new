@@ -82,3 +82,6 @@ Minimal shape:
   resolvable links into both pages' Related navigation.
 - Submit complete rebased content for `merge`; the Core does not perform a model
   merge.
+- Build page patches from each returned `page_requirement.patch_scaffold`.
+  Requirement-ID `sourceRefs` are server handles that Core resolves to exact
+  quotes and locators; do not copy complete SourceRef objects into a patch.

@@ -136,6 +136,6 @@ export async function ensureWorkspace(root, options = {}) {
       },
       limits: { ...DEFAULT_LIMITS, ...workspace.limits, ...(config.limits ?? {}) },
     },
-    revision: await hashDirectory(paths.wiki),
+    revision: options.skipWikiRevision === true ? null : await hashDirectory(paths.wiki),
   }
 }

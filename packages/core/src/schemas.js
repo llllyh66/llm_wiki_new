@@ -119,7 +119,18 @@ export const pagePatchSchema = Object.freeze({
     tags: { type: "array", items: { type: "string", minLength: 1, maxLength: 200 }, maxItems: 100 },
     related: { type: "array", items: { type: "string", minLength: 1, maxLength: 500 }, maxItems: 500 },
     covers: { type: "array", items: { type: "string", minLength: 1, maxLength: 300 }, maxItems: 1000, description: "page_requirements requirement_id values materialized by this canonical page." },
-    sourceRefs: { type: "array", items: analysisSchema.$defs.sourceRef, minItems: 1, maxItems: 500 },
+    sourceRefs: {
+      type: "array",
+      items: {
+        oneOf: [
+          analysisSchema.$defs.sourceRef,
+          { type: "string", pattern: "^page-[0-9a-f]{20}$" },
+        ],
+      },
+      minItems: 1,
+      maxItems: 500,
+      description: "Prefer page requirement IDs copied from page_requirement.patch_scaffold. Core resolves them to exact SourceRefs. Complete SourceRef objects remain accepted for backward compatibility.",
+    },
     rationale: { type: "string", minLength: 1, maxLength: 10000 },
   },
   additionalProperties: false,

@@ -212,6 +212,15 @@ blocked until one full reconciliation clears all provisional paths.
 Different tasks may run one Writer each. Core serializes their workspace write
 transactions and validates only the exact target page paths and hashes, so an
 unrelated page commit no longer invalidates another Writer's paginated plan.
+Each page requirement includes a ready-to-fill patch scaffold. Its SourceRefs
+are requirement IDs which Core resolves to the exact persisted quotes and
+locators, eliminating quote transcription during page generation. Legacy full
+SourceRefs are still accepted and uniquely safe Markdown, Unicode-quote, and
+whitespace differences are repaired before validation. Later page-plan cursors
+reuse the persisted snapshot instead of rebuilding analyses and rereading every
+Wiki page. Tools which do not consume a Wiki revision also skip the full Wiki
+hash, and a newly launched Writer follows the coordinator's current action
+without an extra status probe.
 
 ## Managed workspace
 

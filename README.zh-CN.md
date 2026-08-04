@@ -320,6 +320,9 @@ Skill 会先调用 `llm_wiki_list_tasks` 和 `llm_wiki_status`，然后按 `next
 - 增量投影只更新受当前 batch 影响的页面，并标记为 provisional。
 - 受影响页面传输全文；无关旧页面只传输路径、标题、摘要和哈希等紧凑目录，
   避免 Writer 成本随 Wiki 总文本量线性增长。
+- 每个 `page_requirement` 都带有服务端生成的 `patch_scaffold`；Writer 只需
+  添加页面正文，SourceRef 用 requirement ID 表示，由 Core 解析成精确引用。
+- 页面计划的后续分页直接读取稳定快照，不再重新读取全部分析和 Wiki 页面。
 - provisional 页面在所有未完成任务的检索中都被排除，不会污染用户问答。
 - 超大页面计划可在同一租约下分多次提交，每次最多 50 个 PagePatch。
 - 全部抽取完成后必须进行一次全局去重、矛盾合并和 provisional 复核；
@@ -522,6 +525,32 @@ Schema 匹配使用一次构建的多模式索引，不再对每个类型、属�
 扫描 batch 文本。每次提交的幂等结果按 key 分片保存，避免 batch 越多时
 反复读写一个持续膨胀的 JSON。同一任务还有跨 MCP 进程的短时文件锁，
 多个后台 Worker 可以并行分析，又不会在租约或提交状态上互相覆盖。
+不需要 Wiki revision 的工具不再每次哈希整个 Wiki；查询也不再连续计算
+两次相同 revision。Writer 获得协调器已返回的 `next_action` 时直接执行，
+不再额外调用一次 status。
+
+### PagePatch 的 SourceRef 校验失败
+
+新版不再要求 Writer 复制完整 SourceRef。直接复制
+`page_requirement.patch_scaffold`，添加 `content` 后提交即可：
+
+```json
+{
+  "patchId": "patch-page-...",
+  "path": "wiki/entities/zhang-san.md",
+  "operation": "create",
+  "title": "张三",
+  "pageKind": "entity",
+  "covers": ["page-..."],
+  "sourceRefs": ["page-..."],
+  "content": "# 张三\n\n...",
+  "rationale": "Materialize page requirement page-..."
+}
+```
+
+Core 会将 requirement ID 解析为任务中已验证的精确 quote 和 locator。旧版
+完整 SourceRef 仍可使用；仅有 Markdown 加粗、Unicode 引号或空白差异时，
+服务端会在唯一安全匹配后自动修复，不会让 Writer 重新生成整批页面。
 
 ### `sourceRefs` 或 `reviewItems` 校验失败
 

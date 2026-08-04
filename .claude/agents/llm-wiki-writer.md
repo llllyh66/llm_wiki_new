@@ -15,18 +15,20 @@ Act as the task's only Wiki writer. The coordinator must provide a task ID and
 the stable writer ID `wiki-writer-1`. Follow the Wiki-writer loop in the
 preloaded `llm-wiki-builder` Skill exactly.
 
-First call `llm_wiki_status` with the supplied task ID. If that MCP tool is not
-initially visible, use `ToolSearch` once for `llm_wiki_status`. If it remains
-unavailable, stop immediately and report `mcp_ready: false`; do not substitute
-Read, shell, or another agent. Continue the projection only after returning
-`mcp_ready: true` internally from that successful probe.
+When the coordinator supplies a current Writer `next_action` from status or an
+analysis commit, call that action directly; the successful coordinator call is
+already the capability probe. Only when no current action was supplied, first
+call `llm_wiki_status` with the task ID to recover the lease. If the required
+MCP tool is not initially visible, use `ToolSearch` once before reporting
+`mcp_ready: false`; do not substitute Read, shell, or another agent.
 If status reports an existing projection lease, follow its page-plan
 `next_action` with the returned projection ID. A replacement Writer starts at
 cursor zero so it rebuilds the complete accumulated context; it does not infer
 that the lease is unavailable or switch to extraction work.
 
-Read `wiki_projection.writer_projection_quantum` from status and process no
-more than that many projections in this invocation (currently six). Request
+Use the coordinator-supplied `writer_projection_quantum`, or read it from
+status on the recovery path, and process no more than that many projections in
+this invocation (currently six). Request
 page-plan pages with `max_chars: 40000`. The response intentionally
 contains only domain Schema identity metadata; never fetch or reconstruct the
 full extraction Schema in this writer. Follow the response's `next_action` and
@@ -41,7 +43,11 @@ hashes for affected or same-task provisional pages; `existing_page_catalog` is
 duplicate-avoidance metadata only and must not be replaced without full
 content. Materialize all requirements, recording
 their `requirement_id` values in PagePatch `covers`; `candidate_pages` is not a
-complete page list. Preserve rich page bodies, summaries, tags, wikilinks, and
+complete page list. Start from each requirement's `patch_scaffold` and add its
+page body. Keep the scaffold's requirement-ID `sourceRefs`; Core resolves them
+to exact quotes and locators, so never copy or retype complete SourceRef
+objects. When merging requirements, union their scaffold handles and covers.
+Preserve rich page bodies, summaries, tags, wikilinks, and
 Related navigation. If completion returns `INCOMPLETE_PAGE_COVERAGE`, add the
 listed missing canonical pages and retry the same projection normally.
 In incremental mode follow `writer_guidance`: produce concise grounded drafts,
@@ -59,8 +65,9 @@ and use the returned existing-page content and exact `file_hash`; never guess a
 hash or switch a known existing path from `create` to hashless `merge`.
 Every rejected `llm_wiki_commit_pages` call is atomic when its result says
 `atomic_commit_applied: false`: none of that call's patches were stored. If one
-patch has an invalid quote or shape, correct all entries listed in
-`validation_errors`, preserve the complete local patch subset and its
+patch has an invalid scaffold field, legacy quote, or shape, correct all entries listed in
+`validation_errors` by restoring their `patch_scaffold` fields, preserve the
+complete local patch subset and its
 `projection_complete` value, then resubmit that entire rejected subset with a
 new idempotency key. Never retry only the bad patch. Previously accepted
 partial commits are durable and must not be resubmitted.

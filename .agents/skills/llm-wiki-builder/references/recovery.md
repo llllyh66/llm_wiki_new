@@ -27,7 +27,7 @@ completed worker's slot.
 If a worker reports that the saved MCP result contains one source/JSON line too
 large for the host reader, resume that lease with the same worker and batch IDs
 after rebuilding the current server. `get_batch` enforces hard Agent-facing
-ceilings (3K text per chunk, 6K source text per batch, and 24 KiB serialized
+ceilings (3K text per chunk, 9K source text per batch, and 24 KiB serialized
 chunk payload per batch), budgets the complete response, compacts oversized structured table
 metadata, and repairs unfinished legacy batches without discarding the lease.
 Do not wait for expiry or send another worker to repeat the same unreadable
@@ -97,8 +97,9 @@ For page-patch validation errors such as `INVALID_SOURCE_REF`, use the returned
 `atomic_commit_applied: false`, none of the submitted patches were persisted:
 resubmit the entire rejected patch subset, not only the invalid patch. Preserve
 its `projection_complete` value and use a new idempotency key after editing.
-Copy `sourceRefs` verbatim from the accumulated page requirements; do not
-retype quotes. Patches from an earlier `accepted: true` partial commit remain
+Restore `sourceRefs`, `covers`, path, operation, and hash from the affected
+`page_requirement.patch_scaffold`; requirement-ID SourceRefs are resolved by
+Core, so do not copy or retype quotes. Patches from an earlier `accepted: true` partial commit remain
 durable and are not part of this retry.
 
 If a multipart projection worker stops, inspect `wiki_projection` in status.

@@ -469,6 +469,53 @@ export function validatePagePatchShape(patch, limits) {
   if (patch.expectedFileHash !== undefined && !/^[0-9a-f]{64}$/i.test(patch.expectedFileHash)) fail("INVALID_PAGE_PATCH", "expectedFileHash must be a SHA256 value.")
 }
 
+export function normalizePagePatchSourceRefs(patch, requirements) {
+  if (!patch || typeof patch !== "object" || Array.isArray(patch) || !Array.isArray(patch.sourceRefs)) {
+    return { patch, resolvedRequirementSourceRefs: 0 }
+  }
+  const lookup = new Map((Array.isArray(requirements) ? requirements : [])
+    .map((requirement) => [requirement?.requirement_id, requirement]))
+  const resolved = []
+  let resolvedRequirementSourceRefs = 0
+  for (const [index, ref] of patch.sourceRefs.entries()) {
+    if (typeof ref !== "string") {
+      resolved.push(ref)
+      continue
+    }
+    const requirement = lookup.get(ref)
+    if (!requirement) {
+      fail("INVALID_PAGE_PATCH", `sourceRefs[${index}] requirement ID ${JSON.stringify(ref)} is not part of the current page plan.`, {
+        retryable: true,
+        details: { invalid_requirement_id: ref },
+        suggestedAction: "Copy sourceRefs from page_requirement.patch_scaffold; do not copy or rewrite complete SourceRef objects.",
+      })
+    }
+    const refs = Array.isArray(requirement.source_refs) ? requirement.source_refs : []
+    if (refs.length === 0) {
+      fail("INVALID_PAGE_PATCH", `Page requirement ${ref} has no grounded SourceRefs.`, {
+        retryable: true,
+        suggestedAction: "Restart page-plan collection at cursor zero so Core can rebuild the requirement scaffold.",
+      })
+    }
+    resolved.push(...refs)
+    resolvedRequirementSourceRefs += refs.length
+  }
+  return {
+    patch: { ...patch, sourceRefs: uniqueSourceRefs(resolved) },
+    resolvedRequirementSourceRefs,
+  }
+}
+
+function uniqueSourceRefs(refs) {
+  const seen = new Set()
+  return refs.filter((ref) => {
+    const signature = stableStringify(ref)
+    if (seen.has(signature)) return false
+    seen.add(signature)
+    return true
+  })
+}
+
 export function validatePagePath(relativePath) {
   if (typeof relativePath !== "string" || relativePath.includes("\0")) fail("INVALID_PAGE_PATH", "Page path is invalid.")
   const normalized = relativePath.replace(/\\/g, "/")

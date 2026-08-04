@@ -762,6 +762,8 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
   assert.deepEqual(plan.page_requirements.map((requirement) => requirement.title).sort(), ["Aggregate", "Business Entity"])
   const businessRequirement = plan.page_requirements.find((requirement) => requirement.title === "Business Entity")
   const aggregateRequirement = plan.page_requirements.find((requirement) => requirement.title === "Aggregate")
+  assert.deepEqual(businessRequirement.patch_scaffold.sourceRefs, [businessRequirement.requirement_id])
+  assert.deepEqual(businessRequirement.patch_scaffold.covers, [businessRequirement.requirement_id])
   const committed = await f.core.commitPages({
     task_id: imported.task_id,
     based_on_wiki_revision: plan.based_on_wiki_revision,
@@ -777,7 +779,7 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
       tags: ["domain-model"],
       related: ["concepts/aggregate"],
       covers: [businessRequirement.requirement_id],
-      sourceRefs: [sourceRef],
+      sourceRefs: [businessRequirement.requirement_id],
       rationale: "The source explicitly defines this concept.",
     }, {
       patchId: "aggregate-v1",
@@ -790,11 +792,12 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
       tags: ["domain-model"],
       related: ["concepts/business-entity"],
       covers: [aggregateRequirement.requirement_id],
-      sourceRefs: [sourceRef],
+      sourceRefs: [aggregateRequirement.requirement_id],
       rationale: "The source explicitly defines Aggregate.",
     }],
   })
   assert.equal(committed.accepted, true)
+  assert.equal(committed.normalized_page_requirement_source_refs, 2)
 
   const result = await f.core.finalize({ task_id: imported.task_id })
   assert.equal(result.status, "completed")
@@ -816,6 +819,45 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
   assert.deepEqual(completedRetrieval.available_channels, ["bm25", "embedding", "wiki"])
   const again = await f.core.finalize({ task_id: imported.task_id })
   assert.deepEqual(again, result)
+})
+
+test("page commits repair legacy quote formatting and prefer requirement-ID SourceRefs", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  await writeFile(f.source, "# 客户\n\n客户张三的客户编号为 **C1001**，客户类别为“个人客户”。\n")
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  const evidence = batch.evidence_catalog.find((entry) => entry.quote.includes("客户张三"))
+  assert.ok(evidence)
+  await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    idempotency_key: "page-quote-analysis-v1",
+    analysis: {
+      ...batch.analysis_scaffold,
+      entities: [{ localId: "customer-zhang-san", name: "张三", sourceRefs: [evidence.evidence_index] }],
+      batchSummary: "客户张三的资料。",
+    },
+  })
+  const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
+  const requirement = plan.page_requirements[0]
+  assert.deepEqual(requirement.patch_scaffold.sourceRefs, [requirement.requirement_id])
+  const reconstructedRef = {
+    ...requirement.source_refs[0],
+    quote: '客户张三的客户编号为 C1001，客户类别为"个人客户"。',
+  }
+  const committed = await f.core.commitPages({
+    task_id: imported.task_id,
+    based_on_wiki_revision: plan.based_on_wiki_revision,
+    idempotency_key: "page-quote-repair-v1",
+    patches: [{
+      ...requirement.patch_scaffold,
+      content: "# 张三\n\n客户编号为 C1001。",
+      sourceRefs: [reconstructedRef],
+    }],
+  })
+  assert.equal(committed.accepted, true)
+  assert.equal(committed.normalized_page_source_ref_quotes, 1)
 })
 
 test("parallel workers lease distinct batches and concurrent commits preserve every result", async (t) => {
@@ -1087,6 +1129,7 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
     (error) => error instanceof LlmWikiError && error.code === "PAGE_PLAN_CURSOR_MISMATCH",
   )
   let continuationCursor = restartedPlan.next_cursor
+  const pagePlanRevisionBeforeContinuation = JSON.parse(await readFile(taskPath, "utf8")).pagePlanRevision
   const recoveredExistingPages = []
   while (continuationCursor !== null) {
     const continuation = await f.core.getPagePlanContext({
@@ -1099,6 +1142,7 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
     recoveredExistingPages.push(...continuation.existing_pages)
     continuationCursor = continuation.next_cursor
   }
+  assert.equal(JSON.parse(await readFile(taskPath, "utf8")).pagePlanRevision, pagePlanRevisionBeforeContinuation)
   assert.equal(recoveredExistingPages.length, 1)
   assert.equal(typeof recoveredExistingPages[0].file_hash, "string")
   const acknowledged = await f.core.commitPages({
