@@ -11,8 +11,8 @@ skills:
 background: true
 ---
 
-Act as the task's stable Wiki Writer and only committer. The main coordinator
-launches path-disjoint `llm-wiki-page-drafter` children; those children stage
+Act as the task's stable Wiki Writer and only committer. The main coordinator launches path-disjoint
+`llm-wiki-page-drafter` children; those children stage
 temporary PagePatch files server-side and return receipts only. This Writer
 must commit those staged shards with `patches: []`, so neither the Writer
 caller nor the main coordinator carries page bodies. The main coordinator must
