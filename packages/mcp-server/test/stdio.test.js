@@ -198,21 +198,17 @@ test("built MCP server survives errors and completes the full workflow over one 
   })
   assert.equal(analyzed.isError, undefined)
   assert.equal(analyzed.structuredContent.normalized_source_ref_indexes, 3)
-  assert.equal(analyzed.structuredContent.next_action.tool, "llm_wiki_apply_projection")
+  assert.equal(analyzed.structuredContent.next_action.tool, "llm_wiki_get_page_plan_context")
   const projected = await client.callTool({
     name: "llm_wiki_apply_projection",
     arguments: { task_id: taskId, writer_id: "stdio-wiki-writer", max_projections: 6 },
   })
   assert.equal(projected.isError, undefined)
-  assert.equal(projected.structuredContent.automated, true)
-  assert.deepEqual(projected.structuredContent.projection_runs.map((run) => run.mode), ["incremental"])
+  assert.equal(projected.structuredContent.automated, false)
+  assert.equal(projected.structuredContent.writer_mode, "legacy-semantic")
   assert.equal(projected.structuredContent.semantic_writer_required, true)
-  assert.equal(projected.structuredContent.next_action.tool, "llm_wiki_get_page_plan_context")
-  const finalPlanCall = await client.callTool({
-    name: projected.structuredContent.next_action.tool,
-    arguments: projected.structuredContent.next_action.arguments,
-  })
-  const finalPlan = finalPlanCall.structuredContent
+  assert.equal(projected.structuredContent.next_action.tool, "llm_wiki_commit_pages")
+  const finalPlan = projected.structuredContent
   assert.equal(finalPlan.page_plan_complete, true)
   const finalPatches = finalPlan.page_requirements.map((requirement) => ({
     ...requirement.patch_scaffold,
@@ -231,7 +227,30 @@ test("built MCP server survives errors and completes the full workflow over one 
       idempotency_key: "stdio-final-semantic-v1",
     },
   })
-  assert.equal(semanticCommit.structuredContent.wiki_projection.final_completed, true)
+  assert.equal(semanticCommit.structuredContent.wiki_projection.final_completed, false)
+  const finalReconcileCall = await client.callTool({
+    name: "llm_wiki_get_page_plan_context",
+    arguments: { task_id: taskId, writer_id: "stdio-wiki-writer", cursor: 0, max_chars: 40_000 },
+  })
+  const finalReconcile = finalReconcileCall.structuredContent
+  assert.equal(finalReconcile.projection.mode, "final")
+  const finalCommit = await client.callTool({
+    name: "llm_wiki_commit_pages",
+    arguments: {
+      task_id: taskId,
+      writer_id: "stdio-wiki-writer",
+      projection_id: finalReconcile.projection.projection_id,
+      based_on_wiki_revision: finalReconcile.based_on_wiki_revision,
+      patches: finalReconcile.page_requirements.map((requirement) => ({
+        ...requirement.patch_scaffold,
+        content: `# ${requirement.title}\n\n## Overview\n\nA semantically reconciled grounded page.\n`,
+        summary: "A semantically reconciled grounded page.",
+        tags: [requirement.page_kind],
+      })),
+      idempotency_key: "stdio-final-reconcile-v1",
+    },
+  })
+  assert.equal(finalCommit.structuredContent.wiki_projection.final_completed, true)
   const finalized = await client.callTool({ name: "llm_wiki_finalize", arguments: { task_id: taskId } })
   assert.equal(finalized.structuredContent.status, "completed")
   const status = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: taskId } })

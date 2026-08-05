@@ -77,7 +77,7 @@ Schema 的抽取策略是“抽取时约束”，不是先随意抽取后再静�
 
 ### 2.4 增量 Wiki 投影
 
-当完成的 batch 达到投影条件后，`llm_wiki_apply_projection` 可以快速生成临时 Wiki 页面：
+当完成的 batch 达到投影条件后，Core 会创建一个 Writer projection，交给 Agent Wiki Writer：
 
 - 结构化实体和属性；
 - 已验证的 claims；
@@ -85,29 +85,39 @@ Schema 的抽取策略是“抽取时约束”，不是先随意抽取后再静�
 - 精确证据引用；
 - 原子事务和目标页面 hash 校验。
 
-增量投影的目标是尽快让知识库可查询，不承担完整的跨 batch 语义写作。因此页面在此阶段可能较为简洁，且标记为 provisional。
+Writer 会读取完整的 page plan，生成有标题、概述、关键事实、关系、Related 链接和来源证据的语义页面。增量 projection 的页面可能先标记为 provisional，最终 projection 会重新综合所有 batch 并清除 provisional 状态。
 
 ### 2.5 最终语义重写
 
-所有 batch 完成后，Core 不会把整个知识库的完整页面计划一次性交给 Wiki Writer，而是把 provisional 页面拆成服务端强制执行的语义分片：
+所有 batch 完成后，Core 会创建 final projection，交给同一个 Wiki Writer 做完整语义协调：
 
-1. 每个 final projection 只租约一组 provisional 页面，默认最多 20 个 canonical 页面；
-2. `llm_wiki_get_page_plan_context` 只返回该分片相关的 requirements、实体、claims、关系和完整旧页面，并继续按 cursor 分页；
-3. Writer 综合跨 batch 的实体、声明、关系和 batchSummary；
+1. `llm_wiki_get_page_plan_context` 按 cursor 分页返回稳定的完整 page plan；
+2. Writer 必须读取所有 cursor，直到 `page_plan_complete=true` 且 `next_cursor=null`；
+3. Writer 综合所有 batch 的实体、声明、关系、冲突和现有页面正文；
 4. Writer 重写页面概述、关键事实、关系和 Related 链接；
 5. 原始 chunk 只放在简洁的来源证据区；
-6. 分片独立提交；成功后从待重写路径集合移除，并创建下一分片，失败时从当前 projection 和准确 cursor 恢复；
-7. 所有分片完成后，再由 Finalize 更新 `index.md` 和 `overview.md` 等全局汇总页。
+6. 页面 patch 按最多 50 个一组原子提交，失败时修正整个被拒绝集合后重试；
+7. 最终 projection 完成后，由 Finalize 更新 `index.md` 和 `overview.md` 等全局汇总页。
 
-未变化页面应跳过重写，避免无意义的 LLM 调用和 revision conflict。
+如果 Writer 在某个 cursor 处中断，恢复时必须使用同一 projection ID 和准确 cursor 继续读取；不能在 page plan 未完成前提交页面。`llm_wiki_apply_projection` 只是兼容入口，会转交传统 page-plan Writer 流程，不会自动渲染页面。
 
-### 2.6 Finalize
+### 2.6 Related 关系生成
+
+Related 不是在单一阶段一次性生成，而是分三步完成：
+
+1. 抽取阶段：Extractor 将有证据支持的实体关系写入 `AnalysisEnvelope.relations`；
+2. 投影阶段：Core 根据关系两端的 requirement，生成 `related_requirement_ids`，并在页面 patch 的 `related`、正文关系段落和 Wiki 链接中写入；
+3. Finalize 阶段：Core 扫描页面 frontmatter 与正文 Wiki 链接，补齐双向 Related 关系。
+
+因此，增量页面可以先看到部分 Related；全部 batch 和语义分片完成后，Finalize 才是最终一致的双向关系结果。
+
+### 2.7 Finalize
 
 `llm_wiki_finalize` 完成 Core 拥有的收尾工作：
 
 - 生成或更新 source 页面；
 - 更新 `index.md`、`overview.md`、`log.md`；
-- 更新确定性索引和 Related 关系；
+- 更新确定性索引，并对 Related 关系进行双向补全；
 - 执行 Wiki lint；
 - 将任务标记为 completed。
 

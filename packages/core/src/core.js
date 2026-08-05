@@ -550,16 +550,7 @@ export class LlmWikiCore {
       }
     }
     const plannedRequirements = pageRequirementsWithPatchScaffolds(requirements, existingPages)
-    const semanticPageBatchSize = record.task.pageProjection.semanticPageBatchSize
-      ?? workspace.config.limits.semanticPageBatchSize
-      ?? 20
-    const effectiveRequirements = projection?.mode === "final"
-      ? selectSemanticRequirementShard(plannedRequirements, projectionState(record.task).provisionalPagePaths, semanticPageBatchSize)
-      : plannedRequirements
-    if (projection?.mode === "final") {
-      projection.requirementIds = effectiveRequirements.map((requirement) => requirement.requirement_id)
-      projection.semanticPagePaths = uniqueStrings(effectiveRequirements.map((requirement) => requirement.patch_scaffold.path))
-    }
+    const effectiveRequirements = plannedRequirements
     const revision = workspace.revision
     // Freeze the projection's initial workspace revision for diagnostics, but
     // do not invalidate paginated context when another task changes unrelated
@@ -571,29 +562,15 @@ export class LlmWikiCore {
     record.task.wikiRevision = revision
     await saveTask(record.paths, record.task)
     const fullContext = {
-      batches: projection?.mode === "final" ? [] : analyses.map((analysis) => ({ batch_id: analysis.batchId, summary: analysis.batchSummary, unresolved_questions: analysis.unresolvedQuestions })),
-      entities: projection?.mode === "final"
-        ? filterSemanticCandidates(analyses.flatMap((analysis) => analysis.entities), effectiveRequirements)
-        : analyses.flatMap((analysis) => analysis.entities),
-      concepts: projection?.mode === "final"
-        ? filterSemanticCandidates(analyses.flatMap((analysis) => analysis.concepts), effectiveRequirements)
-        : analyses.flatMap((analysis) => analysis.concepts),
-      claims: projection?.mode === "final"
-        ? filterSemanticCandidates(deduplicateExact(analyses.flatMap((analysis) => analysis.claims)), effectiveRequirements)
-        : deduplicateExact(analyses.flatMap((analysis) => analysis.claims)),
-      relations: projection?.mode === "final"
-        ? filterSemanticCandidates(deduplicateExact(analyses.flatMap((analysis) => analysis.relations)), effectiveRequirements)
-        : deduplicateExact(analyses.flatMap((analysis) => analysis.relations)),
-      candidate_pages: projection?.mode === "final"
-        ? filterSemanticCandidates(deduplicateExact(analyses.flatMap((analysis) => analysis.candidatePages)), effectiveRequirements)
-        : deduplicateExact(analyses.flatMap((analysis) => analysis.candidatePages)),
-      existing_pages: projection?.mode === "final"
-        ? existingPages.filter((page) => projection.semanticPagePaths.includes(page.path))
-        : existingPages,
-      existing_page_catalog: projection?.mode === "final" ? [] : existingPageCatalog,
-      conflicts: projection?.mode === "final"
-        ? filterSemanticCandidates(analyses.flatMap((analysis) => analysis.contradictions), effectiveRequirements)
-        : analyses.flatMap((analysis) => analysis.contradictions),
+      batches: analyses.map((analysis) => ({ batch_id: analysis.batchId, summary: analysis.batchSummary, unresolved_questions: analysis.unresolvedQuestions })),
+      entities: analyses.flatMap((analysis) => analysis.entities),
+      concepts: analyses.flatMap((analysis) => analysis.concepts),
+      claims: deduplicateExact(analyses.flatMap((analysis) => analysis.claims)),
+      relations: deduplicateExact(analyses.flatMap((analysis) => analysis.relations)),
+      candidate_pages: deduplicateExact(analyses.flatMap((analysis) => analysis.candidatePages)),
+      existing_pages: existingPages,
+      existing_page_catalog: existingPageCatalog,
+      conflicts: analyses.flatMap((analysis) => analysis.contradictions),
       required_pages: effectiveRequirements,
     }
     const finalizationHint = fastFinalizationEligibility(record.task, projection, requirements, existingPages, analyses)
@@ -792,7 +769,16 @@ export class LlmWikiCore {
   }
 
   async applyWikiProjection(input) {
-    return this.#withWorkspaceWriteLock(() => this.#withTaskLock(input?.task_id, () => this.#applyWikiProjection(input)))
+    return this.#withWorkspaceWriteLock(() => this.#withTaskLock(input?.task_id, async () => {
+      const context = await this.#getPagePlanContext({
+        task_id: input?.task_id,
+        writer_id: input?.writer_id ?? "wiki-writer-1",
+        ...(input?.projection_id ? { projection_id: input.projection_id } : {}),
+        cursor: input?.cursor ?? 0,
+        max_chars: input?.max_chars ?? 40_000,
+      })
+      return { ...context, accepted: true, automated: false, renderer: "agent-semantic-writer-v1", writer_mode: "legacy-semantic", semantic_writer_required: true }
+    }))
   }
 
   async #applyWikiProjection(input) {
@@ -1039,11 +1025,7 @@ export class LlmWikiCore {
     }
     const commitBatchIds = commitProjection?.batchIds ?? record.task.completedBatchIds
     const commitAnalyses = await loadAnalyses(record, commitBatchIds)
-    const allCommitRequirements = derivePageRequirements(commitAnalyses)
-    const leasedRequirementIds = new Set(commitProjection?.requirementIds ?? [])
-    const commitRequirements = commitProjection?.mode === "final" && leasedRequirementIds.size > 0
-      ? allCommitRequirements.filter((requirement) => leasedRequirementIds.has(requirement.requirement_id))
-      : allCommitRequirements
+    const commitRequirements = derivePageRequirements(commitAnalyses)
     const patchIds = new Set()
     const patchValidationErrors = []
     const normalizedPatches = []
@@ -1152,15 +1134,9 @@ export class LlmWikiCore {
           if (projection.mode === "incremental") {
             record.task.status = record.task.completedBatchIds.length === record.task.batchCount ? "planning" : "extracting"
           } else {
-            const reconciledPaths = new Set(projection.semanticPagePaths ?? journal.patches.map((patch) => patch.path))
-            state.provisionalPagePaths = state.provisionalPagePaths.filter((pagePath) => !reconciledPaths.has(pagePath))
-            if (state.provisionalPagePaths.length === 0) {
-              state.finalCompleted = true
-              record.task.status = "committing"
-            } else {
-              state.finalCompleted = false
-              record.task.status = "planning"
-            }
+            state.finalCompleted = true
+            state.provisionalPagePaths = []
+            record.task.status = "committing"
           }
         } else {
           state.lease.wikiRevision = journal.wikiRevision
@@ -2253,38 +2229,14 @@ function nextAction(task, wikiProjection = pageProjectionStatus(task)) {
 }
 
 function projectionAction(task, wikiProjection = pageProjectionStatus(task)) {
-  const lease = projectionState(task).lease
-  if (lease?.mode === "final") {
-    const traversal = lease.pagePlanTraversal
-    if (traversal?.complete === true) {
-      return {
-        tool: "llm_wiki_commit_pages",
-        arguments: {
-          task_id: task.taskId,
-          writer_id: lease.writerId,
-          projection_id: lease.projectionId,
-          based_on_wiki_revision: lease.wikiRevision,
-        },
-      }
-    }
-    return {
-      tool: "llm_wiki_get_page_plan_context",
-      arguments: {
-        task_id: task.taskId,
-        writer_id: lease.writerId,
-        projection_id: lease.projectionId,
-        cursor: traversal?.nextCursor ?? 0,
-        max_chars: 40_000,
-      },
-    }
-  }
   return {
-    tool: "llm_wiki_apply_projection",
+    tool: "llm_wiki_get_page_plan_context",
     arguments: {
       task_id: task.taskId,
       writer_id: wikiProjection.writer_id ?? "wiki-writer-1",
       ...(wikiProjection.projection_id ? { projection_id: wikiProjection.projection_id } : {}),
-      max_projections: wikiProjection.writer_projection_quantum ?? projectionState(task).writerProjectionQuantum,
+      cursor: wikiProjection.page_plan_next_cursor ?? 0,
+      max_chars: 40_000,
     },
   }
 }

@@ -1039,9 +1039,9 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(ready.status, "extracting")
   assert.equal(ready.wiki_projection.ready, true)
   assert.equal(ready.wiki_projection.mode, "incremental")
-  assert.equal(ready.next_action.tool, "llm_wiki_apply_projection")
+  assert.equal(ready.next_action.tool, "llm_wiki_get_page_plan_context")
   assert.equal(ready.next_action.arguments.writer_id, "wiki-writer-1")
-  assert.equal(projectionSignal.next_action.tool, "llm_wiki_apply_projection")
+  assert.equal(projectionSignal.next_action.tool, "llm_wiki_get_page_plan_context")
   assert.equal(projectionSignal.worker_next_action.tool, "llm_wiki_get_batch")
 
   const incrementalPlan = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1" })
@@ -1057,12 +1057,13 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(leasedStatus.wiki_projection.page_plan_complete, true)
   assert.equal(leasedStatus.wiki_projection.page_plan_next_cursor, null)
   assert.deepEqual(leasedStatus.next_action, {
-    tool: "llm_wiki_apply_projection",
+    tool: "llm_wiki_get_page_plan_context",
     arguments: {
       task_id: imported.task_id,
       writer_id: "wiki-writer-1",
       projection_id: incrementalPlan.projection.projection_id,
-      max_projections: 6,
+      cursor: 0,
+      max_chars: 40_000,
     },
   })
 
@@ -1378,54 +1379,59 @@ test("fast projection renders grounded pages and drains incremental plus final w
   })
 
   const before = await f.core.status({ task_id: imported.task_id })
-  assert.equal(before.next_action.tool, "llm_wiki_apply_projection")
+  assert.equal(before.next_action.tool, "llm_wiki_get_page_plan_context")
   const projected = await f.core.applyWikiProjection({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
     max_projections: 6,
   })
   assert.equal(projected.accepted, true)
-  assert.equal(projected.automated, true)
-  assert.deepEqual(projected.projection_runs.map((run) => run.mode), ["incremental"])
-  assert.equal(projected.projection_runs[0].patch_count, 2)
-  assert.equal(projected.semantic_writer_required, true)
-  assert.equal(projected.wiki_projection.final_completed, false)
-  assert.equal(projected.next_action.tool, "llm_wiki_get_page_plan_context")
-
-  const finalPlan = await f.core.getPagePlanContext(projected.next_action.arguments)
-  assert.equal(finalPlan.projection.mode, "final")
-  assert.equal(finalPlan.page_plan_complete, true)
-  const semanticPatches = finalPlan.page_requirements.map((requirement) => {
-    const body = requirement.title === "Business Entity"
-      ? "Stable identifier semantics connect this entity to the aggregate."
-      : "Aggregate semantics organize Business Entities."
-    return {
-      ...requirement.patch_scaffold,
-      content: `# ${requirement.title}\n\n## Overview\n\n${body}\n`,
-      summary: body,
-      tags: [requirement.page_kind],
-    }
+  assert.equal(projected.automated, false)
+  assert.equal(projected.writer_mode, "legacy-semantic")
+  assert.equal(projected.projection.mode, "incremental")
+  assert.equal(projected.page_plan_complete, true)
+  const incrementalPatches = projected.page_requirements.map((requirement) => ({
+    ...requirement.patch_scaffold,
+    content: `# ${requirement.title}\n\n## Overview\n\nSemantically reconciled page for ${requirement.title}.\n`,
+    summary: `Semantically reconciled page for ${requirement.title}.`,
+    tags: [requirement.page_kind],
+  }))
+  const incremental = await f.core.commitPages({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: projected.projection.projection_id,
+    based_on_wiki_revision: projected.based_on_wiki_revision,
+    idempotency_key: "legacy-semantic-projection-v1",
+    patches: incrementalPatches,
   })
+  assert.equal(incremental.wiki_projection.final_completed, false)
+  const finalPlan = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 40_000 })
+  assert.equal(finalPlan.projection.mode, "final")
   const reconciled = await f.core.commitPages({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
     projection_id: finalPlan.projection.projection_id,
     based_on_wiki_revision: finalPlan.based_on_wiki_revision,
-    idempotency_key: "semantic-final-projection-v1",
-    patches: semanticPatches,
+    idempotency_key: "legacy-semantic-final-v1",
+    patches: finalPlan.page_requirements.map((requirement) => ({
+      ...requirement.patch_scaffold,
+      content: `# ${requirement.title}\n\n## Overview\n\nSemantically reconciled page for ${requirement.title}.\n`,
+      summary: `Semantically reconciled page for ${requirement.title}.`,
+      tags: [requirement.page_kind],
+    })),
   })
   assert.equal(reconciled.wiki_projection.final_completed, true)
   assert.equal(reconciled.next_action.tool, "llm_wiki_finalize")
 
   const businessPage = await readFile(path.join(f.workspace, "wiki", "entities", "business-entity.md"), "utf8")
   const aggregatePage = await readFile(path.join(f.workspace, "wiki", "concepts", "aggregate.md"), "utf8")
-  assert.match(businessPage, /Stable identifier/)
+  assert.match(businessPage, /Semantically reconciled page for Business Entity/)
   assert.match(businessPage, /aggregate/)
-  assert.match(aggregatePage, /Business Entities/)
+  assert.match(aggregatePage, /Semantically reconciled page for Aggregate/)
   assert.match(aggregatePage, /business-entity/)
 })
 
-test("fast projection stays ahead of extractors by leasing more than the legacy eight-batch window", async (t) => {
+test("legacy semantic Writer keeps projections bounded to the original batch window", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
   const files = []
@@ -1466,10 +1472,11 @@ test("fast projection stays ahead of extractors by leasing more than the legacy 
     writer_id: "wiki-writer-1",
     max_projections: 1,
   })
-  assert.equal(projected.processed_projection_count, 1)
-  assert.equal(projected.projection_runs[0].mode, "incremental")
-  assert.equal(projected.projection_runs[0].batch_count, Math.min(analyzed, 32))
-  assert.equal(projected.projection_runs[0].batch_count > 8, true)
+  assert.equal(projected.automated, false)
+  assert.equal(projected.writer_mode, "legacy-semantic")
+  assert.equal(projected.projection.mode, "incremental")
+  assert.equal(projected.projection.batch_ids.length <= 8, true)
+  assert.equal(projected.pagination.returned_items > 0, true)
 })
 
 test("knowledge-base deletion requires confirmation, blocks active tasks, and preserves configuration by scope", async (t) => {

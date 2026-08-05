@@ -58,12 +58,10 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(writer, /Never commit while.*next_cursor.*non-null/s)
   assert.match(writer, /currently six/)
   assert.match(writer, /300–1,200 body characters/)
-  assert.match(writer, /bounded provisional-page shards/)
-  assert.match(skill, /default fast incremental projection leases at most 32 batches/)
-  assert.match(skill, /legacy Agent-authored incremental projection path remains capped at eight batches/)
-  assert.match(skill, /default incremental Writer hot path is `llm_wiki_apply_projection`/)
-  assert.match(writer, /normal action is\s+`llm_wiki_apply_projection`/)
-  assert.match(skill, /Do not call apply_projection again/)
+  assert.match(writer, /page-plan pages|page-plan context/)
+  assert.match(skill, /incremental projection leases at most eight batches/)
+  assert.match(skill, /Wiki Writer uses `llm_wiki_get_page_plan_context`/)
+  assert.match(writer, /`llm_wiki_apply_projection` for compatibility/)
 })
 
 test("MCP publishes the complete Agent-first tool contract without desktop tools", () => {

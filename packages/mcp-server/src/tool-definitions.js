@@ -62,7 +62,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_page_plan_context",
-    description: "Lease and return bounded page-planning context. Read every cursor sequentially until page_plan_complete and next_cursor:null before committing; returned_items counts all context categories, not page requirements. Final semantic reconciliation is server-sharded to at most the configured page batch size, so each projection rewrites only a bounded set of provisional pages. Pagination uses a stable snapshot; target-page hashes remain authoritative.",
+    description: "Lease and return bounded page-planning context for the Agent Wiki Writer. Read every cursor sequentially until page_plan_complete and next_cursor:null before committing; returned_items counts all context categories, not page requirements. Incremental and final projections use the same semantic Writer workflow and a stable snapshot with authoritative target-page hashes.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
@@ -73,7 +73,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_apply_projection",
-    description: "Fast incremental Wiki writer path. Deterministically render validated entities, properties, claims, relations, exact evidence, and Related links into provisional canonical pages. When final semantic reconciliation is reached, it returns llm_wiki_get_page_plan_context and never resets an already advanced page-plan cursor.",
+    description: "Compatibility entrypoint for the original Agent Wiki Writer. It acquires or resumes a page-plan lease and returns llm_wiki_get_page_plan_context; the Agent must collect the complete plan, author semantic PagePatch content, and commit it with llm_wiki_commit_pages.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
