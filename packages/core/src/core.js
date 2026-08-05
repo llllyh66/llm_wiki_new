@@ -967,7 +967,7 @@ export class LlmWikiCore {
     const shardCacheKey = `${record.task.taskId}:${projection.projectionId}:${shard.shard_id}`
     let shardContext = this.pageDraftShardCache.get(shardCacheKey)
     if (!shardContext) {
-      shardContext = pageDraftShardContext(snapshot.context, shard)
+      shardContext = boundDraftShardContext(pageDraftShardContext(snapshot.context, shard), shard)
       this.pageDraftShardCache.set(shardCacheKey, shardContext)
       while (this.pageDraftShardCache.size > 32) this.pageDraftShardCache.delete(this.pageDraftShardCache.keys().next().value)
     }
@@ -1023,6 +1023,7 @@ export class LlmWikiCore {
       candidate_pages: page.values.candidate_pages,
       existing_pages: page.values.existing_pages,
       existing_page_catalog: page.values.existing_page_catalog,
+      draft_context_limits: shardContext.draft_context_limits,
       conflicts: page.values.conflicts,
       page_requirements: page.values.required_pages,
       ...(page.pagination.cursor === 0 ? { page_commit_limits: pageCommitLimits(workspace.config.limits, projection) } : {}),
@@ -2986,6 +2987,36 @@ function pageDraftShardContext(context, shard) {
     existing_pages: (context.existing_pages ?? []).filter((item) => pagePaths.has(item.path) || (item.covers ?? []).some((id) => requirementIds.has(id))),
     existing_page_catalog: (context.existing_page_catalog ?? []).filter((item) => pagePaths.has(item.path)),
     conflicts: (context.conflicts ?? []).filter(factMatches),
+  }
+}
+
+function boundDraftShardContext(context, shard) {
+  const pathCount = Math.max(1, Array.isArray(shard?.paths) ? shard.paths.length : 1)
+  // Existing pages can legitimately be large (the workspace page limit is
+  // 200K). A six-page shard must not place six full bodies in a drafter's
+  // context. Keep a deterministic head/tail excerpt while preserving the
+  // server hash and all requirement/source metadata used for safe commits.
+  const maxBodyChars = Math.max(4_000, Math.floor(24_000 / pathCount))
+  const existingPages = (context.existing_pages ?? []).map((page) => {
+    if (typeof page?.content !== "string" || page.content.length <= maxBodyChars) return page
+    const headChars = Math.floor(maxBodyChars * 0.65)
+    const tailChars = Math.max(1, maxBodyChars - headChars)
+    return {
+      ...page,
+      content: `${page.content.slice(0, headChars)}\n\n<!-- draft context excerpt; full page remains server-side -->\n\n${page.content.slice(-tailChars)}`,
+      content_truncated: true,
+      original_content_chars: page.content.length,
+      context_excerpt_chars: maxBodyChars,
+    }
+  })
+  return {
+    ...context,
+    existing_pages: existingPages,
+    draft_context_limits: {
+      max_response_chars: 40_000,
+      max_existing_page_excerpt_chars: maxBodyChars,
+      full_existing_pages_remain_server_side: true,
+    },
   }
 }
 
