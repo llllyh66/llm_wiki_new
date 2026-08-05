@@ -6,6 +6,7 @@ import { LlmWikiCore } from "../../core/src/index.js"
 import { HeadlessToolRouter } from "./tools.js"
 
 const STDIO_MAX_BUFFER_BYTES = 32 * 1024 * 1024
+const MCP_KEEPALIVE_MS = 5 * 60_000
 
 function log(event, details = {}) {
   try {
@@ -78,7 +79,22 @@ async function main() {
   }
   await server.connect(transport)
   log("ready", { workspace: ".", tools: router.listTools().length, maxBufferBytes: STDIO_MAX_BUFFER_BYTES })
+  // Some hosts (including long-running Agent worker sessions) enforce an
+  // idle timeout outside the MCP process. Keep the protocol session active
+  // while extraction continues without tool calls. A failed ping is only
+  // diagnostic; it must never reject the server's main promise.
+  let keepaliveBusy = false
+  const keepalive = setInterval(() => {
+    if (keepaliveBusy) return
+    keepaliveBusy = true
+    Promise.resolve(server.ping())
+      .then(() => log("keepalive", { status: "ok" }))
+      .catch((error) => log("keepalive", { status: "failed", message: error instanceof Error ? error.message : String(error) }))
+      .finally(() => { keepaliveBusy = false })
+  }, MCP_KEEPALIVE_MS)
+  keepalive.unref?.()
   await closed
+  clearInterval(keepalive)
 }
 
 main().catch((error) => {
