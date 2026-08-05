@@ -255,6 +255,9 @@ export class LlmWikiCore {
           pipeline_background_budget: 4,
           extraction_workers_during_drafting: 2,
           partition_key: "patch_scaffold.path",
+          drafter_handoff: "server-side-temporary-draft-receipt",
+          stage_tool: "llm_wiki_stage_page_drafts",
+          writer_commit_tool: "llm_wiki_commit_pages",
           commit_strategy: "single-writer-durable-waves",
         },
       },
@@ -786,7 +789,10 @@ export class LlmWikiCore {
           minimum_paths: 4,
           pipeline_background_budget: 4,
           extraction_workers_during_drafting: 2,
-          drafter_has_mcp_access: false,
+          drafter_has_mcp_access: true,
+          drafter_handoff: "server-side-temporary-draft-receipt",
+          stage_tool: "llm_wiki_stage_page_drafts",
+          writer_commit_tool: "llm_wiki_commit_pages",
           sole_committer: projection?.writerId ?? null,
           commit_strategy: "single-writer-durable-waves",
         },
@@ -910,7 +916,10 @@ export class LlmWikiCore {
         max_drafters: 4,
         max_paths_per_shard: limits.max_paths_per_draft_shard,
         max_patches_per_wave: limits.recommended_max_patches_per_wave,
-        drafter_has_mcp_access: false,
+        drafter_has_mcp_access: true,
+        drafter_handoff: "server-side-temporary-draft-receipt",
+        stage_tool: "llm_wiki_stage_page_drafts",
+        writer_commit_tool: "llm_wiki_commit_pages",
         sole_committer: projection.writerId,
         commit_strategy: "single-writer-durable-waves",
       },
@@ -1154,6 +1163,327 @@ export class LlmWikiCore {
     return this.#withWorkspaceWriteLock(() => this.#withTaskLock(input?.task_id, () => this.#commitPages(input)))
   }
 
+  // Page drafters never need to return a full PagePatch payload to the
+  // coordinator. They stage one validated, path-disjoint shard in the task's
+  // private draft area; the stable Writer later asks Core to commit that
+  // staged shard server-side. This keeps large page bodies out of the parent
+  // Agent context and makes a lost drafter response recoverable.
+  async stagePageDrafts(input) {
+    return this.#withTaskLock(input?.task_id, () => this.#stagePageDrafts(input))
+  }
+
+  async #stagePageDrafts(input) {
+    const workspace = await this.workspace({ skipWikiRevision: true })
+    const record = await loadTask(workspace.paths, input?.task_id)
+    const projection = requirePageProjectionLease(record.task, input)
+    if (projection.completed === true || projection.pagePlanTraversal?.serverSideManifest !== true) {
+      fail("PAGE_DRAFT_STAGING_UNAVAILABLE", "Server-side draft staging requires an active manifest projection.", {
+        retryable: true,
+        taskId: record.task.taskId,
+        suggestedAction: "Request view=manifest for the active projection before staging a draft shard.",
+      })
+    }
+    const shardId = normalizeDraftShardId(input?.shard_id)
+    const snapshot = await this.#pagePlanSnapshot(record, projection.projectionId)
+    const shard = snapshot?.draftManifest?.find((item) => item.shard_id === shardId)
+    if (!shard) {
+      fail("PAGE_DRAFT_SHARD_NOT_FOUND", "The requested page draft shard does not exist in this stable projection.", {
+        retryable: true,
+        taskId: record.task.taskId,
+        details: { shard_id: shardId },
+        suggestedAction: "Use a shard_id returned by this projection's manifest.",
+      })
+    }
+    if (!Array.isArray(projection.retrievedDraftShardIds) || !projection.retrievedDraftShardIds.includes(shardId)) {
+      fail("PAGE_DRAFT_SHARD_NOT_READY", `Draft shard ${shardId} must be fully retrieved before it can be staged.`, {
+        retryable: true,
+        taskId: record.task.taskId,
+        details: { shard_id: shardId, atomic_commit_applied: false },
+        suggestedAction: "Call llm_wiki_get_page_plan_context for every returned cursor of this shard, then stage the completed draft.",
+      })
+    }
+    const exactReplay = await readExactIdempotencyReplay(record.paths, input?.idempotency_key, {
+      operation: "stage_page_drafts",
+      projectionId: projection.projectionId,
+      shardId,
+      patches: input?.patches,
+    })
+    if (exactReplay) return { ...exactReplay, idempotent_replay: true }
+    const requirements = Array.isArray(snapshot?.context?.required_pages)
+      ? snapshot.context.required_pages
+      : pageRequirementsWithPatchScaffolds(
+          derivePageRequirements(await loadAnalyses(record, projection.batchIds)),
+          snapshot?.context?.existing_pages ?? [],
+        )
+    const normalizedPatches = this.#validateAndNormalizeStagedDrafts(
+      input?.patches,
+      shard,
+      requirements,
+      record,
+      workspace,
+    )
+    const contentChars = normalizedPatches.reduce((sum, patch) => sum + patch.content.length, 0)
+    const draftHash = sha256(stableStringify(normalizedPatches))
+    const draftPath = pageDraftPath(record.paths, projection.projectionId, shardId)
+    const idempotent = await withIdempotency(
+      record.paths,
+      input?.idempotency_key,
+      {
+        operation: "stage_page_drafts",
+        projectionId: projection.projectionId,
+        shardId,
+        patches: normalizedPatches,
+      },
+      async () => {
+        const previous = await readJson(draftPath, null)
+        if (previous?.draft_hash && previous.draft_hash !== draftHash
+          && projection.committedDraftShardIds?.includes(shardId)) {
+          fail("STAGED_DRAFT_EXISTS", "This shard was already committed and cannot be replaced in the completed wave.", {
+            retryable: true,
+            taskId: record.task.taskId,
+            details: { shard_id: shardId, existing_draft_hash: previous.draft_hash, submitted_draft_hash: draftHash },
+            suggestedAction: "Stage the corrected PagePatch under the next uncommitted shard; accepted shards are durable.",
+          })
+        }
+        const stagedAt = previous?.staged_at ?? nowIso()
+        await writeJsonAtomic(draftPath, {
+          schema_version: 1,
+          task_id: record.task.taskId,
+          projection_id: projection.projectionId,
+          writer_id: projection.writerId,
+          shard_id: shardId,
+          draft_hash: draftHash,
+          staged_at: stagedAt,
+          updated_at: nowIso(),
+          patch_count: normalizedPatches.length,
+          content_chars: contentChars,
+          patches: normalizedPatches,
+        })
+        return {
+          accepted: true,
+          staged: true,
+          task_id: record.task.taskId,
+          projection_id: projection.projectionId,
+          writer_id: projection.writerId,
+          shard_id: shardId,
+          draft_hash: draftHash,
+          patch_count: normalizedPatches.length,
+          content_chars: contentChars,
+          staged_at: stagedAt,
+          main_agent_payload: "receipt-only",
+          next_action: {
+            tool: "llm_wiki_get_staged_page_drafts",
+            arguments: {
+              task_id: record.task.taskId,
+              writer_id: projection.writerId,
+              projection_id: projection.projectionId,
+              shard_ids: [shardId],
+            },
+          },
+        }
+      },
+      { exactRequestValue: { operation: "stage_page_drafts", projectionId: projection.projectionId, shardId, patches: input?.patches } },
+    )
+    return { ...idempotent.response, idempotent_replay: idempotent.replayed }
+  }
+
+  async getStagedPageDrafts(input) {
+    return this.#withTaskLock(input?.task_id, () => this.#getStagedPageDrafts(input))
+  }
+
+  async #getStagedPageDrafts(input) {
+    const workspace = await this.workspace({ skipWikiRevision: true })
+    const record = await loadTask(workspace.paths, input?.task_id)
+    const projection = requirePageProjectionLease(record.task, input)
+    if (projection.completed === true || projection.pagePlanTraversal?.serverSideManifest !== true) {
+      fail("PAGE_DRAFT_STAGING_UNAVAILABLE", "Staged drafts are available only for an active manifest projection.", {
+        retryable: true,
+        taskId: record.task.taskId,
+      })
+    }
+    const snapshot = await this.#pagePlanSnapshot(record, projection.projectionId)
+    const manifest = snapshot?.draftManifest ?? []
+    const requested = Array.isArray(input?.shard_ids) && input.shard_ids.length > 0
+      ? uniqueStrings(input.shard_ids.map(normalizeDraftShardId))
+      : manifest.slice(0, 4).map((shard) => shard.shard_id)
+    if (requested.length > 8) fail("INVALID_INPUT", "shard_ids must contain at most 8 entries.")
+    const known = new Set(manifest.map((shard) => shard.shard_id))
+    const unknown = requested.filter((shardId) => !known.has(shardId))
+    if (unknown.length > 0) {
+      fail("PAGE_DRAFT_SHARD_NOT_FOUND", "One or more requested draft shards do not exist in this projection.", {
+        retryable: true,
+        taskId: record.task.taskId,
+        details: { unknown_shard_ids: unknown },
+      })
+    }
+    const staged = []
+    const missing = []
+    for (const shardId of requested) {
+      const draft = await readJson(pageDraftPath(record.paths, projection.projectionId, shardId), null)
+      if (!draft || draft.projection_id !== projection.projectionId || draft.writer_id !== projection.writerId || draft.shard_id !== shardId) {
+        missing.push(shardId)
+        continue
+      }
+      staged.push({
+        shard_id: shardId,
+        draft_hash: draft.draft_hash,
+        patch_count: draft.patch_count,
+        content_chars: draft.content_chars,
+        staged_at: draft.staged_at,
+        updated_at: draft.updated_at,
+      })
+    }
+    return {
+      task_id: record.task.taskId,
+      projection_id: projection.projectionId,
+      writer_id: projection.writerId,
+      requested_shard_ids: requested,
+      staged,
+      missing_shard_ids: missing,
+      ready_for_server_commit: missing.length === 0 && staged.length > 0,
+      main_agent_payload: "metadata-only",
+      next_action: staged.length > 0 && missing.length === 0
+        ? {
+            tool: "llm_wiki_commit_pages",
+            arguments: {
+              task_id: record.task.taskId,
+              writer_id: projection.writerId,
+              projection_id: projection.projectionId,
+              staged_draft_shard_ids: staged.map((item) => item.shard_id),
+              based_on_wiki_revision: projection.wikiRevision ?? snapshot.basedOnWikiRevision,
+              projection_complete: false,
+              patches: [],
+            },
+          }
+        : null,
+    }
+  }
+
+  #validateAndNormalizeStagedDrafts(rawPatches, shard, requirements, record, workspace) {
+    if (!Array.isArray(rawPatches) || rawPatches.length === 0) {
+      fail("INVALID_PAGE_PATCH", "A staged draft shard must contain at least one PagePatch.", {
+        retryable: true,
+        taskId: record.task.taskId,
+      })
+    }
+    if (rawPatches.length > shard.paths.length || rawPatches.length > workspace.config.limits.maxPatchesPerCommit) {
+      fail("PAGE_COMMIT_TOO_LARGE", "A staged draft shard contains more patches than its bounded path assignment.", {
+        retryable: true,
+        taskId: record.task.taskId,
+        details: { submitted_patch_count: rawPatches.length, max_paths_per_shard: shard.paths.length },
+      })
+    }
+    const requirementById = new Map(requirements.map((requirement) => [requirement.requirement_id, requirement]))
+    const shardRequirementIds = new Set(shard.requirement_ids)
+    const shardPaths = new Set(shard.paths)
+    const patchIds = new Set()
+    const patchPaths = new Set()
+    const covered = new Map()
+    const normalizedPatches = []
+    const chunkIndex = this.#taskChunkIndex(record)
+    for (const submittedPatch of rawPatches) {
+      if (!submittedPatch || typeof submittedPatch !== "object" || Array.isArray(submittedPatch)) {
+        fail("INVALID_PAGE_PATCH", "Each staged PagePatch must be an object.", { retryable: true, taskId: record.task.taskId })
+      }
+      validatePagePatchShape(submittedPatch, workspace.config.limits)
+      if (!shardPaths.has(submittedPatch.path)) {
+        fail("INVALID_PAGE_PATCH", `Patch path is outside its assigned draft shard: ${submittedPatch.path}`, {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { shard_id: shard.shard_id, allowed_paths: shard.paths },
+        })
+      }
+      if (patchIds.has(submittedPatch.patchId)) fail("INVALID_PAGE_PATCH", `Duplicate patchId: ${submittedPatch.patchId}`, { retryable: true, taskId: record.task.taskId })
+      if (patchPaths.has(submittedPatch.path)) fail("INVALID_PAGE_PATCH", `Duplicate page path in staged shard: ${submittedPatch.path}`, { retryable: true, taskId: record.task.taskId })
+      patchIds.add(submittedPatch.patchId)
+      patchPaths.add(submittedPatch.path)
+      if (!Array.isArray(submittedPatch.covers) || submittedPatch.covers.length === 0) {
+        fail("INCOMPLETE_PAGE_COVERAGE", `Patch ${submittedPatch.patchId} must declare its requirement coverage.`, {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { shard_id: shard.shard_id },
+        })
+      }
+      const covers = uniqueStrings(submittedPatch.covers)
+      for (const requirementId of covers) {
+        if (!shardRequirementIds.has(requirementId) || !requirementById.has(requirementId)) {
+          fail("INCOMPLETE_PAGE_COVERAGE", `Patch ${submittedPatch.patchId} covers a requirement outside its shard: ${requirementId}`, {
+            retryable: true,
+            taskId: record.task.taskId,
+            details: { shard_id: shard.shard_id, requirement_id: requirementId },
+          })
+        }
+        covered.set(requirementId, (covered.get(requirementId) ?? 0) + 1)
+        const scaffold = requirementById.get(requirementId).patch_scaffold
+        if (scaffold?.path !== submittedPatch.path || scaffold?.operation !== submittedPatch.operation
+          || (scaffold?.expectedFileHash ?? null) !== (submittedPatch.expectedFileHash ?? null)) {
+          fail("INVALID_PAGE_PATCH", `Patch ${submittedPatch.patchId} changed the server scaffold for requirement ${requirementId}.`, {
+            retryable: true,
+            taskId: record.task.taskId,
+            details: {
+              requirement_id: requirementId,
+              shard_id: shard.shard_id,
+              expected_path: scaffold?.path,
+              submitted_path: submittedPatch.path,
+              expected_operation: scaffold?.operation,
+              submitted_operation: submittedPatch.operation,
+              expected_file_hash: scaffold?.expectedFileHash ?? null,
+              submitted_file_hash: submittedPatch.expectedFileHash ?? null,
+            },
+            suggestedAction: "Copy the requirement's patch_scaffold exactly and only add semantic content.",
+          })
+        }
+        const requiredRelated = Array.isArray(scaffold?.related) ? scaffold.related : []
+        if (requiredRelated.some((slug) => !Array.isArray(submittedPatch.related) || !submittedPatch.related.includes(slug))) {
+          fail("INVALID_PAGE_PATCH", `Patch ${submittedPatch.patchId} omitted a required Related page for requirement ${requirementId}.`, {
+            retryable: true,
+            taskId: record.task.taskId,
+            details: { requirement_id: requirementId, required_related: requiredRelated },
+          })
+        }
+        if (!submittedPatch.sourceRefs.some((sourceRef) => sourceRef === requirementId)) {
+          fail("INVALID_PAGE_PATCH", `Patch ${submittedPatch.patchId} must preserve requirement-ID sourceRefs for ${requirementId}.`, {
+            retryable: true,
+            taskId: record.task.taskId,
+            details: { requirement_id: requirementId },
+            suggestedAction: "Copy sourceRefs from page_requirement.patch_scaffold without retyping them.",
+          })
+        }
+      }
+      const normalized = normalizePagePatchSourceRefs(submittedPatch, requirements)
+      const patch = normalized.patch
+      canonicalizeAnalysisSourceRefQuotes(patch, record.batches, chunkIndex)
+      validatePagePatchShape(patch, workspace.config.limits)
+      validateSourceRefs(patch.sourceRefs, record.task, record.batches, workspace.config.limits, chunkIndex)
+      normalizedPatches.push(patch)
+    }
+    for (const requirementId of shard.requirement_ids) {
+      if (covered.get(requirementId) !== 1) {
+        fail(covered.has(requirementId) ? "DUPLICATE_PAGE_COVERAGE" : "INCOMPLETE_PAGE_COVERAGE", `Requirement ${requirementId} must be covered exactly once in staged shard ${shard.shard_id}.`, {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { shard_id: shard.shard_id, requirement_id: requirementId, coverage_count: covered.get(requirementId) ?? 0 },
+        })
+      }
+    }
+    if (patchPaths.size !== shardPaths.size) {
+      fail("INCOMPLETE_PAGE_COVERAGE", `Staged shard ${shard.shard_id} must contain one patch per canonical path.`, {
+        retryable: true,
+        taskId: record.task.taskId,
+        details: { shard_id: shard.shard_id, expected_paths: shard.paths, received_paths: [...patchPaths] },
+      })
+    }
+    const contentChars = normalizedPatches.reduce((sum, patch) => sum + patch.content.length, 0)
+    if (contentChars > workspace.config.limits.maxCommitChars) {
+      fail("PAGE_COMMIT_TOO_LARGE", "The staged draft shard exceeds the bounded content budget.", {
+        retryable: true,
+        taskId: record.task.taskId,
+        details: { shard_id: shard.shard_id, content_chars: contentChars, max_content_chars: workspace.config.limits.maxCommitChars },
+      })
+    }
+    return normalizedPatches
+  }
+
   async applyWikiProjection(input) {
     return this.#withTaskLock(input?.task_id, async () => {
       const context = await this.#getPagePlanContext({
@@ -1172,26 +1502,86 @@ export class LlmWikiCore {
     const workspace = await this.workspace({ skipWikiRevision: true })
     const record = await loadTask(workspace.paths, input?.task_id)
     const projectionCommit = input?.projection_id !== undefined || input?.writer_id !== undefined
-    if (!Array.isArray(input?.patches) || (input.patches.length === 0 && !projectionCommit)) {
+    const stagedDraftShardIds = uniqueStrings((Array.isArray(input?.staged_draft_shard_ids) ? input.staged_draft_shard_ids : []).map(normalizeDraftShardId))
+    const submittedPatches = Array.isArray(input?.patches) ? [...input.patches] : []
+    if (stagedDraftShardIds.length > 0 && submittedPatches.length > 0) {
+      fail("INVALID_INPUT", "Provide either patches or staged_draft_shard_ids, not both.", {
+        retryable: true,
+        taskId: record.task.taskId,
+      })
+    }
+    if (!Array.isArray(input?.patches) && stagedDraftShardIds.length === 0) {
+      fail("INVALID_PAGE_PATCH", "patches must be an array unless staged_draft_shard_ids are supplied.")
+    }
+    if (submittedPatches.length === 0 && stagedDraftShardIds.length === 0 && !projectionCommit) {
       fail("INVALID_PAGE_PATCH", "patches must not be empty outside a leased page projection.")
     }
-    if (input.patches.length > workspace.config.limits.maxPatchesPerCommit) {
-      fail("PAGE_COMMIT_TOO_LARGE", `A page commit accepts at most ${workspace.config.limits.maxPatchesPerCommit} patches; received ${input.patches.length}.`, {
+    const commitProjection = projectionCommit ? requirePageProjectionLease(record.task, input) : null
+    if (stagedDraftShardIds.length > 0 && (!commitProjection || commitProjection.pagePlanTraversal?.serverSideManifest !== true)) {
+      fail("PAGE_DRAFT_STAGING_UNAVAILABLE", "staged_draft_shard_ids require an active server-side manifest projection.", {
+        retryable: true,
+        taskId: record.task.taskId,
+      })
+    }
+    if (stagedDraftShardIds.length > 0) {
+      const snapshot = await this.#pagePlanSnapshot(record, commitProjection.projectionId)
+      const knownShardIds = new Set(snapshot?.draftManifest?.map((shard) => shard.shard_id) ?? [])
+      const retrievedShardIds = new Set(commitProjection.retrievedDraftShardIds ?? [])
+      const alreadyCommitted = stagedDraftShardIds.filter((shardId) => (commitProjection.committedDraftShardIds ?? []).includes(shardId))
+      if (alreadyCommitted.length > 0) {
+        fail("STAGED_DRAFT_EXISTS", "One or more staged shards were already committed; do not resubmit accepted waves.", {
+          retryable: false,
+          taskId: record.task.taskId,
+          details: { already_committed_shard_ids: alreadyCommitted, atomic_commit_applied: false },
+        })
+      }
+      const missing = stagedDraftShardIds.filter((shardId) => !knownShardIds.has(shardId))
+      if (missing.length > 0) {
+        fail("PAGE_DRAFT_SHARD_NOT_FOUND", "One or more staged draft shards do not exist in this projection.", {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { missing_shard_ids: missing },
+        })
+      }
+      const unread = stagedDraftShardIds.filter((shardId) => !retrievedShardIds.has(shardId))
+      if (unread.length > 0) {
+        fail("PAGE_DRAFT_SHARD_NOT_READY", "A staged draft can be committed only after its context cursors are fully retrieved.", {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { unread_draft_shard_ids: unread, atomic_commit_applied: false },
+          suggestedAction: "Have the drafter finish every cursor for the shard, then stage it again.",
+        })
+      }
+      for (const shardId of stagedDraftShardIds) {
+        const staged = await readJson(pageDraftPath(record.paths, commitProjection.projectionId, shardId), null)
+        if (!staged || staged.projection_id !== commitProjection.projectionId || staged.writer_id !== commitProjection.writerId
+          || staged.shard_id !== shardId || !Array.isArray(staged.patches)) {
+          fail("STAGED_DRAFT_NOT_FOUND", `No complete staged draft exists for ${shardId}.`, {
+            retryable: true,
+            taskId: record.task.taskId,
+            details: { shard_id: shardId, atomic_commit_applied: false },
+            suggestedAction: "Ask the drafter to stage the shard again before invoking the Writer commit.",
+          })
+        }
+        submittedPatches.push(...staged.patches)
+      }
+    }
+    if (submittedPatches.length > workspace.config.limits.maxPatchesPerCommit) {
+      fail("PAGE_COMMIT_TOO_LARGE", `A page commit accepts at most ${workspace.config.limits.maxPatchesPerCommit} patches; received ${submittedPatches.length}.`, {
         retryable: true,
         taskId: record.task.taskId,
         details: {
-          submitted_patch_count: input.patches.length,
+          submitted_patch_count: submittedPatches.length,
           max_patches_per_call: workspace.config.limits.maxPatchesPerCommit,
           atomic_commit_applied: false,
         },
         suggestedAction: `Partition canonical paths before drafting and submit a bounded wave of at most ${workspace.config.limits.maxPatchesPerCommit} patches with projection_complete=false. Do not regenerate already accepted waves.`,
       })
     }
-    const commitChars = input.patches.reduce((sum, patch) => sum + (typeof patch?.content === "string" ? patch.content.length : 0), 0)
+    const commitChars = submittedPatches.reduce((sum, patch) => sum + (typeof patch?.content === "string" ? patch.content.length : 0), 0)
     if (commitChars > workspace.config.limits.maxCommitChars) {
       fail("PAGE_COMMIT_TOO_LARGE", `Page content exceeds the ${workspace.config.limits.maxCommitChars}-character commit limit. Submit smaller commits.`)
     }
-    const commitProjection = projectionCommit ? requirePageProjectionLease(record.task, input) : null
     if (commitProjection && commitProjection.pagePlanTraversal?.complete !== true) {
       fail("PAGE_PLAN_INCOMPLETE", "Collect every page-plan cursor before committing any page patches.", {
         retryable: true,
@@ -1219,7 +1609,7 @@ export class LlmWikiCore {
     let normalizedPageSourceRefQuotes = 0
     const provisionalOwners = await workspaceProvisionalPageOwners(workspace, record.task)
     const chunkIndex = this.#taskChunkIndex(record)
-    for (const [patchIndex, submittedPatch] of input.patches.entries()) {
+    for (const [patchIndex, submittedPatch] of submittedPatches.entries()) {
       let patch = submittedPatch
       try {
         const normalized = normalizePagePatchSourceRefs(submittedPatch, commitRequirements)
@@ -1256,13 +1646,13 @@ export class LlmWikiCore {
     }
     if (patchValidationErrors.length > 0) {
       const first = patchValidationErrors[0]
-      fail(first.code, `Page patch validation failed for ${patchValidationErrors.length} of ${input.patches.length} submitted patches.`, {
+      fail(first.code, `Page patch validation failed for ${patchValidationErrors.length} of ${submittedPatches.length} submitted patches.`, {
         retryable: true,
         taskId: record.task.taskId,
         details: {
           validation_errors: patchValidationErrors,
           invalid_patch_count: patchValidationErrors.length,
-          submitted_patch_count: input.patches.length,
+          submitted_patch_count: submittedPatches.length,
           atomic_commit_applied: false,
           retry_scope: "entire_rejected_patch_set",
         },
@@ -1275,7 +1665,16 @@ export class LlmWikiCore {
       const manifest = snapshot?.draftManifest ?? []
       const knownShardIds = new Set(manifest.map((shard) => shard.shard_id))
       const retrievedShardIds = new Set(commitProjection.retrievedDraftShardIds ?? [])
-      submittedManifestShardIds = uniqueStrings(input?.draft_shard_ids ?? [])
+      const explicitlySubmittedShardIds = uniqueStrings(input?.draft_shard_ids ?? [])
+      if (stagedDraftShardIds.length > 0 && explicitlySubmittedShardIds.length > 0
+        && stableStringify(stagedDraftShardIds) !== stableStringify(explicitlySubmittedShardIds)) {
+        fail("INVALID_INPUT", "draft_shard_ids and staged_draft_shard_ids must identify the same shards when both are supplied.", {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { draft_shard_ids: explicitlySubmittedShardIds, staged_draft_shard_ids: stagedDraftShardIds },
+        })
+      }
+      submittedManifestShardIds = stagedDraftShardIds.length > 0 ? stagedDraftShardIds : explicitlySubmittedShardIds
       if (submittedManifestShardIds.length === 0 || submittedManifestShardIds.some((shardId) => !knownShardIds.has(shardId))) {
         fail("INVALID_PAGE_PATCH", "Manifest wave commits must identify one or more valid draft_shard_ids.", {
           retryable: true,
@@ -1303,6 +1702,7 @@ export class LlmWikiCore {
       writerId: input?.writer_id,
       projectionComplete: input?.projection_complete !== false,
       draftShardIds: submittedManifestShardIds,
+      stagedDraftShardIds,
     }, async () => {
       let projection = commitProjection
       const projectionComplete = input?.projection_complete !== false
@@ -1410,6 +1810,14 @@ export class LlmWikiCore {
         record.task.status = "committing"
       }
       await saveTask(record.paths, record.task)
+      // Keep staged files until task state is durable. A crash before this
+      // point must leave the Writer's server-side input replayable.
+      if (stagedDraftShardIds.length > 0) {
+        await Promise.all(stagedDraftShardIds.map((shardId) => rm(pageDraftPath(record.paths, projection?.projectionId, shardId), { force: true }).catch(() => {})))
+      }
+      if (projectionComplete && projection?.pagePlanTraversal?.serverSideManifest === true) {
+        await rm(record.paths.pageDrafts, { recursive: true, force: true }).catch(() => {})
+      }
       const wikiProjection = projection ? pageProjectionStatus(record.task) : undefined
       let nextDraftShard = null
       if (projection && !projectionComplete) {
@@ -1429,6 +1837,10 @@ export class LlmWikiCore {
         unrelated_wiki_changes_accepted: journal.concurrentWikiChange,
         normalized_page_requirement_source_refs: resolvedPageRequirementSourceRefs,
         normalized_page_source_ref_quotes: normalizedPageSourceRefQuotes,
+        ...(stagedDraftShardIds.length > 0 ? {
+          committed_staged_draft_shard_ids: stagedDraftShardIds,
+          main_agent_payload: "receipt-only",
+        } : {}),
         written_pages: journal.patches.map((patch) => ({ path: patch.path, file_hash: patch.fileHash })),
         ...(projection ? {
           projection: publicProjection(projection),
@@ -1437,7 +1849,19 @@ export class LlmWikiCore {
           provisional_pages: projectionState(record.task).provisionalPagePaths,
           wiki_projection: wikiProjection,
         } : {}),
-        next_action: projection && !projectionComplete && nextDraftShard
+        next_action: stagedDraftShardIds.length > 0 && projection && !projectionComplete && nextDraftShard
+          ? {
+              tool: "llm_wiki_get_page_plan_context",
+              arguments: {
+                task_id: record.task.taskId,
+                writer_id: projection.writerId,
+                projection_id: projection.projectionId,
+                view: "manifest",
+                cursor: 0,
+                max_chars: 40_000,
+              },
+            }
+          : projection && !projectionComplete && nextDraftShard
           ? {
               tool: "llm_wiki_get_page_plan_context",
               arguments: {
@@ -1965,6 +2389,9 @@ function pageProjectionStatus(task) {
       pipeline_background_budget: 4,
       extraction_workers_during_drafting: 2,
       partition_key: "patch_scaffold.path",
+      drafter_handoff: "server-side-temporary-draft-receipt",
+      stage_tool: "llm_wiki_stage_page_drafts",
+      writer_commit_tool: "llm_wiki_commit_pages",
       commit_strategy: "single-writer-durable-waves",
     },
     final_completed: state.finalCompleted,
@@ -2583,6 +3010,18 @@ function normalizePagePlanCursor(value) {
   const cursor = value === undefined || value === null ? 0 : Number(value)
   if (!Number.isInteger(cursor) || cursor < 0) fail("INVALID_INPUT", "cursor must be a non-negative integer.")
   return cursor
+}
+
+function normalizeDraftShardId(value) {
+  if (typeof value !== "string" || !/^draft-[0-9]{4,}$/.test(value)) {
+    fail("INVALID_INPUT", "shard_id must be a server-generated draft shard ID.")
+  }
+  return value
+}
+
+function pageDraftPath(paths, projectionId, shardId) {
+  const key = sha256(`${String(projectionId)}\n${String(shardId)}`)
+  return path.join(paths.pageDrafts, `${key}.json`)
 }
 
 function pagePlanDomainSchemaMetadata(metadata) {

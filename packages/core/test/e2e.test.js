@@ -1074,6 +1074,9 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
     pipeline_background_budget: 4,
     extraction_workers_during_drafting: 2,
     partition_key: "patch_scaffold.path",
+    drafter_handoff: "server-side-temporary-draft-receipt",
+    stage_tool: "llm_wiki_stage_page_drafts",
+    writer_commit_tool: "llm_wiki_commit_pages",
     commit_strategy: "single-writer-durable-waves",
   })
   const sourceRefs = []
@@ -1976,6 +1979,67 @@ test("server-side page manifests keep 50-plus-page projections in durable bounde
     idempotency_key: "many-page-final-ack-v1",
   })
   assert.equal(completed.projection_complete, true)
+})
+
+test("page drafters stage receipt-only shards and the Writer commits them server-side", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  await analyzeAll(f.core, imported)
+  const manifest = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    view: "manifest",
+    cursor: 0,
+    max_chars: 40_000,
+  })
+  const action = manifest.draft_manifest.draft_actions[0]
+  const shard = await f.core.getPagePlanContext(action.arguments)
+  assert.equal(shard.draft_shard_complete, true)
+  const patches = shard.page_requirements.map((requirement) => ({
+    ...requirement.patch_scaffold,
+    content: `# ${requirement.title}\n\n## Summary\n\nA server-staged semantic draft.\n`,
+    summary: "A server-staged semantic draft.",
+  }))
+  const staged = await f.core.stagePageDrafts({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: manifest.projection.projection_id,
+    shard_id: shard.shard.shard_id,
+    patches,
+    idempotency_key: "stage-page-draft-v1",
+  })
+  assert.equal(staged.accepted, true)
+  assert.equal(staged.main_agent_payload, "receipt-only")
+  assert.equal(staged.patches, undefined)
+  const stagedStatus = await f.core.getStagedPageDrafts({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: manifest.projection.projection_id,
+    shard_ids: [shard.shard.shard_id],
+  })
+  assert.equal(stagedStatus.ready_for_server_commit, true)
+  assert.equal(stagedStatus.staged[0].draft_hash, staged.draft_hash)
+  const committed = await f.core.commitPages({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: manifest.projection.projection_id,
+    staged_draft_shard_ids: [shard.shard.shard_id],
+    based_on_wiki_revision: manifest.based_on_wiki_revision,
+    projection_complete: false,
+    patches: [],
+    idempotency_key: "commit-staged-page-draft-v1",
+  })
+  assert.equal(committed.accepted, true)
+  assert.deepEqual(committed.committed_staged_draft_shard_ids, [shard.shard.shard_id])
+  assert.equal(committed.main_agent_payload, "receipt-only")
+  const after = await f.core.getStagedPageDrafts({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: manifest.projection.projection_id,
+    shard_ids: [shard.shard.shard_id],
+  })
+  assert.deepEqual(after.missing_shard_ids, [shard.shard.shard_id])
 })
 
 test("invalid SourceRefs, page traversal, symlinks, and stale hashes are rejected", async (t) => {

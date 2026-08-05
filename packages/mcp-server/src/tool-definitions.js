@@ -62,7 +62,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_page_plan_context",
-    description: "Lease a stable semantic Wiki projection. Prefer view=manifest: it returns hard commit limits and small server-side draft shards without putting the full plan in model context. When parallel drafting is enabled, the coordinator should launch one llm-wiki-page-drafter per disjoint shard (up to four) and keep the stable Writer as the sole committer; serial Writer is fallback only. Then fetch one view=draft-shard at a time and durably commit each bounded wave. Legacy view=plan cursor traversal remains available for compatibility.",
+    description: "Lease a stable semantic Wiki projection. Prefer view=manifest: it returns hard commit limits and small server-side draft shards without putting the full plan in model context. When parallel drafting is enabled, the coordinator launches one llm-wiki-page-drafter per disjoint shard (up to four); each drafter fetches its own bounded context and stages a temporary PagePatch receipt. The stable Writer is the sole committer and uses staged_draft_shard_ids with patches:[]; serial page drafting is fallback only. Legacy view=plan cursor traversal remains available for compatibility.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
@@ -84,14 +84,37 @@ const toolDefinitions = [
     }, ["task_id"]),
   },
   {
+    name: "llm_wiki_stage_page_drafts",
+    description: "Persist one fully retrieved, path-disjoint semantic PagePatch shard in task-scoped temporary staging without writing Wiki pages. Page drafters use this receipt-only handoff; the stable Writer later commits the staged shard server-side.",
+    inputSchema: closedObject({
+      task_id: taskId,
+      writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
+      projection_id: { type: "string", minLength: 1, maxLength: 100 },
+      shard_id: { type: "string", pattern: "^draft-[0-9]{4,}$" },
+      patches: { type: "array", minItems: 1, maxItems: 6, items: { type: "object" } },
+      idempotency_key: { type: "string", minLength: 8, maxLength: 200 },
+    }, ["task_id", "writer_id", "projection_id", "shard_id", "patches", "idempotency_key"]),
+  },
+  {
+    name: "llm_wiki_get_staged_page_drafts",
+    description: "Return metadata-only receipts for staged PagePatch shards. It never returns page bodies, so the coordinator can hand off to the stable Writer without retaining draft content in its context.",
+    inputSchema: closedObject({
+      task_id: taskId,
+      writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
+      projection_id: { type: "string", minLength: 1, maxLength: 100 },
+      shard_ids: { type: "array", maxItems: 8, uniqueItems: true, items: { type: "string", pattern: "^draft-[0-9]{4,}$" } },
+    }, ["task_id", "writer_id", "projection_id"]),
+  },
+  {
     name: "llm_wiki_commit_pages",
-    description: "Atomically commit one bounded semantic Wiki wave. Hard maximum: 50 patches and the returned page_commit_limits may recommend a smaller wave. Partition paths before drafting, commit accepted waves with projection_complete=false, and never regenerate accepted waves. Finish with projection_complete=true after every manifest shard is covered.",
+    description: "Atomically commit one bounded semantic Wiki wave. Hard maximum: 50 patches and the returned page_commit_limits may recommend a smaller wave. Use staged_draft_shard_ids with patches:[] to let the stable Writer commit drafter-created temporary shards server-side without loading page bodies into the coordinator. Partition paths before drafting, commit accepted waves with projection_complete=false, and never regenerate accepted waves. Finish with projection_complete=true after every manifest shard is covered.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
       projection_id: { type: "string", minLength: 1, maxLength: 100 },
       projection_complete: { type: "boolean", description: "Set false when more bounded patch commits remain for this projection. Omit or true on the final commit, including an empty acknowledgement." },
       draft_shard_ids: { type: "array", minItems: 1, maxItems: 8, uniqueItems: true, items: { type: "string", pattern: "^draft-[0-9]{4,}$" }, description: "For projection_complete=false manifest waves, copy the shard IDs from the returned commit action." },
+      staged_draft_shard_ids: { type: "array", minItems: 1, maxItems: 8, uniqueItems: true, items: { type: "string", pattern: "^draft-[0-9]{4,}$" }, description: "Optional server-side temporary draft shards produced by llm_wiki_stage_page_drafts. Use this instead of page bodies; Core loads and validates the staged patches atomically." },
       based_on_wiki_revision: { type: "string", pattern: "^[0-9a-f]{64}$" },
       patches: { type: "array", minItems: 0, maxItems: 50, items: { type: "object" } },
       idempotency_key: { type: "string", minLength: 8, maxLength: 200 },

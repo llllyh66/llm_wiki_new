@@ -304,9 +304,11 @@ typed entity or any relation.
    When `ready: true` and `in_progress: false`, run the bounded Writer loop in
    the main coordinator with stable writer ID `wiki-writer-1`, starting from
    the exact `next_action` returned by status or `commit_analysis`. The
-   coordinator performs only fast page-plan collection, local validation, and
-   the final MCP commit; semantic drafting is delegated in step 8 so the main
-   Agent remains responsive while drafts run. This placement is intentional:
+   coordinator performs only fast manifest coordination and receipt validation;
+   page bodies are staged server-side and the stable Writer commits them, so
+   the main Agent never receives generated PagePatch content. Semantic
+   drafting is delegated in step 8 so the main Agent remains responsive while
+   drafts run. This placement is intentional:
    Claude background subagents cannot reliably spawn nested subagents, so a
    background `llm-wiki-writer` cannot be the parent of parallel drafters.
    Never run two projection coordinators or MCP committers for one task. When
@@ -348,33 +350,23 @@ typed entity or any relation.
       per call. Never generate an oversized patch set and split it afterward.
       Partition first. Page planning never requires the multi-megabyte domain
       Schema, so do not fetch or reconstruct it.
-   2. Follow the manifest's `next_action` to fetch one
-      `view: "draft-shard"`. A server shard contains at most six canonical
-      paths and only their requirements, matching facts, relations, conflicts,
-      and full affected existing pages. If that shard itself has more cursors,
-      follow only its returned cursor until `draft_shard_complete: true`.
-      Draft-shard cursors are sequential; do not skip ahead. If a tool result is
-      lost, replay a cursor already returned by the server before continuing.
-      Generate patches immediately for that bounded shard, then discard its
-      source context after a successful commit. Do not traverse every manifest
-      shard before drafting, do not retain all page data in the main context,
-      and do not restart from shard 1 after context compaction. The server's
-      next action resumes the first requirement not yet durably covered.
-      A path is indivisible: every requirement sharing
-      `patch_scaffold.path` stays in one shard.
-      For multiple available shards, use only the exact bounded
-      `draft_manifest.draft_actions` returned by Core; do not invent shard IDs.
-      The coordinator must launch project Agent
+   2. Use only the exact bounded `draft_manifest.draft_actions` returned by
+      Core; do not invent shard IDs. The coordinator must launch project Agent
       `llm-wiki-page-drafter` in waves of at most four concurrent children
-      whenever `parallel_drafting.enabled` is true. Launch one child per exact
-      `draft_actions` shard, collect the bounded JSON results, validate them
-      by path and requirement before joining the wave, and only then call the
-      single committer. If fewer than two disjoint shards are available,
-      process the one shard locally to avoid subagent overhead.
-      Each child receives exactly one self-contained server shard and never the
-      full manifest or another shard. A drafter has no tools or MCP access and
-      returns PagePatch JSON only. If that project Agent is unavailable, draft
-      the shard locally; never launch a general-purpose replacement.
+      whenever `parallel_drafting.enabled` is true. Pass each child only its
+      exact task, Writer, projection, and shard action. The child fetches its
+      own bounded `view: "draft-shard"` context, follows only that shard's
+      sequential cursors, and calls `llm_wiki_stage_page_drafts` after
+      generating its patches. It returns a compact receipt containing a shard
+      ID and draft hash, never PagePatch bodies. Validate only those receipts
+      in the coordinator. Then launch or resume the stable `llm-wiki-writer`,
+      which calls `llm_wiki_get_staged_page_drafts` and commits with
+      `staged_draft_shard_ids` and `patches: []`; page bodies remain in the
+      task-scoped temporary staging area. If fewer than two disjoint shards are
+      available, process the one shard locally or use the serial fallback.
+      Each child receives exactly one shard and never the full manifest or
+      another shard. If that project Agent is unavailable, use the explicitly
+      documented serial fallback; never launch a general-purpose replacement.
       Respect the four-Agent pipeline budget: normally two extractors plus two
       drafters while extraction overlaps, then up to four drafters afterward.
    3. For `incremental` mode, update only pages affected by the projection's
@@ -411,18 +403,18 @@ typed entity or any relation.
       (`type`, `title`, `created`, `updated`, `tags`, `related`, `sources`,
       `covers`, `summary`) and makes valid Related links bidirectional during
       Finalize.
-      Before committing one bounded wave of parallel drafts, join them deterministically by path
-      and reject any local result with a duplicate/unassigned path, missing or
-      duplicate requirement coverage, changed scaffold operation/hash/path,
-      changed requirement-ID `sourceRefs`, or omitted required Related slug.
-      Regenerate that shard locally before calling MCP. Only the stable parent
-      Writer may invoke `llm_wiki_commit_pages`; parallel draft generation must
-      never become parallel commits.
+      The staging call performs the deterministic path, requirement, scaffold,
+      SourceRef, Related, and context-completeness checks. A receipt without a
+      server draft hash is not success. Never copy staged patch bodies into the
+      coordinator context. Only the stable Writer may invoke
+      `llm_wiki_commit_pages`, and it must use `staged_draft_shard_ids` with
+      `patches: []`; parallel draft generation must never become parallel
+      commits.
    5. Obey `page_commit_limits` before drafting. A wave must contain no more
       than the returned recommended count and can never exceed the hard 50
       patches or the content-character ceiling. Pass task ID, writer ID,
       projection ID, current Wiki revision, and a unique idempotency key. Set
-      `projection_complete: false` for every shard/wave commit. Each accepted
+      `projection_complete: false` for every staged shard/wave commit. Each accepted
       call must copy the returned `draft_shard_ids`; these IDs, rather than
       pre-existing page coverage, are the durable proof that final semantic
       rewriting actually processed the shard. Each accepted

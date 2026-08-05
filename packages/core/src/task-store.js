@@ -36,6 +36,7 @@ export function taskPaths(workspacePaths, taskId) {
     result: path.join(root, "result.json"),
     domainSchema: path.join(root, "domain-schema.json"),
     pagePlan: path.join(root, "page-plan.json"),
+    pageDrafts: path.join(root, "page-drafts"),
   }
 }
 
@@ -44,6 +45,7 @@ export async function createTask(workspace, sources, options = {}) {
   const paths = taskPaths(workspace.paths, taskId)
   await ensureDir(paths.analysis)
   await ensureDir(paths.idempotencyDir)
+  await ensureDir(paths.pageDrafts)
   const maxChunkChars = Math.min(workspace.config.limits.maxChunkChars, MAX_AGENT_CHUNK_CHARS)
   const totalSourceChars = sources.flatMap((source) => source.chunks)
     .reduce((sum, chunk) => sum + (typeof chunk?.text === "string" ? chunk.text.length : 0), 0)

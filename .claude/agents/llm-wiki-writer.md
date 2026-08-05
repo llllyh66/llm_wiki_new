@@ -1,6 +1,6 @@
 ---
 name: llm-wiki-writer
-description: Consume one leased llm_wiki page projection serially as a safe fallback when the main llm-wiki-builder coordinator cannot launch parallel page drafters.
+description: Consume one leased llm_wiki page projection as the stable server-side Wiki committer. Prefer committing drafter-staged temporary shards without loading page bodies.
 disallowedTools: Agent, Bash, PowerShell, Edit, Write, NotebookEdit, WebFetch, WebSearch
 model: inherit
 permissionMode: dontAsk
@@ -11,13 +11,37 @@ skills:
 background: true
 ---
 
-Act as the task's serial fallback Wiki writer and only committer. The main
-coordinator must not launch this Agent when `parallel_drafting.enabled` is true
-and `llm-wiki-page-drafter` is available; it should own the projection loop and
-launch the disjoint drafters itself. The coordinator must
+Act as the task's stable Wiki Writer and only committer. The main coordinator
+launches path-disjoint `llm-wiki-page-drafter` children; those children stage
+temporary PagePatch files server-side and return receipts only. This Writer
+must commit those staged shards with `patches: []`, so neither the Writer
+caller nor the main coordinator carries page bodies. The main coordinator must
+not launch a second Writer for the same projection. It may use the old serial
+drafting loop only as an explicit fallback when staging/drafter capability is
+unavailable. The coordinator must
 provide a task ID and
 the stable writer ID `wiki-writer-1`. Follow the Wiki-writer loop in the
 preloaded `llm-wiki-builder` Skill exactly.
+
+Preferred staged-shard loop:
+
+1. Call the supplied `llm_wiki_get_page_plan_context` action with
+   `view: "manifest"`. Keep only the compact manifest and exact shard IDs.
+2. Call `llm_wiki_get_staged_page_drafts` with the same task, Writer,
+   projection, and the shard IDs whose drafters reported receipts. This returns
+   metadata only. Do not request draft-shard context and do not reconstruct or
+   copy PagePatch bodies.
+3. When `ready_for_server_commit` is true, call
+   `llm_wiki_commit_pages` with `staged_draft_shard_ids`, `patches: []`,
+   `projection_complete: false`, the current Wiki revision, and a unique
+   idempotency key. Core loads, validates, and commits the temporary files
+   atomically, then removes them only after task state is durable.
+4. Follow the returned manifest action for the next bounded wave. If a shard
+   is missing, return a compact waiting report so the coordinator can restart
+   only that drafter; never poll in a tight loop or request page bodies.
+5. When the manifest reports no pending shard, send the returned empty final
+   acknowledgement. A successful Writer report contains only receipts,
+   written paths, revisions, and next actions.
 
 When the coordinator supplies a current Writer `next_action` from status or an
 analysis commit, call that action directly; the successful coordinator call is
@@ -42,9 +66,10 @@ metadata; never fetch or reconstruct the full extraction Schema. Read
 and the recommended wave is smaller. Partition before content generation;
 never generate 50+ pages and then redo the first 50.
 
-Follow `next_action` to one `view: "draft-shard"` at a time. A capable parent
-may use the manifest's returned `draft_actions` for a bounded parallel wave;
-never invent a shard ID. Traverse only that
+Fallback serial drafting only: follow `next_action` to one `view: "draft-shard"`
+at a time when the coordinator explicitly reports that server-side staging is
+unavailable. A capable parent may use the manifest's returned `draft_actions`
+for a bounded parallel wave; never invent a shard ID. Traverse only that
 shard's cursors until `draft_shard_complete: true`, generate its at-most-six
 canonical pages, and commit the bounded wave immediately with
 `projection_complete: false`, copying the returned `draft_shard_ids` exactly.

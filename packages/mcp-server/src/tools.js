@@ -15,6 +15,9 @@ const ATOMIC_PAGE_REJECTION_CODES = new Set([
   "INCOMPLETE_PAGE_COVERAGE",
   "PAGE_DRAFT_SHARDS_INCOMPLETE",
   "PAGE_DRAFT_SHARD_NOT_READY",
+  "STAGED_DRAFT_NOT_FOUND",
+  "STAGED_DRAFT_EXISTS",
+  "PAGE_DRAFT_STAGING_UNAVAILABLE",
   "DUPLICATE_PAGE_COVERAGE",
   "FILE_HASH_CONFLICT",
   "PROVISIONAL_PAGE_CONFLICT",
@@ -112,6 +115,9 @@ function pageCommitRetryScope(code) {
   if (code === "PAGE_PLAN_INCOMPLETE") return "prepare_server_manifest_then_process_one_bounded_shard"
   if (code === "PAGE_DRAFT_SHARDS_INCOMPLETE") return "process_next_uncommitted_server_shard"
   if (code === "PAGE_DRAFT_SHARD_NOT_READY") return "retrieve_all_cursors_for_the_reported_server_shard"
+  if (code === "STAGED_DRAFT_NOT_FOUND") return "restage_the_reported_shard_then_retry_server_commit"
+  if (code === "STAGED_DRAFT_EXISTS") return "do_not_resubmit_an_accepted_shard"
+  if (code === "PAGE_DRAFT_STAGING_UNAVAILABLE") return "resume_the_active_manifest_projection_before_server_commit"
   if (code === "INCOMPLETE_PAGE_COVERAGE") return "entire_rejected_patch_set_plus_missing_coverage"
   if (code === "DUPLICATE_PAGE_COVERAGE") return "entire_rejected_patch_set_after_unique_coverage_reconciliation"
   if (["FILE_HASH_CONFLICT", "PROVISIONAL_PAGE_CONFLICT"].includes(code)) return "entire_rejected_patch_set_after_rebase"
@@ -122,6 +128,9 @@ function pageCommitRetryInstruction(code) {
   if (code === "PAGE_PLAN_INCOMPLETE") return "Request view=manifest, then generate and commit one bounded draft shard at a time."
   if (code === "PAGE_DRAFT_SHARDS_INCOMPLETE") return "Process the returned next draft shard; accepted earlier shards are durable and must not be regenerated."
   if (code === "PAGE_DRAFT_SHARD_NOT_READY") return "Retrieve every cursor for the returned draft shard before committing it; accepted earlier shards remain durable."
+  if (code === "STAGED_DRAFT_NOT_FOUND") return "Restage the reported shard with a new idempotency key, then retry the same server-side commit without loading page bodies."
+  if (code === "STAGED_DRAFT_EXISTS") return "Do not resubmit an accepted shard; continue with the next uncommitted manifest shard."
+  if (code === "PAGE_DRAFT_STAGING_UNAVAILABLE") return "Resume the active manifest projection and stage the shard before retrying the Writer commit."
   if (code === "INCOMPLETE_PAGE_COVERAGE") return "Add the reported missing coverage to the rejected set and resubmit it; no patch from the rejected call was stored."
   if (code === "DUPLICATE_PAGE_COVERAGE") return "Keep every requirement ID on one canonical path, repair all reported duplicate owners, and resubmit the whole rejected set."
   if (["FILE_HASH_CONFLICT", "PROVISIONAL_PAGE_CONFLICT"].includes(code)) return "Rebase the conflicting target, then resubmit the whole rejected atomic patch set; do not retry only one patch."
@@ -181,7 +190,7 @@ function recoveryAction(tool, args, error) {
       },
     }
   }
-  if (tool === "llm_wiki_commit_pages" && ["INVALID_PAGE_PATCH", "INVALID_PAGE_PATH", "INVALID_SOURCE_REF", "INCOMPLETE_PAGE_COVERAGE", "DUPLICATE_PAGE_COVERAGE", "PAGE_COMMIT_TOO_LARGE"].includes(error.code)) {
+  if (tool === "llm_wiki_commit_pages" && ["INVALID_PAGE_PATCH", "INVALID_PAGE_PATH", "INVALID_SOURCE_REF", "INCOMPLETE_PAGE_COVERAGE", "DUPLICATE_PAGE_COVERAGE", "PAGE_COMMIT_TOO_LARGE", "STAGED_DRAFT_NOT_FOUND", "PAGE_DRAFT_STAGING_UNAVAILABLE"].includes(error.code)) {
     return {
       tool,
       arguments: {
@@ -190,6 +199,7 @@ function recoveryAction(tool, args, error) {
         projection_id: args?.projection_id,
         based_on_wiki_revision: args?.based_on_wiki_revision,
         projection_complete: args?.projection_complete !== false,
+        ...(Array.isArray(args?.staged_draft_shard_ids) ? { staged_draft_shard_ids: args.staged_draft_shard_ids } : {}),
       },
     }
   }
@@ -229,6 +239,8 @@ export class HeadlessToolRouter {
       case "llm_wiki_retrieve_context": return this.core.retrieveContext(args)
       case "llm_wiki_commit_analysis": return this.core.commitAnalysis(args)
       case "llm_wiki_get_page_plan_context": return this.core.getPagePlanContext(args)
+      case "llm_wiki_stage_page_drafts": return this.core.stagePageDrafts(args)
+      case "llm_wiki_get_staged_page_drafts": return this.core.getStagedPageDrafts(args)
       case "llm_wiki_apply_projection": return this.core.applyWikiProjection(args)
       case "llm_wiki_commit_pages": return this.core.commitPages(args)
       case "llm_wiki_finalize": return this.core.finalize(args)

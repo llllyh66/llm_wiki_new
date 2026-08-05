@@ -20,6 +20,8 @@
       "mcp__llm-wiki__llm_wiki_retrieve_context",
       "mcp__llm-wiki__llm_wiki_commit_analysis",
       "mcp__llm-wiki__llm_wiki_get_page_plan_context",
+      "mcp__llm-wiki__llm_wiki_stage_page_drafts",
+      "mcp__llm-wiki__llm_wiki_get_staged_page_drafts",
       "mcp__llm-wiki__llm_wiki_apply_projection",
       "mcp__llm-wiki__llm_wiki_commit_pages",
       "mcp__llm-wiki__llm_wiki_finalize",
