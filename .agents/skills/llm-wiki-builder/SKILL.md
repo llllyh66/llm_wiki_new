@@ -309,7 +309,10 @@ typed entity or any relation.
    Agent remains responsive while drafts run. This placement is intentional:
    Claude background subagents cannot reliably spawn nested subagents, so a
    background `llm-wiki-writer` cannot be the parent of parallel drafters.
-   Never run two projection coordinators or MCP committers for one task. Use
+   Never run two projection coordinators or MCP committers for one task. When
+   the returned `parallel_drafting.execution_mode` is
+   `coordinator-owned-parallel-drafters`, the main coordinator must launch
+   the available `llm-wiki-page-drafter` children before drafting locally. Use
    project `llm-wiki-writer` only as a serial background fallback when the host
    cannot launch `llm-wiki-page-drafter`; do not run it at the same time as the
    coordinator Writer loop. The Core normally opens a
@@ -361,8 +364,13 @@ typed entity or any relation.
       `patch_scaffold.path` stays in one shard.
       For multiple available shards, use only the exact bounded
       `draft_manifest.draft_actions` returned by Core; do not invent shard IDs.
-      The coordinator may launch project Agent
-      `llm-wiki-page-drafter` in waves of at most four concurrent children.
+      The coordinator must launch project Agent
+      `llm-wiki-page-drafter` in waves of at most four concurrent children
+      whenever `parallel_drafting.enabled` is true. Launch one child per exact
+      `draft_actions` shard, collect the bounded JSON results, validate them
+      by path and requirement before joining the wave, and only then call the
+      single committer. If fewer than two disjoint shards are available,
+      process the one shard locally to avoid subagent overhead.
       Each child receives exactly one self-contained server shard and never the
       full manifest or another shard. A drafter has no tools or MCP access and
       returns PagePatch JSON only. If that project Agent is unavailable, draft

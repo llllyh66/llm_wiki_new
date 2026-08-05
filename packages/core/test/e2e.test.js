@@ -1066,6 +1066,8 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(imported.wiki_projection.writer_committers, 1)
   assert.deepEqual(imported.wiki_projection.parallel_page_drafting, {
     enabled: true,
+    execution_mode: "coordinator-owned-parallel-drafters",
+    fallback_mode: "serial-writer-only",
     max_drafters: 4,
     max_paths_per_shard: 6,
     minimum_paths: 4,
@@ -1480,6 +1482,8 @@ test("compatibility projection redirects to the semantic Writer and final commit
   assert.equal(projectedManifest.writer_mode, "legacy-semantic")
   assert.equal(projectedManifest.parallel_drafting.partition_key, "page_requirement.patch_scaffold.path")
   assert.equal(projectedManifest.parallel_drafting.same_path_requirements_are_indivisible, true)
+  assert.equal(projectedManifest.parallel_drafting.execution_mode, "coordinator-owned-parallel-drafters")
+  assert.equal(projectedManifest.parallel_drafting.fallback_mode, "serial-writer-only")
   assert.equal(projectedManifest.parallel_drafting.sole_committer, "wiki-writer-1")
   assert.equal(projected.projection.mode, "incremental")
   assert.equal(projected.page_plan_complete, true)

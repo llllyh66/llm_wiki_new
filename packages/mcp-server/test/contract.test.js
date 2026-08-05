@@ -69,6 +69,8 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(writer, /currently six/)
   assert.match(writer, /300–1,200 body characters/)
   assert.match(writer, /server-side shard manifest/)
+  assert.match(writer, /serial fallback Wiki writer/)
+  assert.match(writer, /must not launch this Agent when `parallel_drafting\.enabled` is true/)
   assert.match(skill, /incremental projection leases at most eight batches/)
   assert.match(skill, /coordinator Writer loop uses `llm_wiki_get_page_plan_context`/)
   assert.match(writer, /`llm_wiki_apply_projection` for compatibility/)
@@ -78,6 +80,8 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(skill, /background subagents cannot reliably spawn nested subagents/)
   assert.match(skill, /path is indivisible.*requirement sharing\s+`patch_scaffold\.path`/s)
   assert.match(skill, /parallel draft generation must\s+never become parallel commits/)
+  assert.match(skill, /must launch project Agent\s+`llm-wiki-page-drafter`/)
+  assert.match(skill, /coordinator-owned-parallel-drafters/)
   assert.match(skill, /Never generate an oversized patch set and split it afterward/)
   assert.match(skill, /Do not traverse every manifest\s+shard before drafting/)
 })
@@ -118,6 +122,8 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
   const pageCommit = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_commit_pages")
   assert.equal(pageCommit.inputSchema.properties.patches.maxItems, 50)
   assert.match(pageCommit.description, /Hard maximum: 50 patches/)
+  assert.match(pagePlan.description, /parallel drafting.*coordinator/i)
+  assert.match(pagePlan.description, /sole committer/i)
 })
 
 test("MCP router returns structured Core errors", async (t) => {

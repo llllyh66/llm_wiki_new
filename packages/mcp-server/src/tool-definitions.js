@@ -62,7 +62,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_page_plan_context",
-    description: "Lease a stable semantic Wiki projection. Prefer view=manifest: it returns hard commit limits and small server-side draft shards without putting the full plan in model context. Then fetch one view=draft-shard at a time and durably commit each bounded wave. Legacy view=plan cursor traversal remains available for compatibility.",
+    description: "Lease a stable semantic Wiki projection. Prefer view=manifest: it returns hard commit limits and small server-side draft shards without putting the full plan in model context. When parallel drafting is enabled, the coordinator should launch one llm-wiki-page-drafter per disjoint shard (up to four) and keep the stable Writer as the sole committer; serial Writer is fallback only. Then fetch one view=draft-shard at a time and durably commit each bounded wave. Legacy view=plan cursor traversal remains available for compatibility.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },

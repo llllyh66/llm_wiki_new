@@ -11,7 +11,10 @@ skills:
 background: true
 ---
 
-Act as the task's fallback Wiki writer and only committer. The coordinator must
+Act as the task's serial fallback Wiki writer and only committer. The main
+coordinator must not launch this Agent when `parallel_drafting.enabled` is true
+and `llm-wiki-page-drafter` is available; it should own the projection loop and
+launch the disjoint drafters itself. The coordinator must
 provide a task ID and
 the stable writer ID `wiki-writer-1`. Follow the Wiki-writer loop in the
 preloaded `llm-wiki-builder` Skill exactly.

@@ -247,6 +247,8 @@ export class LlmWikiCore {
         writer_committers: 1,
         parallel_page_drafting: {
           enabled: true,
+          execution_mode: "coordinator-owned-parallel-drafters",
+          fallback_mode: "serial-writer-only",
           max_drafters: 4,
           max_paths_per_shard: 6,
           minimum_paths: 4,
@@ -775,6 +777,8 @@ export class LlmWikiCore {
         },
         parallel_drafting: {
           enabled: true,
+          execution_mode: "coordinator-owned-parallel-drafters",
+          fallback_mode: "serial-writer-only",
           partition_key: "page_requirement.patch_scaffold.path",
           same_path_requirements_are_indivisible: true,
           max_drafters: 4,
@@ -899,6 +903,8 @@ export class LlmWikiCore {
       },
       parallel_drafting: {
         enabled: manifest.length > 1,
+        execution_mode: "coordinator-owned-parallel-drafters",
+        fallback_mode: "serial-writer-only",
         partition_key: "page_requirement.patch_scaffold.path",
         same_path_requirements_are_indivisible: true,
         max_drafters: 4,
@@ -1951,6 +1957,8 @@ function pageProjectionStatus(task) {
     writer_committers: 1,
     parallel_page_drafting: {
       enabled: true,
+      execution_mode: "coordinator-owned-parallel-drafters",
+      fallback_mode: "serial-writer-only",
       max_drafters: 4,
       max_paths_per_shard: 6,
       minimum_paths: 4,

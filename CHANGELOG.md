@@ -2,6 +2,13 @@
 
 ## [Unreleased] - 2026-08-05
 
+### Writer 并行草稿流水线
+
+- 页面 manifest 现在明确声明 `coordinator-owned-parallel-drafters` 执行模式：主协调器必须为互不重叠的 shard 启动最多 4 个 `llm-wiki-page-drafter`。
+- 保留单一 Writer 提交者、路径不可分割约束和原子提交，避免为了提速引入同路径冲突、重复 coverage 或 Related 页面竞争。
+- 串行 `llm-wiki-writer` 明确降级为无法启动 drafter 时的 fallback，不再被误当作默认并行 Writer。
+- 补充 MCP 合约测试，防止后续提示词或工具描述回退到串行页面生成。
+
 ### 第二轮隐性 Bug 修复
 
 - 强制 draft shard 按 cursor 顺序读取；跳过前置上下文的提交会返回可恢复的 `PAGE_PLAN_CURSOR_MISMATCH`，避免伪造“已完整读取”并绕过语义重写。
