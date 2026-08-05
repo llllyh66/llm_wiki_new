@@ -348,11 +348,14 @@ typed entity or any relation.
       `projection.projection_id`, mode, revision, and `page_commit_limits`
       before generating any content. The hard limit is currently 50 patches
       per call. Never generate an oversized patch set and split it afterward.
-      Partition first. Page planning never requires the multi-megabyte domain
+      Partition first. A path is indivisible: requirement sharing
+      `patch_scaffold.path` must stay in the same shard. Page planning never requires the multi-megabyte domain
       Schema, so do not fetch or reconstruct it.
    2. Use only the exact bounded `draft_manifest.draft_actions` returned by
       Core; do not invent shard IDs. The coordinator must launch project Agent
       `llm-wiki-page-drafter` in waves of at most four concurrent children
+      Do not traverse every manifest shard before drafting; start the first
+      bounded wave as soon as its shard actions are available.
       whenever `parallel_drafting.enabled` is true. Pass each child only its
       exact task, Writer, projection, and shard action. The child fetches its
       own bounded `view: "draft-shard"` context, follows only that shard's
@@ -408,8 +411,7 @@ typed entity or any relation.
       server draft hash is not success. Never copy staged patch bodies into the
       coordinator context. Only the stable Writer may invoke
       `llm_wiki_commit_pages`, and it must use `staged_draft_shard_ids` with
-      `patches: []`; parallel draft generation must never become parallel
-      commits.
+      `patches: []`; parallel draft generation must never become parallel commits.
    5. Obey `page_commit_limits` before drafting. A wave must contain no more
       than the returned recommended count and can never exceed the hard 50
       patches or the content-character ceiling. Pass task ID, writer ID,

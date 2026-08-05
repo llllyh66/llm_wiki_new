@@ -1996,6 +1996,8 @@ test("page drafters stage receipt-only shards and the Writer commits them server
   const action = manifest.draft_manifest.draft_actions[0]
   const shard = await f.core.getPagePlanContext(action.arguments)
   assert.equal(shard.draft_shard_complete, true)
+  assert.equal(shard.draft_context_limits.max_response_chars, 40_000)
+  assert.equal(shard.draft_context_limits.full_existing_pages_remain_server_side, true)
   const patches = shard.page_requirements.map((requirement) => ({
     ...requirement.patch_scaffold,
     content: `# ${requirement.title}\n\n## Summary\n\nA server-staged semantic draft.\n`,

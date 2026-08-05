@@ -67,6 +67,11 @@ import {
 
 const BATCH_LEASE_MS = 30 * 60 * 1_000
 const PAGE_PROJECTION_LEASE_MS = 60 * 60 * 1_000
+// Drafters receive one path-disjoint shard at a time. Keep the server-side
+// response bounded even if a caller passes the legacy 200K page-plan limit;
+// full page bodies remain available to Core through the patch scaffold/hash
+// contract and never need to cross the drafter or coordinator context.
+const DRAFT_SHARD_RESPONSE_MAX_CHARS = 40_000
 
 export class LlmWikiCore {
   static async open(workspaceRoot = process.cwd()) {
@@ -995,7 +1000,12 @@ export class LlmWikiCore {
         suggestedAction: `Continue draft shard ${shard.shard_id} with cursor ${expectedCursor}. A previously returned cursor may be replayed after a lost tool response.`,
       })
     }
-    const page = paginatePagePlan(shardContext, requestedCursor, input?.max_chars, workspace.config.limits.maxPagePlanChars)
+    const page = paginatePagePlan(
+      shardContext,
+      requestedCursor,
+      Math.min(Number(input?.max_chars) || DRAFT_SHARD_RESPONSE_MAX_CHARS, DRAFT_SHARD_RESPONSE_MAX_CHARS),
+      DRAFT_SHARD_RESPONSE_MAX_CHARS,
+    )
     if (!previouslySeen) {
       seenCursors[shard.shard_id] = uniqueIntegers([...(seenCursors[shard.shard_id] ?? []), requestedCursor])
       nextCursors[shard.shard_id] = page.pagination.next_cursor

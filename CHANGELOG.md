@@ -24,6 +24,8 @@
 - shard 成功写入后立即保存 `draft_shard_ids`，Writer 重启或上下文压缩后从第一个未完成 shard 继续。
 - final projection 必须完成全部 shard 后才能确认，不会因旧页面已有 coverage 而跳过语义重写。
 - 大型页面计划只返回分片上下文，避免一次性生成 50+ 页面后重新生成前半部分。
+- drafter 生成的 PagePatch 现在只写入任务级临时 staging；主协调器和 Writer 只传递 receipt/hash，Writer 通过 `staged_draft_shard_ids` 在服务端原子提交。
+- draft-shard 响应强制限制在约 40K 字符，并对既有大页面发送确定性的头尾摘要；完整页面正文保留在服务端，避免上下文压缩或超限。
 - 保留 `view=plan` 作为旧版 page-plan cursor 流程的兼容入口。
 
 ### 抽取与 MCP 稳定性
@@ -40,4 +42,4 @@
 
 - 更新 Skill、Writer Agent、恢复指南和技术文档，统一采用 manifest → shard → durable commit 流程。
 - 新增 50+ 页面分片写入、提前 finalize 拒绝、上下文恢复和 MCP 错误恢复测试。
-- 全量测试通过：Core 35 项、MCP Server 12 项、CLI 1 项。
+- 全量测试通过：Core 36 项、MCP Server 12 项、CLI 1 项。
