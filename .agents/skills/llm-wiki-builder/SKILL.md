@@ -366,7 +366,8 @@ typed entity or any relation.
       which calls `llm_wiki_get_staged_page_drafts` and commits with
       `staged_draft_shard_ids` and `patches: []`; page bodies remain in the
       task-scoped temporary staging area. If fewer than two disjoint shards are
-      available, process the one shard locally or use the serial fallback.
+      available, launch one drafter or use the serial Writer fallback; never
+      fetch PagePatch bodies into the coordinator just because the wave has one shard.
       Each child receives exactly one shard and never the full manifest or
       another shard. If that project Agent is unavailable, use the explicitly
       documented serial fallback; never launch a general-purpose replacement.
