@@ -2024,6 +2024,10 @@ export class LlmWikiCore {
       })
     }
     await rm(path.join(record.paths.root, "staging"), { recursive: true, force: true })
+    // Page drafters use a separate task-scoped temporary area. Do not leave
+    // large PagePatch bodies behind when a task is cancelled before its Writer
+    // commits them; a later task must never be able to observe stale drafts.
+    await rm(record.paths.pageDrafts, { recursive: true, force: true }).catch(() => {})
     if (pageProjection.lease) {
       this.#clearPagePlanCaches(record.task.taskId, pageProjection.lease.projectionId)
       await rm(record.paths.pagePlan, { force: true }).catch(() => {})

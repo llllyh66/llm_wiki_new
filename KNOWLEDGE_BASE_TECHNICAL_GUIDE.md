@@ -87,6 +87,10 @@ Schema 的抽取策略是“抽取时约束”，不是先随意抽取后再静�
 
 主协调器中的 Writer loop 先请求服务端持久化的 compact manifest。manifest 在生成正文之前明确返回“单次最多 50 个 patch”的硬限制，并按精确的 `patch_scaffold.path` 预先分成最多 6 个路径的 shard；同一路径的全部 requirement 始终留在一个 shard。Writer 每次只取一个 shard 的必要事实、关系和现有页面，生成后立即持久化提交，不再把整个 page plan 和几百个 patch 放入模型上下文。已接受的 shard 是恢复检查点，即使 context compaction 或 Writer 重启，也会从第一个未覆盖 shard 继续，不重做前 50 页。
 
+页面 drafter 不把 PagePatch 正文返回给主协调器：它通过 `llm_wiki_stage_page_drafts` 将一个路径互斥的 shard 写入任务级临时 staging，只返回 `draft_hash`、数量和字符数等 receipt。稳定 Writer 通过 `llm_wiki_get_staged_page_drafts` 获取元数据，再用 `llm_wiki_commit_pages(staged_draft_shard_ids, patches=[])` 让 Core 在服务端读取、校验并原子提交。提交成功并完成任务状态持久化后，Core 才删除暂存文件。
+
+draft-shard 的服务端响应硬上限约为 40K 字符；对既有超大页面只提供确定性的头尾摘要并保留 hash，完整正文不离开服务端。这样即使调用方误传 200K 的旧 `max_chars`，也不会把大页面或整批 patch 带入主 Agent 上下文。
+
 抽取与页面生成同时进行时，协调器使用 4 个后台 Agent 的共享预算，通常分配为 2 个 extractor + 2 个 page drafter；不会中断正在处理 batch 的 extractor，而是在 worker quantum 结束后调整补位。抽取完成后可将 4 个槽位全部用于页面分片。这样可避免 extractor 持续占满并发槽导致 writer backlog 无限增长。
 
 ### 2.5 最终语义重写
@@ -94,8 +98,8 @@ Schema 的抽取策略是“抽取时约束”，不是先随意抽取后再静�
 所有 batch 完成后，Core 会创建 final projection，交给同一个 Wiki Writer 做完整语义协调：
 
 1. `llm_wiki_get_page_plan_context(view="manifest")` 在服务端冻结完整计划，只返回紧凑分片清单和提交限制；
-2. Writer 按 `next_action` 读取一个 `view="draft-shard"`，仅在分片内综合相关 batch 的实体、声明、关系、冲突和现有页面；
-3. Writer 可让多个 page drafter 并行重写互斥 shard 的概述、关键事实、关系和 Related 链接，但仍由唯一 Writer 统一提交；
+2. 每个 page drafter 按自己的 `draft_action` 读取一个 `view="draft-shard"`，仅在分片内综合相关 batch 的实体、声明、关系、冲突和现有页面，然后调用 `llm_wiki_stage_page_drafts`；
+3. Writer 用 `llm_wiki_get_staged_page_drafts` 检查 receipt，并让 Core 通过 `staged_draft_shard_ids` 统一、原子提交；页面正文不经过主 Agent；
 4. 原始 chunk 只放在简洁的来源证据区；
 5. 每个小 wave 以 `projection_complete=false` 原子提交，并原样回传服务端给出的 `draft_shard_ids`；这些持久化 ID 证明 final Writer 确实处理了该 shard，不会因旧页已有 coverage 而跳过语义重写。成功后立即丢弃该分片上下文；所有 shard 处理后用空 patch 和 `projection_complete=true` 完成最终覆盖审计；
 6. 最终 projection 完成后，由 Finalize 更新 `index.md` 和 `overview.md` 等全局汇总页。
@@ -146,7 +150,9 @@ Embedding 配置位于 `.llm-wiki/config.json` 的 `retrieval.embedding`，包�
 | `llm_wiki_commit_analysis` | 校验并持久化一个 batch 的结构化分析 |
 | `llm_wiki_get_page_plan_context` | 返回服务端 manifest 或有界 draft shard，传统 plan cursor 仅作兼容 |
 | `llm_wiki_apply_projection` | 兼容入口：获取 compact manifest，不自动写页面 |
-| `llm_wiki_commit_pages` | 原子提交页面 patch |
+| `llm_wiki_stage_page_drafts` | 将单个 drafter 的完整 shard 暂存在服务端，只返回 receipt |
+| `llm_wiki_get_staged_page_drafts` | 读取暂存 shard 的元数据，不返回页面正文 |
+| `llm_wiki_commit_pages` | 原子提交页面 patch，或通过 `staged_draft_shard_ids` 提交服务端暂存 shard |
 | `llm_wiki_finalize` | 生成索引、来源页并完成任务 |
 | `llm_wiki_status` | 查看任务、租约、并行建议和下一步动作 |
 | `llm_wiki_list_tasks` | 列出当前 workspace 的任务 |

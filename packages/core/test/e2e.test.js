@@ -2044,6 +2044,39 @@ test("page drafters stage receipt-only shards and the Writer commits them server
   assert.deepEqual(after.missing_shard_ids, [shard.shard.shard_id])
 })
 
+test("aborting a task removes uncommitted server-side page drafts", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  await analyzeAll(f.core, imported)
+  const manifest = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    view: "manifest",
+    cursor: 0,
+    max_chars: 40_000,
+  })
+  const shard = await f.core.getPagePlanContext(manifest.draft_manifest.draft_actions[0].arguments)
+  const patches = shard.page_requirements.map((requirement) => ({
+    ...requirement.patch_scaffold,
+    content: `# ${requirement.title}\n\nStaged then cancelled.\n`,
+    summary: "Staged then cancelled.",
+  }))
+  await f.core.stagePageDrafts({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: manifest.projection.projection_id,
+    shard_id: shard.shard.shard_id,
+    patches,
+    idempotency_key: "stage-page-draft-abort-v1",
+  })
+  const draftDir = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "page-drafts")
+  assert.equal((await readdir(draftDir)).length, 1)
+  const aborted = await f.core.abort({ task_id: imported.task_id, reason: "cancel staged draft" })
+  assert.equal(aborted.status, "cancelled")
+  await assert.rejects(() => access(draftDir))
+})
+
 test("invalid SourceRefs, page traversal, symlinks, and stale hashes are rejected", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
