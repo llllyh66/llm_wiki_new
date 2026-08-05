@@ -79,9 +79,12 @@ one Writer invocation drains up to six ready projections (48 batches) immediatel
 backlog exists. Incremental plans include full content only for affected pages
 and compact catalog metadata for unrelated pages. A final all-batch reconciliation stabilizes
 the pages before Finalize.
-Writers collect every page-plan cursor from a stable server-side snapshot
-before committing. The Core rejects premature commits with the exact next
-cursor, so later-page provisional hashes cannot be missed or guessed.
+The Writer first requests a server-side page manifest. The manifest declares
+the hard 50-patch commit limit and returns bounded draft shards of at most six
+canonical paths. Each accepted shard is a durable checkpoint identified by
+`draft_shard_ids`; after a restart or context compaction, the Writer resumes
+from the first unfinished shard instead of regenerating earlier pages. The
+legacy full page-plan cursor mode remains available for compatibility.
 Incremental pages use concise grounded drafts. When extraction finishes, Core
 first drains any remaining bounded projections instead of creating one giant
 all-batch final prompt. If all requirements then have unique explicit coverage

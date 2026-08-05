@@ -941,7 +941,7 @@ test("large tasks use compact 9K batches, cached bounds, and longer worker quant
   const batchesPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "batches.json")
   const persisted = JSON.parse(await readFile(batchesPath, "utf8"))
   assert.equal(persisted.every((batch) => batch.charCount <= 9_000 && batch.payloadBytes <= 24 * 1024), true)
-  assert.equal(persisted.flatMap((batch) => batch.chunks).every((chunk) => chunk.taskPayloadVersion === 2), true)
+  assert.equal(persisted.flatMap((batch) => batch.chunks).every((chunk) => chunk.taskPayloadVersion === 3), true)
   assert.equal(persisted.flatMap((batch) => batch.chunks).flatMap((chunk) => chunk.structuredData ?? [])
     .every((table) => table.compacted === true && table.markdown === undefined && table.rows === undefined), true)
 
@@ -980,6 +980,72 @@ test("a worker invocation can resume its leased batch by stable worker ID after 
   assert.deepEqual(resumed.chunks, leased.chunks)
 })
 
+test("a smaller get_batch request never repartitions another worker's live lease", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const largeSource = path.join(f.incoming, "lease-stability.md")
+  const lines = Array.from({ length: 900 }, (_, index) => `Stable evidence row ${String(index).padStart(4, "0")} belongs to its leased batch.`)
+  await writeFile(largeSource, `# Lease stability\n\n${lines.join("\n")}\n`)
+  const imported = await f.core.importFiles({ files: [{ path: largeSource }], options: { max_batch_chars: 9_000 } })
+  assert.equal(imported.batch_count > 2, true)
+
+  const first = await f.core.getBatch({ task_id: imported.task_id, worker_id: "extractor-live-1", max_chars: 9_000 })
+  const firstText = first.chunks.map((chunk) => chunk.text).join("\n")
+  const second = await f.core.getBatch({ task_id: imported.task_id, worker_id: "extractor-live-2", max_chars: 6_000 })
+  assert.notEqual(second.batch_id, first.batch_id)
+  const taskRoot = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id)
+  const persistedBatches = JSON.parse(await readFile(path.join(taskRoot, "batches.json"), "utf8"))
+  const persistedFirst = persistedBatches.find((batch) => batch.batchId === first.batch_id)
+  assert.equal(persistedFirst.chunks.map((chunk) => chunk.text).join("\n"), firstText)
+  const unleased = persistedBatches.find((batch) => ![first.batch_id, second.batch_id].includes(batch.batchId))
+  await assert.rejects(
+    () => f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: unleased.batchId,
+      worker_id: "extractor-unleased",
+      idempotency_key: "unleased-analysis-v1",
+      analysis: {},
+    }),
+    (error) => error instanceof LlmWikiError && error.code === "BATCH_LEASE_REQUIRED",
+  )
+
+  const evidence = first.evidence_catalog[0]
+  const committed = await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: first.batch_id,
+    worker_id: "extractor-live-1",
+    idempotency_key: "lease-stability-commit-v1",
+    analysis: {
+      ...first.analysis_scaffold,
+      entities: [{ localId: "lease-stability", name: evidence.quote, sourceRefs: [evidence.evidence_index] }],
+      batchSummary: "Lease stability evidence.",
+    },
+  })
+  assert.equal(committed.accepted, true)
+  const replay = await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: first.batch_id,
+    worker_id: "extractor-live-1",
+    idempotency_key: "lease-stability-commit-v1",
+    analysis: {
+      ...first.analysis_scaffold,
+      entities: [{ localId: "lease-stability", name: evidence.quote, sourceRefs: [evidence.evidence_index] }],
+      batchSummary: "Lease stability evidence.",
+    },
+  })
+  assert.equal(replay.idempotent_replay, true)
+  await assert.rejects(
+    () => f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: first.batch_id,
+      worker_id: "extractor-live-1",
+      idempotency_key: "lease-stability-commit-v1",
+      analysis: { ...first.analysis_scaffold, batchSummary: "Changed request." },
+    }),
+    (error) => error instanceof LlmWikiError && error.code === "IDEMPOTENCY_CONFLICT",
+  )
+})
+
 test("micro-batch Wiki projection uses one writer, hides provisional pages, and requires final reconciliation", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
@@ -1001,7 +1067,7 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
     pipeline_background_budget: 4,
     extraction_workers_during_drafting: 2,
     partition_key: "patch_scaffold.path",
-    commit_strategy: "single-writer-atomic",
+    commit_strategy: "single-writer-durable-waves",
   })
   const sourceRefs = []
   const analyzeNext = async (index) => {
@@ -1389,17 +1455,25 @@ test("compatibility projection redirects to the semantic Writer and final commit
 
   const before = await f.core.status({ task_id: imported.task_id })
   assert.equal(before.next_action.tool, "llm_wiki_get_page_plan_context")
-  const projected = await f.core.applyWikiProjection({
+  const projectedManifest = await f.core.applyWikiProjection({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
     max_projections: 6,
   })
-  assert.equal(projected.accepted, true)
-  assert.equal(projected.automated, false)
-  assert.equal(projected.writer_mode, "legacy-semantic")
-  assert.equal(projected.parallel_drafting.partition_key, "page_requirement.patch_scaffold.path")
-  assert.equal(projected.parallel_drafting.same_path_requirements_are_indivisible, true)
-  assert.equal(projected.parallel_drafting.sole_committer, "wiki-writer-1")
+  const projected = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: projectedManifest.projection.projection_id,
+    view: "plan",
+    cursor: 0,
+    max_chars: 200_000,
+  })
+  assert.equal(projectedManifest.accepted, true)
+  assert.equal(projectedManifest.automated, false)
+  assert.equal(projectedManifest.writer_mode, "legacy-semantic")
+  assert.equal(projectedManifest.parallel_drafting.partition_key, "page_requirement.patch_scaffold.path")
+  assert.equal(projectedManifest.parallel_drafting.same_path_requirements_are_indivisible, true)
+  assert.equal(projectedManifest.parallel_drafting.sole_committer, "wiki-writer-1")
   assert.equal(projected.projection.mode, "incremental")
   assert.equal(projected.page_plan_complete, true)
   const incrementalPatches = projected.page_requirements.map((requirement) => ({
@@ -1691,6 +1765,12 @@ test("get_batch repairs an 81K single-line legacy batch in place and preserves i
   assert.equal(repaired.batch_limits.payload_bytes <= 24 * 1024, true)
   assert.equal(repaired.batch_limits.agent_payload_ceiling_bytes, 24 * 1024)
   assert.equal(repaired.batch_limits.safely_repartitioned, true)
+  for (const chunk of repaired.chunks) {
+    assert.equal(chunk.endOffset - chunk.startOffset, chunk.text.length)
+  }
+  for (let index = 1; index < repaired.chunks.length; index += 1) {
+    assert.equal(repaired.chunks[index].startOffset >= repaired.chunks[index - 1].endOffset, true)
+  }
   assert.equal(Buffer.byteLength(JSON.stringify(repaired, null, 2)) < 40 * 1024, true)
   assert.equal(Math.max(...JSON.stringify(repaired, null, 2).split("\n").map((line) => line.length)) <= 4_000, true)
   assert.equal(repaired.chunks.every((chunk) => chunk.structuredData?.every((table) => table.compacted === true)), true)
@@ -1745,6 +1825,108 @@ test("page-plan pagination is revision-stable and oversized page commits are rej
     }),
     (error) => error instanceof LlmWikiError && error.code === "PAGE_COMMIT_TOO_LARGE",
   )
+})
+
+test("server-side page manifests keep 50-plus-page projections in durable bounded shards", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const source = path.join(f.incoming, "many-pages.md")
+  const statements = Array.from({ length: 52 }, (_, index) => `Entity ${index} is a supported business object.`)
+  await writeFile(source, `# Many pages\n\n${statements.join("\n\n")}\n`)
+  const imported = await f.core.importFiles({ files: [{ path: source }] })
+  const batch = await f.core.getBatch({ task_id: imported.task_id, worker_id: "manifest-extractor" })
+  const chunk = batch.chunks.find((item) => item.text.includes(statements[0]))
+  const sourceRefs = statements.map((quote) => ({
+    sourceId: chunk.sourceId,
+    chunkId: chunk.chunkId,
+    quote,
+    locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
+  }))
+  await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    worker_id: batch.worker_id,
+    idempotency_key: "many-page-analysis-v1",
+    analysis: {
+      schemaVersion: 1,
+      taskId: imported.task_id,
+      batchId: batch.batch_id,
+      sourceRefs,
+      entities: statements.map((content, index) => ({ localId: `entity-${index}`, name: `Entity ${index}`, content, sourceRefs: [index] })),
+      concepts: [], claims: [], relations: [], contradictions: [], candidatePages: [], reviewItems: [],
+      batchSummary: "Fifty-two supported entities.", unresolvedQuestions: [],
+    },
+  })
+
+  const manifest = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    view: "manifest",
+    cursor: 0,
+    max_chars: 40_000,
+  })
+  assert.equal(manifest.view, "manifest")
+  assert.equal(manifest.page_commit_limits.max_patches_per_call, 50)
+  assert.equal(manifest.draft_manifest.page_count, 52)
+  assert.equal(manifest.draft_manifest.shard_count, 9)
+  assert.equal(manifest.draft_manifest.returned_shard_count, 4)
+  assert.equal(manifest.draft_manifest.complete_manifest_persisted_server_side, true)
+  assert.equal(manifest.draft_manifest.shards.every((shard) => shard.page_count <= 6), true)
+  assert.equal(manifest.page_requirements, undefined)
+  await assert.rejects(
+    () => f.core.commitPages({
+      task_id: imported.task_id,
+      writer_id: "wiki-writer-1",
+      projection_id: manifest.projection.projection_id,
+      based_on_wiki_revision: manifest.based_on_wiki_revision,
+      projection_complete: true,
+      patches: [],
+      idempotency_key: "many-page-premature-final-v1",
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "PAGE_DRAFT_SHARDS_INCOMPLETE"
+      && error.details?.next_draft_shard?.shard_id === "draft-0001",
+  )
+
+  let action = manifest.next_action
+  let revision = manifest.based_on_wiki_revision
+  let committedPages = 0
+  const visitedShards = []
+  while (action.tool === "llm_wiki_get_page_plan_context") {
+    const shard = await f.core.getPagePlanContext(action.arguments)
+    assert.equal(shard.view, "draft-shard")
+    assert.equal(shard.draft_shard_complete, true)
+    assert.equal(shard.page_requirements.length <= 6, true)
+    visitedShards.push(shard.shard.shard_id)
+    const patches = shard.page_requirements.map((requirement) => ({
+      ...requirement.patch_scaffold,
+      content: `# ${requirement.title}\n\n## Summary\n\n${requirement.title} is a supported business object.\n`,
+      summary: `${requirement.title} is a supported business object.`,
+    }))
+    const committed = await f.core.commitPages({
+      task_id: imported.task_id,
+      writer_id: "wiki-writer-1",
+      projection_id: manifest.projection.projection_id,
+      based_on_wiki_revision: revision,
+      projection_complete: false,
+      draft_shard_ids: [shard.shard.shard_id],
+      patches,
+      idempotency_key: `many-page-shard-${shard.shard.shard_id}`,
+    })
+    revision = committed.wiki_revision
+    committedPages += patches.length
+    action = committed.next_action
+  }
+  assert.equal(committedPages, 52)
+  assert.equal(new Set(visitedShards).size, 9)
+  assert.equal(action.tool, "llm_wiki_commit_pages")
+  assert.deepEqual(action.arguments.patches, [])
+  const completed = await f.core.commitPages({
+    ...action.arguments,
+    based_on_wiki_revision: revision,
+    idempotency_key: "many-page-final-ack-v1",
+  })
+  assert.equal(completed.projection_complete, true)
 })
 
 test("invalid SourceRefs, page traversal, symlinks, and stale hashes are rejected", async (t) => {

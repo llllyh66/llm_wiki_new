@@ -62,18 +62,20 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_page_plan_context",
-    description: "Lease and return bounded page-planning context for the Agent Wiki Writer. Read every cursor sequentially until page_plan_complete and next_cursor:null before committing; returned_items counts all context categories, not page requirements. Incremental and final projections use the same semantic Writer workflow and a stable snapshot with authoritative target-page hashes.",
+    description: "Lease a stable semantic Wiki projection. Prefer view=manifest: it returns hard commit limits and small server-side draft shards without putting the full plan in model context. Then fetch one view=draft-shard at a time and durably commit each bounded wave. Legacy view=plan cursor traversal remains available for compatibility.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
       projection_id: { type: "string", minLength: 1, maxLength: 100 },
+      view: { enum: ["plan", "manifest", "draft-shard"], description: "Use manifest first, then draft-shard with a returned shard_id. plan is the legacy whole-plan cursor protocol." },
+      shard_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^draft-[0-9]{4,}$" },
       cursor: { type: ["integer", "null"], minimum: 0 },
       max_chars: { type: "integer", minimum: 20000, maximum: 200000 },
     }, ["task_id"]),
   },
   {
     name: "llm_wiki_apply_projection",
-    description: "Compatibility entrypoint for the original Agent Wiki Writer. It acquires or resumes a page-plan lease and returns llm_wiki_get_page_plan_context; the Agent must collect the complete plan, author semantic PagePatch content, and commit it with llm_wiki_commit_pages.",
+    description: "Compatibility entrypoint that acquires or resumes a projection and returns its compact server-side draft manifest. It never writes pages automatically.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
@@ -83,12 +85,13 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_commit_pages",
-    description: "Atomically commit one fully collected leased Wiki projection. Read all page-plan cursors before the first commit, then use projection_complete:false only to split the accumulated patches into bounded transactions. A rejected atomic call stores none of its patches and returns the complete retry scope; correct all listed errors and resubmit that entire rejected subset. Transactions use target-page create/hash checks, so unrelated task writes do not invalidate the plan.",
+    description: "Atomically commit one bounded semantic Wiki wave. Hard maximum: 50 patches and the returned page_commit_limits may recommend a smaller wave. Partition paths before drafting, commit accepted waves with projection_complete=false, and never regenerate accepted waves. Finish with projection_complete=true after every manifest shard is covered.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
       projection_id: { type: "string", minLength: 1, maxLength: 100 },
       projection_complete: { type: "boolean", description: "Set false when more bounded patch commits remain for this projection. Omit or true on the final commit, including an empty acknowledgement." },
+      draft_shard_ids: { type: "array", minItems: 1, maxItems: 8, uniqueItems: true, items: { type: "string", pattern: "^draft-[0-9]{4,}$" }, description: "For projection_complete=false manifest waves, copy the shard IDs from the returned commit action." },
       based_on_wiki_revision: { type: "string", pattern: "^[0-9a-f]{64}$" },
       patches: { type: "array", minItems: 0, maxItems: 50, items: { type: "object" } },
       idempotency_key: { type: "string", minLength: 8, maxLength: 200 },

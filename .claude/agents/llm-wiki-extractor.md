@@ -32,6 +32,9 @@ keep MCP usable.
 Pass the coordinator-supplied `recommended_batch_chars` as `max_chars` to
 `llm_wiki_get_batch` (use 6000 only when resuming from an old server response);
 this is a safe persisted repartition, not response truncation.
+Never choose a different batch size from sibling workers. On
+`BATCH_LEASE_REQUIRED`, follow the returned `get_batch` action with this exact
+worker and batch ID, then retry the unchanged analysis and idempotency key.
 
 For a large domain Schema, use `get_batch.workspace_context.domain_schema_auto_selection`
 directly when `ready: true`; do not make a Schema tool call on that normal path.

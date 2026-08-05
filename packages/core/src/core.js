@@ -20,6 +20,7 @@ import {
   createTask,
   ensureBoundedTaskBatches,
   loadTask,
+  readExactIdempotencyReplay,
   saveTask,
   taskPaths,
   withIdempotency,
@@ -81,6 +82,8 @@ export class LlmWikiCore {
     this.domainSchemaSelectionCache = new Map()
     this.taskChunkIndexCache = new Map()
     this.taskAnalysisCache = new Map()
+    this.pagePlanSnapshotCache = new Map()
+    this.pageDraftShardCache = new Map()
   }
 
   async workspace(options = {}) {
@@ -100,9 +103,20 @@ export class LlmWikiCore {
   async #taskDomainSchema(record) {
     if (!record.task.domainSchema) return null
     const cacheKey = `${record.task.taskId}:${record.task.domainSchema.hash ?? "unknown"}`
-    if (this.domainSchemaCache.has(cacheKey)) return this.domainSchemaCache.get(cacheKey)
-    const schema = await loadTaskDomainSchema(record)
-    this.domainSchemaCache.set(cacheKey, schema)
+    if (this.domainSchemaCache.has(cacheKey)) return await this.domainSchemaCache.get(cacheKey)
+    // Cache the in-flight read, not only its result. Parallel get_batch calls
+    // for a large Schema otherwise read and parse the same multi-megabyte JSON
+    // once per worker during startup.
+    const pending = loadTaskDomainSchema(record)
+    this.domainSchemaCache.set(cacheKey, pending)
+    let schema
+    try {
+      schema = await pending
+      this.domainSchemaCache.set(cacheKey, schema)
+    } catch (error) {
+      if (this.domainSchemaCache.get(cacheKey) === pending) this.domainSchemaCache.delete(cacheKey)
+      throw error
+    }
     while (this.domainSchemaCache.size > 8) {
       this.domainSchemaCache.delete(this.domainSchemaCache.keys().next().value)
     }
@@ -135,13 +149,54 @@ export class LlmWikiCore {
 
   async #taskAnalyses(record) {
     const cacheKey = `${record.task.taskId}:${record.task.analysisRevision}:${record.task.completedBatchIds.length}`
-    if (this.taskAnalysisCache.has(cacheKey)) return this.taskAnalysisCache.get(cacheKey)
-    const analyses = await loadAnalyses(record, record.task.completedBatchIds)
-    this.taskAnalysisCache.set(cacheKey, analyses)
+    if (this.taskAnalysisCache.has(cacheKey)) return await this.taskAnalysisCache.get(cacheKey)
+    const pending = loadAnalyses(record, record.task.completedBatchIds)
+    this.taskAnalysisCache.set(cacheKey, pending)
+    let analyses
+    try {
+      analyses = await pending
+      this.taskAnalysisCache.set(cacheKey, analyses)
+    } catch (error) {
+      if (this.taskAnalysisCache.get(cacheKey) === pending) this.taskAnalysisCache.delete(cacheKey)
+      throw error
+    }
     while (this.taskAnalysisCache.size > 4) {
       this.taskAnalysisCache.delete(this.taskAnalysisCache.keys().next().value)
     }
     return analyses
+  }
+
+  async #pagePlanSnapshot(record, projectionId) {
+    const cacheKey = `${record.task.taskId}:${projectionId}`
+    if (this.pagePlanSnapshotCache.has(cacheKey)) return await this.pagePlanSnapshotCache.get(cacheKey)
+    const pending = readJson(record.paths.pagePlan, null)
+    this.pagePlanSnapshotCache.set(cacheKey, pending)
+    try {
+      const snapshot = await pending
+      if (!snapshot || snapshot.projectionId !== projectionId) {
+        this.pagePlanSnapshotCache.delete(cacheKey)
+        return snapshot
+      }
+      this.pagePlanSnapshotCache.set(cacheKey, snapshot)
+      while (this.pagePlanSnapshotCache.size > 4) this.pagePlanSnapshotCache.delete(this.pagePlanSnapshotCache.keys().next().value)
+      return snapshot
+    } catch (error) {
+      if (this.pagePlanSnapshotCache.get(cacheKey) === pending) this.pagePlanSnapshotCache.delete(cacheKey)
+      throw error
+    }
+  }
+
+  #cachePagePlanSnapshot(taskId, snapshot) {
+    const cacheKey = `${taskId}:${snapshot.projectionId}`
+    this.pagePlanSnapshotCache.set(cacheKey, snapshot)
+    while (this.pagePlanSnapshotCache.size > 4) this.pagePlanSnapshotCache.delete(this.pagePlanSnapshotCache.keys().next().value)
+  }
+
+  #clearPagePlanCaches(taskId, projectionId) {
+    this.pagePlanSnapshotCache.delete(`${taskId}:${projectionId}`)
+    for (const key of this.pageDraftShardCache.keys()) {
+      if (key.startsWith(`${taskId}:${projectionId}:`)) this.pageDraftShardCache.delete(key)
+    }
   }
 
   async importFiles(input) {
@@ -198,7 +253,7 @@ export class LlmWikiCore {
           pipeline_background_budget: 4,
           extraction_workers_during_drafting: 2,
           partition_key: "patch_scaffold.path",
-          commit_strategy: "single-writer-atomic",
+          commit_strategy: "single-writer-durable-waves",
         },
       },
       wiki_revision: task.wikiRevision,
@@ -208,10 +263,12 @@ export class LlmWikiCore {
   }
 
   async getBatch(input) {
-    return this.#withTaskLock(input?.task_id, () => this.#getBatch(input))
+    const leased = await this.#withTaskLock(input?.task_id, () => this.#leaseBatch(input))
+    if (leased.terminalResponse) return leased.terminalResponse
+    return this.#buildBatchResponse(leased)
   }
 
-  async #getBatch(input) {
+  async #leaseBatch(input) {
     const workspace = await this.workspace({ skipWikiRevision: true })
     const requestedBatchChars = input?.max_chars === undefined ? null : Number(input.max_chars)
     if (requestedBatchChars !== null && (!Number.isInteger(requestedBatchChars) || requestedBatchChars < 1_000 || requestedBatchChars > 24_000)) {
@@ -220,18 +277,21 @@ export class LlmWikiCore {
     const effectiveLimits = requestedBatchChars === null
       ? workspace.config.limits
       : { ...workspace.config.limits, maxBatchChars: Math.min(workspace.config.limits.maxBatchChars, requestedBatchChars) }
-    const record = await ensureBoundedTaskBatches(
-      await loadTask(workspace.paths, input?.task_id),
-      effectiveLimits,
-    )
+    const workerId = normalizeWorkerId(input?.worker_id)
+    const initialRecord = await loadTask(workspace.paths, input?.task_id)
+    const requested = input?.batch_id
+    const workerOwnedBatchId = requested ?? Object.entries(validBatchLeases(initialRecord.task))
+      .find(([batchId, lease]) => lease.workerId === workerId && !initialRecord.task.completedBatchIds.includes(batchId))?.[0]
+    const record = await ensureBoundedTaskBatches(initialRecord, effectiveLimits, {
+      workerId,
+      repairLeasedBatchId: workerOwnedBatchId,
+    })
     if (["planning", "committing", "finalizing", "completed"].includes(record.task.status)
       && record.task.completedBatchIds.length === record.task.batchCount) {
-      return { task_id: record.task.taskId, completed: true, chunks: [], next_action: nextAction(record.task) }
+      return { terminalResponse: { task_id: record.task.taskId, completed: true, chunks: [], next_action: nextAction(record.task) } }
     }
     assertTaskStatus(record.task, ["prepared", "extracting"])
-    const workerId = normalizeWorkerId(input?.worker_id)
     record.task.batchLeases = validBatchLeases(record.task)
-    const requested = input?.batch_id
     let batch
     if (requested) {
       batch = record.batches.find((item) => item.batchId === requested)
@@ -252,7 +312,7 @@ export class LlmWikiCore {
       const remaining = record.task.batchCount - record.task.completedBatchIds.length
       if (remaining > 0) {
         await saveTask(record.paths, record.task)
-        return {
+        return { terminalResponse: {
           task_id: record.task.taskId,
           completed: false,
           waiting: true,
@@ -261,15 +321,18 @@ export class LlmWikiCore {
           leased_batches: Object.keys(record.task.batchLeases).length,
           retry_after_ms: 1_000,
           next_action: { tool: "llm_wiki_get_batch", arguments: { task_id: record.task.taskId, worker_id: workerId } },
-        }
+        } }
       }
-      return { task_id: record.task.taskId, completed: true, chunks: [], next_action: nextAction(record.task) }
+      return { terminalResponse: { task_id: record.task.taskId, completed: true, chunks: [], next_action: nextAction(record.task) } }
     }
     const leasedAt = nowIso()
     const expiresAt = new Date(Date.now() + BATCH_LEASE_MS).toISOString()
     record.task.batchLeases[batch.batchId] = { workerId, leasedAt, expiresAt }
-    record.task.activeBatchId = batch.batchId
     await saveTask(record.paths, record.task)
+    return { workspace, record, batch, workerId, expiresAt, requestedBatchChars }
+  }
+
+  async #buildBatchResponse({ workspace, record, batch, workerId, expiresAt, requestedBatchChars }) {
     const domainSchema = await this.#taskDomainSchema(record)
     // get_batch is the extraction hot path. Keep its complete MCP response
     // below the host's tool-output warning threshold; larger Schemas are
@@ -328,6 +391,20 @@ export class LlmWikiCore {
         grounded_candidates_require_source_refs: true,
         review_item_shape: { content: "string", sourceRefs: [0] },
         max_quote_chars: 1000,
+        generation_limits: {
+          evidence_catalog: 400,
+          resolved_source_refs: 500,
+          entities: 500,
+          concepts: 500,
+          claims: 1_000,
+          relations: 1_000,
+          contradictions: 500,
+          candidate_pages: 500,
+          review_items: 500,
+          unresolved_questions: 200,
+          batch_summary_chars: 20_000,
+          rule: "Observe these limits before generation. Never emit an oversized array and then retry by regenerating its prefix.",
+        },
       },
       analysis_scaffold: {
         schemaVersion: 1,
@@ -424,7 +501,22 @@ export class LlmWikiCore {
     const batch = record.batches.find((item) => item.batchId === input?.batch_id)
     if (!batch) fail("INVALID_ANALYSIS", "Batch does not belong to the task.")
     const workerId = normalizeWorkerId(input?.worker_id)
+    const exactIdempotencyRequest = {
+      operation: "commit_analysis",
+      batchId: batch.batchId,
+      analysis: input?.analysis,
+      acceptDroppedCandidates: input?.accept_dropped_candidates === true,
+    }
+    const exactReplay = await readExactIdempotencyReplay(record.paths, input?.idempotency_key, exactIdempotencyRequest)
+    if (exactReplay) return { ...exactReplay, idempotent_replay: true }
     const lease = validBatchLeases(record.task)[batch.batchId]
+    if (!lease) {
+      fail("BATCH_LEASE_REQUIRED", `Batch ${batch.batchId} must be actively leased before analysis can be committed.`, {
+        retryable: true,
+        details: { batch_id: batch.batchId, worker_id: workerId },
+        suggestedAction: "Call llm_wiki_get_batch with the same task_id, batch_id, and worker_id to acquire or renew the lease, then retry the unchanged commit.",
+      })
+    }
     if (lease && lease.workerId !== workerId) {
       fail("BATCH_LEASED", `Batch ${batch.batchId} is leased by another extraction worker.`, {
         retryable: true,
@@ -465,12 +557,11 @@ export class LlmWikiCore {
       record.task.batchCompletedAt[batch.batchId] = nowIso()
       record.task.analysisRevision += 1
       if (record.task.batchLeases) delete record.task.batchLeases[batch.batchId]
-      record.task.activeBatchId = undefined
       const remaining = record.task.batchCount - record.task.completedBatchIds.length
       record.task.status = remaining === 0 ? "planning" : "extracting"
       const wikiProjection = pageProjectionStatus(record.task)
       const extractionNextAction = remaining > 0
-        ? { tool: "llm_wiki_get_batch", arguments: { task_id: record.task.taskId } }
+        ? { tool: "llm_wiki_get_batch", arguments: { task_id: record.task.taskId, worker_id: workerId } }
         : null
       const projectionNextAction = wikiProjection.ready
         ? projectionAction(record.task, wikiProjection)
@@ -489,12 +580,15 @@ export class LlmWikiCore {
         next_action: projectionNextAction ?? extractionNextAction,
         worker_next_action: extractionNextAction,
       }
-    })
+    }, { exactRequestValue: exactIdempotencyRequest })
     return { ...idempotent.response, idempotent_replay: idempotent.replayed }
   }
 
   async getPagePlanContext(input) {
-    return this.#withWorkspaceWriteLock(() => this.#withTaskLock(input?.task_id, () => this.#getPagePlanContext(input)))
+    // Planning writes only this task's lease/snapshot. Target-path hashes in
+    // commitPageTransaction protect concurrent Wiki updates, so a global
+    // workspace writer lock here would only stall unrelated tasks.
+    return this.#withTaskLock(input?.task_id, () => this.#getPagePlanContext(input))
   }
 
   async #getPagePlanContext(input) {
@@ -502,6 +596,7 @@ export class LlmWikiCore {
     const record = await loadTask(workspace.paths, input?.task_id)
     const requestedCursor = normalizePagePlanCursor(input?.cursor)
     const projectionRequested = input?.writer_id !== undefined || input?.projection_id !== undefined
+    const requestedView = normalizePagePlanView(input?.view, projectionRequested)
     let projection
     if (projectionRequested) {
       assertTaskStatus(record.task, ["extracting", "planning", "committing"])
@@ -518,6 +613,22 @@ export class LlmWikiCore {
         }
       }
       projection = acquired.lease
+      const stableSnapshot = await this.#pagePlanSnapshot(record, projection.projectionId)
+      if (stableSnapshot?.projectionId === projection.projectionId && stableSnapshot.context) {
+        if (requestedView === "manifest") {
+          return this.#pagePlanManifestResponse(workspace, record, projection, stableSnapshot)
+        }
+        if (requestedView === "draft-shard") {
+          return this.#pageDraftShardResponse(workspace, record, projection, stableSnapshot, input)
+        }
+      }
+      if (requestedView === "draft-shard") {
+        fail("PAGE_PLAN_SNAPSHOT_MISSING", "Prepare the server-side page manifest before requesting a draft shard.", {
+          retryable: true,
+          taskId: record.task.taskId,
+          suggestedAction: "Call llm_wiki_get_page_plan_context with view=manifest for the same projection.",
+        })
+      }
       if (requestedCursor > 0) {
         return this.#continuePagePlanContext(workspace, record, projection, requestedCursor, input)
       }
@@ -591,21 +702,35 @@ export class LlmWikiCore {
       conflicts: analyses.flatMap((analysis) => analysis.contradictions),
       required_pages: effectiveRequirements,
     }
+    const draftManifest = buildPageDraftManifest(effectiveRequirements)
     const finalizationHint = semanticFinalizationHint(record.task, projection, requirements, existingPages, analyses)
     const context = fullContext
     if (projection) {
-      await writeJsonAtomic(record.paths.pagePlan, {
+      const snapshot = {
         schemaVersion: 1,
         projectionId: projection.projectionId,
         basedOnWikiRevision: planRevision,
         createdAt: nowIso(),
         context,
+        draftManifest,
         finalizationHint,
-      })
+      }
+      await writeJsonAtomic(record.paths.pagePlan, snapshot)
+      this.#cachePagePlanSnapshot(record.task.taskId, snapshot)
       projection.pagePlanTraversal = {
         projectionId: projection.projectionId,
         nextCursor: 0,
         complete: false,
+      }
+      if (requestedView === "manifest") {
+        return this.#pagePlanManifestResponse(workspace, record, projection, {
+          schemaVersion: 1,
+          projectionId: projection.projectionId,
+          basedOnWikiRevision: planRevision,
+          context,
+          draftManifest,
+          finalizationHint,
+        })
       }
     }
     const page = paginatePagePlan(context, requestedCursor, input?.max_chars, workspace.config.limits.maxPagePlanChars)
@@ -634,6 +759,7 @@ export class LlmWikiCore {
       page_requirements: page.values.required_pages,
       ...(page.pagination.cursor === 0 ? {
         page_patch_schema: pagePatchSchema,
+        page_commit_limits: pageCommitLimits(workspace.config.limits, projection),
         page_patch_scaffold_contract: {
           ready_to_fill: true,
           instruction: "Copy page_requirement.patch_scaffold, add content, and submit it. Keep its path, operation, expectedFileHash, covers, and requirement-ID sourceRefs unchanged unless intentionally merging requirements.",
@@ -651,7 +777,7 @@ export class LlmWikiCore {
           extraction_workers_during_drafting: 2,
           drafter_has_mcp_access: false,
           sole_committer: projection?.writerId ?? null,
-          commit_strategy: "single-writer-atomic",
+          commit_strategy: "single-writer-durable-waves",
         },
         // Extraction has already enforced the task Schema. Page planning needs
         // only stable identity metadata, never the multi-megabyte definitions.
@@ -705,6 +831,197 @@ export class LlmWikiCore {
     }
   }
 
+  async #pagePlanManifestResponse(workspace, record, projection, snapshot) {
+    const manifest = snapshot.draftManifest ?? buildPageDraftManifest(snapshot.context.required_pages ?? [])
+    const committedShardIds = new Set(projection.committedDraftShardIds ?? [])
+    const pendingShards = manifest.filter((shard) => !committedShardIds.has(shard.shard_id))
+    const availableShards = pendingShards.slice(0, 4)
+    const nextShard = availableShards[0] ?? null
+    projection.pagePlanTraversal = {
+      projectionId: projection.projectionId,
+      nextCursor: null,
+      complete: true,
+      totalItems: Object.values(snapshot.context).reduce((sum, values) => sum + (Array.isArray(values) ? values.length : 0), 0),
+      collectedItems: 0,
+      serverSideManifest: true,
+    }
+    projection.nextDraftShardId = nextShard?.shard_id ?? null
+    projection.expiresAt = new Date(Date.now() + PAGE_PROJECTION_LEASE_MS).toISOString()
+    await saveTask(record.paths, record.task)
+    const limits = pageCommitLimits(workspace.config.limits, projection)
+    return {
+      task_id: record.task.taskId,
+      view: "manifest",
+      projection: publicProjection(projection),
+      provisional: projection.mode === "incremental",
+      based_on_wiki_revision: snapshot.basedOnWikiRevision ?? projection.wikiRevision ?? record.task.wikiRevision,
+      current_wiki_revision: workspace.revision,
+      revision_scope: "target-pages",
+      page_plan_complete: true,
+      commit_ready: true,
+      page_commit_limits: limits,
+      draft_manifest: {
+        shard_count: manifest.length,
+        page_count: manifest.reduce((sum, shard) => sum + shard.paths.length, 0),
+        requirement_count: manifest.reduce((sum, shard) => sum + shard.requirement_ids.length, 0),
+        committed_shard_count: committedShardIds.size,
+        pending_shard_count: pendingShards.length,
+        returned_shard_count: availableShards.length,
+        shards: availableShards,
+        complete_manifest_persisted_server_side: true,
+        workflow: "Fetch one draft shard at a time, generate only that shard's patches, and durably commit bounded waves with projection_complete=false. Never materialize the whole manifest in model context. After every shard is covered, send one empty projection_complete=true acknowledgement.",
+        draft_actions: availableShards.map((shard) => ({
+          tool: "llm_wiki_get_page_plan_context",
+          arguments: {
+            task_id: record.task.taskId,
+            writer_id: projection.writerId,
+            projection_id: projection.projectionId,
+            view: "draft-shard",
+            shard_id: shard.shard_id,
+            cursor: 0,
+            max_chars: 40_000,
+          },
+        })),
+      },
+      page_patch_schema: pagePatchSchema,
+      page_patch_scaffold_contract: {
+        ready_to_fill: true,
+        instruction: "Copy each shard requirement's patch_scaffold and add content. Never reconstruct exact SourceRefs.",
+        source_ref_mode: "page-requirement-id",
+        exact_source_refs_resolved_by_core: true,
+      },
+      parallel_drafting: {
+        enabled: manifest.length > 1,
+        partition_key: "page_requirement.patch_scaffold.path",
+        same_path_requirements_are_indivisible: true,
+        max_drafters: 4,
+        max_paths_per_shard: limits.max_paths_per_draft_shard,
+        max_patches_per_wave: limits.recommended_max_patches_per_wave,
+        drafter_has_mcp_access: false,
+        sole_committer: projection.writerId,
+        commit_strategy: "single-writer-durable-waves",
+      },
+      domain_schema: pagePlanDomainSchemaMetadata(record.task.domainSchema),
+      domain_schema_pagination: null,
+      pagination: { cursor: 0, next_cursor: null, returned_items: manifest.length, total_items: manifest.length, truncated: false },
+      next_cursor: null,
+      next_action: nextShard
+        ? {
+            tool: "llm_wiki_get_page_plan_context",
+            arguments: {
+              task_id: record.task.taskId,
+              writer_id: projection.writerId,
+              projection_id: projection.projectionId,
+              view: "draft-shard",
+              shard_id: nextShard.shard_id,
+              cursor: 0,
+              max_chars: 40_000,
+            },
+          }
+        : {
+            tool: "llm_wiki_commit_pages",
+            arguments: {
+              task_id: record.task.taskId,
+              writer_id: projection.writerId,
+              projection_id: projection.projectionId,
+              based_on_wiki_revision: snapshot.basedOnWikiRevision ?? projection.wikiRevision ?? record.task.wikiRevision,
+              projection_complete: true,
+              patches: [],
+            },
+          },
+    }
+  }
+
+  async #pageDraftShardResponse(workspace, record, projection, snapshot, input) {
+    const manifest = snapshot.draftManifest ?? buildPageDraftManifest(snapshot.context.required_pages ?? [])
+    const shardId = typeof input?.shard_id === "string" ? input.shard_id : ""
+    const shard = manifest.find((candidate) => candidate.shard_id === shardId)
+    if (!shard) fail("PAGE_DRAFT_SHARD_NOT_FOUND", "The requested page draft shard does not exist in this stable projection.", {
+      retryable: true,
+      taskId: record.task.taskId,
+      details: { shard_id: shardId, available_shard_ids: manifest.map((item) => item.shard_id).slice(0, 100) },
+      suggestedAction: "Use a shard_id returned by this projection's manifest.",
+    })
+    const shardCacheKey = `${record.task.taskId}:${projection.projectionId}:${shard.shard_id}`
+    let shardContext = this.pageDraftShardCache.get(shardCacheKey)
+    if (!shardContext) {
+      shardContext = pageDraftShardContext(snapshot.context, shard)
+      this.pageDraftShardCache.set(shardCacheKey, shardContext)
+      while (this.pageDraftShardCache.size > 32) this.pageDraftShardCache.delete(this.pageDraftShardCache.keys().next().value)
+    }
+    const page = paginatePagePlan(shardContext, normalizePagePlanCursor(input?.cursor), input?.max_chars, workspace.config.limits.maxPagePlanChars)
+    projection.expiresAt = new Date(Date.now() + PAGE_PROJECTION_LEASE_MS).toISOString()
+    await saveTask(record.paths, record.task)
+    const limits = pageCommitLimits(workspace.config.limits, projection)
+    return {
+      task_id: record.task.taskId,
+      view: "draft-shard",
+      shard: {
+        ...shard,
+        complete: page.pagination.next_cursor === null,
+      },
+      analysis_summary: {
+        batches: page.values.batches,
+        entities: page.values.entities,
+        concepts: page.values.concepts,
+        claims: page.values.claims,
+        relations: page.values.relations,
+      },
+      candidate_pages: page.values.candidate_pages,
+      existing_pages: page.values.existing_pages,
+      existing_page_catalog: page.values.existing_page_catalog,
+      conflicts: page.values.conflicts,
+      page_requirements: page.values.required_pages,
+      ...(page.pagination.cursor === 0 ? { page_commit_limits: pageCommitLimits(workspace.config.limits, projection) } : {}),
+      ...(page.pagination.cursor === 0 ? {
+        page_patch_schema: pagePatchSchema,
+        page_commit_limits: limits,
+      } : {}),
+      based_on_wiki_revision: snapshot.basedOnWikiRevision ?? projection.wikiRevision ?? record.task.wikiRevision,
+      current_wiki_revision: workspace.revision,
+      revision_scope: "target-pages",
+      page_plan_complete: true,
+      draft_shard_complete: page.pagination.next_cursor === null,
+      commit_ready: page.pagination.next_cursor === null,
+      projection: publicProjection(projection),
+      provisional: projection.mode === "incremental",
+      ...(projection.mode === "incremental" ? {
+        writer_guidance: {
+          mode: "concise-incremental-draft",
+          recommended_body_chars: { min: 300, max: 1_200 },
+          instruction: "Write only grounded facts required by this shard and merge relevant existing content.",
+        },
+      } : {}),
+      ...(projection.mode === "final" && snapshot.finalizationHint ? { finalization_hint: snapshot.finalizationHint } : {}),
+      pagination: page.pagination,
+      next_cursor: page.pagination.next_cursor,
+      next_action: page.pagination.next_cursor !== null
+        ? {
+            tool: "llm_wiki_get_page_plan_context",
+            arguments: {
+              task_id: record.task.taskId,
+              writer_id: projection.writerId,
+              projection_id: projection.projectionId,
+              view: "draft-shard",
+              shard_id: shard.shard_id,
+              cursor: page.pagination.next_cursor,
+              max_chars: Math.min(Math.max(Number(input?.max_chars) || 40_000, 20_000), workspace.config.limits.maxPagePlanChars),
+            },
+          }
+        : {
+            tool: "llm_wiki_commit_pages",
+            arguments: {
+              task_id: record.task.taskId,
+              writer_id: projection.writerId,
+              projection_id: projection.projectionId,
+              based_on_wiki_revision: projection.wikiRevision ?? snapshot.basedOnWikiRevision,
+              projection_complete: false,
+              draft_shard_ids: [shard.shard_id],
+            },
+          },
+    }
+  }
+
   async #continuePagePlanContext(workspace, record, projection, requestedCursor, input) {
     const traversal = projection.pagePlanTraversal
     const expectedCursor = traversal?.nextCursor
@@ -716,7 +1033,7 @@ export class LlmWikiCore {
         suggestedAction: `Continue the same projection with cursor ${expectedCursor ?? 0}; use cursor 0 only to deliberately restart page-plan collection.`,
       })
     }
-    const snapshot = await readJson(record.paths.pagePlan, null)
+    const snapshot = await this.#pagePlanSnapshot(record, projection.projectionId)
     if (!snapshot || snapshot.projectionId !== projection.projectionId || !snapshot.context) {
       fail("PAGE_PLAN_SNAPSHOT_MISSING", "The stable page-plan snapshot is missing.", {
         retryable: true,
@@ -794,16 +1111,17 @@ export class LlmWikiCore {
   }
 
   async applyWikiProjection(input) {
-    return this.#withWorkspaceWriteLock(() => this.#withTaskLock(input?.task_id, async () => {
+    return this.#withTaskLock(input?.task_id, async () => {
       const context = await this.#getPagePlanContext({
         task_id: input?.task_id,
         writer_id: input?.writer_id ?? "wiki-writer-1",
         ...(input?.projection_id ? { projection_id: input.projection_id } : {}),
+        view: "manifest",
         cursor: input?.cursor ?? 0,
         max_chars: input?.max_chars ?? 40_000,
       })
       return { ...context, accepted: true, automated: false, renderer: "agent-semantic-writer-v1", writer_mode: "legacy-semantic", semantic_writer_required: true }
-    }))
+    })
   }
 
   async #commitPages(input) {
@@ -813,7 +1131,18 @@ export class LlmWikiCore {
     if (!Array.isArray(input?.patches) || (input.patches.length === 0 && !projectionCommit)) {
       fail("INVALID_PAGE_PATCH", "patches must not be empty outside a leased page projection.")
     }
-    if (input.patches.length > workspace.config.limits.maxPatchesPerCommit) fail("INVALID_PAGE_PATCH", "Too many patches in one commit.")
+    if (input.patches.length > workspace.config.limits.maxPatchesPerCommit) {
+      fail("PAGE_COMMIT_TOO_LARGE", `A page commit accepts at most ${workspace.config.limits.maxPatchesPerCommit} patches; received ${input.patches.length}.`, {
+        retryable: true,
+        taskId: record.task.taskId,
+        details: {
+          submitted_patch_count: input.patches.length,
+          max_patches_per_call: workspace.config.limits.maxPatchesPerCommit,
+          atomic_commit_applied: false,
+        },
+        suggestedAction: `Partition canonical paths before drafting and submit a bounded wave of at most ${workspace.config.limits.maxPatchesPerCommit} patches with projection_complete=false. Do not regenerate already accepted waves.`,
+      })
+    }
     const commitChars = input.patches.reduce((sum, patch) => sum + (typeof patch?.content === "string" ? patch.content.length : 0), 0)
     if (commitChars > workspace.config.limits.maxCommitChars) {
       fail("PAGE_COMMIT_TOO_LARGE", `Page content exceeds the ${workspace.config.limits.maxCommitChars}-character commit limit. Submit smaller commits.`)
@@ -829,7 +1158,7 @@ export class LlmWikiCore {
           collected_items: commitProjection.pagePlanTraversal?.collectedItems ?? 0,
           total_items: commitProjection.pagePlanTraversal?.totalItems ?? null,
         },
-        suggestedAction: "Call llm_wiki_get_page_plan_context with the returned expected cursor until next_cursor is null; then split the accumulated patches into partial commits.",
+        suggestedAction: "Use view=manifest to prepare a server-side plan, then fetch and commit bounded draft shards. Do not accumulate the whole plan in model context.",
       })
     }
     if (commitProjection?.mode === "final" && record.task.completedBatchIds.length !== record.task.batchCount) {
@@ -896,6 +1225,21 @@ export class LlmWikiCore {
         suggestedAction: "Correct every listed patch, then resubmit the entire patch set from this rejected atomic call with a new idempotency key.",
       })
     }
+    let submittedManifestShardIds = []
+    if (commitProjection?.completed !== true && commitProjection?.pagePlanTraversal?.serverSideManifest === true && input?.projection_complete === false) {
+      const snapshot = await this.#pagePlanSnapshot(record, commitProjection.projectionId)
+      const manifest = snapshot?.draftManifest ?? []
+      const knownShardIds = new Set(manifest.map((shard) => shard.shard_id))
+      submittedManifestShardIds = uniqueStrings(input?.draft_shard_ids ?? [])
+      if (submittedManifestShardIds.length === 0 || submittedManifestShardIds.some((shardId) => !knownShardIds.has(shardId))) {
+        fail("INVALID_PAGE_PATCH", "Manifest wave commits must identify one or more valid draft_shard_ids.", {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { submitted_draft_shard_ids: submittedManifestShardIds, available_draft_shard_ids: [...knownShardIds].slice(0, 100), atomic_commit_applied: false },
+          suggestedAction: "Copy draft_shard_ids from the shard's returned llm_wiki_commit_pages next_action.",
+        })
+      }
+    }
     const idempotent = await withIdempotency(record.paths, input?.idempotency_key, {
       operation: "commit_pages",
       basedOn: input?.based_on_wiki_revision,
@@ -903,6 +1247,7 @@ export class LlmWikiCore {
       projectionId: input?.projection_id,
       writerId: input?.writer_id,
       projectionComplete: input?.projection_complete !== false,
+      draftShardIds: submittedManifestShardIds,
     }, async () => {
       let projection = commitProjection
       const projectionComplete = input?.projection_complete !== false
@@ -920,8 +1265,25 @@ export class LlmWikiCore {
         })
       }
       if (projectionComplete) {
+        if (projection?.pagePlanTraversal?.serverSideManifest === true) {
+          const snapshot = await this.#pagePlanSnapshot(record, projection.projectionId)
+          const manifest = snapshot?.draftManifest ?? []
+          const completedShardIds = new Set(projection.committedDraftShardIds ?? [])
+          const missingShards = manifest.filter((shard) => !completedShardIds.has(shard.shard_id))
+          if (missingShards.length > 0) {
+            fail("PAGE_DRAFT_SHARDS_INCOMPLETE", "Every server-side draft shard must be processed before completing the projection.", {
+              retryable: true,
+              taskId: record.task.taskId,
+              details: { missing_shard_count: missingShards.length, next_draft_shard: missingShards[0] },
+              suggestedAction: `Fetch and process draft shard ${missingShards[0].shard_id}; accepted earlier shards remain durable.`,
+            })
+          }
+        }
         const coverage = await pageRequirementCoverageAudit(workspace.paths.wiki, commitRequirements, normalizedPatches)
         if (coverage.missing.length > 0) {
+          const snapshot = await this.#pagePlanSnapshot(record, projection.projectionId)
+          const manifest = snapshot?.draftManifest ?? buildPageDraftManifest(pageRequirementsWithPatchScaffolds(commitRequirements, []))
+          const nextDraftShard = manifest.find((shard) => shard.requirement_ids.includes(coverage.missing[0].requirement_id)) ?? null
           fail("INCOMPLETE_PAGE_COVERAGE", `The Wiki projection does not materialize every required entity, concept, and candidate page. Missing: ${coverage.missing.slice(0, 5).map((item) => item.title).join(", ")}${coverage.missing.length > 5 ? ", ..." : ""}.`, {
             retryable: true,
             taskId: record.task.taskId,
@@ -929,8 +1291,11 @@ export class LlmWikiCore {
               missing_count: coverage.missing.length,
               missing_page_requirements: coverage.missing.slice(0, 100),
               truncated: coverage.missing.length > 100,
+              ...(nextDraftShard ? { next_draft_shard: nextDraftShard } : {}),
             },
-            suggestedAction: "Create or update canonical pages for every missing requirement and set each patch.covers to the corresponding requirement_id before completing the projection.",
+            suggestedAction: nextDraftShard
+              ? `Fetch draft shard ${nextDraftShard.shard_id}, commit it with projection_complete=false, and continue from the server's next action.`
+              : "Create or update canonical pages for every missing requirement before completing the projection.",
           })
         }
         if (coverage.duplicates.length > 0) {
@@ -955,6 +1320,9 @@ export class LlmWikiCore {
       record.task.wikiRevision = journal.wikiRevision
       if (projection) {
         const state = projectionState(record.task)
+        if (projection.pagePlanTraversal?.serverSideManifest === true && input?.projection_complete === false) {
+          projection.committedDraftShardIds = uniqueStrings([...(projection.committedDraftShardIds ?? []), ...submittedManifestShardIds])
+        }
         state.provisionalPagePaths = [...new Set([
           ...state.provisionalPagePaths,
           ...journal.patches.map((patch) => patch.path),
@@ -969,6 +1337,7 @@ export class LlmWikiCore {
           ].slice(0, 20)
           state.lease = null
           await rm(record.paths.pagePlan, { force: true }).catch(() => {})
+          this.#clearPagePlanCaches(record.task.taskId, projection.projectionId)
           if (projection.mode === "incremental") {
             record.task.status = record.task.completedBatchIds.length === record.task.batchCount ? "planning" : "extracting"
           } else {
@@ -985,6 +1354,15 @@ export class LlmWikiCore {
       }
       await saveTask(record.paths, record.task)
       const wikiProjection = projection ? pageProjectionStatus(record.task) : undefined
+      let nextDraftShard = null
+      if (projection && !projectionComplete) {
+        const snapshot = await this.#pagePlanSnapshot(record, projection.projectionId)
+        const manifest = snapshot?.draftManifest ?? buildPageDraftManifest(pageRequirementsWithPatchScaffolds(commitRequirements, []))
+        const completedShardIds = new Set(projection.committedDraftShardIds ?? [])
+        nextDraftShard = manifest.find((shard) => !completedShardIds.has(shard.shard_id)) ?? null
+        projection.nextDraftShardId = nextDraftShard?.shard_id ?? null
+        await saveTask(record.paths, record.task)
+      }
       return {
         accepted: true,
         transaction_id: journal.transactionId,
@@ -1002,7 +1380,20 @@ export class LlmWikiCore {
           provisional_pages: projectionState(record.task).provisionalPagePaths,
           wiki_projection: wikiProjection,
         } : {}),
-        next_action: projection && !projectionComplete
+        next_action: projection && !projectionComplete && nextDraftShard
+          ? {
+              tool: "llm_wiki_get_page_plan_context",
+              arguments: {
+                task_id: record.task.taskId,
+                writer_id: projection.writerId,
+                projection_id: projection.projectionId,
+                view: "draft-shard",
+                shard_id: nextDraftShard.shard_id,
+                cursor: 0,
+                max_chars: 40_000,
+              },
+            }
+          : projection && !projectionComplete
           ? {
               tool: "llm_wiki_commit_pages",
               arguments: {
@@ -1010,6 +1401,8 @@ export class LlmWikiCore {
                 writer_id: projection.writerId,
                 projection_id: projection.projectionId,
                 based_on_wiki_revision: journal.wikiRevision,
+                projection_complete: true,
+                patches: [],
               },
             }
           : projection?.mode === "incremental" && wikiProjection?.ready
@@ -1120,6 +1513,10 @@ export class LlmWikiCore {
   }
 
   async abort(input) {
+    return this.#withTaskLock(input?.task_id, () => this.#abort(input))
+  }
+
+  async #abort(input) {
     const workspace = await this.workspace({ skipWikiRevision: true })
     const record = await loadTask(workspace.paths, input?.task_id)
     if (["completed", "cancelled"].includes(record.task.status)) {
@@ -1135,6 +1532,11 @@ export class LlmWikiCore {
       })
     }
     await rm(path.join(record.paths.root, "staging"), { recursive: true, force: true })
+    if (pageProjection.lease) {
+      this.#clearPagePlanCaches(record.task.taskId, pageProjection.lease.projectionId)
+      await rm(record.paths.pagePlan, { force: true }).catch(() => {})
+      pageProjection.lease = null
+    }
     record.task.status = "cancelled"
     record.task.cancelledAt = nowIso()
     record.task.cancelReason = typeof input?.reason === "string" ? input.reason.slice(0, 2_000) : "Cancelled by Agent"
@@ -1193,6 +1595,8 @@ export class LlmWikiCore {
       this.domainSchemaSelectionCache.clear()
       this.taskChunkIndexCache.clear()
       this.taskAnalysisCache.clear()
+      this.pagePlanSnapshotCache.clear()
+      this.pageDraftShardCache.clear()
     }
     return {
       accepted: true,
@@ -1421,9 +1825,11 @@ function projectionState(task) {
       : Number.isInteger(current.writerProjectionQuantum) && current.writerProjectionQuantum > 0
         ? current.writerProjectionQuantum
         : 6,
-    semanticPageBatchSize: Number.isInteger(current.semanticPageBatchSize) && current.semanticPageBatchSize > 0
-      ? Math.min(current.semanticPageBatchSize, 50)
-      : 20,
+    semanticPageBatchSize: current.semanticPageBatchSize === 20
+      ? 24
+      : Number.isInteger(current.semanticPageBatchSize) && current.semanticPageBatchSize > 0
+        ? Math.min(current.semanticPageBatchSize, 50)
+        : 24,
     debounceMs: Number.isInteger(current.debounceMs) && current.debounceMs >= 0 ? current.debounceMs : 30_000,
     projectedBatchIds: Array.isArray(current.projectedBatchIds) ? current.projectedBatchIds : [],
     revision: Number.isInteger(current.revision) && current.revision >= 0 ? current.revision : 0,
@@ -1485,7 +1891,7 @@ function pageProjectionStatus(task) {
     projected_batches: state.projectedBatchIds.length,
     unprojected_batches: unprojected.length,
     provisional_pages: state.provisionalPagePaths.length,
-    semantic_page_batch_size: state.semanticPageBatchSize ?? 20,
+    semantic_page_batch_size: state.semanticPageBatchSize ?? 24,
     writer_committers: 1,
     parallel_page_drafting: {
       enabled: true,
@@ -1495,7 +1901,7 @@ function pageProjectionStatus(task) {
       pipeline_background_budget: 4,
       extraction_workers_during_drafting: 2,
       partition_key: "patch_scaffold.path",
-      commit_strategy: "single-writer-atomic",
+      commit_strategy: "single-writer-durable-waves",
     },
     final_completed: state.finalCompleted,
     in_progress: Boolean(state.lease),
@@ -1507,6 +1913,7 @@ function pageProjectionStatus(task) {
       page_plan_next_cursor: state.lease.pagePlanTraversal
         ? state.lease.pagePlanTraversal.nextCursor
         : 0,
+      committed_draft_shards: Array.isArray(state.lease.committedDraftShardIds) ? state.lease.committedDraftShardIds.length : 0,
     } : {}),
     ...(nextReadyAt ? { next_ready_at: nextReadyAt } : {}),
   }
@@ -1552,9 +1959,11 @@ function acquirePageProjection(task, input) {
     mode,
     batchIds,
     analysisRevision: task.analysisRevision,
+    semanticPageBatchSize: state.semanticPageBatchSize,
     leasedAt: timestamp,
     expiresAt: new Date(Date.now() + PAGE_PROJECTION_LEASE_MS).toISOString(),
     wikiRevision: null,
+    committedDraftShardIds: [],
   }
   return { lease: state.lease, status: pageProjectionStatus(task) }
 }
@@ -1584,6 +1993,7 @@ function publicProjection(projection) {
     batch_ids: projection.batchIds,
     analysis_revision: projection.analysisRevision,
     lease_expires_at: projection.expiresAt,
+    committed_draft_shards: Array.isArray(projection.committedDraftShardIds) ? projection.committedDraftShardIds.length : 0,
     ...(projection.safelyRepartitioned ? {
       safely_repartitioned: true,
       repartitioned_from_batch_count: projection.repartitionedFromBatchCount,
@@ -1986,6 +2396,116 @@ function paginatePagePlan(context, requestedCursor, requestedMaxChars, configure
   }
 }
 
+function normalizePagePlanView(value, projectionRequested) {
+  if (value === undefined || value === null || value === "") return projectionRequested ? "plan" : "plan"
+  if (!["plan", "manifest", "draft-shard"].includes(value)) fail("INVALID_INPUT", "view must be plan, manifest, or draft-shard.")
+  return value
+}
+
+function pageCommitLimits(limits, projection) {
+  const hardMax = Math.max(1, Number(limits.maxPatchesPerCommit) || 50)
+  const maxPathsPerShard = Math.min(6, hardMax)
+  const recommendedWave = Math.min(hardMax, maxPathsPerShard * 4, Number(projection?.semanticPageBatchSize) || 24)
+  return {
+    max_patches_per_call: hardMax,
+    max_content_chars_per_call: limits.maxCommitChars,
+    max_paths_per_draft_shard: maxPathsPerShard,
+    recommended_max_patches_per_wave: Math.max(1, recommendedWave),
+    hard_rule: `Never generate or submit more than ${hardMax} patches in one call. Partition paths before drafting; do not generate an oversized set and split it afterward.`,
+    context_rule: "Keep only one bounded draft shard (or one bounded wave) in model context. Commit accepted waves durably before loading later shards.",
+  }
+}
+
+function buildPageDraftManifest(requirements, maxPathsPerShard = 6) {
+  const byPath = new Map()
+  for (const requirement of requirements ?? []) {
+    const pagePath = requirement?.patch_scaffold?.path ?? requirement?.preferred_path
+    if (typeof pagePath !== "string" || !pagePath) continue
+    const group = byPath.get(pagePath) ?? []
+    group.push(requirement)
+    byPath.set(pagePath, group)
+  }
+  const pathGroups = [...byPath.entries()].sort(([left], [right]) => left.localeCompare(right))
+  const shards = []
+  for (let offset = 0; offset < pathGroups.length; offset += maxPathsPerShard) {
+    const groups = pathGroups.slice(offset, offset + maxPathsPerShard)
+    const shardNumber = shards.length + 1
+    shards.push({
+      shard_id: `draft-${String(shardNumber).padStart(4, "0")}`,
+      paths: groups.map(([pagePath]) => pagePath),
+      requirement_ids: groups.flatMap(([, values]) => values.map((value) => value.requirement_id)),
+      page_count: groups.length,
+      same_path_requirements_are_indivisible: true,
+    })
+  }
+  return shards
+}
+
+function pageDraftShardContext(context, shard) {
+  const requirementIds = new Set(shard.requirement_ids)
+  const pagePaths = new Set(shard.paths)
+  const selectedRequirements = (context.required_pages ?? []).filter((item) => requirementIds.has(item.requirement_id))
+  const batchIds = new Set(selectedRequirements.flatMap((item) => item.batch_ids ?? []))
+  const titles = selectedRequirements.map((item) => String(item.title ?? "").normalize("NFKC").toLowerCase()).filter(Boolean)
+  const sourceKeys = new Set(selectedRequirements.flatMap((item) => item.source_refs ?? []).map(pagePlanSourceRefKey).filter(Boolean))
+  const sourceChunkKeys = new Set(selectedRequirements.flatMap((item) => item.source_refs ?? []).map(pagePlanSourceChunkKey).filter(Boolean))
+  const textualMatch = (item) => {
+    if (!item || typeof item !== "object") return false
+    const text = [item.name, item.title, item.content, item.subject, item.object, item.source, item.target]
+      .filter((value) => typeof value === "string")
+      .join(" ")
+      .normalize("NFKC")
+      .toLowerCase()
+    return titles.some((title) => title && text.includes(title))
+  }
+  const exactEvidenceMatch = (item) => (item?.sourceRefs ?? []).some((sourceRef) => sourceKeys.has(pagePlanSourceRefKey(sourceRef)))
+  const sameChunkEvidenceMatch = (item) => (item?.sourceRefs ?? []).some((sourceRef) => sourceChunkKeys.has(pagePlanSourceChunkKey(sourceRef)))
+  const identityMatches = (item) => exactEvidenceMatch(item) || textualMatch(item)
+  const factMatches = (item) => exactEvidenceMatch(item) || sameChunkEvidenceMatch(item) || textualMatch(item)
+  const matchingEntities = (context.entities ?? []).filter(identityMatches)
+  const matchingConcepts = (context.concepts ?? []).filter(identityMatches)
+  const localIds = new Set([...matchingEntities, ...matchingConcepts]
+    .map((item) => item.localId ?? item.local_id)
+    .filter((value) => typeof value === "string" && value))
+  const relationMatches = (item) => factMatches(item) || [
+    item?.sourceEntityLocalId,
+    item?.source_entity_local_id,
+    item?.sourceLocalId,
+    item?.targetEntityLocalId,
+    item?.target_entity_local_id,
+    item?.targetLocalId,
+  ].some((value) => localIds.has(value))
+  return {
+    batches: (context.batches ?? []).filter((item) => batchIds.has(item.batch_id)),
+    required_pages: selectedRequirements,
+    entities: matchingEntities,
+    concepts: matchingConcepts,
+    claims: (context.claims ?? []).filter(factMatches),
+    relations: (context.relations ?? []).filter(relationMatches),
+    candidate_pages: (context.candidate_pages ?? []).filter(identityMatches),
+    existing_pages: (context.existing_pages ?? []).filter((item) => pagePaths.has(item.path) || (item.covers ?? []).some((id) => requirementIds.has(id))),
+    existing_page_catalog: (context.existing_page_catalog ?? []).filter((item) => pagePaths.has(item.path)),
+    conflicts: (context.conflicts ?? []).filter(factMatches),
+  }
+}
+
+function pagePlanSourceRefKey(sourceRef) {
+  if (!sourceRef || typeof sourceRef !== "object") return null
+  const sourceId = sourceRef.sourceId ?? sourceRef.source_id
+  const chunkId = sourceRef.chunkId ?? sourceRef.chunk_id
+  if (typeof sourceId !== "string" || typeof chunkId !== "string") return null
+  const quote = typeof sourceRef.quote === "string" ? sourceRef.quote : ""
+  return `${sourceId}:${chunkId}:${quote}`
+}
+
+function pagePlanSourceChunkKey(sourceRef) {
+  if (!sourceRef || typeof sourceRef !== "object") return null
+  const sourceId = sourceRef.sourceId ?? sourceRef.source_id
+  const chunkId = sourceRef.chunkId ?? sourceRef.chunk_id
+  if (typeof sourceId !== "string" || typeof chunkId !== "string") return null
+  return `${sourceId}:${chunkId}`
+}
+
 function normalizePagePlanCursor(value) {
   const cursor = value === undefined || value === null ? 0 : Number(value)
   if (!Number.isInteger(cursor) || cursor < 0) fail("INVALID_INPUT", "cursor must be a non-negative integer.")
@@ -2056,7 +2576,7 @@ function nextAction(task, wikiProjection = pageProjectionStatus(task)) {
 
 function projectionAction(task, wikiProjection = pageProjectionStatus(task)) {
   const lease = projectionState(task).lease
-  if (lease?.pagePlanTraversal?.complete === true) {
+  if (lease?.pagePlanTraversal?.complete === true && lease.pagePlanTraversal?.serverSideManifest !== true) {
     return {
       tool: "llm_wiki_commit_pages",
       arguments: {
@@ -2067,12 +2587,40 @@ function projectionAction(task, wikiProjection = pageProjectionStatus(task)) {
       },
     }
   }
+  if (lease?.pagePlanTraversal?.serverSideManifest === true && lease.nextDraftShardId) {
+    return {
+      tool: "llm_wiki_get_page_plan_context",
+      arguments: {
+        task_id: task.taskId,
+        writer_id: lease.writerId,
+        projection_id: lease.projectionId,
+        view: "draft-shard",
+        shard_id: lease.nextDraftShardId,
+        cursor: 0,
+        max_chars: 40_000,
+      },
+    }
+  }
+  if (lease?.pagePlanTraversal?.serverSideManifest === true) {
+    return {
+      tool: "llm_wiki_commit_pages",
+      arguments: {
+        task_id: task.taskId,
+        writer_id: lease.writerId,
+        projection_id: lease.projectionId,
+        based_on_wiki_revision: lease.wikiRevision,
+        projection_complete: true,
+        patches: [],
+      },
+    }
+  }
   return {
     tool: "llm_wiki_get_page_plan_context",
     arguments: {
       task_id: task.taskId,
       writer_id: wikiProjection.writer_id ?? "wiki-writer-1",
       ...(wikiProjection.projection_id ? { projection_id: wikiProjection.projection_id } : {}),
+      view: "manifest",
       cursor: wikiProjection.page_plan_next_cursor ?? 0,
       max_chars: 40_000,
     },

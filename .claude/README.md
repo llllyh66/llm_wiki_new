@@ -85,18 +85,15 @@ multi-route retrieval defaults.
 
 An extractor stops and reports `writer_required: true` as soon as its accepted
 commit makes a projection ready. The coordinator starts `wiki-writer-1` before
-replacing that extractor. The default `llm_wiki_apply_projection` call renders
-only facts already validated during extraction and commits them in bounded
-transactions. Legacy page-plan calls use 40K-character pages and include
-only domain Schema identity metadata, so a multi-megabyte extraction Schema is
-never copied into the Wiki writer's tool response.
-Legacy incremental page plans include full text only for pages affected by the current
-projection. Unrelated pages are represented by compact catalog entries, so
-Writer cost no longer grows with the total byte size of the existing Wiki.
-The Writer must collect every sequential page-plan cursor before its first
-commit. Core persists a stable projection snapshot and rejects premature
-commits with the exact next cursor, preventing provisional pages hidden on a
-later cursor from being recreated without their current hashes.
+replacing that extractor. The default `llm_wiki_apply_projection` call returns
+a compact server-side draft manifest; it never renders or writes pages
+automatically. The Writer fetches one at-most-six-path shard, drafts it, and
+commits a durable bounded wave before loading the next shard. The manifest
+states the hard 50-patch limit before generation, so an oversized result is
+never generated and then repeated. Full affected page content and hashes
+appear only in their matching shard. This keeps large final reconciliation out
+of model context and lets recovery resume at the first uncovered shard after
+context compaction.
 
 At the beginning of a later user turn, the coordinator calls
 `llm_wiki_status`. Its `worker_recovery.leases` list contains each persisted

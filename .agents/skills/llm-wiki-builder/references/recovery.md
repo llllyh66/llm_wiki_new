@@ -79,18 +79,20 @@ onto that newer workspace state.
 
 On `FILE_HASH_CONFLICT`, no patches in that atomic commit were applied. Call
 `llm_wiki_get_page_plan_context` with the same task, Writer, and projection IDs,
-restart at cursor zero, follow every returned cursor to null, read the newest
-content/hash for the reported target path, semantically rebase
+use `view: "manifest"`, follow the first uncovered shard, read the newest
+content/hash for the reported target path, and semantically rebase
 that page, and retry. Never force an overwrite or start a second Writer for the
 same task. A `WIKI_REVISION_CONFLICT` from an unrelated-path change indicates
 an older Core process is still running; restart that process on the updated
 build, then resume the existing task and lease instead of creating a new task.
 
-`PAGE_PLAN_INCOMPLETE` means the Writer tried to commit before collecting the
-whole bounded plan. Follow the returned `next_action` cursor exactly until
-`page_plan_complete: true`; Core serves those pages from a stable projection
-snapshot. Only then generate patches. `projection_complete: false` splits more
-than 50 accumulated patches and does not authorize per-cursor commits.
+`PAGE_PLAN_INCOMPLETE` is a legacy-plan recovery. Prefer restarting the same
+projection with `view: "manifest"`; Core persists the complete plan and returns
+bounded `draft-shard` actions, so the model never has to retain every cursor.
+Read `page_commit_limits` before drafting. Partition paths first, generate only
+one shard or bounded wave, and commit it with `projection_complete: false`.
+Never generate more than 50 patches, never regenerate an accepted wave, and
+finish with the returned empty `projection_complete: true` acknowledgement.
 
 For page-patch validation errors such as `INVALID_SOURCE_REF`, use the returned
 `validation_errors` entries to repair every identified patch. When

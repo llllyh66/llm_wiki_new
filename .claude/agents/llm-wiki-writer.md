@@ -32,24 +32,32 @@ this invocation (currently six). Call the supplied
 `llm_wiki_get_page_plan_context` action directly. If the coordinator supplies
 `llm_wiki_apply_projection` for compatibility, call it once and follow the
 returned page-plan action; it is only a redirect and never writes pages.
-Request page-plan pages with `max_chars: 40000`. The response intentionally
-contains only domain Schema identity metadata; never fetch or reconstruct the
-full extraction Schema in this writer. Follow the response's `next_action` and
-request every `next_cursor` sequentially until `page_plan_complete: true` and
-`next_cursor: null`. Never commit while `next_cursor` is non-null. The
-`pagination.returned_items` value counts all context categories, not page
-requirements; accumulate every returned array, including `page_requirements`,
-`existing_pages`, and `existing_page_catalog`, across all cursors before
-generating patches. An empty `page_requirements` array on a later cursor does
-not mean the plan is complete. `existing_pages` contains full content and
-hashes for affected or same-task provisional pages; `existing_page_catalog` is
-duplicate-avoidance metadata only and must not be replaced without full
-content. Materialize all requirements, recording
-their `requirement_id` values in PagePatch `covers`; `candidate_pages` is not a
-complete page list. Start from each requirement's `patch_scaffold` and add its
-page body. Keep the scaffold's requirement-ID `sourceRefs`; Core resolves them
-to exact quotes and locators, so never copy or retype complete SourceRef
-objects. When merging requirements, union their scaffold handles and covers.
+Request `view: "manifest"` with `max_chars: 40000`. The response intentionally
+contains only a compact server-side shard manifest and domain Schema identity
+metadata; never fetch or reconstruct the full extraction Schema. Read
+`page_commit_limits` before drafting: the hard maximum is 50 patches per call,
+and the recommended wave is smaller. Partition before content generation;
+never generate 50+ pages and then redo the first 50.
+
+Follow `next_action` to one `view: "draft-shard"` at a time. A capable parent
+may use the manifest's returned `draft_actions` for a bounded parallel wave;
+never invent a shard ID. Traverse only that
+shard's cursors until `draft_shard_complete: true`, generate its at-most-six
+canonical pages, and commit the bounded wave immediately with
+`projection_complete: false`, copying the returned `draft_shard_ids` exactly.
+Those IDs prevent old page coverage from skipping final semantic rewriting.
+An accepted wave is durable: discard its large
+context and never regenerate it after context compaction. Follow the commit's
+next action to the first still-uncovered shard. Do not collect all manifest
+shards or all page patches in model context. When no shard remains, send the
+returned empty `patches: []`, `projection_complete: true` acknowledgement.
+
+Within a shard, `existing_pages` contains full content and hashes for affected
+pages; catalog-only metadata is never sufficient for replacement. Materialize
+all requirements, record their IDs in PagePatch `covers`, and start from each
+`patch_scaffold`. Keep requirement-ID `sourceRefs`; Core resolves exact quotes
+and locators. When requirements share one assigned path, union their scaffold
+handles and covers.
 
 Preserve rich page bodies, summaries, tags, wikilinks, and
 Related navigation. If completion returns `INCOMPLETE_PAGE_COVERAGE`, add the
@@ -60,11 +68,12 @@ batches. Do not repeatedly expand boilerplate. In final mode, reconcile all
 returned batches and every affected provisional page into a coherent semantic
 Wiki page set. Finalize is allowed only after
 `wiki_projection.final_completed: true`.
-Use `projection_complete: false` only after the entire plan is collected, to
-split an accumulated patch list into commits of at most 50 patches. It does not
-mean “commit one cursor page, then fetch the next cursor.” On
-`FILE_HASH_CONFLICT`, restart collection at cursor zero for the same projection
-and use the returned existing-page content and exact `file_hash`; never guess a
+Never submit more than `page_commit_limits.max_patches_per_call` (currently 50)
+or generate more than the recommended wave. `PAGE_COMMIT_TOO_LARGE` repairs
+only the unaccepted local wave; it never restarts the manifest or regenerates
+accepted pages. On
+`FILE_HASH_CONFLICT`, request `view: "manifest"` for the same projection and
+follow its first uncovered shard to obtain current page content and exact `file_hash`; never guess a
 hash or switch a known existing path from `create` to hashless `merge`.
 Every rejected `llm_wiki_commit_pages` call is atomic when its result says
 `atomic_commit_applied: false`: none of that call's patches were stored. If one
@@ -75,7 +84,7 @@ complete local patch subset and its
 new idempotency key. Never retry only the bad patch. Previously accepted
 partial commits are durable and must not be resubmitted.
 In the legacy loop, after each completed incremental commit, immediately follow
-`writer_next_action: llm_wiki_get_page_plan_context` with cursor zero while the
+`writer_next_action: llm_wiki_get_page_plan_context` with `view: "manifest"` while the
 projection quantum has capacity. Do not call status between these backlog
 projections. Every projection is independently committed and checkpointed.
 

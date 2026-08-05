@@ -85,7 +85,7 @@ Schema 的抽取策略是“抽取时约束”，不是先随意抽取后再静�
 - 精确证据引用；
 - 原子事务和目标页面 hash 校验。
 
-主协调器中的 Writer loop 会读取完整的 page plan，生成有标题、概述、关键事实、关系、Related 链接和来源证据的语义页面。页面数达到 4 个后，主协调器按精确的 `patch_scaffold.path` 将页面分成互不重叠的 shard，最多启动 4 个无 MCP 权限的 page drafter 并行生成正文；同一路径的全部 requirement 始终留在一个 shard。主协调器仍是唯一提交者，会校验路径唯一性、coverage、scaffold、hash 和 SourceRef 后再原子提交，因此并行生成不会引入 revision 冲突。增量 projection 的页面可能先标记为 provisional，最终 projection 会重新综合所有 batch 并清除 provisional 状态。
+主协调器中的 Writer loop 先请求服务端持久化的 compact manifest。manifest 在生成正文之前明确返回“单次最多 50 个 patch”的硬限制，并按精确的 `patch_scaffold.path` 预先分成最多 6 个路径的 shard；同一路径的全部 requirement 始终留在一个 shard。Writer 每次只取一个 shard 的必要事实、关系和现有页面，生成后立即持久化提交，不再把整个 page plan 和几百个 patch 放入模型上下文。已接受的 shard 是恢复检查点，即使 context compaction 或 Writer 重启，也会从第一个未覆盖 shard 继续，不重做前 50 页。
 
 抽取与页面生成同时进行时，协调器使用 4 个后台 Agent 的共享预算，通常分配为 2 个 extractor + 2 个 page drafter；不会中断正在处理 batch 的 extractor，而是在 worker quantum 结束后调整补位。抽取完成后可将 4 个槽位全部用于页面分片。这样可避免 extractor 持续占满并发槽导致 writer backlog 无限增长。
 
@@ -93,15 +93,14 @@ Schema 的抽取策略是“抽取时约束”，不是先随意抽取后再静�
 
 所有 batch 完成后，Core 会创建 final projection，交给同一个 Wiki Writer 做完整语义协调：
 
-1. `llm_wiki_get_page_plan_context` 按 cursor 分页返回稳定的完整 page plan；
-2. Writer 必须读取所有 cursor，直到 `page_plan_complete=true` 且 `next_cursor=null`；
-3. Writer 综合所有 batch 的实体、声明、关系、冲突和现有页面正文；
-4. Writer 可让多个 page drafter 并行重写互斥页面的概述、关键事实、关系和 Related 链接，但仍由唯一 Writer 统一提交；
-5. 原始 chunk 只放在简洁的来源证据区；
-6. 页面 patch 按最多 50 个一组原子提交，失败时修正整个被拒绝集合后重试；
-7. 最终 projection 完成后，由 Finalize 更新 `index.md` 和 `overview.md` 等全局汇总页。
+1. `llm_wiki_get_page_plan_context(view="manifest")` 在服务端冻结完整计划，只返回紧凑分片清单和提交限制；
+2. Writer 按 `next_action` 读取一个 `view="draft-shard"`，仅在分片内综合相关 batch 的实体、声明、关系、冲突和现有页面；
+3. Writer 可让多个 page drafter 并行重写互斥 shard 的概述、关键事实、关系和 Related 链接，但仍由唯一 Writer 统一提交；
+4. 原始 chunk 只放在简洁的来源证据区；
+5. 每个小 wave 以 `projection_complete=false` 原子提交，并原样回传服务端给出的 `draft_shard_ids`；这些持久化 ID 证明 final Writer 确实处理了该 shard，不会因旧页已有 coverage 而跳过语义重写。成功后立即丢弃该分片上下文；所有 shard 处理后用空 patch 和 `projection_complete=true` 完成最终覆盖审计；
+6. 最终 projection 完成后，由 Finalize 更新 `index.md` 和 `overview.md` 等全局汇总页。
 
-如果 Writer 在某个 cursor 处中断，恢复时必须使用同一 projection ID 和准确 cursor 继续读取；不能在 page plan 未完成前提交页面。`llm_wiki_apply_projection` 只是兼容入口，会转交传统 page-plan Writer 流程，不会自动渲染页面。
+如果 Writer 在 shard 内的 cursor 处中断，恢复时使用同一 projection ID、shard ID 和准确 cursor；如果上下文已被压缩，直接按状态返回的未覆盖 shard 恢复，无需重放已接受页面。`llm_wiki_apply_projection` 只是兼容入口，会返回同一 compact manifest，不会自动渲染页面。
 
 ### 2.6 Related 关系生成
 
@@ -145,8 +144,8 @@ Embedding 配置位于 `.llm-wiki/config.json` 的 `retrieval.embedding`，包�
 | `llm_wiki_get_domain_schema` | 分页、搜索或按类型读取领域 Schema |
 | `llm_wiki_retrieve_context` | BM25 + Embedding + Wiki 多路召回 |
 | `llm_wiki_commit_analysis` | 校验并持久化一个 batch 的结构化分析 |
-| `llm_wiki_get_page_plan_context` | 分页读取页面计划和最终 Writer 上下文 |
-| `llm_wiki_apply_projection` | 兼容入口：转交传统 Wiki Writer 的 page-plan 流程，不自动写页面 |
+| `llm_wiki_get_page_plan_context` | 返回服务端 manifest 或有界 draft shard，传统 plan cursor 仅作兼容 |
+| `llm_wiki_apply_projection` | 兼容入口：获取 compact manifest，不自动写页面 |
 | `llm_wiki_commit_pages` | 原子提交页面 patch |
 | `llm_wiki_finalize` | 生成索引、来源页并完成任务 |
 | `llm_wiki_status` | 查看任务、租约、并行建议和下一步动作 |
@@ -221,7 +220,7 @@ npm run build
 1. 先调用 `llm_wiki_status`；
 2. 按返回的 `next_action` 继续；
 3. worker 消失时使用原 worker_id 重新启动；
-4. `get_page_plan_context` 必须按 cursor 顺序读到 `next_cursor=null`；
+4. Writer 先取 manifest，再仅按当前 draft shard 的 cursor 读到 `next_cursor=null`；
 5. 原子提交失败时修复整个被拒绝 patch 集合后，用新的 idempotency key 重试；
 6. 代码更新后重新 `npm run build` 并重启 Claude MCP，避免继续使用旧 dist。
 

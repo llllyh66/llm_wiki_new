@@ -141,7 +141,7 @@ async function retrievalDocuments(workspace, taskRecord, currentBatchId) {
   let sourcesTotal = 0
   for (const batch of taskRecord.batches) {
     for (const chunk of batch.chunks) {
-      const isCurrent = batch.batchId === (currentBatchId ?? taskRecord.task.activeBatchId)
+      const isCurrent = batch.batchId === currentBatchId
       if (isCurrent) currentTotal += 1
       else sourcesTotal += 1
       const target = isCurrent ? current : sources

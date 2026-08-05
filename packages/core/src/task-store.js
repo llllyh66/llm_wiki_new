@@ -17,8 +17,8 @@ const LARGE_AGENT_BATCH_CHARS = 9_000
 const LARGE_TASK_SOURCE_CHARS = 60_000
 const MAX_AGENT_BATCH_CHARS = LARGE_AGENT_BATCH_CHARS
 const MAX_AGENT_NESTED_STRING_CHARS = 3_000
-const TASK_BATCH_BOUNDS_VERSION = 2
-const TASK_CHUNK_PAYLOAD_VERSION = 2
+const TASK_BATCH_BOUNDS_VERSION = 3
+const TASK_CHUNK_PAYLOAD_VERSION = 3
 const BATCH_FILE_CACHE_LIMIT = 12
 const batchFileCache = new Map()
 
@@ -85,7 +85,7 @@ export async function createTask(workspace, sources, options = {}) {
       batchThreshold: 4,
       batchLimit: 8,
       writerProjectionQuantum: 6,
-      semanticPageBatchSize: workspace.config.limits.semanticPageBatchSize ?? 20,
+      semanticPageBatchSize: workspace.config.limits.semanticPageBatchSize ?? 24,
       debounceMs: 30_000,
       projectedBatchIds: [],
       revision: 0,
@@ -143,7 +143,7 @@ function makeBatches(taskId, chunks, maxChars) {
   return batches
 }
 
-export async function ensureBoundedTaskBatches(record, limits) {
+export async function ensureBoundedTaskBatches(record, limits, options = {}) {
   let changed = false
   const batches = []
   const maxBatchChars = Math.min(
@@ -158,11 +158,29 @@ export async function ensureBoundedTaskBatches(record, limits) {
     MAX_AGENT_CHUNK_CHARS,
   )
   const maxBatchPayloadBytes = batchPayloadLimit(maxBatchChars)
+  const completedBatchIds = new Set(record.task.completedBatchIds)
   const metadataWithinBounds = record.batches.length === record.task.batchCount
-    && record.batches.every((batch) => batch.charCount <= maxBatchChars && Number(batch.payloadBytes) <= maxBatchPayloadBytes)
+    && record.batches.every((batch) => completedBatchIds.has(batch.batchId)
+      || (batch.charCount <= maxBatchChars && Number(batch.payloadBytes) <= maxBatchPayloadBytes))
   if (metadataWithinBounds && batchBoundsCover(record.task.batchBounds, maxChunkChars, maxBatchChars, maxBatchPayloadBytes)) return record
   for (const batch of record.batches) {
-    if (record.task.completedBatchIds.includes(batch.batchId)) {
+    if (completedBatchIds.has(batch.batchId)) {
+      batches.push(batch)
+      continue
+    }
+    const lease = record.task.batchLeases?.[batch.batchId]
+    const liveLease = lease
+      && typeof lease.workerId === "string"
+      && Number.isFinite(Date.parse(lease.expiresAt))
+      && Date.parse(lease.expiresAt) > Date.now()
+    const leasedRepairAllowed = liveLease
+      && lease.workerId === options.workerId
+      && batch.batchId === options.repairLeasedBatchId
+    // A worker may already be analyzing the exact bytes it received. Another
+    // worker requesting a smaller batch size must never rewrite that leased
+    // batch underneath it; only the lease owner explicitly resuming that batch
+    // may trigger legacy oversize repair.
+    if (liveLease && !leasedRepairAllowed) {
       batches.push(batch)
       continue
     }
@@ -201,7 +219,7 @@ export async function ensureBoundedTaskBatches(record, limits) {
   record.task.batchLayoutRevision = (Number(record.task.batchLayoutRevision) || 0) + 1
   const persistedBatchIds = new Set(batches.map((batch) => batch.batchId))
   record.task.batchLeases = Object.fromEntries(Object.entries(record.task.batchLeases ?? {})
-    .filter(([batchId]) => persistedBatchIds.has(batchId) && !record.task.completedBatchIds.includes(batchId)))
+    .filter(([batchId]) => persistedBatchIds.has(batchId) && !completedBatchIds.has(batchId)))
   if (record.task.activeBatchId && !persistedBatchIds.has(record.task.activeBatchId)) record.task.activeBatchId = undefined
   await writeJsonAtomic(record.paths.batches, batches)
   batchFileCache.delete(record.paths.batches)
@@ -221,15 +239,18 @@ function boundTaskChunks(chunks, maxChars, maxPayloadBytes = MAX_TASK_CHUNK_PAYL
     const pieces = splitChunkText(text, maxChars)
     return pieces.map((piece, index) => {
       const { structuredData: _structuredData, ...base } = compactedChunk
+      const pieceText = piece.text
       return {
         ...base,
-        chunkId: `chunk-${sha256(`${chunk.chunkId}:${index}:${piece}`).slice(0, 24)}`,
+        chunkId: `chunk-${sha256(`${chunk.chunkId}:${index}:${pieceText}`).slice(0, 24)}`,
         parentChunkId: chunk.chunkId,
         partIndex: index,
         headingPath: Array.isArray(chunk.headingPath) ? chunk.headingPath.map((heading) => String(heading).slice(0, 500)).slice(0, 12) : [],
-        text: piece,
-        tokenEstimate: Math.ceil(piece.length / 4),
-        contentHash: sha256(piece),
+        ...(Number.isInteger(chunk.startOffset) ? { startOffset: chunk.startOffset + piece.start } : {}),
+        ...(Number.isInteger(chunk.startOffset) ? { endOffset: chunk.startOffset + piece.end } : {}),
+        text: pieceText,
+        tokenEstimate: Math.ceil(pieceText.length / 4),
+        contentHash: sha256(pieceText),
         ...(Array.isArray(compactedChunk.structuredData) ? { structuredData: compactedChunk.structuredData } : {}),
       }
     })
@@ -304,16 +325,25 @@ function batchBoundsCover(value, maxChunkChars, maxBatchChars, maxPayloadBytes) 
 }
 
 function splitChunkText(text, maxChars) {
-  if (!text) return [""]
+  if (!text) return [{ text: "", start: 0, end: 0 }]
   const pieces = []
-  let rest = text
-  while (rest.length > maxChars) {
-    const window = rest.slice(0, maxChars + 1)
+  let cursor = 0
+  while (text.length - cursor > maxChars) {
+    const window = text.slice(cursor, cursor + maxChars + 1)
     const cut = Math.max(window.lastIndexOf("\n"), window.lastIndexOf("。"), window.lastIndexOf(". "), window.lastIndexOf(" "), Math.floor(maxChars * 0.6))
-    pieces.push(rest.slice(0, cut).trim())
-    rest = rest.slice(cut).trimStart()
+    let start = cursor
+    let end = cursor + cut
+    while (start < end && /\s/u.test(text[start])) start += 1
+    while (end > start && /\s/u.test(text[end - 1])) end -= 1
+    if (start < end) pieces.push({ text: text.slice(start, end), start, end })
+    cursor += cut
+    while (cursor < text.length && /\s/u.test(text[cursor])) cursor += 1
   }
-  if (rest.trim() || pieces.length === 0) pieces.push(rest.trim())
+  let start = cursor
+  let end = text.length
+  while (start < end && /\s/u.test(text[start])) start += 1
+  while (end > start && /\s/u.test(text[end - 1])) end -= 1
+  if (start < end || pieces.length === 0) pieces.push({ text: text.slice(start, end), start, end })
   return pieces
 }
 
@@ -348,7 +378,7 @@ export function assertTaskStatus(task, allowed) {
   }
 }
 
-export async function withIdempotency(paths, key, requestValue, operation) {
+export async function withIdempotency(paths, key, requestValue, operation, options = {}) {
   if (typeof key !== "string" || key.length < 8 || key.length > 200) {
     fail("INVALID_INPUT", "idempotency_key must contain 8 to 200 characters.")
   }
@@ -362,8 +392,27 @@ export async function withIdempotency(paths, key, requestValue, operation) {
     return { replayed: true, response: existing.response }
   }
   const response = await operation()
-  await writeJsonAtomic(shardPath, { key, requestHash, response, createdAt: nowIso() })
+  const exactRequestHash = options.exactRequestValue === undefined
+    ? undefined
+    : sha256(stableStringify(options.exactRequestValue))
+  await writeJsonAtomic(shardPath, { key, requestHash, ...(exactRequestHash ? { exactRequestHash } : {}), response, createdAt: nowIso() })
   return { replayed: false, response }
+}
+
+export async function readExactIdempotencyReplay(paths, key, requestValue) {
+  if (typeof key !== "string" || key.length < 8 || key.length > 200) {
+    fail("INVALID_INPUT", "idempotency_key must contain 8 to 200 characters.")
+  }
+  await ensureShardedIdempotency(paths)
+  const existing = await readJson(path.join(paths.idempotencyDir, `${sha256(key)}.json`), null)
+  if (!existing) return null
+  if (existing.key !== key) fail("IDEMPOTENCY_CONFLICT", "The idempotency key hash collides with another stored key.")
+  const exactRequestHash = sha256(stableStringify(requestValue))
+  if (typeof existing.exactRequestHash !== "string") return null
+  if (existing.exactRequestHash !== exactRequestHash) {
+    fail("IDEMPOTENCY_CONFLICT", "The idempotency key was already used with a different request.")
+  }
+  return existing.response
 }
 
 async function ensureShardedIdempotency(paths) {

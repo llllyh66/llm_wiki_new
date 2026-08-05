@@ -96,6 +96,10 @@ typed entity or any relation.
    1. Call `llm_wiki_get_batch` with the task ID, its unchanged `worker_id`,
       and `max_chars` set to `parallel_extraction.recommended_batch_chars`
       supplied by the coordinator (fall back to 6000 only for an old server).
+      Use the same recommendation for every worker in the task; do not tune
+      `max_chars` independently per worker. A smaller request never rewrites a
+      batch under another live lease, but inconsistent sizes cause avoidable
+      repartition scans and extra batches.
       The lease prevents two workers from receiving the same
       batch. Pass the same `worker_id` to `llm_wiki_commit_analysis`.
       Treat the returned batch as complete and indivisible. `batch_limits`
@@ -171,7 +175,9 @@ typed entity or any relation.
       numeric `schemaVersion: 1`, `taskId`, `batchId`, `sourceRefMode`, the
       prefilled numeric `sourceRefs` catalog, and every empty required
       collection; only then fill extracted values. Do not recreate the envelope
-      from memory. The server has already generated exact quotes and spreadsheet
+      from memory. Treat `analysis_contract.generation_limits` as
+      pre-generation hard bounds; never generate an oversized array merely to
+      trim and repeat its prefix after validation. The server has already generated exact quotes and spreadsheet
       locators in `evidence_catalog`. Cite its zero-based `evidence_index`
       directly in each candidate's `sourceRefs`; never retype a quote, read the
       original source file, or reconstruct `sheetName`/`cellRange`. The Core
@@ -237,6 +243,10 @@ typed entity or any relation.
       original file. For legacy locator failures, rebuild the reference from the
       returned chunk template. Error details include `allowed_sheet_names` or
       `allowed_cell_ranges`; do not patch the rejected spelling manually.
+      If commit returns `BATCH_LEASE_REQUIRED`, call the supplied
+      `llm_wiki_get_batch` recovery action with the same task, batch, and worker
+      IDs, then retry the unchanged payload and idempotency key. Never submit an
+      analysis for a batch that this worker did not lease.
    8. When `waiting: true` or `completed: true`, stop this worker normally;
       other leased workers may still be processing the remaining batches. Do
       not poll in a tight loop.
@@ -323,51 +333,40 @@ typed entity or any relation.
    page-plan or commit action, follow the exact returned action. Do not infer
    a new cursor or restart the projection from an earlier page.
 
-   One bounded coordinator Writer invocation processes up
-   to six projections, committing each projection independently:
-   1. Call `llm_wiki_get_page_plan_context` with task ID, writer ID, and cursor
-      `0`, explicitly using `max_chars: 40000`. If it returns `waiting: true`,
-      report normally and stop. Page-plan responses contain only domain Schema
-      identity metadata; extraction has already enforced the full Schema. Do
-      not call `llm_wiki_get_domain_schema`, do not ask the Core to inline the
-      Schema, and do not ignore a genuinely truncated page-plan result.
-   2. Record the returned `projection.projection_id`, `projection.mode`, and
-      `based_on_wiki_revision`. Follow `next_cursor` to null, passing the same
-      writer and projection IDs on every page, and accumulate all categories.
-      Do not generate or submit any patch until `page_plan_complete: true` and
-      `next_cursor: null`. Core enforces sequential traversal and returns
-      `PAGE_PLAN_INCOMPLETE` with the exact required cursor if this rule is
-      violated. `pagination.returned_items` counts records across every context
-      category; it is never the number of page requirements. An empty
-      `page_requirements` array on a later cursor does not mean traversal is
-      complete because that cursor may contain existing-page hashes or claims.
-      Revision validation is target-page scoped. Keep the projection's original
-      `based_on_wiki_revision` while paginating even when
-      `current_wiki_revision` changes or
-      `concurrent_wiki_changes_detected: true`; those fields mean another task
-      changed unrelated Wiki paths, not that this plan is invalid.
-      `existing_pages` contains full content only for pages affected by this
-      projection (matching path, title, coverage, or provisional ownership).
-      `existing_page_catalog` contains compact metadata for unrelated pages;
-      use it to avoid duplicates, but never replace a catalog-only page without
-      receiving its full content and current hash in `existing_pages`. The page
-      patch Schema and domain metadata appear only on cursor zero.
-      After completing traversal, group requirements by exact
-      `patch_scaffold.path`. A path is indivisible: every requirement sharing
-      it and its full existing page must go to the same shard. For four or more
-      paths, the main coordinator launches project Agent
-      `llm-wiki-page-drafter` in
-      waves of at most four concurrent children and at most six paths per
-      shard. Pass only shard-relevant analyses, relations, full existing pages,
-      compact catalog metadata, and the returned patch Schema. Never duplicate
-      the full plan into every child's context. For smaller plans, draft
-      directly because Agent startup costs more than it saves. A drafter has no
-      MCP access, cannot lease or commit a projection, and returns PagePatch
-      JSON only. If the project Agent is unavailable, draft locally rather
-      than launching a general-purpose substitute.
-      During extraction/drafting overlap, respect the four-Agent pipeline
-      budget from step 6; normally use two extractors plus two drafters. After
-      extraction completes, all four slots may draft different path shards.
+   One bounded coordinator Writer invocation processes up to six projections,
+   committing each projection independently:
+   1. Call `llm_wiki_get_page_plan_context` with task ID, stable writer ID,
+      `view: "manifest"`, cursor `0`, and `max_chars: 40000`. Follow the exact
+      status action when it already contains those arguments. The server builds
+      and persists the complete plan; the response is a compact
+      `draft_manifest`, not the full analysis corpus. Record
+      `projection.projection_id`, mode, revision, and `page_commit_limits`
+      before generating any content. The hard limit is currently 50 patches
+      per call. Never generate an oversized patch set and split it afterward.
+      Partition first. Page planning never requires the multi-megabyte domain
+      Schema, so do not fetch or reconstruct it.
+   2. Follow the manifest's `next_action` to fetch one
+      `view: "draft-shard"`. A server shard contains at most six canonical
+      paths and only their requirements, matching facts, relations, conflicts,
+      and full affected existing pages. If that shard itself has more cursors,
+      follow only its returned cursor until `draft_shard_complete: true`.
+      Generate patches immediately for that bounded shard, then discard its
+      source context after a successful commit. Do not traverse every manifest
+      shard before drafting, do not retain all page data in the main context,
+      and do not restart from shard 1 after context compaction. The server's
+      next action resumes the first requirement not yet durably covered.
+      A path is indivisible: every requirement sharing
+      `patch_scaffold.path` stays in one shard.
+      For multiple available shards, use only the exact bounded
+      `draft_manifest.draft_actions` returned by Core; do not invent shard IDs.
+      The coordinator may launch project Agent
+      `llm-wiki-page-drafter` in waves of at most four concurrent children.
+      Each child receives exactly one self-contained server shard and never the
+      full manifest or another shard. A drafter has no tools or MCP access and
+      returns PagePatch JSON only. If that project Agent is unavailable, draft
+      the shard locally; never launch a general-purpose replacement.
+      Respect the four-Agent pipeline budget: normally two extractors plus two
+      drafters while extraction overlaps, then up to four drafters afterward.
    3. For `incremental` mode, update only pages affected by the projection's
       batch IDs. Reuse canonical paths, merge with existing grounded content,
       and avoid speculative or duplicate pages. Follow `writer_guidance`: keep
@@ -377,7 +376,7 @@ typed entity or any relation.
       every repeated incremental update. For `final` mode, inspect all batch
       analyses, reconcile cross-batch duplicates and contradictions, and
       explicitly review every existing page marked `provisional: true`.
-      In both modes, treat accumulated `page_requirements` as the minimum
+      In both modes, treat the current shard's `page_requirements` as the minimum
       materialization contract, not as optional suggestions. It includes
       important entities and concepts even when `candidate_pages` is sparse.
       Create or update a canonical page for every requirement. When several
@@ -402,25 +401,29 @@ typed entity or any relation.
       (`type`, `title`, `created`, `updated`, `tags`, `related`, `sources`,
       `covers`, `summary`) and makes valid Related links bidirectional during
       Finalize.
-      Before committing parallel drafts, join them deterministically by path
+      Before committing one bounded wave of parallel drafts, join them deterministically by path
       and reject any local result with a duplicate/unassigned path, missing or
       duplicate requirement coverage, changed scaffold operation/hash/path,
       changed requirement-ID `sourceRefs`, or omitted required Related slug.
       Regenerate that shard locally before calling MCP. Only the stable parent
       Writer may invoke `llm_wiki_commit_pages`; parallel draft generation must
       never become parallel commits.
-   5. Submit at most 50 patches per `llm_wiki_commit_pages` call. Pass task ID,
-      writer ID, projection ID, current Wiki revision, and a unique idempotency
-      key. Set `projection_complete: false` while more bounded commits remain;
-      use each response's new `wiki_revision` for the next commit. On the last
-      call omit `projection_complete` or set it true. Submit an empty final
-      patch array when the projection needs no page changes and every
-      `page_requirement` is already covered by an existing canonical page.
+   5. Obey `page_commit_limits` before drafting. A wave must contain no more
+      than the returned recommended count and can never exceed the hard 50
+      patches or the content-character ceiling. Pass task ID, writer ID,
+      projection ID, current Wiki revision, and a unique idempotency key. Set
+      `projection_complete: false` for every shard/wave commit. Each accepted
+      call must copy the returned `draft_shard_ids`; these IDs, rather than
+      pre-existing page coverage, are the durable proof that final semantic
+      rewriting actually processed the shard. Each accepted
+      wave is a durable checkpoint; immediately follow its returned
+      `next_action` to the next missing shard and never regenerate or resubmit
+      an accepted wave. When the server says no shard remains, send the
+      returned empty `patches: []`, `projection_complete: true`
+      acknowledgement. This final coverage audit completes the projection.
       `INCOMPLETE_PAGE_COVERAGE` is a normal recoverable result: author the
       listed missing pages or attach their requirement IDs to an appropriate
       existing-page update, then retry without restarting MCP.
-      Partial commits split the patch list accumulated after full page-plan
-      traversal; they never alternate “read one cursor, commit its items.”
       A rejected page commit with `atomic_commit_applied: false` stored none of
       the submitted patches. Inspect every entry in `validation_errors`, fix
       the local patch objects (restore the affected requirement's
@@ -429,6 +432,9 @@ typed entity or any relation.
       the same `projection_complete` value. Never submit only the one corrected
       patch: the other valid patches from that rejected call were not retained.
       Do not resubmit subsets from earlier calls that returned `accepted: true`.
+      `PAGE_COMMIT_TOO_LARGE` means the wave was partitioned incorrectly:
+      repartition the not-yet-accepted local wave before regenerating prose.
+      Never go back to the first manifest shard.
    6. Treat incremental writes and incomplete multipart writes as provisional.
       They are deliberately excluded from retrieval. Only a completed `final`
       projection clears provisional state.

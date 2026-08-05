@@ -23,7 +23,7 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
     assert.match(agent, /^permissionMode: dontAsk$/m)
     assert.match(agent, /ToolSearch/)
   }
-  assert.doesNotMatch(drafter, /^tools:/m)
+  assert.match(drafter, /^tools: \[\]$/m)
   assert.match(drafter, /^disallowedTools:.*ToolSearch$/m)
   assert.doesNotMatch(drafter, /^mcpServers:/m)
   assert.match(drafter, /^permissionMode: dontAsk$/m)
@@ -62,11 +62,13 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(skill, /never retype a quote, read the\s+original source file/)
   assert.match(extractor, /cite `evidence_index` values directly/)
   assert.match(skill, /at most two `commit_analysis` attempts for each batch/)
-  assert.match(writer, /returned_items.*all context categories/)
-  assert.match(writer, /Never commit while.*next_cursor.*non-null/s)
+  assert.match(writer, /view: "manifest"/)
+  assert.match(writer, /hard maximum is 50 patches per call/)
+  assert.match(writer, /Do not collect all manifest\s+shards/s)
+  assert.match(writer, /accepted wave is durable/i)
   assert.match(writer, /currently six/)
   assert.match(writer, /300–1,200 body characters/)
-  assert.match(writer, /page-plan pages|page-plan context/)
+  assert.match(writer, /server-side shard manifest/)
   assert.match(skill, /incremental projection leases at most eight batches/)
   assert.match(skill, /coordinator Writer loop uses `llm_wiki_get_page_plan_context`/)
   assert.match(writer, /`llm_wiki_apply_projection` for compatibility/)
@@ -74,8 +76,10 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(writer, /^disallowedTools: Agent,/m)
   assert.match(skill, /at most four concurrent/)
   assert.match(skill, /background subagents cannot reliably spawn nested subagents/)
-  assert.match(skill, /group requirements by exact\s+`patch_scaffold\.path`/)
+  assert.match(skill, /path is indivisible.*requirement sharing\s+`patch_scaffold\.path`/s)
   assert.match(skill, /parallel draft generation must\s+never become parallel commits/)
+  assert.match(skill, /Never generate an oversized patch set and split it afterward/)
+  assert.match(skill, /Do not traverse every manifest\s+shard before drafting/)
 })
 
 test("MCP publishes the complete Agent-first tool contract without desktop tools", () => {
@@ -108,6 +112,12 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
     assert.equal(Array.isArray(tool.inputSchema.required), true)
     assert.equal(tool._meta["anthropic/alwaysLoad"], true)
   }
+  const pagePlan = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_get_page_plan_context")
+  assert.deepEqual(pagePlan.inputSchema.properties.view.enum, ["plan", "manifest", "draft-shard"])
+  assert.equal(typeof pagePlan.inputSchema.properties.shard_id, "object")
+  const pageCommit = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_commit_pages")
+  assert.equal(pageCommit.inputSchema.properties.patches.maxItems, 50)
+  assert.match(pageCommit.description, /Hard maximum: 50 patches/)
 })
 
 test("MCP router returns structured Core errors", async (t) => {
@@ -142,6 +152,28 @@ test("commit_analysis validation failures are recoverable business results, not 
   }
 })
 
+test("an expired or missing extraction lease recovers through get_batch without disconnecting MCP", async () => {
+  const router = new HeadlessToolRouter({
+    commitAnalysis: async () => {
+      throw new LlmWikiError("BATCH_LEASE_REQUIRED", "Lease must be renewed.", { retryable: true })
+    },
+  })
+  const response = await router.callMcp("llm_wiki_commit_analysis", {
+    task_id: "task-example",
+    batch_id: "batch-0007",
+    worker_id: "extractor-2",
+    analysis: {},
+    idempotency_key: "lease-recovery-v1",
+  })
+  assert.equal(response.isError, undefined)
+  assert.equal(response.structuredContent.error.code, "BATCH_LEASE_REQUIRED")
+  assert.deepEqual(response.structuredContent.next_action, {
+    tool: "llm_wiki_get_batch",
+    arguments: { task_id: "task-example", batch_id: "batch-0007", worker_id: "extractor-2" },
+  })
+  assert.equal(response.structuredContent.mcp_connection_usable, true)
+})
+
 test("premature page commits return the exact next page-plan cursor without disconnecting MCP", async () => {
   const router = new HeadlessToolRouter({
     commitPages: async () => {
@@ -168,7 +200,8 @@ test("premature page commits return the exact next page-plan cursor without disc
       task_id: "task-example",
       writer_id: "wiki-writer-1",
       projection_id: "projection-example",
-      cursor: 63,
+      view: "manifest",
+      cursor: 0,
       max_chars: 40_000,
     },
   })
@@ -219,6 +252,43 @@ test("page validation rejection reports atomic whole-subset retry semantics", as
     },
   })
   assert.equal(response.structuredContent.mcp_connection_usable, true)
+})
+
+test("unfinished server-side page shards recover without restarting or disconnecting", async () => {
+  const nextShard = { shard_id: "draft-0007", paths: ["wiki/entities/example.md"], requirement_ids: ["page-example"] }
+  const router = new HeadlessToolRouter({
+    commitPages: async () => {
+      throw new LlmWikiError("PAGE_DRAFT_SHARDS_INCOMPLETE", "Draft shards remain.", {
+        retryable: true,
+        details: { missing_shard_count: 3, next_draft_shard: nextShard },
+      })
+    },
+  })
+  const response = await router.callMcp("llm_wiki_commit_pages", {
+    task_id: "task-example",
+    writer_id: "wiki-writer-1",
+    projection_id: "projection-example",
+    based_on_wiki_revision: "c".repeat(64),
+    projection_complete: true,
+    patches: [],
+    idempotency_key: "unfinished-shards-v1",
+  })
+  assert.equal(response.isError, undefined)
+  assert.equal(response.structuredContent.error.code, "PAGE_DRAFT_SHARDS_INCOMPLETE")
+  assert.equal(response.structuredContent.atomic_commit_applied, false)
+  assert.equal(response.structuredContent.mcp_connection_usable, true)
+  assert.deepEqual(response.structuredContent.next_action, {
+    tool: "llm_wiki_get_page_plan_context",
+    arguments: {
+      task_id: "task-example",
+      writer_id: "wiki-writer-1",
+      projection_id: "projection-example",
+      view: "draft-shard",
+      shard_id: "draft-0007",
+      cursor: 0,
+      max_chars: 40_000,
+    },
+  })
 })
 
 test("parallel draft coverage conflicts remain recoverable without disconnecting MCP", async () => {
