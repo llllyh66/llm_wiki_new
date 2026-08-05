@@ -1185,16 +1185,32 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(finalPlan.page_plan_complete, true)
   assert.equal(finalPlan.projection.mode, "final")
   assert.equal(finalPlan.projection.batch_ids.length, 6)
-  assert.equal(finalPlan.finalization_hint.fast_path_eligible, true)
-  assert.equal(finalPlan.finalization_hint.recommended_action, "submit-empty-final-commit")
-  assert.equal(finalPlan.pagination.total_items, 0)
+  assert.equal(finalPlan.finalization_hint.fast_path_eligible, false)
+  assert.equal(finalPlan.finalization_hint.recommended_action, "final-semantic-reconciliation")
+  assert.equal(finalPlan.page_requirements.length > 0, true)
+  const finalPatchesByPath = new Map()
+  for (const requirement of finalPlan.page_requirements) {
+    const existing = finalPatchesByPath.get(requirement.patch_scaffold.path)
+    if (existing) {
+      existing.covers = [...new Set([...existing.covers, requirement.requirement_id])]
+      existing.sourceRefs = [...new Set([...existing.sourceRefs, requirement.requirement_id])]
+      continue
+    }
+    finalPatchesByPath.set(requirement.patch_scaffold.path, {
+      ...requirement.patch_scaffold,
+      content: `# ${requirement.title}\n\n## Overview\n\nA reconciled cross-batch summary for ${requirement.title}.\n`,
+      summary: `A reconciled cross-batch summary for ${requirement.title}.`,
+      tags: [requirement.page_kind],
+    })
+  }
+  const finalPatches = [...finalPatchesByPath.values()]
   const stable = await f.core.commitPages({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
     projection_id: finalPlan.projection.projection_id,
     based_on_wiki_revision: finalPlan.based_on_wiki_revision,
     idempotency_key: "final-projection-pages-v1",
-    patches: [],
+    patches: finalPatches,
   })
   assert.equal(stable.provisional, false)
   assert.deepEqual(stable.provisional_pages, [])
@@ -1370,11 +1386,36 @@ test("fast projection renders grounded pages and drains incremental plus final w
   })
   assert.equal(projected.accepted, true)
   assert.equal(projected.automated, true)
-  assert.deepEqual(projected.projection_runs.map((run) => run.mode), ["incremental", "final"])
+  assert.deepEqual(projected.projection_runs.map((run) => run.mode), ["incremental"])
   assert.equal(projected.projection_runs[0].patch_count, 2)
-  assert.equal(projected.projection_runs[1].fast_finalization, true)
-  assert.equal(projected.wiki_projection.final_completed, true)
-  assert.equal(projected.next_action.tool, "llm_wiki_finalize")
+  assert.equal(projected.semantic_writer_required, true)
+  assert.equal(projected.wiki_projection.final_completed, false)
+  assert.equal(projected.next_action.tool, "llm_wiki_get_page_plan_context")
+
+  const finalPlan = await f.core.getPagePlanContext(projected.next_action.arguments)
+  assert.equal(finalPlan.projection.mode, "final")
+  assert.equal(finalPlan.page_plan_complete, true)
+  const semanticPatches = finalPlan.page_requirements.map((requirement) => {
+    const body = requirement.title === "Business Entity"
+      ? "Stable identifier semantics connect this entity to the aggregate."
+      : "Aggregate semantics organize Business Entities."
+    return {
+      ...requirement.patch_scaffold,
+      content: `# ${requirement.title}\n\n## Overview\n\n${body}\n`,
+      summary: body,
+      tags: [requirement.page_kind],
+    }
+  })
+  const reconciled = await f.core.commitPages({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: finalPlan.projection.projection_id,
+    based_on_wiki_revision: finalPlan.based_on_wiki_revision,
+    idempotency_key: "semantic-final-projection-v1",
+    patches: semanticPatches,
+  })
+  assert.equal(reconciled.wiki_projection.final_completed, true)
+  assert.equal(reconciled.next_action.tool, "llm_wiki_finalize")
 
   const businessPage = await readFile(path.join(f.workspace, "wiki", "entities", "business-entity.md"), "utf8")
   const aggregatePage = await readFile(path.join(f.workspace, "wiki", "concepts", "aggregate.md"), "utf8")

@@ -89,15 +89,15 @@ Schema 的抽取策略是“抽取时约束”，不是先随意抽取后再静�
 
 ### 2.5 最终语义重写
 
-所有 batch 完成后，快速投影不会直接提交空的 final commit，而会把完整页面计划交给 Wiki Writer：
+所有 batch 完成后，Core 不会把整个知识库的完整页面计划一次性交给 Wiki Writer，而是把 provisional 页面拆成服务端强制执行的语义分片：
 
-1. `llm_wiki_get_page_plan_context` 按 cursor 分页返回稳定页面计划；
-2. Writer 按页面分片处理，默认每批约 20 个页面；
+1. 每个 final projection 只租约一组 provisional 页面，默认最多 20 个 canonical 页面；
+2. `llm_wiki_get_page_plan_context` 只返回该分片相关的 requirements、实体、claims、关系和完整旧页面，并继续按 cursor 分页；
 3. Writer 综合跨 batch 的实体、声明、关系和 batchSummary；
 4. Writer 重写页面概述、关键事实、关系和 Related 链接；
 5. 原始 chunk 只放在简洁的来源证据区；
-6. 页面批次独立提交，失败时从当前批次恢复；
-7. 页面全部完成后，再重写 `index.md` 和 `overview.md` 等全局汇总页。
+6. 分片独立提交；成功后从待重写路径集合移除，并创建下一分片，失败时从当前 projection 和准确 cursor 恢复；
+7. 所有分片完成后，再由 Finalize 更新 `index.md` 和 `overview.md` 等全局汇总页。
 
 未变化页面应跳过重写，避免无意义的 LLM 调用和 revision conflict。
 
@@ -227,4 +227,3 @@ wiki/            # 最终生成的 Markdown 知识库
 ```
 
 不要复制 `node_modules/` 或旧的 `packages/mcp-server/dist/` 到新电脑；在新环境重新安装依赖并构建即可。
-

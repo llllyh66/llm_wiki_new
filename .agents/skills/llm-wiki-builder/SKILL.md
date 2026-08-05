@@ -298,14 +298,16 @@ typed entity or any relation.
    of launching a general-purpose replacement. The Core normally opens a
    projection after four new batches, after the 30-second debounce, or
    immediately for final reconciliation when all batches finish. Each
-   default fast projection leases at most 32 batches. The legacy Agent-authored
-   projection path remains capped at eight batches. Thus an accumulated backlog
+   default fast incremental projection leases at most 32 batches. Final
+   semantic reconciliation is Core-sharded (normally 20 provisional pages per
+   projection), so it never places every task page in one Writer prompt. The
+   legacy Agent-authored incremental projection path remains capped at eight batches. Thus an accumulated backlog
    is amortized across fewer canonical-page updates without becoming one giant
    Writer prompt. If extraction finishes with unprojected batches,
    Core drains those bounded incremental catch-up projections before opening
    final reconciliation; it never turns the entire task into one premature
    final projection.
-8. The default Writer hot path is `llm_wiki_apply_projection`. Call the exact
+8. The default incremental Writer hot path is `llm_wiki_apply_projection`. Call the exact
    action supplied by status or `commit_analysis`, with stable Writer ID
    `wiki-writer-1` and `max_projections` set to
    `wiki_projection.writer_projection_quantum` (currently six). The Core
@@ -320,9 +322,15 @@ typed entity or any relation.
    follow it directly. The tool itself normally consumes that complete quantum
    in one call.
 
-   Use the following legacy manual Writer loop only when a current server
-   explicitly returns `llm_wiki_get_page_plan_context` or does not publish
-   `llm_wiki_apply_projection`. One legacy Wiki-writer invocation processes up
+   When `llm_wiki_apply_projection` returns
+   `semantic_writer_required: true`, immediately follow its exact
+   `llm_wiki_get_page_plan_context` action. Do not call apply_projection again
+   for that projection: it cannot author semantic patches and will only report
+   the same required cursor or page-commit action.
+
+   Use the following manual Writer loop whenever a current server explicitly
+   returns `llm_wiki_get_page_plan_context` (including every final semantic
+   shard), or when it does not publish `llm_wiki_apply_projection`. One Wiki-writer invocation processes up
    to six projections, committing each projection independently:
    1. Call `llm_wiki_get_page_plan_context` with task ID, writer ID, and cursor
       `0`, explicitly using `max_chars: 40000`. If it returns `waiting: true`,
@@ -357,14 +365,14 @@ typed entity or any relation.
       an incremental page to a concise grounded draft (normally 300–1,200 body
       characters), add only facts introduced by the leased batches, and omit
       generic filler. Rich cross-batch synthesis belongs in final mode, not in
-      every repeated incremental update. For `final` mode, inspect all
-      batch analyses, reconcile cross-batch duplicates and contradictions, and
-      explicitly review every existing page marked `provisional: true`.
-      When `finalization_hint.fast_path_eligible: true`, Core has verified that
-      all batches were incrementally projected, every requirement has exactly
-      one explicit page cover, all provisional paths exist, and no extracted
-      contradiction remains. Submit the recommended empty final commit
-      immediately; do not regenerate already complete pages.
+      every repeated incremental update. For `final` mode, reconcile only the
+      bounded semantic shard returned by Core. It contains at most
+      `semantic_reconciliation.page_batch_size` provisional pages and their
+      relevant entities, claims, relations, requirements, and full existing
+      page bodies. Rewrite every page in that shard as a coherent summary and
+      keep raw evidence concise. Do not load or rewrite pages absent from the
+      shard. After the shard commits, the next final projection leases the next
+      provisional page group.
       In both modes, treat accumulated `page_requirements` as the minimum
       materialization contract, not as optional suggestions. It includes
       important entities and concepts even when `candidate_pages` is sparse.

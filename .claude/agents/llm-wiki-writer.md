@@ -21,10 +21,10 @@ already the capability probe. Only when no current action was supplied, first
 call `llm_wiki_status` with the task ID to recover the lease. If the required
 MCP tool is not initially visible, use `ToolSearch` once before reporting
 `mcp_ready: false`; do not substitute Read, shell, or another agent.
-If status reports an existing projection lease, follow its page-plan
-`next_action` with the returned projection ID. A replacement Writer starts at
-cursor zero so it rebuilds the complete accumulated context; it does not infer
-that the lease is unavailable or switch to extraction work.
+If status reports an existing projection lease, follow its exact page-plan
+`next_action` with the returned projection ID and cursor. A replacement Writer
+must not restart at cursor zero when Core reports a nonzero
+`page_plan_next_cursor`; the stable server snapshot preserves traversal state.
 
 Use the coordinator-supplied `writer_projection_quantum`, or read it from
 status on the recovery path, and process no more than that many projections in
@@ -35,9 +35,14 @@ deterministically turns the already validated analysis into grounded pages and
 drains the backlog without per-page drafting. Return its compact projection
 report; do not call page-plan tools first.
 
-Only for compatibility when a current server explicitly returns
-`llm_wiki_get_page_plan_context` or does not publish the fast tool, request
-legacy page-plan pages with `max_chars: 40000`. The response intentionally
+When `llm_wiki_apply_projection` returns `semantic_writer_required: true`,
+follow its exact `llm_wiki_get_page_plan_context` action and do not call
+apply_projection again for that projection. Final semantic work is split by
+Core into bounded provisional-page shards (normally 20 pages each).
+
+Whenever a current server explicitly returns
+`llm_wiki_get_page_plan_context`, request page-plan pages with
+`max_chars: 40000`. The response intentionally
 contains only domain Schema identity metadata; never fetch or reconstruct the
 full extraction Schema in this writer. Follow the response's `next_action` and
 request every `next_cursor` sequentially until `page_plan_complete: true` and
@@ -60,11 +65,11 @@ Related navigation. If completion returns `INCOMPLETE_PAGE_COVERAGE`, add the
 listed missing canonical pages and retry the same projection normally.
 In incremental mode follow `writer_guidance`: produce concise grounded drafts,
 normally 300–1,200 body characters, and add only facts from the current leased
-batches. Do not repeatedly expand boilerplate. In final mode, if
-`finalization_hint.fast_path_eligible` is true, submit the recommended empty
-final commit immediately; Core has already verified explicit unique coverage,
-complete incremental projection, existing provisional paths, and zero
-extracted contradictions.
+batches. Do not repeatedly expand boilerplate. In final mode, rewrite every
+page returned in the current semantic shard, but do not load or rewrite pages
+absent from that shard. After a successful shard commit, follow `next_action`
+to acquire the next shard. Finalize is allowed only after
+`wiki_projection.final_completed: true`.
 Use `projection_complete: false` only after the entire plan is collected, to
 split an accumulated patch list into commits of at most 50 patches. It does not
 mean “commit one cursor page, then fetch the next cursor.” On
