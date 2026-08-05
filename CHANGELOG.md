@@ -42,4 +42,4 @@
 
 - 更新 Skill、Writer Agent、恢复指南和技术文档，统一采用 manifest → shard → durable commit 流程。
 - 新增 50+ 页面分片写入、提前 finalize 拒绝、上下文恢复和 MCP 错误恢复测试。
-- 全量测试通过：Core 36 项、MCP Server 12 项、CLI 1 项。
+- 全量测试通过：Core 37 项、MCP Server 12 项、CLI 1 项。
