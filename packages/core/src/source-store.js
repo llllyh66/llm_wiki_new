@@ -70,11 +70,13 @@ async function importOne(workspace, input, displayName) {
   }
 
   const tempPath = path.join(workspace.paths.importStaging, `import-${randomUUID()}.tmp`)
-  const sourceHandle = await open(sourcePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-  const destinationHandle = await open(tempPath, "wx", 0o600)
+  let sourceHandle
+  let destinationHandle
   const hash = createHash("sha256")
   let sizeBytes = 0
   try {
+    sourceHandle = await open(sourcePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+    destinationHandle = await open(tempPath, "wx", 0o600)
     const info = await sourceHandle.stat()
     if (!info.isFile()) fail("SOURCE_NOT_READABLE", "The attachment changed and is no longer a regular file.")
     if (info.size > workspace.config.limits.maxSourceBytes) fail("SOURCE_TOO_LARGE", "Source exceeds the workspace size limit.")
@@ -89,9 +91,12 @@ async function importOne(workspace, input, displayName) {
       await destinationHandle.write(chunk)
     }
     await destinationHandle.sync()
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => {})
+    throw error
   } finally {
-    await sourceHandle.close().catch(() => {})
-    await destinationHandle.close().catch(() => {})
+    await sourceHandle?.close().catch(() => {})
+    await destinationHandle?.close().catch(() => {})
   }
 
   const contentHash = hash.digest("hex")

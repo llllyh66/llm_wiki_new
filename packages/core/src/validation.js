@@ -12,6 +12,12 @@ const GROUNDING_QUALITY_COLLECTIONS = new Set(["claims", "relations", "contradic
 const GENERIC_GROUNDING_TERMS = new Set(["content", "data", "document", "item", "内容", "数据", "文档", "指标", "体系", "关系", "概述", "包含", "包括"])
 const ALLOWED_PAGE_ROOTS = new Set(AGENT_PAGE_ROOTS)
 const SYSTEM_PAGES = new Set(["wiki/index.md", "wiki/overview.md", "wiki/log.md"])
+const ANALYSIS_TOP_LEVEL_FIELDS = new Set([
+  "schemaVersion", "taskId", "batchId", "sourceRefs", "sourceRefMode", "entities", "concepts",
+  "claims", "relations", "contradictions", "candidatePages", "reviewItems", "batchSummary", "unresolvedQuestions",
+])
+const ANALYSIS_ARRAY_LIMITS = Object.freeze({ sourceRefs: 500, entities: 500, concepts: 500, claims: 1_000, relations: 1_000, contradictions: 500, candidatePages: 500, reviewItems: 500, unresolvedQuestions: 200 })
+const PAGE_PATCH_FIELDS = new Set(["patchId", "path", "operation", "expectedFileHash", "title", "pageKind", "content", "summary", "tags", "related", "covers", "sourceRefs", "rationale"])
 
 export function normalizeAnalysisEnvelope(analysis, options = {}) {
   if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) {
@@ -124,14 +130,20 @@ export function validateAnalysisShape(analysis, taskId, batchId) {
   }
   if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) addError("analysis must be an object, not a serialized JSON string or array")
   else {
+    for (const key of Object.keys(analysis)) if (!ANALYSIS_TOP_LEVEL_FIELDS.has(key)) addError(`analysis contains unsupported field: ${key}`)
     if (analysis.schemaVersion !== 1) addError("schemaVersion must be 1")
     if (analysis.taskId !== taskId) addError("taskId does not match the task")
     if (analysis.batchId !== batchId) addError("batchId does not match the batch")
-    for (const key of ANALYSIS_ARRAYS) if (!Array.isArray(analysis[key])) addError(`${key} must be an array`)
+    for (const key of ANALYSIS_ARRAYS) {
+      if (!Array.isArray(analysis[key])) addError(`${key} must be an array`)
+      else if (analysis[key].length > ANALYSIS_ARRAY_LIMITS[key]) addError(`${key} exceeds ${ANALYSIS_ARRAY_LIMITS[key]} items`)
+    }
     if (typeof analysis.batchSummary !== "string") addError("batchSummary must be a string")
+    else if (analysis.batchSummary.length > 20_000) addError("batchSummary exceeds 20000 characters")
     if (Array.isArray(analysis.unresolvedQuestions)) {
       analysis.unresolvedQuestions.forEach((item, index) => {
         if (typeof item !== "string") addError(`unresolvedQuestions[${index}] must be a string`)
+        else if (item.length > 2_000) addError(`unresolvedQuestions[${index}] exceeds 2000 characters`)
       })
     }
     const catalog = new Set()
@@ -160,6 +172,8 @@ export function validateAnalysisShape(analysis, taskId, batchId) {
         }
         if (collection === "reviewItems" && (typeof item.content !== "string" || !item.content.trim())) {
           addError(`reviewItems[${itemIndex}].content must be a non-empty string`)
+        } else if (collection === "reviewItems" && item.content.length > 10_000) {
+          addError(`reviewItems[${itemIndex}].content exceeds 10000 characters`)
         }
         if (GROUNDED_ANALYSIS_COLLECTIONS.has(collection)) {
           if (!Array.isArray(item.sourceRefs) || item.sourceRefs.length === 0) {
@@ -425,6 +439,31 @@ export function validateSourceRefs(refs, task, batches, limits, chunkIndex) {
       if (headingPath !== undefined && (!Array.isArray(headingPath) || headingPath.some((part) => typeof part !== "string"))) fail("INVALID_SOURCE_REF", "locator.headingPath must be a string array.")
       if (sheetName !== undefined && (typeof sheetName !== "string" || !sheetName.trim() || sheetName.length > 500)) fail("INVALID_SOURCE_REF", "locator.sheetName must be a non-empty bounded string.")
       if (cellRange !== undefined && (typeof cellRange !== "string" || !/^[A-Z]{1,3}[1-9]\d*:[A-Z]{1,3}[1-9]\d*$/i.test(cellRange))) fail("INVALID_SOURCE_REF", "locator.cellRange must be an A1-style range.")
+      if (startOffset !== undefined && Number.isInteger(chunk.startOffset) && startOffset !== chunk.startOffset) {
+        fail("INVALID_SOURCE_REF", `locator.startOffset does not match chunk ${ref.chunkId}; copy an exact source_ref_templates value.`, {
+          retryable: true,
+          details: { expected_start_offset: chunk.startOffset },
+        })
+      }
+      if (endOffset !== undefined && Number.isInteger(chunk.endOffset) && endOffset !== chunk.endOffset) {
+        fail("INVALID_SOURCE_REF", `locator.endOffset does not match chunk ${ref.chunkId}; copy an exact source_ref_templates value.`, {
+          retryable: true,
+          details: { expected_end_offset: chunk.endOffset },
+        })
+      }
+      if (page !== undefined && Number.isInteger(chunk.pageNumber) && page !== chunk.pageNumber) {
+        fail("INVALID_SOURCE_REF", `locator.page does not match chunk ${ref.chunkId}; copy an exact source_ref_templates value.`, {
+          retryable: true,
+          details: { expected_page: chunk.pageNumber },
+        })
+      }
+      if (headingPath !== undefined && Array.isArray(chunk.headingPath)
+        && stableStringify(headingPath) !== stableStringify(chunk.headingPath)) {
+        fail("INVALID_SOURCE_REF", `locator.headingPath does not match chunk ${ref.chunkId}; copy an exact source_ref_templates value.`, {
+          retryable: true,
+          details: { expected_heading_path: chunk.headingPath },
+        })
+      }
       const structuredTables = Array.isArray(chunk.structuredData) ? chunk.structuredData : []
       const allowedSheetNames = [...new Set([chunk.sheetName, ...structuredTables.map((table) => table.sheetName)].filter((value) => typeof value === "string"))]
       const allowedCellRanges = [...new Set([chunk.cellRange, ...structuredTables.map((table) => table.cellRange)].filter((value) => typeof value === "string"))]
@@ -450,14 +489,27 @@ function normalizeQuote(value) {
 
 export function validatePagePatchShape(patch, limits) {
   if (!patch || typeof patch !== "object" || Array.isArray(patch)) fail("INVALID_PAGE_PATCH", "Each patch must be an object.")
+  for (const key of Object.keys(patch)) if (!PAGE_PATCH_FIELDS.has(key)) fail("INVALID_PAGE_PATCH", `Patch contains unsupported field: ${key}`)
   for (const key of ["patchId", "path", "operation", "title", "pageKind", "content", "rationale"]) {
     if (typeof patch[key] !== "string" || !patch[key].trim()) fail("INVALID_PAGE_PATCH", `Patch ${key} is required.`)
   }
   if (!new Set(["create", "replace", "merge"]).has(patch.operation)) fail("INVALID_PAGE_PATCH", `Unsupported page operation: ${patch.operation}`)
   if (!Array.isArray(patch.sourceRefs) || patch.sourceRefs.length === 0) fail("INVALID_PAGE_PATCH", "Every page patch requires at least one SourceRef.")
+  if (patch.sourceRefs.length > 500) fail("INVALID_PAGE_PATCH", "Patch sourceRefs exceeds 500 items.")
+  if (patch.patchId.length > 200) fail("INVALID_PAGE_PATCH", "Patch patchId exceeds 200 characters.")
+  if (patch.title.length > 500) fail("INVALID_PAGE_PATCH", "Patch title exceeds 500 characters.")
+  if (patch.pageKind.length > 100) fail("INVALID_PAGE_PATCH", "Patch pageKind exceeds 100 characters.")
+  if (patch.rationale.length > 10_000) fail("INVALID_PAGE_PATCH", "Patch rationale exceeds 10000 characters.")
+  const arrayLimits = { tags: [100, 200], related: [500, 500], covers: [1_000, 300] }
   for (const field of ["tags", "related", "covers"]) {
     if (patch[field] !== undefined && (!Array.isArray(patch[field]) || patch[field].some((value) => typeof value !== "string" || !value.trim()))) {
       fail("INVALID_PAGE_PATCH", `Patch ${field} must be an array of non-empty strings.`)
+    }
+    if (Array.isArray(patch[field])) {
+      const [maximumItems, maximumChars] = arrayLimits[field]
+      if (patch[field].length > maximumItems || patch[field].some((value) => value.length > maximumChars)) {
+        fail("INVALID_PAGE_PATCH", `Patch ${field} exceeds its count or item-length limit.`)
+      }
     }
   }
   if (patch.summary !== undefined && (typeof patch.summary !== "string" || patch.summary.length > 500)) fail("INVALID_PAGE_PATCH", "Patch summary must not exceed 500 characters.")

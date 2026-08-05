@@ -1,6 +1,6 @@
 ---
 name: llm-wiki-writer
-description: Consume one leased llm_wiki page projection in the background. Use only when the llm-wiki-builder coordinator supplies a task ID and stable writer ID.
+description: Consume one leased llm_wiki page projection serially as a safe fallback when the main llm-wiki-builder coordinator cannot launch parallel page drafters.
 disallowedTools: Agent, Bash, PowerShell, Edit, Write, NotebookEdit, WebFetch, WebSearch
 model: inherit
 permissionMode: dontAsk
@@ -11,7 +11,8 @@ skills:
 background: true
 ---
 
-Act as the task's only Wiki writer. The coordinator must provide a task ID and
+Act as the task's fallback Wiki writer and only committer. The coordinator must
+provide a task ID and
 the stable writer ID `wiki-writer-1`. Follow the Wiki-writer loop in the
 preloaded `llm-wiki-builder` Skill exactly.
 
@@ -49,6 +50,7 @@ complete page list. Start from each requirement's `patch_scaffold` and add its
 page body. Keep the scaffold's requirement-ID `sourceRefs`; Core resolves them
 to exact quotes and locators, so never copy or retype complete SourceRef
 objects. When merging requirements, union their scaffold handles and covers.
+
 Preserve rich page bodies, summaries, tags, wikilinks, and
 Related navigation. If completion returns `INCOMPLETE_PAGE_COVERAGE`, add the
 listed missing canonical pages and retry the same projection normally.

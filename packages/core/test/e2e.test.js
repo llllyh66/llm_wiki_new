@@ -992,6 +992,17 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   const imported = await f.core.importFiles({ files, options: { max_batch_chars: 1_000 } })
   assert.equal(imported.batch_count, 6)
   assert.equal(imported.wiki_projection.batch_threshold, 4)
+  assert.equal(imported.wiki_projection.writer_committers, 1)
+  assert.deepEqual(imported.wiki_projection.parallel_page_drafting, {
+    enabled: true,
+    max_drafters: 4,
+    max_paths_per_shard: 6,
+    minimum_paths: 4,
+    pipeline_background_budget: 4,
+    extraction_workers_during_drafting: 2,
+    partition_key: "patch_scaffold.path",
+    commit_strategy: "single-writer-atomic",
+  })
   const sourceRefs = []
   const analyzeNext = async (index) => {
     const batch = await f.core.getBatch({ task_id: imported.task_id, worker_id: `projector-extractor-${index}` })
@@ -1057,13 +1068,12 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(leasedStatus.wiki_projection.page_plan_complete, true)
   assert.equal(leasedStatus.wiki_projection.page_plan_next_cursor, null)
   assert.deepEqual(leasedStatus.next_action, {
-    tool: "llm_wiki_get_page_plan_context",
+    tool: "llm_wiki_commit_pages",
     arguments: {
       task_id: imported.task_id,
       writer_id: "wiki-writer-1",
       projection_id: incrementalPlan.projection.projection_id,
-      cursor: 0,
-      max_chars: 40_000,
+      based_on_wiki_revision: incrementalPlan.based_on_wiki_revision,
     },
   })
 
@@ -1186,7 +1196,7 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(finalPlan.page_plan_complete, true)
   assert.equal(finalPlan.projection.mode, "final")
   assert.equal(finalPlan.projection.batch_ids.length, 6)
-  assert.equal(finalPlan.finalization_hint.fast_path_eligible, false)
+  assert.equal(finalPlan.finalization_hint.semantic_writer_required, true)
   assert.equal(finalPlan.finalization_hint.recommended_action, "final-semantic-reconciliation")
   assert.equal(finalPlan.page_requirements.length > 0, true)
   const finalPatchesByPath = new Map()
@@ -1237,7 +1247,6 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
   const imported = await f.core.importFiles({ files, options: { max_batch_chars: 1_000 } })
   assert.equal(imported.batch_count, 16)
   assert.equal(imported.wiki_projection.batch_limit, 8)
-  assert.equal(imported.wiki_projection.fast_projection_batch_limit, 32)
   assert.equal(imported.wiki_projection.writer_projection_quantum, 6)
 
   const refs = []
@@ -1331,7 +1340,7 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
   assert.equal(second.existing_page_catalog.some((page) => page.path === "wiki/concepts/unrelated-large.md"), true)
 })
 
-test("fast projection renders grounded pages and drains incremental plus final work without Agent page drafting", async (t) => {
+test("compatibility projection redirects to the semantic Writer and final commits remain idempotent", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
   const imported = await f.core.importFiles({ files: [{ path: f.source }] })
@@ -1388,6 +1397,9 @@ test("fast projection renders grounded pages and drains incremental plus final w
   assert.equal(projected.accepted, true)
   assert.equal(projected.automated, false)
   assert.equal(projected.writer_mode, "legacy-semantic")
+  assert.equal(projected.parallel_drafting.partition_key, "page_requirement.patch_scaffold.path")
+  assert.equal(projected.parallel_drafting.same_path_requirements_are_indivisible, true)
+  assert.equal(projected.parallel_drafting.sole_committer, "wiki-writer-1")
   assert.equal(projected.projection.mode, "incremental")
   assert.equal(projected.page_plan_complete, true)
   const incrementalPatches = projected.page_requirements.map((requirement) => ({
@@ -1396,6 +1408,38 @@ test("fast projection renders grounded pages and drains incremental plus final w
     summary: `Semantically reconciled page for ${requirement.title}.`,
     tags: [requirement.page_kind],
   }))
+  await assert.rejects(
+    () => f.core.commitPages({
+      task_id: imported.task_id,
+      writer_id: "wiki-writer-1",
+      projection_id: projected.projection.projection_id,
+      based_on_wiki_revision: projected.based_on_wiki_revision,
+      idempotency_key: "parallel-draft-duplicate-path-v1",
+      patches: [incrementalPatches[0], { ...incrementalPatches[0], patchId: `${incrementalPatches[0].patchId}-duplicate` }],
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "INVALID_PAGE_PATCH"
+      && error.details?.validation_errors?.some((item) => /Duplicate page path/.test(item.message)),
+  )
+  const duplicateCoverage = {
+    ...incrementalPatches[0],
+    patchId: `${incrementalPatches[0].patchId}-duplicate-coverage`,
+    path: incrementalPatches[0].path.replace(/\.md$/, "-duplicate-coverage.md"),
+    operation: "create",
+    title: `${incrementalPatches[0].title} duplicate`,
+  }
+  delete duplicateCoverage.expectedFileHash
+  await assert.rejects(
+    () => f.core.commitPages({
+      task_id: imported.task_id,
+      writer_id: "wiki-writer-1",
+      projection_id: projected.projection.projection_id,
+      based_on_wiki_revision: projected.based_on_wiki_revision,
+      idempotency_key: "parallel-draft-duplicate-coverage-v1",
+      patches: [...incrementalPatches, duplicateCoverage],
+    }),
+    (error) => error instanceof LlmWikiError && error.code === "DUPLICATE_PAGE_COVERAGE",
+  )
   const incremental = await f.core.commitPages({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
@@ -1407,7 +1451,7 @@ test("fast projection renders grounded pages and drains incremental plus final w
   assert.equal(incremental.wiki_projection.final_completed, false)
   const finalPlan = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 40_000 })
   assert.equal(finalPlan.projection.mode, "final")
-  const reconciled = await f.core.commitPages({
+  const finalRequest = {
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
     projection_id: finalPlan.projection.projection_id,
@@ -1419,9 +1463,13 @@ test("fast projection renders grounded pages and drains incremental plus final w
       summary: `Semantically reconciled page for ${requirement.title}.`,
       tags: [requirement.page_kind],
     })),
-  })
+  }
+  const reconciled = await f.core.commitPages(finalRequest)
   assert.equal(reconciled.wiki_projection.final_completed, true)
   assert.equal(reconciled.next_action.tool, "llm_wiki_finalize")
+  const replayed = await f.core.commitPages(finalRequest)
+  assert.equal(replayed.idempotent_replay, true)
+  assert.equal(replayed.transaction_id, reconciled.transaction_id)
 
   const businessPage = await readFile(path.join(f.workspace, "wiki", "entities", "business-entity.md"), "utf8")
   const aggregatePage = await readFile(path.join(f.workspace, "wiki", "concepts", "aggregate.md"), "utf8")
@@ -1514,16 +1562,40 @@ test("concurrent task writers serialize transactions and accept stale global rev
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
   const secondSource = path.join(f.incoming, "second-product.md")
-  await writeFile(secondSource, `${f.content}\nSecond task owns a distinct source.\n`)
+  await writeFile(secondSource, "# Second Product\n\nSecond Product is a distinct canonical object.\n")
 
   const [firstTask, secondTask] = await Promise.all([
     f.core.importFiles({ files: [{ path: f.source }] }),
     f.core.importFiles({ files: [{ path: secondSource }] }),
   ])
-  const [firstRef, secondRef] = await Promise.all([
-    analyzeAll(f.core, firstTask),
-    analyzeAll(f.core, secondTask),
-  ])
+  const firstRefPromise = analyzeAll(f.core, firstTask)
+  const secondRefPromise = (async () => {
+    const batch = await f.core.getBatch({ task_id: secondTask.task_id })
+    const chunk = batch.chunks.find((item) => item.text.includes("Second Product is a distinct canonical object."))
+    const sourceRef = {
+      sourceId: chunk.sourceId,
+      chunkId: chunk.chunkId,
+      quote: "Second Product is a distinct canonical object.",
+      locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
+    }
+    await f.core.commitAnalysis({
+      task_id: secondTask.task_id,
+      batch_id: batch.batch_id,
+      idempotency_key: "concurrent-second-analysis",
+      analysis: {
+        schemaVersion: 1,
+        taskId: secondTask.task_id,
+        batchId: batch.batch_id,
+        sourceRefs: [sourceRef],
+        entities: [{ localId: "entity-second-product", name: "Second Product", sourceRefs: [0] }],
+        concepts: [], claims: [], relations: [], contradictions: [], candidatePages: [], reviewItems: [],
+        batchSummary: "Defines Second Product.",
+        unresolvedQuestions: [],
+      },
+    })
+    return sourceRef
+  })()
+  const [firstRef, secondRef] = await Promise.all([firstRefPromise, secondRefPromise])
   const [firstPlan, secondPlan] = await Promise.all([
     f.core.getPagePlanContext({ task_id: firstTask.task_id }),
     f.core.getPagePlanContext({ task_id: secondTask.task_id }),

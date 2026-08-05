@@ -8,6 +8,7 @@
     "allow": [
       "Agent",
       "Agent(llm-wiki-extractor)",
+      "Agent(llm-wiki-page-drafter)",
       "Agent(llm-wiki-writer)",
       "Skill(llm-wiki-builder)",
       "ToolSearch",

@@ -135,15 +135,20 @@ Claude Code。
 Agent，当前最多 4 个；大型 Schema 也不再降为 2 个，因为每个 worker 只获取服务端选中的
 相关类型。每个 Agent 使用固定 `worker_id` 租约不同批次，Core
 串行保护同一任务的状态提交，因此不会抢同一批次或覆盖其他 Agent 的结果。
-主 Agent 只负责协调和回答用户问题；唯一的后台 Wiki Writer 与抽取 Agent
+主 Agent 负责轻量的 page-plan 协调和唯一提交，后台抽取 Agent 与 page drafter
 形成流水线，每新增 4 个 batch 或等待满 30 秒后增量更新受影响页面。
-默认快速投影每次最多处理 32 个 batch，一次 Writer 后台调用最多连续处理 6 个
-已就绪投影。Core 直接把已验证的实体、属性、事实、关系和证据渲染成页面，
-无需 Agent 逐页写作、分页收集 page plan 或复制 quote。
+每个增量 projection 最多租约 8 个 batch，一次 Writer 后台调用最多连续处理 6 个
+projection。协调器 Writer loop 会分页读取完整 page plan；当 canonical page 达到 4 个时，按
+`patch_scaffold.path` 分成互斥 shard，最多使用 4 个无 MCP 权限的 page drafter
+并行生成语义正文，再由唯一 Writer 校验并提交。小计划直接生成，避免 Agent 启动
+开销。Core 只负责
+校验 SourceRef、页面结构、哈希和事务，不自动替代 Agent 写作。
 任一 `commit_analysis` 使投影就绪时，该 extractor 会立即返回
 `writer_required: true`，而不是继续领取 batch；主 Agent 随即启动
-`wiki-writer-1`，再按需补充 extractor。`status.next_action` 也会在投影就绪时
-优先指向 `llm_wiki_apply_projection`，因此不需要等用户追问才生成页面。
+协调器 Writer loop，再按需补充 extractor。抽取与写入重叠时使用总计 4 个后台
+Agent 的预算，通常保留 2 个 extractor 和 2 个 page drafter；投影提交后恢复完整
+extractor 数量。`status.next_action` 也会在投影就绪时
+优先指向 `llm_wiki_get_page_plan_context`，因此不需要等用户追问才生成页面。
 项目级 `.claude/agents/llm-wiki-extractor.md` 会显式复用项目的
 `llm-wiki` MCP 连接，并通过 `disallowedTools` 禁用 Shell、任意写入、网络和
 嵌套 Agent。它不再用 `tools: Read, mcp__llm-wiki__*` 作为严格白名单，避免
@@ -316,11 +321,12 @@ Skill 会先调用 `llm_wiki_list_tasks` 和 `llm_wiki_status`，然后按 `next
 
 - 新增 4 个已抽取 batch、最旧未投影 batch 等待超过 30 秒，或全部 batch
   完成时，Core 会开放一个 Wiki 投影窗口。
-- 默认快速投影窗口最多包含 32 个 batch；积压时 Writer 一次最多连续消化 6 个窗口。
+- 每个增量 projection 最多包含 8 个 batch；积压时 Writer 一次最多连续处理 6 个 projection。
 - 增量投影只更新受当前 batch 影响的页面，并标记为 provisional。
-- Core 使用已验证分析和服务端保存的精确 SourceRef 生成页面，不把大型
-  Schema、旧页全文或页面补丁发给 Agent。
-- 传统 `page_requirement + patch_scaffold` 流程仅作为自定义散文和旧服务兼容路径。
+- Writer 使用已验证分析、服务端保存的精确 SourceRef 和 `page_requirement + patch_scaffold`
+  生成语义页面；大型 Schema 只以元数据形式提供给 Writer。
+- 页面数达到 4 个时按 canonical path 分片，最多 4 个 drafter 并行生成；同一路径
+  不跨 shard，drafter 不调用 MCP，唯一 Writer 统一校验和原子提交。
 - provisional 页面在所有未完成任务的检索中都被排除，不会污染用户问答。
 - 超大页面计划可在同一租约下分多次提交，每次最多 50 个 PagePatch。
 - 全部抽取完成后必须进行一次全局去重、矛盾合并和 provisional 复核；
@@ -479,14 +485,15 @@ MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 ### 已完成多个 batch，但没有生成 Wiki 页面
 
 运行 `llm_wiki_status`。当 `wiki_projection.ready` 为 `true` 时，最新版会让
-`next_action.tool` 直接返回 `llm_wiki_apply_projection`，并带上固定的
-`writer_id: wiki-writer-1`。它会由服务端确定性生成和提交页面，不再让 Agent 逐页写作。
+`next_action.tool` 直接返回 `llm_wiki_get_page_plan_context`，并带上固定的
+`writer_id: wiki-writer-1`。Writer 会读取完整 page plan 后逐页生成并提交语义页面。
 后台 extractor 也会停止并向主 Agent 返回
 `writer_required: true`，从而触发 Writer；不要继续等待更多 batch，也不要启动
-第二个 Writer。
+第二个 projection 提交者。主协调器启动的 `llm-wiki-page-drafter` 只生成互斥
+页面草稿，不持有 lease，也不属于第二个 Writer；串行后台 Writer 是无法启动
+drafter 时的回退，不能与协调器 Writer loop 同时运行。
 
-默认快速投影不会把 Schema 或页面正文发给 Agent。仅在兼容旧服务或显式要求
-自定义页面散文时才走传统页面规划。即使领域 Schema 接近 5 MiB，
+页面规划不会内联完整 Schema。即使领域 Schema 接近 5 MiB，
 传统 `llm_wiki_get_page_plan_context` 也只返回 Schema ID、版本、哈希和大小元数据，
 并将页面规划正文按约 40K 字符分页。Writer 应沿 `next_cursor` 读取完所有页面，
 不能以“忽略 Schema”或“忽略截断响应”的方式继续。如果旧任务显示

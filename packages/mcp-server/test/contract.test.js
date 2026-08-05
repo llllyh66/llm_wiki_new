@@ -12,6 +12,7 @@ const textResult = (result) => JSON.parse(result.content[0].text)
 test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool allowlist", async () => {
   const extractor = await readFile(new URL("../../../.claude/agents/llm-wiki-extractor.md", import.meta.url), "utf8")
   const writer = await readFile(new URL("../../../.claude/agents/llm-wiki-writer.md", import.meta.url), "utf8")
+  const drafter = await readFile(new URL("../../../.claude/agents/llm-wiki-page-drafter.md", import.meta.url), "utf8")
   const settings = JSON.parse(await readFile(new URL("../../../.claude/settings.json", import.meta.url), "utf8"))
   const skill = await readFile(new URL("../../../.agents/skills/llm-wiki-builder/SKILL.md", import.meta.url), "utf8")
 
@@ -22,8 +23,15 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
     assert.match(agent, /^permissionMode: dontAsk$/m)
     assert.match(agent, /ToolSearch/)
   }
+  assert.doesNotMatch(drafter, /^tools:/m)
+  assert.match(drafter, /^disallowedTools:.*ToolSearch$/m)
+  assert.doesNotMatch(drafter, /^mcpServers:/m)
+  assert.match(drafter, /^permissionMode: dontAsk$/m)
+  assert.match(drafter, /exactly one\s+patch per assigned canonical path/)
+  assert.match(drafter, /no duplicate paths/)
   assert.equal(settings.enableAllProjectMcpServers, true)
   assert.equal(settings.permissions.allow.includes("Agent(llm-wiki-extractor)"), true)
+  assert.equal(settings.permissions.allow.includes("Agent(llm-wiki-page-drafter)"), true)
   assert.equal(settings.permissions.allow.includes("Agent(llm-wiki-writer)"), true)
   assert.equal(settings.permissions.allow.includes("ToolSearch"), true)
   assert.equal(settings.permissions.allow.includes("mcp__llm-wiki"), true)
@@ -60,8 +68,14 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(writer, /300–1,200 body characters/)
   assert.match(writer, /page-plan pages|page-plan context/)
   assert.match(skill, /incremental projection leases at most eight batches/)
-  assert.match(skill, /Wiki Writer uses `llm_wiki_get_page_plan_context`/)
+  assert.match(skill, /coordinator Writer loop uses `llm_wiki_get_page_plan_context`/)
   assert.match(writer, /`llm_wiki_apply_projection` for compatibility/)
+  assert.match(writer, /fallback Wiki writer and only committer/)
+  assert.match(writer, /^disallowedTools: Agent,/m)
+  assert.match(skill, /at most four concurrent/)
+  assert.match(skill, /background subagents cannot reliably spawn nested subagents/)
+  assert.match(skill, /group requirements by exact\s+`patch_scaffold\.path`/)
+  assert.match(skill, /parallel draft generation must\s+never become parallel commits/)
 })
 
 test("MCP publishes the complete Agent-first tool contract without desktop tools", () => {
@@ -204,6 +218,31 @@ test("page validation rejection reports atomic whole-subset retry semantics", as
       projection_complete: true,
     },
   })
+  assert.equal(response.structuredContent.mcp_connection_usable, true)
+})
+
+test("parallel draft coverage conflicts remain recoverable without disconnecting MCP", async () => {
+  const router = new HeadlessToolRouter({
+    commitPages: async () => {
+      throw new LlmWikiError("DUPLICATE_PAGE_COVERAGE", "Requirement is owned by two paths.", {
+        retryable: true,
+        details: { duplicate_page_requirements: [{ requirement_id: "page-example", paths: ["wiki/entities/a.md", "wiki/entities/b.md"] }] },
+      })
+    },
+  })
+  const response = await router.callMcp("llm_wiki_commit_pages", {
+    task_id: "task-example",
+    writer_id: "wiki-writer-1",
+    projection_id: "projection-example",
+    based_on_wiki_revision: "a".repeat(64),
+    patches: [{ patchId: "patch-a" }, { patchId: "patch-b" }],
+    idempotency_key: "duplicate-coverage-v1",
+  })
+  assert.equal(response.isError, undefined)
+  assert.equal(response.structuredContent.error.code, "DUPLICATE_PAGE_COVERAGE")
+  assert.equal(response.structuredContent.atomic_commit_applied, false)
+  assert.equal(response.structuredContent.page_commit_recovery.retry_scope, "entire_rejected_patch_set_after_unique_coverage_reconciliation")
+  assert.equal(response.structuredContent.next_action.tool, "llm_wiki_commit_pages")
   assert.equal(response.structuredContent.mcp_connection_usable, true)
 })
 

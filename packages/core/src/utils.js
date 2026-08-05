@@ -53,27 +53,37 @@ export async function writeJsonAtomic(filePath, value) {
   await ensureDir(path.dirname(filePath))
   const temp = `${filePath}.tmp-${process.pid}-${randomUUID()}`
   const payload = `${JSON.stringify(value, null, 2)}\n`
-  const handle = await open(temp, "wx", 0o600)
   try {
-    await handle.writeFile(payload, "utf8")
-    await handle.sync()
-  } finally {
-    await handle.close()
+    const handle = await open(temp, "wx", 0o600)
+    try {
+      await handle.writeFile(payload, "utf8")
+      await handle.sync()
+    } finally {
+      await handle.close().catch(() => {})
+    }
+    await rename(temp, filePath)
+  } catch (error) {
+    await rm(temp, { force: true }).catch(() => {})
+    throw error
   }
-  await rename(temp, filePath)
 }
 
 export async function writeTextAtomic(filePath, content) {
   await ensureDir(path.dirname(filePath))
   const temp = `${filePath}.tmp-${process.pid}-${randomUUID()}`
-  const handle = await open(temp, "wx", 0o600)
   try {
-    await handle.writeFile(content, "utf8")
-    await handle.sync()
-  } finally {
-    await handle.close()
+    const handle = await open(temp, "wx", 0o600)
+    try {
+      await handle.writeFile(content, "utf8")
+      await handle.sync()
+    } finally {
+      await handle.close().catch(() => {})
+    }
+    await rename(temp, filePath)
+  } catch (error) {
+    await rm(temp, { force: true }).catch(() => {})
+    throw error
   }
-  await rename(temp, filePath)
 }
 
 export async function listFilesRecursive(root, predicate = () => true) {
@@ -91,6 +101,22 @@ export async function listFilesRecursive(root, predicate = () => true) {
   }
   await walk(root)
   return result
+}
+
+export async function mapWithConcurrency(values, concurrency, mapper) {
+  const items = Array.from(values)
+  if (items.length === 0) return []
+  const results = new Array(items.length)
+  const workerCount = Math.min(items.length, Math.max(1, Math.floor(Number(concurrency) || 1)))
+  let cursor = 0
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (cursor < items.length) {
+      const index = cursor
+      cursor += 1
+      results[index] = await mapper(items[index], index)
+    }
+  }))
+  return results
 }
 
 export function stableStringify(value) {
@@ -156,4 +182,62 @@ export async function hashDirectory(root, predicate = (file) => file.endsWith(".
 export async function writeFileExclusive(filePath, content) {
   await ensureDir(path.dirname(filePath))
   await writeFile(filePath, content, { flag: "wx", mode: 0o600 })
+}
+
+export async function acquireProcessFileLock(filePath, metadata = {}, options = {}) {
+  const waitMs = Math.max(0, Number(options.waitMs) || 0)
+  const retryMs = Math.min(Math.max(Number(options.retryMs) || 25, 10), 1_000)
+  const unreadableStaleMs = Math.max(Number(options.unreadableStaleMs) || 120_000, 10_000)
+  const startedAt = Date.now()
+  await ensureDir(path.dirname(filePath))
+  while (true) {
+    const lockId = newId("lock")
+    let handle
+    try {
+      handle = await open(filePath, "wx", 0o600)
+      await handle.writeFile(`${JSON.stringify({ ...metadata, lockId, pid: process.pid, createdAt: nowIso() })}\n`, "utf8")
+      await handle.sync()
+      return async () => {
+        await handle.close().catch(() => {})
+        const current = await readFile(filePath, "utf8").catch(() => "")
+        if (current.includes(`\"lockId\":\"${lockId}\"`)) await rm(filePath, { force: true }).catch(() => {})
+      }
+    } catch (error) {
+      await handle?.close().catch(() => {})
+      if (error?.code !== "EEXIST") throw error
+      if (await removeStaleProcessLock(filePath, unreadableStaleMs)) continue
+      if (Date.now() - startedAt >= waitMs) {
+        const busy = new Error("The file lock is held by another live process.")
+        busy.code = "FILE_LOCK_BUSY"
+        throw busy
+      }
+      await new Promise((resolve) => setTimeout(resolve, retryMs))
+    }
+  }
+}
+
+async function removeStaleProcessLock(filePath, unreadableStaleMs) {
+  const before = await readFile(filePath, "utf8").catch(() => null)
+  if (before === null) return true
+  let record
+  try { record = JSON.parse(before) } catch { record = null }
+  if (Number.isInteger(record?.pid) && processIsAlive(record.pid)) return false
+  if (!Number.isInteger(record?.pid)) {
+    const info = await stat(filePath).catch(() => null)
+    if (!info || Date.now() - info.mtimeMs <= unreadableStaleMs) return false
+  }
+  const current = await readFile(filePath, "utf8").catch(() => null)
+  if (current !== before) return false
+  await rm(filePath, { force: true }).catch(() => {})
+  return true
+}
+
+function processIsAlive(pid) {
+  if (pid === process.pid) return true
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error?.code === "EPERM"
+  }
 }

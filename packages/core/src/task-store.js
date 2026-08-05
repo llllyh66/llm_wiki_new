@@ -93,6 +93,7 @@ export async function createTask(workspace, sources, options = {}) {
       lastCommittedAt: null,
       finalCompleted: false,
       provisionalPagePaths: [],
+      completedProjectionLeases: [],
     },
     analysisRevision: 0,
     pagePlanRevision: 0,

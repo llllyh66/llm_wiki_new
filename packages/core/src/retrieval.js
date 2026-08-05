@@ -514,6 +514,29 @@ export async function buildEmbeddingIndex(workspace) {
   return { schemaVersion: 1, generatedAt: new Date().toISOString(), truncated: loaded.truncated, ...(await warmEmbeddingCache(workspace, loaded.documents)) }
 }
 
+export async function buildRetrievalIndexes(workspace) {
+  const loaded = await wikiDocuments(workspace, configuredDocumentLimit(workspace))
+  const pages = loaded.documents
+  const generatedAt = new Date().toISOString()
+  const embedding = { schemaVersion: 1, generatedAt, truncated: loaded.truncated, ...(await warmEmbeddingCache(workspace, pages)) }
+  return {
+    bm25: {
+      schemaVersion: 2,
+      generatedAt,
+      truncated: loaded.truncated,
+      documents: pages.map((document) => ({ id: document.id, path: document.path, title: document.title, hash: document.hash, length: lexicalTokens(document.content).length })),
+    },
+    vector: {
+      schemaVersion: 2,
+      kind: "deterministic-feature-hash-fallback",
+      generatedAt,
+      truncated: loaded.truncated,
+      documents: pages.map((document) => ({ id: document.id, path: document.path, hash: document.hash, dimensions: VECTOR_DIMENSIONS, vector: embedText(document.content) })),
+    },
+    embedding,
+  }
+}
+
 function configuredDocumentLimit(workspace) {
   return clampInteger(workspace.config.retrieval?.maxDocuments, 100, MAX_RETRIEVAL_DOCUMENTS, MAX_RETRIEVAL_DOCUMENTS)
 }

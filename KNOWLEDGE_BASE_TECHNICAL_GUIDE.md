@@ -85,7 +85,9 @@ Schema 的抽取策略是“抽取时约束”，不是先随意抽取后再静�
 - 精确证据引用；
 - 原子事务和目标页面 hash 校验。
 
-Writer 会读取完整的 page plan，生成有标题、概述、关键事实、关系、Related 链接和来源证据的语义页面。增量 projection 的页面可能先标记为 provisional，最终 projection 会重新综合所有 batch 并清除 provisional 状态。
+主协调器中的 Writer loop 会读取完整的 page plan，生成有标题、概述、关键事实、关系、Related 链接和来源证据的语义页面。页面数达到 4 个后，主协调器按精确的 `patch_scaffold.path` 将页面分成互不重叠的 shard，最多启动 4 个无 MCP 权限的 page drafter 并行生成正文；同一路径的全部 requirement 始终留在一个 shard。主协调器仍是唯一提交者，会校验路径唯一性、coverage、scaffold、hash 和 SourceRef 后再原子提交，因此并行生成不会引入 revision 冲突。增量 projection 的页面可能先标记为 provisional，最终 projection 会重新综合所有 batch 并清除 provisional 状态。
+
+抽取与页面生成同时进行时，协调器使用 4 个后台 Agent 的共享预算，通常分配为 2 个 extractor + 2 个 page drafter；不会中断正在处理 batch 的 extractor，而是在 worker quantum 结束后调整补位。抽取完成后可将 4 个槽位全部用于页面分片。这样可避免 extractor 持续占满并发槽导致 writer backlog 无限增长。
 
 ### 2.5 最终语义重写
 
@@ -94,7 +96,7 @@ Writer 会读取完整的 page plan，生成有标题、概述、关键事实、
 1. `llm_wiki_get_page_plan_context` 按 cursor 分页返回稳定的完整 page plan；
 2. Writer 必须读取所有 cursor，直到 `page_plan_complete=true` 且 `next_cursor=null`；
 3. Writer 综合所有 batch 的实体、声明、关系、冲突和现有页面正文；
-4. Writer 重写页面概述、关键事实、关系和 Related 链接；
+4. Writer 可让多个 page drafter 并行重写互斥页面的概述、关键事实、关系和 Related 链接，但仍由唯一 Writer 统一提交；
 5. 原始 chunk 只放在简洁的来源证据区；
 6. 页面 patch 按最多 50 个一组原子提交，失败时修正整个被拒绝集合后重试；
 7. 最终 projection 完成后，由 Finalize 更新 `index.md` 和 `overview.md` 等全局汇总页。
@@ -144,7 +146,7 @@ Embedding 配置位于 `.llm-wiki/config.json` 的 `retrieval.embedding`，包�
 | `llm_wiki_retrieve_context` | BM25 + Embedding + Wiki 多路召回 |
 | `llm_wiki_commit_analysis` | 校验并持久化一个 batch 的结构化分析 |
 | `llm_wiki_get_page_plan_context` | 分页读取页面计划和最终 Writer 上下文 |
-| `llm_wiki_apply_projection` | 快速增量投影和批量排空投影队列 |
+| `llm_wiki_apply_projection` | 兼容入口：转交传统 Wiki Writer 的 page-plan 流程，不自动写页面 |
 | `llm_wiki_commit_pages` | 原子提交页面 patch |
 | `llm_wiki_finalize` | 生成索引、来源页并完成任务 |
 | `llm_wiki_status` | 查看任务、租约、并行建议和下一步动作 |

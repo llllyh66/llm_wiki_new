@@ -1,18 +1,18 @@
-import { lstat, open, readFile, rename, rm } from "node:fs/promises"
+import { lstat, readFile, rename, rm } from "node:fs/promises"
 import path from "node:path"
 import { randomUUID } from "node:crypto"
 import { fail } from "./errors.js"
 import { assertNoSymlinkEscape, validatePagePath } from "./validation.js"
-import { ensureDir, hashDirectory, nowIso, pathExists, readJson, sha256, writeJsonAtomic, writeTextAtomic } from "./utils.js"
+import { acquireProcessFileLock, ensureDir, hashDirectory, nowIso, pathExists, readJson, sha256, writeJsonAtomic, writeTextAtomic } from "./utils.js"
 import { prepareWikiPageContent } from "./wiki-page.js"
 
 export async function commitPageTransaction(workspace, task, patches, basedOnWikiRevision) {
   const lockPath = path.join(workspace.paths.locks, "write.lock")
-  let lock
+  let releaseLock
   try {
-    lock = await open(lockPath, "wx", 0o600)
+    releaseLock = await acquireProcessFileLock(lockPath, { kind: "wiki-transaction", taskId: task.taskId }, { waitMs: 0 })
   } catch (error) {
-    if (error?.code === "EEXIST") fail("WORKSPACE_LOCKED", "Another Wiki transaction is in progress.", { retryable: true })
+    if (error?.code === "FILE_LOCK_BUSY") fail("WORKSPACE_LOCKED", "Another Wiki transaction is in progress.", { retryable: true })
     throw error
   }
   const transactionId = `txn-${randomUUID()}`
@@ -22,8 +22,6 @@ export async function commitPageTransaction(workspace, task, patches, basedOnWik
   const targets = []
   const applied = []
   try {
-    await lock.writeFile(`${JSON.stringify({ transactionId, taskId: task.taskId, createdAt: nowIso() })}\n`)
-    await lock.sync()
     const actualRevision = await hashDirectory(workspace.paths.wiki)
     // The Wiki revision covers the whole workspace. Another task may have
     // safely changed an unrelated page after this Writer collected its plan.
@@ -118,8 +116,7 @@ export async function commitPageTransaction(workspace, task, patches, basedOnWik
     throw error
   } finally {
     await rm(stagingRoot, { recursive: true, force: true }).catch(() => {})
-    await lock.close().catch(() => {})
-    await rm(lockPath, { force: true }).catch(() => {})
+    await releaseLock().catch(() => {})
   }
 }
 

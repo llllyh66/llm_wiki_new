@@ -11,25 +11,34 @@ export async function lintWiki(workspace, selectedPaths) {
   const pages = []
   for (const file of allFiles) {
     const relative = `wiki/${relativePosix(workspace.paths.wiki, file)}`
-    if (selected && !selected.has(relative)) continue
     const content = await readFile(file, "utf8")
     const parsed = parseWikiPage(content)
     const title = parsed.title || path.basename(file, ".md")
     const links = [...new Set([...parsed.related, ...extractWikiLinks(parsed.body)].map(normalizeLink))]
-    pages.push({ relative, slug: relative.replace(/^wiki\//, "").replace(/\.md$/i, ""), basename: path.basename(file, ".md"), title, links, content, parsed })
+    pages.push({ relative, slug: relative.replace(/^wiki\//, "").replace(/\.md$/i, ""), basename: path.basename(file, ".md"), title, links, content, parsed, selected: !selected || selected.has(relative) })
   }
-  const lookup = new Map()
+  const exact = new Map()
+  const aliases = new Map()
   pages.forEach((page, index) => {
-    lookup.set(normalizeLink(page.slug), index)
-    lookup.set(normalizeLink(page.basename), index)
-    lookup.set(normalizeLink(page.title), index)
+    exact.set(normalizeLink(page.slug), index)
+    for (const alias of [page.basename, page.title]) {
+      const key = normalizeLink(alias)
+      const indexes = aliases.get(key) ?? new Set()
+      indexes.add(index)
+      aliases.set(key, indexes)
+    }
   })
+  const uniqueAlias = (value) => {
+    const indexes = aliases.get(normalizeLink(value))
+    return indexes?.size === 1 ? [...indexes][0] : undefined
+  }
   const inbound = new Array(pages.length).fill(0)
   const findings = []
   pages.forEach((page, pageIndex) => {
+    if (!page.selected) return
     if (!page.content.trim()) findings.push({ code: "EMPTY_PAGE", severity: "error", page: page.relative, detail: "Page is empty." })
     for (const link of page.links) {
-      const target = lookup.get(link) ?? lookup.get(normalizeLink(path.posix.basename(link)))
+      const target = exact.get(link) ?? uniqueAlias(path.posix.basename(link))
       if (target === undefined) findings.push({ code: "BROKEN_LINK", severity: "warning", page: page.relative, detail: `Broken wikilink: [[${link}]]` })
       else inbound[target] += 1
     }
@@ -42,6 +51,7 @@ export async function lintWiki(workspace, selectedPaths) {
     }
   })
   pages.forEach((page, index) => {
+    if (!page.selected) return
     if (inbound[index] === 0 && !isAggregate(page.relative)) findings.push({ code: "ORPHAN_PAGE", severity: "info", page: page.relative, detail: "No other page links to this page." })
   })
   return {

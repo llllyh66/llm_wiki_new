@@ -13,6 +13,7 @@ const ATOMIC_PAGE_REJECTION_CODES = new Set([
   "PAGE_COMMIT_TOO_LARGE",
   "PAGE_PLAN_INCOMPLETE",
   "INCOMPLETE_PAGE_COVERAGE",
+  "DUPLICATE_PAGE_COVERAGE",
   "FILE_HASH_CONFLICT",
   "PROVISIONAL_PAGE_CONFLICT",
   "WORKSPACE_LOCKED",
@@ -108,6 +109,7 @@ function errorResult(error, context = {}) {
 function pageCommitRetryScope(code) {
   if (code === "PAGE_PLAN_INCOMPLETE") return "collect_full_plan_then_submit_entire_intended_patch_set"
   if (code === "INCOMPLETE_PAGE_COVERAGE") return "entire_rejected_patch_set_plus_missing_coverage"
+  if (code === "DUPLICATE_PAGE_COVERAGE") return "entire_rejected_patch_set_after_unique_coverage_reconciliation"
   if (["FILE_HASH_CONFLICT", "PROVISIONAL_PAGE_CONFLICT"].includes(code)) return "entire_rejected_patch_set_after_rebase"
   return "entire_rejected_patch_set"
 }
@@ -115,6 +117,7 @@ function pageCommitRetryScope(code) {
 function pageCommitRetryInstruction(code) {
   if (code === "PAGE_PLAN_INCOMPLETE") return "Collect every remaining page-plan cursor before generating or submitting patches."
   if (code === "INCOMPLETE_PAGE_COVERAGE") return "Add the reported missing coverage to the rejected set and resubmit it; no patch from the rejected call was stored."
+  if (code === "DUPLICATE_PAGE_COVERAGE") return "Keep every requirement ID on one canonical path, repair all reported duplicate owners, and resubmit the whole rejected set."
   if (["FILE_HASH_CONFLICT", "PROVISIONAL_PAGE_CONFLICT"].includes(code)) return "Rebase the conflicting target, then resubmit the whole rejected atomic patch set; do not retry only one patch."
   return "Correct every reported invalid patch and resubmit the whole rejected atomic patch set with a new idempotency key; do not retry only the failing patch."
 }
@@ -138,7 +141,7 @@ function recoveryAction(tool, args, error) {
       },
     }
   }
-  if (tool === "llm_wiki_commit_pages" && error.code === "FILE_HASH_CONFLICT") {
+  if (tool === "llm_wiki_commit_pages" && ["FILE_HASH_CONFLICT", "PROVISIONAL_PAGE_CONFLICT"].includes(error.code)) {
     return {
       tool: "llm_wiki_get_page_plan_context",
       arguments: {
@@ -150,7 +153,7 @@ function recoveryAction(tool, args, error) {
       },
     }
   }
-  if (tool === "llm_wiki_commit_pages" && ["INVALID_PAGE_PATCH", "INVALID_PAGE_PATH", "INVALID_SOURCE_REF", "INCOMPLETE_PAGE_COVERAGE", "PAGE_COMMIT_TOO_LARGE"].includes(error.code)) {
+  if (tool === "llm_wiki_commit_pages" && ["INVALID_PAGE_PATCH", "INVALID_PAGE_PATH", "INVALID_SOURCE_REF", "INCOMPLETE_PAGE_COVERAGE", "DUPLICATE_PAGE_COVERAGE", "PAGE_COMMIT_TOO_LARGE"].includes(error.code)) {
     return {
       tool,
       arguments: {
@@ -213,7 +216,7 @@ export class HeadlessToolRouter {
     try {
       const inputBytes = Buffer.byteLength(JSON.stringify(args))
       if (inputBytes > MAX_MCP_INPUT_BYTES) {
-        throw new LlmWikiError("MCP_INPUT_TOO_LARGE", `Tool input exceeds the ${MAX_MCP_INPUT_BYTES}-byte MCP limit. Submit smaller batches.`)
+        throw new LlmWikiError("MCP_INPUT_TOO_LARGE", `Tool input exceeds the ${MAX_MCP_INPUT_BYTES}-byte MCP limit. Submit smaller batches.`, { retryable: true })
       }
       return serializeResult(await this.call(name, args))
     } catch (error) {

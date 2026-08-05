@@ -256,10 +256,14 @@ typed entity or any relation.
      next bounded worker invocation in that freed slot with the same stable ID;
      `get_batch` will lease the next available batch or return `waiting` when
      all remaining work is already reserved.
-   - If `wiki_projection.ready: true`, start the one Wiki writer immediately,
-     then still reconcile available extraction slots and every uncommitted
-     lease while the writer runs. Projection readiness is not extraction
-     completion.
+   - If `wiki_projection.ready: true`, start the coordinator Writer loop
+     immediately. Use a total background budget of four project Agents while
+     page drafting is active: keep at most two extraction workers and reserve
+     up to two slots for page drafters. Do not interrupt an extractor in the
+     middle of its bounded quantum; apply the cap as workers return, and resume
+     the full extraction recommendation after the projection commits. Every
+     already leased but uncommitted batch remains recoverable by its stable
+     worker ID. Projection readiness is not extraction completion.
    - Stop replacing extractors only when status shows all batches completed,
      or when a replacement itself returns `waiting` because no unleased work
      exists.
@@ -287,22 +291,25 @@ typed entity or any relation.
    without an actual transport exception from a tool call. Background-agent
    disappearance is an orchestration event, not task-state or MCP data loss.
 7. Inspect `wiki_projection` in every analysis commit report and status result.
-   When `ready: true` and `in_progress: false`, start exactly one background
-   project `llm-wiki-writer` with task ID and stable writer ID
-   `wiki-writer-1`. Also pass the exact Writer `next_action` just returned by
-   status or `commit_analysis` and the current `writer_projection_quantum`.
-   The new Writer follows that action directly and does not spend another MCP
-   call rechecking status; status is only its fallback for a resumed lease when
-   no current action was supplied. Never run two Wiki writers for one task. If it reports
-   `mcp_ready: false`, perform the same writer loop in the coordinator instead
-   of launching a general-purpose replacement. The Core normally opens a
+   When `ready: true` and `in_progress: false`, run the bounded Writer loop in
+   the main coordinator with stable writer ID `wiki-writer-1`, starting from
+   the exact `next_action` returned by status or `commit_analysis`. The
+   coordinator performs only fast page-plan collection, local validation, and
+   the final MCP commit; semantic drafting is delegated in step 8 so the main
+   Agent remains responsive while drafts run. This placement is intentional:
+   Claude background subagents cannot reliably spawn nested subagents, so a
+   background `llm-wiki-writer` cannot be the parent of parallel drafters.
+   Never run two projection coordinators or MCP committers for one task. Use
+   project `llm-wiki-writer` only as a serial background fallback when the host
+   cannot launch `llm-wiki-page-drafter`; do not run it at the same time as the
+   coordinator Writer loop. The Core normally opens a
    projection after four new batches, after the 30-second debounce, or
    immediately for final reconciliation when all batches finish. Each
    incremental projection leases at most eight batches. The Writer
    processes each projection independently and commits semantic pages before
    continuing; if extraction finishes with unprojected batches, drain those
    projections before opening the final full reconciliation.
-8. The Wiki Writer uses `llm_wiki_get_page_plan_context` and
+8. The coordinator Writer loop uses `llm_wiki_get_page_plan_context` and
    `llm_wiki_commit_pages` for every projection. `llm_wiki_apply_projection`
    is only a compatibility redirect to the same page-plan action and never
    writes pages automatically. Call the exact
@@ -313,11 +320,10 @@ typed entity or any relation.
    validates evidence, page shape, hashes, and atomic transactions; it never
    invents semantic facts. Return the
    compact projection report after that call; if its next action is another
-   `llm_wiki_apply_projection` and the invocation quantum still has capacity,
-   follow it directly. The tool itself normally consumes that complete quantum
-   in one call.
+   page-plan or commit action, follow the exact returned action. Do not infer
+   a new cursor or restart the projection from an earlier page.
 
-   One Wiki-writer invocation processes up
+   One bounded coordinator Writer invocation processes up
    to six projections, committing each projection independently:
    1. Call `llm_wiki_get_page_plan_context` with task ID, writer ID, and cursor
       `0`, explicitly using `max_chars: 40000`. If it returns `waiting: true`,
@@ -346,6 +352,22 @@ typed entity or any relation.
       use it to avoid duplicates, but never replace a catalog-only page without
       receiving its full content and current hash in `existing_pages`. The page
       patch Schema and domain metadata appear only on cursor zero.
+      After completing traversal, group requirements by exact
+      `patch_scaffold.path`. A path is indivisible: every requirement sharing
+      it and its full existing page must go to the same shard. For four or more
+      paths, the main coordinator launches project Agent
+      `llm-wiki-page-drafter` in
+      waves of at most four concurrent children and at most six paths per
+      shard. Pass only shard-relevant analyses, relations, full existing pages,
+      compact catalog metadata, and the returned patch Schema. Never duplicate
+      the full plan into every child's context. For smaller plans, draft
+      directly because Agent startup costs more than it saves. A drafter has no
+      MCP access, cannot lease or commit a projection, and returns PagePatch
+      JSON only. If the project Agent is unavailable, draft locally rather
+      than launching a general-purpose substitute.
+      During extraction/drafting overlap, respect the four-Agent pipeline
+      budget from step 6; normally use two extractors plus two drafters. After
+      extraction completes, all four slots may draft different path shards.
    3. For `incremental` mode, update only pages affected by the projection's
       batch IDs. Reuse canonical paths, merge with existing grounded content,
       and avoid speculative or duplicate pages. Follow `writer_guidance`: keep
@@ -380,6 +402,13 @@ typed entity or any relation.
       (`type`, `title`, `created`, `updated`, `tags`, `related`, `sources`,
       `covers`, `summary`) and makes valid Related links bidirectional during
       Finalize.
+      Before committing parallel drafts, join them deterministically by path
+      and reject any local result with a duplicate/unassigned path, missing or
+      duplicate requirement coverage, changed scaffold operation/hash/path,
+      changed requirement-ID `sourceRefs`, or omitted required Related slug.
+      Regenerate that shard locally before calling MCP. Only the stable parent
+      Writer may invoke `llm_wiki_commit_pages`; parallel draft generation must
+      never become parallel commits.
    5. Submit at most 50 patches per `llm_wiki_commit_pages` call. Pass task ID,
       writer ID, projection ID, current Wiki revision, and a unique idempotency
       key. Set `projection_complete: false` while more bounded commits remain;
@@ -413,7 +442,8 @@ typed entity or any relation.
       remains ready.
 9. Continue extraction and Wiki projections as a pipeline. A Wiki writer may
    run while extractors process later batches. Multiple tasks may each have one
-   Writer: Core serializes workspace transactions and checks exact target-page
+   Writer committer, and one Writer may parallelize path-disjoint drafting:
+   Core serializes workspace transactions and checks exact target-page
    hashes, so a write to an unrelated page does not invalidate another task's
    projection or block retrieval.
 10. When completed batches equal total batches, ensure a `final` projection
