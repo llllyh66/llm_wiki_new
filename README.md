@@ -87,9 +87,9 @@ from the first unfinished shard instead of regenerating earlier pages. The
 legacy full page-plan cursor mode remains available for compatibility.
 Incremental pages use concise grounded drafts. When extraction finishes, Core
 first drains any remaining bounded projections instead of creating one giant
-all-batch final prompt. If all requirements then have unique explicit coverage
-and no contradiction exists, final reconciliation becomes a verified empty
-stabilization commit rather than a full page rewrite.
+all-batch final prompt. Final reconciliation always processes the server-side
+shard manifest, even when pages already have coverage, so semantic rewriting
+is never skipped.
 
 Each extractor invocation handles a bounded quantum of up to six batches,
 persisting an independent checkpoint after every batch. This amortizes Agent

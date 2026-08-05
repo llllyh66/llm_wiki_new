@@ -14,6 +14,7 @@ const ATOMIC_PAGE_REJECTION_CODES = new Set([
   "PAGE_PLAN_INCOMPLETE",
   "INCOMPLETE_PAGE_COVERAGE",
   "PAGE_DRAFT_SHARDS_INCOMPLETE",
+  "PAGE_DRAFT_SHARD_NOT_READY",
   "DUPLICATE_PAGE_COVERAGE",
   "FILE_HASH_CONFLICT",
   "PROVISIONAL_PAGE_CONFLICT",
@@ -110,6 +111,7 @@ function errorResult(error, context = {}) {
 function pageCommitRetryScope(code) {
   if (code === "PAGE_PLAN_INCOMPLETE") return "prepare_server_manifest_then_process_one_bounded_shard"
   if (code === "PAGE_DRAFT_SHARDS_INCOMPLETE") return "process_next_uncommitted_server_shard"
+  if (code === "PAGE_DRAFT_SHARD_NOT_READY") return "retrieve_all_cursors_for_the_reported_server_shard"
   if (code === "INCOMPLETE_PAGE_COVERAGE") return "entire_rejected_patch_set_plus_missing_coverage"
   if (code === "DUPLICATE_PAGE_COVERAGE") return "entire_rejected_patch_set_after_unique_coverage_reconciliation"
   if (["FILE_HASH_CONFLICT", "PROVISIONAL_PAGE_CONFLICT"].includes(code)) return "entire_rejected_patch_set_after_rebase"
@@ -119,6 +121,7 @@ function pageCommitRetryScope(code) {
 function pageCommitRetryInstruction(code) {
   if (code === "PAGE_PLAN_INCOMPLETE") return "Request view=manifest, then generate and commit one bounded draft shard at a time."
   if (code === "PAGE_DRAFT_SHARDS_INCOMPLETE") return "Process the returned next draft shard; accepted earlier shards are durable and must not be regenerated."
+  if (code === "PAGE_DRAFT_SHARD_NOT_READY") return "Retrieve every cursor for the returned draft shard before committing it; accepted earlier shards remain durable."
   if (code === "INCOMPLETE_PAGE_COVERAGE") return "Add the reported missing coverage to the rejected set and resubmit it; no patch from the rejected call was stored."
   if (code === "DUPLICATE_PAGE_COVERAGE") return "Keep every requirement ID on one canonical path, repair all reported duplicate owners, and resubmit the whole rejected set."
   if (["FILE_HASH_CONFLICT", "PROVISIONAL_PAGE_CONFLICT"].includes(code)) return "Rebase the conflicting target, then resubmit the whole rejected atomic patch set; do not retry only one patch."
@@ -164,7 +167,7 @@ function recoveryAction(tool, args, error) {
       },
     }
   }
-  if (tool === "llm_wiki_commit_pages" && ["INCOMPLETE_PAGE_COVERAGE", "PAGE_DRAFT_SHARDS_INCOMPLETE"].includes(error.code) && error.details?.next_draft_shard?.shard_id) {
+  if (tool === "llm_wiki_commit_pages" && ["INCOMPLETE_PAGE_COVERAGE", "PAGE_DRAFT_SHARDS_INCOMPLETE", "PAGE_DRAFT_SHARD_NOT_READY"].includes(error.code) && error.details?.next_draft_shard?.shard_id) {
     return {
       tool: "llm_wiki_get_page_plan_context",
       arguments: {

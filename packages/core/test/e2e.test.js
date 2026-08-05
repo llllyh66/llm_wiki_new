@@ -1397,6 +1397,8 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
   assert.equal(committed.wiki_projection.unprojected_batches, 4)
   assert.equal(committed.next_action.tool, "llm_wiki_get_page_plan_context")
   assert.equal(committed.writer_next_action.tool, "llm_wiki_get_page_plan_context")
+  assert.equal(committed.next_action.arguments.view, "manifest")
+  assert.equal(committed.writer_next_action.arguments.view, "manifest")
 
   const second = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 40_000 })
   assert.equal(second.projection.batch_ids.length, 4)
@@ -1858,6 +1860,11 @@ test("server-side page manifests keep 50-plus-page projections in durable bounde
     },
   })
 
+  await assert.rejects(
+    () => f.core.getPagePlanContext({ task_id: imported.task_id, view: "manifest" }),
+    (error) => error instanceof LlmWikiError && error.code === "INVALID_INPUT",
+  )
+
   const manifest = await f.core.getPagePlanContext({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
@@ -1873,6 +1880,21 @@ test("server-side page manifests keep 50-plus-page projections in durable bounde
   assert.equal(manifest.draft_manifest.complete_manifest_persisted_server_side, true)
   assert.equal(manifest.draft_manifest.shards.every((shard) => shard.page_count <= 6), true)
   assert.equal(manifest.page_requirements, undefined)
+  await assert.rejects(
+    () => f.core.commitPages({
+      task_id: imported.task_id,
+      writer_id: "wiki-writer-1",
+      projection_id: manifest.projection.projection_id,
+      based_on_wiki_revision: manifest.based_on_wiki_revision,
+      projection_complete: false,
+      draft_shard_ids: ["draft-0001"],
+      patches: [],
+      idempotency_key: "many-page-unread-shard-v1",
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "PAGE_DRAFT_SHARD_NOT_READY"
+      && error.details?.next_draft_shard?.shard_id === "draft-0001",
+  )
   await assert.rejects(
     () => f.core.commitPages({
       task_id: imported.task_id,

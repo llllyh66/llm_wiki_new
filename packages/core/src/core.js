@@ -597,6 +597,13 @@ export class LlmWikiCore {
     const requestedCursor = normalizePagePlanCursor(input?.cursor)
     const projectionRequested = input?.writer_id !== undefined || input?.projection_id !== undefined
     const requestedView = normalizePagePlanView(input?.view, projectionRequested)
+    if (!projectionRequested && requestedView !== "plan") {
+      fail("INVALID_INPUT", `${requestedView} page-plan view requires writer_id or projection_id.`, {
+        retryable: true,
+        taskId: record.task.taskId,
+        suggestedAction: "Call llm_wiki_get_page_plan_context with the stable Wiki writer ID from task status.",
+      })
+    }
     let projection
     if (projectionRequested) {
       assertTaskStatus(record.task, ["extracting", "planning", "committing"])
@@ -950,6 +957,9 @@ export class LlmWikiCore {
       while (this.pageDraftShardCache.size > 32) this.pageDraftShardCache.delete(this.pageDraftShardCache.keys().next().value)
     }
     const page = paginatePagePlan(shardContext, normalizePagePlanCursor(input?.cursor), input?.max_chars, workspace.config.limits.maxPagePlanChars)
+    if (page.pagination.next_cursor === null) {
+      projection.retrievedDraftShardIds = uniqueStrings([...(projection.retrievedDraftShardIds ?? []), shard.shard_id])
+    }
     projection.expiresAt = new Date(Date.now() + PAGE_PROJECTION_LEASE_MS).toISOString()
     await saveTask(record.paths, record.task)
     const limits = pageCommitLimits(workspace.config.limits, projection)
@@ -1230,6 +1240,7 @@ export class LlmWikiCore {
       const snapshot = await this.#pagePlanSnapshot(record, commitProjection.projectionId)
       const manifest = snapshot?.draftManifest ?? []
       const knownShardIds = new Set(manifest.map((shard) => shard.shard_id))
+      const retrievedShardIds = new Set(commitProjection.retrievedDraftShardIds ?? [])
       submittedManifestShardIds = uniqueStrings(input?.draft_shard_ids ?? [])
       if (submittedManifestShardIds.length === 0 || submittedManifestShardIds.some((shardId) => !knownShardIds.has(shardId))) {
         fail("INVALID_PAGE_PATCH", "Manifest wave commits must identify one or more valid draft_shard_ids.", {
@@ -1237,6 +1248,16 @@ export class LlmWikiCore {
           taskId: record.task.taskId,
           details: { submitted_draft_shard_ids: submittedManifestShardIds, available_draft_shard_ids: [...knownShardIds].slice(0, 100), atomic_commit_applied: false },
           suggestedAction: "Copy draft_shard_ids from the shard's returned llm_wiki_commit_pages next_action.",
+        })
+      }
+      const unreadShardIds = submittedManifestShardIds.filter((shardId) => !retrievedShardIds.has(shardId))
+      if (unreadShardIds.length > 0) {
+        const nextShard = manifest.find((shard) => shard.shard_id === unreadShardIds[0])
+        fail("PAGE_DRAFT_SHARD_NOT_READY", "A manifest shard can be committed only after all of its context cursors were retrieved.", {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { unread_draft_shard_ids: unreadShardIds, ...(nextShard ? { next_draft_shard: nextShard } : {}), atomic_commit_applied: false },
+          suggestedAction: `Fetch every cursor for draft shard ${unreadShardIds[0]} before committing it; accepted earlier shards remain durable.`,
         })
       }
     }
@@ -1322,6 +1343,8 @@ export class LlmWikiCore {
         const state = projectionState(record.task)
         if (projection.pagePlanTraversal?.serverSideManifest === true && input?.projection_complete === false) {
           projection.committedDraftShardIds = uniqueStrings([...(projection.committedDraftShardIds ?? []), ...submittedManifestShardIds])
+          const submittedSet = new Set(submittedManifestShardIds)
+          projection.retrievedDraftShardIds = (projection.retrievedDraftShardIds ?? []).filter((shardId) => !submittedSet.has(shardId))
         }
         state.provisionalPagePaths = [...new Set([
           ...state.provisionalPagePaths,
@@ -1406,14 +1429,14 @@ export class LlmWikiCore {
               },
             }
           : projection?.mode === "incremental" && wikiProjection?.ready
-          ? { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: record.task.taskId, writer_id: projection.writerId } }
+          ? { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: record.task.taskId, writer_id: projection.writerId, view: "manifest" } }
           : projection?.mode === "incremental"
           ? { tool: "llm_wiki_status", arguments: { task_id: record.task.taskId } }
           : projection?.mode === "final" && wikiProjection?.ready
           ? projectionAction(record.task, wikiProjection)
           : { tool: "llm_wiki_finalize", arguments: { task_id: record.task.taskId } },
         writer_next_action: projection?.mode === "incremental" && wikiProjection?.ready
-          ? { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: record.task.taskId, writer_id: projection.writerId } }
+          ? { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: record.task.taskId, writer_id: projection.writerId, view: "manifest" } }
           : null,
       }
     })
@@ -1914,6 +1937,7 @@ function pageProjectionStatus(task) {
         ? state.lease.pagePlanTraversal.nextCursor
         : 0,
       committed_draft_shards: Array.isArray(state.lease.committedDraftShardIds) ? state.lease.committedDraftShardIds.length : 0,
+      retrieved_draft_shards: Array.isArray(state.lease.retrievedDraftShardIds) ? state.lease.retrievedDraftShardIds.length : 0,
     } : {}),
     ...(nextReadyAt ? { next_ready_at: nextReadyAt } : {}),
   }
@@ -1964,6 +1988,7 @@ function acquirePageProjection(task, input) {
     expiresAt: new Date(Date.now() + PAGE_PROJECTION_LEASE_MS).toISOString(),
     wikiRevision: null,
     committedDraftShardIds: [],
+    retrievedDraftShardIds: [],
   }
   return { lease: state.lease, status: pageProjectionStatus(task) }
 }
@@ -1994,6 +2019,7 @@ function publicProjection(projection) {
     analysis_revision: projection.analysisRevision,
     lease_expires_at: projection.expiresAt,
     committed_draft_shards: Array.isArray(projection.committedDraftShardIds) ? projection.committedDraftShardIds.length : 0,
+    retrieved_draft_shards: Array.isArray(projection.retrievedDraftShardIds) ? projection.retrievedDraftShardIds.length : 0,
     ...(projection.safelyRepartitioned ? {
       safely_repartitioned: true,
       repartitioned_from_batch_count: projection.repartitionedFromBatchCount,

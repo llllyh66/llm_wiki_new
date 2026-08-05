@@ -80,7 +80,7 @@ const toolDefinitions = [
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
       projection_id: { type: "string", minLength: 1, maxLength: 100, description: "Resume an existing projection lease. Omit to acquire the next ready projection." },
-      max_projections: { type: "integer", minimum: 1, maximum: 24, description: "Maximum bounded projections to drain in this call. Defaults to six." },
+      max_projections: { type: "integer", minimum: 1, maximum: 24, description: "Legacy coordinator hint retained for compatibility; the call returns one compact manifest and the coordinator follows its next_action." },
     }, ["task_id"]),
   },
   {
