@@ -16,6 +16,17 @@ function log(event, details = {}) {
   }
 }
 
+// A rejected promise outside the tool router must not terminate the long-lived
+// STDIO process. Tool-level failures are converted to structured results by
+// HeadlessToolRouter; these handlers cover SDK/transport callbacks and late
+// filesystem promises that would otherwise make Claude report "disconnect".
+process.on("uncaughtException", (error) => {
+  log("uncaught-exception", { message: error instanceof Error ? error.message : String(error) })
+})
+process.on("unhandledRejection", (reason) => {
+  log("unhandled-rejection", { message: reason instanceof Error ? reason.message : String(reason) })
+})
+
 function parseWorkspace(argv) {
   const index = argv.indexOf("--workspace")
   if (index < 0) return process.cwd()
@@ -31,11 +42,29 @@ async function main() {
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: router.listTools() }))
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const startedAt = Date.now()
-    const result = await router.callMcp(request.params.name, request.params.arguments ?? {})
-    const structured = result.structuredContent
-    const status = result._meta?.llmWikiStatus === "rejected" || structured?.accepted === false ? "rejected" : "ok"
-    log("tool-call", { name: request.params.name, status, durationMs: Date.now() - startedAt })
-    return result
+    const name = request?.params?.name ?? "<invalid-tool>"
+    try {
+      const result = await router.callMcp(name, request?.params?.arguments ?? {})
+      const structured = result.structuredContent
+      const status = result._meta?.llmWikiStatus === "rejected" || structured?.accepted === false ? "rejected" : "ok"
+      log("tool-call", { name, status, durationMs: Date.now() - startedAt })
+      return result
+    } catch (error) {
+      // This is a last-resort SDK boundary guard. Normally callMcp already
+      // catches and serializes every Core error; returning a protocol-safe
+      // result here prevents one unexpected handler failure from closing MCP.
+      log("tool-handler-error", { name, message: error instanceof Error ? error.message : String(error) })
+      return {
+        content: [{ type: "text", text: JSON.stringify({
+          ok: false,
+          accepted: false,
+          rejected: true,
+          error: { code: "MCP_HANDLER_ERROR", message: "Tool handler failed; retry the operation.", retryable: true },
+          next_action: { tool: "llm_wiki_list_tasks", arguments: {} },
+          mcp_connection_usable: true,
+        }) }],
+      }
+    }
   })
   const transport = new StdioServerTransport(process.stdin, process.stdout, { maxBufferSize: STDIO_MAX_BUFFER_BYTES })
   transport.onerror = (error) => log("transport-error", { message: error.message })

@@ -4,7 +4,12 @@ import { ensureDir, pathExists, readJson, sha256, stableStringify, writeJsonAtom
 
 const MAX_EMBEDDING_DIMENSIONS = 8_192
 const MAX_EMBEDDING_BATCH = 32
-const DEFAULT_TIMEOUT_MS = 30_000
+// Embedding calls are the only external operation with an AbortController.
+// Keep a generous budget for large knowledge bases: this is a retrieval
+// degradation timeout, not an MCP request timeout, and it must never close the
+// long-lived STDIO connection.
+const DEFAULT_TIMEOUT_MS = 120_000
+const DEFAULT_TOTAL_TIMEOUT_MS = 600_000
 const MAX_EMBEDDING_RESPONSE_BYTES = 16 * 1024 * 1024
 const SUPPORTED_PROVIDERS = new Set(["none", "openai-compatible", "ollama"])
 
@@ -14,8 +19,8 @@ export function resolveEmbeddingConfig(workspace) {
   const model = process.env.LLM_WIKI_EMBEDDING_MODEL || configured.model || ""
   const endpoint = process.env.LLM_WIKI_EMBEDDING_URL || configured.endpoint || defaultEndpoint(provider)
   const batchSize = clampInteger(configured.batchSize, 1, MAX_EMBEDDING_BATCH, 16)
-  const timeoutMs = clampInteger(configured.timeoutMs, 1_000, 120_000, DEFAULT_TIMEOUT_MS)
-  const totalTimeoutMs = clampInteger(configured.totalTimeoutMs, 5_000, 300_000, 60_000)
+  const timeoutMs = clampInteger(configured.timeoutMs, 1_000, 600_000, DEFAULT_TIMEOUT_MS)
+  const totalTimeoutMs = clampInteger(configured.totalTimeoutMs, 5_000, 900_000, DEFAULT_TOTAL_TIMEOUT_MS)
   const maxInputChars = clampInteger(configured.maxInputChars, 1_000, 32_000, 8_000)
   const maxDocuments = clampInteger(configured.maxDocuments, 10, 10_000, 1_000)
   const supported = SUPPORTED_PROVIDERS.has(provider)
