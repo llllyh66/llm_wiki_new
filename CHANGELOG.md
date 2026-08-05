@@ -2,6 +2,13 @@
 
 ## [Unreleased] - 2026-08-05
 
+### 第二轮隐性 Bug 修复
+
+- 强制 draft shard 按 cursor 顺序读取；跳过前置上下文的提交会返回可恢复的 `PAGE_PLAN_CURSOR_MISMATCH`，避免伪造“已完整读取”并绕过语义重写。
+- 校验 OpenAI-compatible Embedding 返回的向量索引必须完整、唯一且在请求范围内，防止异常响应造成文档与向量错配；异常继续降级到本地特征哈希召回。
+- 允许显式删除已失败任务遗留的知识库数据；仍阻止 importing、extracting、planning、committing、finalizing 等活动任务期间的删除。
+- 复核 Schema/XLSX 边界处理，并补充 draft cursor、Embedding 异常索引和失败任务清理回归测试。
+
 ### Writer 页面写入与大上下文恢复
 
 - 新增服务端持久化的页面 manifest 和 draft shard 流程。
@@ -27,4 +34,3 @@
 - 更新 Skill、Writer Agent、恢复指南和技术文档，统一采用 manifest → shard → durable commit 流程。
 - 新增 50+ 页面分片写入、提前 finalize 拒绝、上下文恢复和 MCP 错误恢复测试。
 - 全量测试通过：Core 35 项、MCP Server 12 项、CLI 1 项。
-

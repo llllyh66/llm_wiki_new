@@ -956,9 +956,37 @@ export class LlmWikiCore {
       this.pageDraftShardCache.set(shardCacheKey, shardContext)
       while (this.pageDraftShardCache.size > 32) this.pageDraftShardCache.delete(this.pageDraftShardCache.keys().next().value)
     }
-    const page = paginatePagePlan(shardContext, normalizePagePlanCursor(input?.cursor), input?.max_chars, workspace.config.limits.maxPagePlanChars)
-    if (page.pagination.next_cursor === null) {
-      projection.retrievedDraftShardIds = uniqueStrings([...(projection.retrievedDraftShardIds ?? []), shard.shard_id])
+    const requestedCursor = normalizePagePlanCursor(input?.cursor)
+    const nextCursors = projection.draftShardNextCursors && typeof projection.draftShardNextCursors === "object" && !Array.isArray(projection.draftShardNextCursors)
+      ? projection.draftShardNextCursors
+      : {}
+    const seenCursors = projection.draftShardSeenCursors && typeof projection.draftShardSeenCursors === "object" && !Array.isArray(projection.draftShardSeenCursors)
+      ? projection.draftShardSeenCursors
+      : {}
+    projection.draftShardNextCursors = nextCursors
+    projection.draftShardSeenCursors = seenCursors
+    const expectedCursor = Number.isInteger(nextCursors[shard.shard_id]) ? nextCursors[shard.shard_id] : 0
+    const previouslySeen = Array.isArray(seenCursors[shard.shard_id]) && seenCursors[shard.shard_id].includes(requestedCursor)
+    if (requestedCursor !== expectedCursor && !previouslySeen) {
+      fail("PAGE_PLAN_CURSOR_MISMATCH", "Draft-shard cursors must be requested sequentially before committing the shard.", {
+        retryable: true,
+        taskId: record.task.taskId,
+        details: {
+          shard_id: shard.shard_id,
+          requested_cursor: requestedCursor,
+          expected_cursor: expectedCursor,
+          projection_id: projection.projectionId,
+        },
+        suggestedAction: `Continue draft shard ${shard.shard_id} with cursor ${expectedCursor}. A previously returned cursor may be replayed after a lost tool response.`,
+      })
+    }
+    const page = paginatePagePlan(shardContext, requestedCursor, input?.max_chars, workspace.config.limits.maxPagePlanChars)
+    if (!previouslySeen) {
+      seenCursors[shard.shard_id] = uniqueIntegers([...(seenCursors[shard.shard_id] ?? []), requestedCursor])
+      nextCursors[shard.shard_id] = page.pagination.next_cursor
+      if (page.pagination.next_cursor === null) {
+        projection.retrievedDraftShardIds = uniqueStrings([...(projection.retrievedDraftShardIds ?? []), shard.shard_id])
+      }
     }
     projection.expiresAt = new Date(Date.now() + PAGE_PROJECTION_LEASE_MS).toISOString()
     await saveTask(record.paths, record.task)
@@ -1587,7 +1615,12 @@ export class LlmWikiCore {
     }
     const workspace = await this.workspace({ skipWikiRevision: true })
     const tasks = await workspaceTaskRecords(workspace.paths.tasks)
-    const activeTasks = tasks.filter((task) => task.status === "corrupt" || ACTIVE_TASK_STATUSES.includes(task.status))
+    // A failed task is resumable for diagnostics/finalization, but it no
+    // longer owns an extraction or page-write lease. It must not prevent an
+    // explicit knowledge-base cleanup; active statuses are the only ones that
+    // can still race with deletion.
+    const deletionActiveStatuses = ACTIVE_TASK_STATUSES.filter((status) => status !== "failed")
+    const activeTasks = tasks.filter((task) => task.status === "corrupt" || deletionActiveStatuses.includes(task.status))
     if (activeTasks.length > 0) {
       fail("KNOWLEDGE_BASE_BUSY", "Cannot delete while an extraction or Wiki task is active.", {
         retryable: true,
@@ -1989,6 +2022,8 @@ function acquirePageProjection(task, input) {
     wikiRevision: null,
     committedDraftShardIds: [],
     retrievedDraftShardIds: [],
+    draftShardNextCursors: {},
+    draftShardSeenCursors: {},
   }
   return { lease: state.lease, status: pageProjectionStatus(task) }
 }
@@ -2376,6 +2411,10 @@ function uniqueByStable(values) {
 
 function uniqueStrings(values) {
   return [...new Set(values.map((value) => String(value ?? "").trim()).filter(Boolean))]
+}
+
+function uniqueIntegers(values) {
+  return [...new Set(values.filter((value) => Number.isInteger(value)))]
 }
 
 function latestPageRecords(history) {

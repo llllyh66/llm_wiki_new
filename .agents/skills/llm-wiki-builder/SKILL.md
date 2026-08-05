@@ -350,6 +350,8 @@ typed entity or any relation.
       paths and only their requirements, matching facts, relations, conflicts,
       and full affected existing pages. If that shard itself has more cursors,
       follow only its returned cursor until `draft_shard_complete: true`.
+      Draft-shard cursors are sequential; do not skip ahead. If a tool result is
+      lost, replay a cursor already returned by the server before continuing.
       Generate patches immediately for that bounded shard, then discard its
       source context after a successful commit. Do not traverse every manifest
       shard before drafting, do not retain all page data in the main context,

@@ -37,6 +37,9 @@ export function resolveEmbeddingConfig(workspace) {
     maxInputChars,
     maxDocuments,
     apiKey: process.env.LLM_WIKI_EMBEDDING_API_KEY || "",
+    // The endpoint is part of the embedding identity. Two compatible servers
+    // may use the same provider/model names while producing different vector
+    // spaces; reusing the old cache would silently corrupt RRF ranking.
     fingerprint: sha256(stableStringify({ provider, model, endpoint, maxInputChars })).slice(0, 24),
   }
 }
@@ -164,9 +167,26 @@ async function requestEmbeddings(inputs, config) {
   } finally {
     clearTimeout(timeout)
   }
-  const vectors = config.provider === "ollama"
-    ? payload?.embeddings
-    : [...(Array.isArray(payload?.data) ? payload.data : [])].sort((left, right) => Number(left.index) - Number(right.index)).map((item) => item.embedding)
+  let vectors
+  if (config.provider === "ollama") {
+    vectors = payload?.embeddings
+  } else {
+    const data = Array.isArray(payload?.data) ? payload.data : []
+    const ordered = new Array(inputs.length)
+    const seenIndexes = new Set()
+    for (const item of data) {
+      const index = Number(item?.index)
+      if (!Number.isInteger(index) || index < 0 || index >= inputs.length || seenIndexes.has(index)) {
+        throw new LlmWikiError("EMBEDDING_INVALID_RESPONSE", "Embedding endpoint returned duplicate or out-of-range vector indexes.", { retryable: true })
+      }
+      seenIndexes.add(index)
+      ordered[index] = item.embedding
+    }
+    if (seenIndexes.size !== inputs.length || ordered.some((item) => item === undefined)) {
+      throw new LlmWikiError("EMBEDDING_INVALID_RESPONSE", "Embedding endpoint did not return a complete indexed vector set.", { retryable: true })
+    }
+    vectors = ordered
+  }
   if (!Array.isArray(vectors) || vectors.length !== inputs.length) {
     throw new LlmWikiError("EMBEDDING_INVALID_RESPONSE", "Embedding endpoint returned the wrong number of vectors.", { retryable: true })
   }

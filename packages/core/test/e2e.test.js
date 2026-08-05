@@ -678,8 +678,8 @@ test("real embedding recall is cached and endpoint failures degrade without fail
     const payload = JSON.parse(options.body)
     const inputs = Array.isArray(payload.input) ? payload.input : [payload.input]
     return new Response(JSON.stringify({
-      data: endpointMalformed ? [] : inputs.map((input, index) => ({
-        index,
+      data: endpointMalformed === "empty" ? [] : inputs.map((input, index) => ({
+        index: endpointMalformed === "bad-index" ? 99 : index,
         embedding: /\b(car|automobile)\b/i.test(input) ? [1, 0, 0] : [0, 1, 0],
       })),
     }), { status: 200, headers: { "content-type": "application/json" } })
@@ -701,10 +701,15 @@ test("real embedding recall is cached and endpoint failures degrade without fail
   assert.equal(second.channel_status.embedding.cache_hits > 0, true)
   assert.equal(requests - requestsAfterFirst, 1)
 
-  endpointMalformed = true
+  endpointMalformed = "empty"
   const malformed = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: batch.batch_id, queries: ["car"], channels: ["embedding"] })
   assert.equal(malformed.channel_status.embedding.mode, "feature-hash-fallback")
   assert.equal(malformed.channel_status.embedding.reason, "EMBEDDING_INVALID_RESPONSE")
+
+  endpointMalformed = "bad-index"
+  const malformedIndex = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: batch.batch_id, queries: ["car"], channels: ["embedding"] })
+  assert.equal(malformedIndex.channel_status.embedding.mode, "feature-hash-fallback")
+  assert.equal(malformedIndex.channel_status.embedding.reason, "EMBEDDING_INVALID_RESPONSE")
 
   endpointMalformed = false
   endpointUnavailable = true
@@ -1616,6 +1621,10 @@ test("knowledge-base deletion requires confirmation, blocks active tasks, and pr
     (error) => error instanceof LlmWikiError && error.code === "KNOWLEDGE_BASE_BUSY",
   )
   await f.core.abort({ task_id: imported.task_id, reason: "Deletion test" })
+  const taskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
+  const failedTask = JSON.parse(await readFile(taskPath, "utf8"))
+  failedTask.status = "failed"
+  await writeFile(taskPath, JSON.stringify(failedTask))
   await mkdir(path.join(f.workspace, "wiki", "topics"), { recursive: true })
   await writeFile(path.join(f.workspace, "wiki", "topics", "manual.md"), "# Manual\n\nKeep this only until deletion.\n")
 
@@ -1880,6 +1889,20 @@ test("server-side page manifests keep 50-plus-page projections in durable bounde
   assert.equal(manifest.draft_manifest.complete_manifest_persisted_server_side, true)
   assert.equal(manifest.draft_manifest.shards.every((shard) => shard.page_count <= 6), true)
   assert.equal(manifest.page_requirements, undefined)
+  await assert.rejects(
+    () => f.core.getPagePlanContext({
+      task_id: imported.task_id,
+      writer_id: "wiki-writer-1",
+      projection_id: manifest.projection.projection_id,
+      view: "draft-shard",
+      shard_id: "draft-0001",
+      cursor: 1,
+      max_chars: 40_000,
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "PAGE_PLAN_CURSOR_MISMATCH"
+      && error.details?.expected_cursor === 0,
+  )
   await assert.rejects(
     () => f.core.commitPages({
       task_id: imported.task_id,

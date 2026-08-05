@@ -45,6 +45,8 @@ never invent a shard ID. Traverse only that
 shard's cursors until `draft_shard_complete: true`, generate its at-most-six
 canonical pages, and commit the bounded wave immediately with
 `projection_complete: false`, copying the returned `draft_shard_ids` exactly.
+Draft-shard cursors are sequential; never skip ahead. If a tool result is lost,
+replay a cursor already returned by the server before continuing.
 Those IDs prevent old page coverage from skipping final semantic rewriting.
 An accepted wave is durable: discard its large
 context and never regenerate it after context compaction. Follow the commit's
