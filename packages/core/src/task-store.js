@@ -85,6 +85,7 @@ export async function createTask(workspace, sources, options = {}) {
       batchThreshold: 4,
       batchLimit: 8,
       writerProjectionQuantum: 6,
+      semanticPageBatchSize: workspace.config.limits.semanticPageBatchSize ?? 20,
       debounceMs: 30_000,
       projectedBatchIds: [],
       revision: 0,

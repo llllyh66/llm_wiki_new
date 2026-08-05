@@ -12,6 +12,9 @@ export const DEFAULT_LIMITS = Object.freeze({
   maxCommitChars: 2_000_000,
   maxPagePlanChars: 200_000,
   maxPatchesPerCommit: 50,
+  // Maximum number of pages a semantic Writer should rewrite in one logical
+  // page batch. The page-plan cursor still provides character-level paging.
+  semanticPageBatchSize: 20,
   maxQuoteChars: 1_000,
 })
 

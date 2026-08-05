@@ -643,6 +643,15 @@ export class LlmWikiCore {
         },
       } : {}),
       ...(projection?.mode === "final" ? { finalization_hint: finalizationHint } : {}),
+      ...(projection?.mode === "final" ? {
+        semantic_reconciliation: {
+          strategy: "page-sharded-map-reduce",
+          page_batch_size: record.task.pageProjection.semanticPageBatchSize ?? workspace.config.limits.semanticPageBatchSize ?? 20,
+          skip_unchanged_pages: true,
+          global_summary_after_page_batches: true,
+          instruction: "Process page requirements in page batches. Commit each completed page batch before continuing. After all page batches, rewrite index.md and overview.md once from the resulting page summaries.",
+        },
+      } : {}),
       ...(projection ? {
         projection: publicProjection(projection),
         provisional: projection.mode === "incremental",
@@ -772,6 +781,7 @@ export class LlmWikiCore {
     const writtenPages = []
     let writtenPageCount = 0
     let latestWikiRevision = null
+    let semanticHandoff = null
 
     for (let index = 0; index < requestedMaximum; index += 1) {
       const run = await this.#applySingleWikiProjection({
@@ -780,7 +790,10 @@ export class LlmWikiCore {
         ...(index === 0 && input?.projection_id ? { projection_id: input.projection_id } : {}),
         fast_path: true,
       })
-      if (run.waiting) break
+      if (run.waiting) {
+        if (run.semantic_writer_required) semanticHandoff = run
+        break
+      }
       projectionRuns.push(run.projection_run)
       writtenPageCount += run.written_pages.length
       if (writtenPages.length < 500) writtenPages.push(...run.written_pages.slice(0, 500 - writtenPages.length))
@@ -806,9 +819,13 @@ export class LlmWikiCore {
       written_pages: writtenPages,
       written_pages_truncated: writtenPageCount > writtenPages.length,
       ...(latestWikiRevision ? { wiki_revision: latestWikiRevision } : {}),
+      ...(semanticHandoff ? {
+        semantic_writer_required: true,
+        writer_guidance: semanticHandoff.writer_guidance,
+      } : {}),
       wiki_projection: wikiProjection,
       waiting: projectionRuns.length === 0,
-      next_action: nextAction(record.task, wikiProjection),
+      next_action: semanticHandoff?.next_action ?? nextAction(record.task, wikiProjection),
     }
   }
 
@@ -821,6 +838,34 @@ export class LlmWikiCore {
     if (!acquired.lease) return { waiting: true, written_pages: [] }
 
     const projection = acquired.lease
+    // Incremental projections are intentionally deterministic and cheap. The
+    // final projection is different: it is the only point where the Writer
+    // should synthesize all batches into coherent summary pages. Hand the
+    // leased projection to the normal page-plan/Writer workflow instead of
+    // silently replacing that synthesis with an evidence dump.
+    if (projection.mode === "final" && input.fast_path === true) {
+      projection.pagePlanTraversal = undefined
+      projection.expiresAt = new Date(Date.now() + PAGE_PROJECTION_LEASE_MS).toISOString()
+      await saveTask(record.paths, record.task)
+      return {
+        waiting: true,
+        written_pages: [],
+        semantic_writer_required: true,
+        writer_guidance: {
+          mode: "final-semantic-reconciliation",
+          strategy: "page-sharded-map-reduce",
+          page_batch_size: record.task.pageProjection.semanticPageBatchSize ?? 20,
+          skip_unchanged_pages: true,
+          global_summary_after_page_batches: true,
+          instruction: "Use the complete page plan to rewrite each page as a coherent cross-batch summary. Keep claims grounded, preserve exact server-provided sourceRefs, include related-page links, and place raw evidence in a concise source section rather than using it as the page body.",
+          incremental_pages_are_provisional: true,
+        },
+        next_action: {
+          tool: "llm_wiki_get_page_plan_context",
+          arguments: { task_id: record.task.taskId, writer_id: projection.writerId, projection_id: projection.projectionId },
+        },
+      }
+    }
     const allAnalyses = await this.#taskAnalyses(record)
     const projectionBatchIds = new Set(projection.batchIds)
     const projectionAnalyses = allAnalyses.filter((analysis) => projectionBatchIds.has(analysis.batchId))
@@ -1728,15 +1773,21 @@ function fastFinalizationEligibility(task, projection, requirements, existingPag
     && missingProvisionalPaths.length === 0
   return {
     ...result,
-    fast_path_eligible: eligible,
-    recommended_action: eligible ? "submit-empty-final-commit" : "full-reconciliation",
+    // Coverage is sufficient for a no-op deterministic final commit, but a
+    // no-op would skip the semantic Writer pass and leave provisional pages
+    // as raw evidence. Keep this diagnostic separate and always require the
+    // final synthesis by default.
+    fast_path_eligible: false,
+    deterministic_coverage_eligible: eligible,
+    semantic_writer_required: true,
+    recommended_action: "final-semantic-reconciliation",
     all_batches_projected: allBatchesProjected,
     missing_requirement_count: missingRequirementIds.length,
     duplicate_requirement_coverage_count: duplicateRequirementIds.length,
     missing_provisional_page_count: missingProvisionalPaths.length,
-    ...(eligible ? {
-      instruction: "All batches were incrementally projected, every requirement has exactly one explicit page cover, every provisional page exists, and no contradiction was extracted. Submit an empty final commit to stabilize pages without rewriting them.",
-    } : {}),
+    instruction: eligible
+      ? "All batches are covered, but a final semantic Writer pass is still required to synthesize coherent summaries and related-page links."
+      : "Complete a full semantic reconciliation after correcting coverage or contradiction issues.",
   }
 }
 
