@@ -23,6 +23,12 @@
 - 未捕获的进程级异常现在会记录后优雅退出并交还给宿主重启；普通工具校验错误仍由路由器转换为可恢复的结构化结果。
 - 增加短周期心跳的真实 STDIO 回归测试，验证连续 ping/pong 后仍可正常调用 `listTools`。
 
+### 技术文档与运维说明
+
+- 技术文档新增 MCP 长连接诊断 Runbook，说明 `ready`、`keepalive`、`shutdown-requested` 和 STDIO 管道关闭日志的含义及恢复动作。
+- 记录 `LLM_WIKI_MCP_KEEPALIVE_MS`、`LLM_WIKI_MCP_KEEPALIVE_TIMEOUT_MS` 的默认值与边界，避免误把心跳失败、宿主关闭管道和普通工具校验错误混为同一类问题。
+- 补充升级后的 `npm run build`、`npm test` 和 Claude `/mcp` 重启步骤，明确 `dist/` 不纳入 Git。
+
 ### 第二轮隐性 Bug 修复
 
 - 强制 draft shard 按 cursor 顺序读取；跳过前置上下文的提交会返回可恢复的 `PAGE_PLAN_CURSOR_MISMATCH`，避免伪造“已完整读取”并绕过语义重写。

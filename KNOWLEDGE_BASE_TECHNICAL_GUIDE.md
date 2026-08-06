@@ -188,6 +188,33 @@ MCP Server 是 STDIO 长连接适配器。工具业务错误不会使用 MCP `is
 
 如果仍然显示断开，应检查 MCP stderr 中的 `transport-error`、`protocol-error`、`uncaught-exception`、`unhandled-rejection`、`shutdown-requested` 和 `keepalive` 日志。`keepalive.status=failed` 只表示宿主没有及时回复 ping，不会单独关闭连接；若出现 `stdin-closed`、`stdout-closed` 或 `transport-closed`，说明宿主已经关闭了 STDIO 管道，需要由 Claude 重新启动 MCP 进程。默认心跳为 5 分钟，可临时用 `LLM_WIKI_MCP_KEEPALIVE_MS` 和 `LLM_WIKI_MCP_KEEPALIVE_TIMEOUT_MS` 缩短诊断周期，生产环境不建议设置为低于 1 分钟。
 
+### 5.1 长连接诊断 Runbook
+
+服务启动后的 `ready` 日志会记录 `keepaliveMs`、`keepaliveTimeoutMs` 和 `maxBufferBytes`，可以先确认 Claude 实际启动的是哪一个构建产物。当前默认值和允许范围如下：
+
+| 配置 | 默认值 | 允许范围 | 用途 |
+| --- | ---: | ---: | --- |
+| `LLM_WIKI_MCP_KEEPALIVE_MS` | `300000` ms | `1000`–`1800000` ms | 两次协议 ping 的间隔 |
+| `LLM_WIKI_MCP_KEEPALIVE_TIMEOUT_MS` | `30000` ms | `250`–`60000` ms | 单次 ping 等待 pong 的预算 |
+
+定位断开时按以下顺序判断：
+
+1. `tool-call` 后仍能看到 `keepalive.status=ok`：MCP Server 和 STDIO 管道仍然存活，问题更可能在宿主 Agent 的 worker 生命周期或跨 turn 调度，不需要重启 MCP。
+2. 出现 `keepalive.status=failed` 但之后仍能调用工具：这是一次宿主 pong 延迟或丢失，只记录诊断，不会触发断开；继续观察下一次心跳。
+3. 出现 `uncaught-exception`、`unhandled-rejection` 或 `shutdown-requested`：服务发现进程级异常后主动优雅关闭，避免继续返回不可信结果；让 Claude 重新启动 MCP 后再按任务状态恢复。
+4. 出现 `stdin-closed`、`stdout-closed` 或 `transport-closed`：对端已经关闭了 STDIO 管道，服务端无法阻止外部进程终止；重新启动 MCP 后使用原 `task_id` 和 `worker_id` 恢复，不要重新导入源文件。
+
+升级代码后必须重新生成实际运行的 `dist`：
+
+```bash
+npm run build
+npm test
+```
+
+然后完全重启 Claude，或执行 `/mcp` 重启项目连接。`.mcp.json` 运行的是
+`packages/mcp-server/dist/index.js`，`dist/` 不提交到 Git；只执行 `git pull` 不会刷新
+正在运行的 MCP 进程。
+
 ## 6. 删除知识库
 
 调用 `llm_wiki_delete_knowledge_base` 时必须显式确认：
