@@ -4,7 +4,7 @@ const closedObject = (properties, required = []) => ({ type: "object", propertie
 const toolDefinitions = [
   {
     name: "llm_wiki_import_files",
-    description: "Import Agent-visible supported documents, including XLSX workbooks, into the current workspace's managed source store, parse and batch them, and create a resumable task. Initializes the workspace automatically. The result requires background-agent-first extraction even when batch_count=1; the main Agent should coordinate and not call get_batch directly unless a worker creation or transport failure is recorded.",
+    description: "Import Agent-visible supported documents, including XLSX workbooks, into the current workspace's managed source store, parse and batch them, and create a resumable task. XLSX uses the configured native/auto/optional excel-parser Provider with safe native fallback and structured parser diagnostics. Initializes the workspace automatically. The result requires background-agent-first extraction even when batch_count=1; the main Agent should coordinate and not call get_batch directly unless a worker creation or transport failure is recorded.",
     inputSchema: closedObject({
       files: {
         type: "array", minItems: 1, maxItems: 100,

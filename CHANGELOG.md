@@ -5,10 +5,19 @@
 ### 版本分支初始化
 
 - 从 `V1.0.0` 基线创建 `v1.1.0-beta` 开发分支。
-- 本版本仅完成后续 Excel 增强解析与检索改造的版本隔离，功能暂未实现。
+- 本 Beta 分支用于 Excel 增强解析与多视图检索改造；当前版本已完成可选 Provider、原生回退和基础检索视图。
 - 后续 Beta 修补遵循 `V1.1.0-beta.N` 递增；稳定版补丁遵循 `V1.1.x`。
 
 ## [Unreleased] - 2026-08-06
+
+### Excel 增强解析与多视图检索
+
+- 新增可选 `excel-parser` Provider；未安装 Python 或增强解析失败时自动回退现有原生 XLSX 解析器。
+- 增加受控 Python Bridge、超时/输出/Cell 数量限制，解析异常以结构化诊断返回，不会关闭 MCP。
+- 引入 `spreadsheet-document-v2` 统一 Chunk，保留 Sheet、A1 范围、公式、命名区域、关键单元格和依赖摘要。
+- Excel Chunk 现在可生成表格正文、公式、依赖和命名区域多种检索视图，BM25 与 Embedding 在 Wiki 完成前即可使用这些视图进行 RRF 召回。
+- 解析指纹纳入 Provider、版本和配置；增强解析器切换后不会错误复用旧的 Markdown Chunk，重复导入重解析采用原子替换。
+- 增加增强解析结果标准化和多视图检索回归测试；不会执行 Excel 公式、宏或外部链接。
 
 ### Writer 职责与 Related 一致性修复
 

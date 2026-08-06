@@ -276,3 +276,56 @@ wiki/            # 最终生成的 Markdown 知识库
 ```
 
 不要复制 `node_modules/` 或旧的 `packages/mcp-server/dist/` 到新电脑；在新环境重新安装依赖并构建即可。
+
+## 9. Excel 增强解析与多路检索
+
+`v1.1.0-beta` 增加了可选的 `excel-parser` Provider。它通过受控 Python
+Bridge 调用外部解析器，随后由 Core 转换为 `spreadsheet-document-v2`。
+Bridge 使用独立的 stdin/stdout，不与 MCP STDIO 共用协议流；超时、输出过大、
+Python 缺失或解析失败都会转为结构化诊断，并在 `auto` 模式下回退到原生
+OOXML 解析器。
+
+统一 Chunk 至少保留以下信息：
+
+- Sheet 名和连续 A1 范围；
+- 确定性证据正文；
+- 公式及缓存值；
+- 关键单元格、命名区域和依赖摘要；
+- 解析 Provider、版本和内容指纹。
+
+每个 Excel Chunk 可以派生多个检索视图：`excel-block`、`excel-formula`、
+`excel-dependency` 和 `excel-named-range`。Wiki 尚未完成时，BM25 和
+Embedding 会索引这些视图并通过 RRF 融合；Wiki 完成后继续加入 Wiki 图谱
+通道。视图共享原始 `sourceId/chunkId/locator`，因此检索结果仍能回到精确
+的 Sheet/A1 证据。
+
+默认配置为：
+
+```json
+{
+  "parsing": {
+    "excel": {
+      "provider": "auto",
+      "pythonExecutable": "python3",
+      "timeoutMs": 120000,
+      "maxCellsPerSheet": 250000,
+      "maxTotalCells": 750000,
+      "maxOutputBytes": 67108864,
+      "maxChunkTokens": 700
+    }
+  }
+}
+```
+
+启用增强 Provider 前安装 Python 3.10+ 和固定版本依赖：
+
+```bash
+python3 -m venv .llm-wiki-python
+. .llm-wiki-python/bin/activate
+python -m pip install excel-parser==0.2.1
+```
+
+`native` 强制使用 Node 解析器；`auto` 优先尝试增强解析并安全回退；
+`excel-parser` 要求增强解析器必须可用。解析缓存指纹包含 Provider、版本、
+标准化模型版本和关键选项，因此切换解析器不会错误复用旧 Chunk；重复导入
+的重解析采用临时目录原子替换。

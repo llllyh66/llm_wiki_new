@@ -2942,7 +2942,8 @@ function semanticFinalizationHint(task, projection, requirements, existingPages,
 
 function stripInternalSource(source) {
   const { manifest: _manifest, chunks: _chunks, ...publicSource } = source
-  return publicSource
+  const parser = source.manifest?.metadata?.parser
+  return parser ? { ...publicSource, parser } : publicSource
 }
 
 async function workspaceTaskRecords(tasksRoot) {

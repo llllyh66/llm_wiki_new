@@ -18,6 +18,26 @@ export const DEFAULT_LIMITS = Object.freeze({
   maxQuoteChars: 1_000,
 })
 
+export const DEFAULT_PARSING = Object.freeze({
+  excel: {
+    provider: "auto",
+    pythonExecutable: "python3",
+    timeoutMs: 120_000,
+    maxCellsPerSheet: 250_000,
+    maxTotalCells: 750_000,
+    maxOutputBytes: 64 * 1024 * 1024,
+    maxChunkTokens: 700,
+    features: {
+      formulas: true,
+      dependencies: true,
+      namedRanges: true,
+      charts: true,
+      kpiCandidates: true,
+      sheetSummaries: true,
+    },
+  },
+})
+
 const DEFAULT_SCHEMA = `# llm_wiki Schema
 
 Agent-authored pages are allowed under:
@@ -115,12 +135,14 @@ export async function ensureWorkspace(root, options = {}) {
       stateDir: ".llm-wiki",
       targetLanguage: options.targetLanguage || "zh-CN",
       schemaPath: "llm-wiki.schema.md",
+      parsing: DEFAULT_PARSING,
       retrieval: { bm25: true, embedding: { provider: "none", maxDocuments: 1_000 }, wiki: true, vectorFallback: true, rrfK: 60, maxDocuments: 10_000 },
       limits: { ...DEFAULT_LIMITS },
     })
     await writeJsonAtomic(paths.config, {
       schemaVersion: 1,
       targetLanguage: options.targetLanguage || "zh-CN",
+      parsing: DEFAULT_PARSING,
       retrieval: { bm25: true, embedding: { provider: "none", maxDocuments: 1_000 }, wiki: true, vectorFallback: true, rrfK: 60, maxDocuments: 10_000 },
       limits: { ...DEFAULT_LIMITS },
     })
@@ -135,6 +157,21 @@ export async function ensureWorkspace(root, options = {}) {
     config: {
       ...workspace,
       ...config,
+      parsing: {
+        ...DEFAULT_PARSING,
+        ...(workspace.parsing ?? {}),
+        ...(config.parsing ?? {}),
+        excel: {
+          ...DEFAULT_PARSING.excel,
+          ...(workspace.parsing?.excel ?? {}),
+          ...(config.parsing?.excel ?? {}),
+          features: {
+            ...DEFAULT_PARSING.excel.features,
+            ...(workspace.parsing?.excel?.features ?? {}),
+            ...(config.parsing?.excel?.features ?? {}),
+          },
+        },
+      },
       retrieval: {
         ...workspace.retrieval,
         ...(config.retrieval ?? {}),

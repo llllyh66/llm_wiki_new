@@ -122,6 +122,31 @@ body. Legacy `wiki/collection/slug.md` bullets inside a Related section and
 Markdown links to Wiki pages are accepted and rewritten deterministically, so
 frontmatter and body navigation cannot diverge.
 
+### Optional enhanced Excel parsing
+
+The `v1.1.0-beta` line includes an optional `knowledgestack/excel-parser`
+Provider. It preserves workbook blocks, formulas, named ranges, key cells, and
+dependency summaries, then exposes deterministic `excel-block`, `excel-formula`,
+`excel-dependency`, and `excel-named-range` retrieval views to BM25 and
+Embedding before Wiki pages exist. The native Node OOXML parser remains the
+fallback, so Python is not required for normal operation.
+
+Install the optional dependency with Python 3.10+:
+
+```bash
+python3 -m venv .llm-wiki-python
+. .llm-wiki-python/bin/activate
+python -m pip install excel-parser==0.2.1
+```
+
+Set `parsing.excel.provider` in `.llm-wiki/config.json` to `auto` (recommended),
+`native`, or `excel-parser`. The `auto` mode falls back safely when Python or
+the package is unavailable. Parsing runs in an isolated child process with
+bounded time, cells, output, and memory-facing payloads; its stdout never shares
+the MCP protocol stream. See [the Chinese guide](README.zh-CN.md) and
+`KNOWLEDGE_BASE_TECHNICAL_GUIDE.md` for the complete configuration and recovery
+behavior.
+
 ## Architecture
 
 ```text

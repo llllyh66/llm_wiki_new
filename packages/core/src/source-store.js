@@ -4,6 +4,7 @@ import { lstat, open, rename, rm } from "node:fs/promises"
 import path from "node:path"
 import { LlmWikiError, fail } from "./errors.js"
 import { parseManagedSource, SUPPORTED_SOURCE_TYPES } from "./parser.js"
+import { EXCEL_MEDIA_TYPE, resolveSpreadsheetProvider, spreadsheetParserFingerprint, spreadsheetParserVersion } from "./spreadsheet-parser.js"
 import {
   cleanDisplayName,
   ensureDir,
@@ -105,47 +106,89 @@ async function importOne(workspace, input, displayName) {
   const manifestPath = path.join(workspace.paths.sourceManifests, `${sourceId}.json`)
   const duplicate = await pathExists(manifestPath)
   let manifest = duplicate ? await readJson(manifestPath) : undefined
-  if (!duplicate) {
+  const spreadsheetOptions = workspace.config.parsing?.excel ?? {}
+  const selectedSpreadsheetProvider = mediaType === EXCEL_MEDIA_TYPE
+    ? await resolveSpreadsheetProvider(spreadsheetOptions).catch((error) => {
+      if (spreadsheetOptions.provider === "excel-parser") throw error
+      return "native"
+    })
+    : null
+  const expectedParserFingerprint = mediaType === EXCEL_MEDIA_TYPE
+    ? spreadsheetParserFingerprint({ ...spreadsheetOptions, maxChunkChars: workspace.config.limits.maxChunkChars }, selectedSpreadsheetProvider)
+    : "headless-document-v3"
+  const existingProvider = manifest?.metadata?.parser?.provider
+  const explicitProviderChange = mediaType === EXCEL_MEDIA_TYPE
+    && spreadsheetOptions.provider !== "auto"
+    && existingProvider !== (selectedSpreadsheetProvider === "enhanced" ? "excel-parser" : "native")
+  const missingFingerprint = duplicate && !manifest?.parserFingerprint
+  const needsReparse = duplicate && (
+    missingFingerprint
+    || explicitProviderChange
+    || (spreadsheetOptions.provider !== "auto" && manifest?.parserFingerprint !== expectedParserFingerprint)
+  )
+  if (!duplicate || needsReparse) {
+    let managedPath
+    let extractedWriteDir
     try {
       await ensureDir(objectDir)
-      const managedName = safeManagedName(displayName, extension)
-      const managedPath = path.join(objectDir, managedName)
-      await rename(tempPath, managedPath)
+      if (!duplicate) {
+        const managedName = safeManagedName(displayName, extension)
+        managedPath = path.join(objectDir, managedName)
+        await rename(tempPath, managedPath)
+      } else {
+        managedPath = path.join(workspace.paths.root, manifest.managedRelativePath)
+        await rm(tempPath, { force: true })
+      }
       const extractedDir = path.join(objectDir, "extracted")
-      await ensureDir(extractedDir)
+      extractedWriteDir = duplicate ? path.join(objectDir, `extracted-next-${randomUUID()}`) : extractedDir
+      await ensureDir(extractedWriteDir)
       const parsed = await parseManagedSource(
         managedPath,
         sourceId,
         mediaType,
-        { maxChunkChars: workspace.config.limits.maxChunkChars },
+        { maxChunkChars: workspace.config.limits.maxChunkChars, spreadsheet: spreadsheetOptions },
       )
-      const documentPath = path.join(extractedDir, "document.json")
-      const markdownPath = path.join(extractedDir, "document.md")
-      const chunksPath = path.join(extractedDir, "chunks.json")
+      const documentPath = path.join(extractedWriteDir, "document.json")
+      const markdownPath = path.join(extractedWriteDir, "document.md")
+      const chunksPath = path.join(extractedWriteDir, "chunks.json")
       await writeJsonAtomic(documentPath, parsed.document)
       await writeTextAtomic(markdownPath, parsed.markdown)
       await writeJsonAtomic(chunksPath, parsed.chunks)
+      if (duplicate) {
+        await rm(extractedDir, { recursive: true, force: true })
+        await rename(extractedWriteDir, extractedDir)
+      }
+      const actualParserFingerprint = mediaType === EXCEL_MEDIA_TYPE
+        ? spreadsheetParserFingerprint(
+          { ...spreadsheetOptions, maxChunkChars: workspace.config.limits.maxChunkChars },
+          parsed.parser?.provider === "excel-parser" ? "enhanced" : "native",
+        )
+        : expectedParserFingerprint
       manifest = {
-        schemaVersion: 1,
+        ...(duplicate ? manifest : {}),
+        schemaVersion: 2,
         sourceId,
         contentHash,
         originalName: displayName,
         managedRelativePath: relativePosix(workspace.paths.root, managedPath),
         mediaType,
         sizeBytes,
-        importedAt: nowIso(),
+        importedAt: manifest?.importedAt ?? nowIso(),
+        ...(duplicate ? { reparsedAt: nowIso() } : {}),
         originalLocationHint: stripPrivateLocation(sourcePath),
-        parserVersion: "headless-document-v3",
+        parserVersion: parsed.parser ? spreadsheetParserVersion(parsed) : "headless-document-v3",
+        parserFingerprint: actualParserFingerprint,
         extractedDocumentPath: relativePosix(workspace.paths.root, documentPath),
         chunksPath: relativePosix(workspace.paths.root, chunksPath),
-        extractionHash: sha256(parsed.markdown),
+        extractionHash: sha256(`${actualParserFingerprint}:${parsed.markdown}`),
         status: "parsed",
-        metadata: { chunkCount: parsed.chunks.length },
+        metadata: { ...(manifest?.metadata ?? {}), ...(parsed.document.metadata ?? {}), chunkCount: parsed.chunks.length },
       }
       await writeJsonAtomic(path.join(objectDir, "metadata.json"), manifest)
       await writeJsonAtomic(manifestPath, manifest)
     } catch (error) {
-      await rm(objectDir, { recursive: true, force: true }).catch(() => {})
+      if (!duplicate) await rm(objectDir, { recursive: true, force: true }).catch(() => {})
+      else if (extractedWriteDir) await rm(extractedWriteDir, { recursive: true, force: true }).catch(() => {})
       await rm(tempPath, { force: true }).catch(() => {})
       throw error
     }
@@ -161,6 +204,7 @@ async function importOne(workspace, input, displayName) {
     chunk_count: chunks.length,
     disposition: duplicate ? "duplicate" : "imported",
     ...(duplicate ? { duplicate_of: sourceId } : {}),
+    ...(needsReparse ? { reparsed: true } : {}),
     manifest,
     chunks,
   }

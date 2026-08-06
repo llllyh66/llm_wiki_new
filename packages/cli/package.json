@@ -9,7 +9,7 @@
     "src"
   ],
   "dependencies": {
-    "@llm-wiki/core": "1.0.0"
+    "@llm-wiki/core": "1.1.0-beta.0"
   },
   "scripts": {
     "build": "node --check src/index.js",

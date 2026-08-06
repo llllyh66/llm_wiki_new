@@ -86,6 +86,7 @@ export async function retrieveContext(workspace, taskRecord, queries, options = 
       ...(item.document.sourceId ? { source_id: item.document.sourceId } : {}),
       ...(item.document.chunkId ? { chunk_id: item.document.chunkId } : {}),
       ...(item.document.locator ? { locator: item.document.locator } : {}),
+      ...(item.document.view ? { view: item.document.view } : {}),
       ...(item.document.section !== undefined ? { section: item.document.section } : {}),
     })
   }
@@ -142,20 +143,14 @@ async function retrievalDocuments(workspace, taskRecord, currentBatchId) {
   for (const batch of taskRecord.batches) {
     for (const chunk of batch.chunks) {
       const isCurrent = batch.batchId === currentBatchId
-      if (isCurrent) currentTotal += 1
-      else sourcesTotal += 1
+      const sourceDocuments = spreadsheetChunkDocuments(chunk)
+      if (isCurrent) currentTotal += sourceDocuments.length
+      else sourcesTotal += sourceDocuments.length
       const target = isCurrent ? current : sources
-      if (target.length >= maximumDocuments) continue
-      target.push(makeDocument({
-        id: `source:${chunk.sourceId}:${chunk.chunkId}`,
-        kind: "source-chunk",
-        path: `${chunk.sourceId}/${chunk.chunkId}`,
-        title: chunkTitle(chunk),
-        content: chunk.text,
-        sourceId: chunk.sourceId,
-        chunkId: chunk.chunkId,
-        locator: chunkLocator(chunk),
-      }))
+      for (const document of sourceDocuments) {
+        if (target.length >= maximumDocuments) break
+        target.push(document)
+      }
     }
   }
   const all = fairTake([current, wiki, analyses, sources], maximumDocuments)
@@ -426,6 +421,32 @@ function splitSections(content, maxChars) {
 
 function makeDocument(document) {
   return { ...document, hash: sha256(`${document.title}\n${document.content}`) }
+}
+
+function spreadsheetChunkDocuments(chunk) {
+  const base = makeDocument({
+    id: `source:${chunk.sourceId}:${chunk.chunkId}`,
+    kind: "source-chunk",
+    path: `${chunk.sourceId}/${chunk.chunkId}`,
+    title: chunkTitle(chunk),
+    content: chunk.text,
+    sourceId: chunk.sourceId,
+    chunkId: chunk.chunkId,
+    locator: chunkLocator(chunk),
+    ...(chunk.retrievalViews?.length > 0 ? { view: "excel-block" } : {}),
+  })
+  if (!Array.isArray(chunk.retrievalViews) || chunk.retrievalViews.length === 0) return [base]
+  return [base, ...chunk.retrievalViews.slice(0, 6).map((view, index) => makeDocument({
+    id: `source:${chunk.sourceId}:${chunk.chunkId}:view:${view.view ?? index}`,
+    kind: "source-structure",
+    path: `${chunk.sourceId}/${chunk.chunkId}`,
+    title: view.title || `${chunkTitle(chunk)} ${view.view ?? "structure"}`,
+    content: view.content || chunk.text,
+    sourceId: chunk.sourceId,
+    chunkId: chunk.chunkId,
+    locator: chunkLocator(chunk),
+    view: view.view ?? "excel-structure",
+  }))]
 }
 
 function chunkTitle(chunk) {

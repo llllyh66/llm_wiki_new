@@ -57,6 +57,47 @@ Related 的 canonical 格式是 frontmatter 中的 `collection/slug`，以及正
 请先将 `.xls` 另存为 `.xlsx`。Excel 公式不会被执行，Core 只读取文件中
 已保存的缓存结果，也不会访问外部链接。
 
+### Excel 增强解析（可选）
+
+Beta 分支提供可选的 `knowledgestack/excel-parser` Provider。它会额外保留
+表格块、公式、命名区域、关键单元格和依赖摘要，并为 BM25/Embedding 生成
+表格正文、公式、依赖和命名区域多路检索视图。Wiki 页面尚未生成时，查询也能
+直接利用这些结构化视图。
+
+基础 Node 解析器始终可用；没有 Python、Python 包未安装或增强解析超时/失败时，
+系统会自动回退原生解析器，不会影响 MCP 连接。启用增强 Provider 需要 Python
+3.10 或更高版本：
+
+```bash
+python3 -m venv .llm-wiki-python
+. .llm-wiki-python/bin/activate       # Windows: .llm-wiki-python\\Scripts\\activate
+python -m pip install excel-parser==0.2.1
+```
+
+在 `.llm-wiki/config.json` 中可配置：
+
+```json
+{
+  "parsing": {
+    "excel": {
+      "provider": "auto",
+      "pythonExecutable": "python3",
+      "timeoutMs": 120000,
+      "maxCellsPerSheet": 250000,
+      "maxTotalCells": 750000,
+      "maxOutputBytes": 67108864,
+      "maxChunkTokens": 700
+    }
+  }
+}
+```
+
+`provider` 可设为 `native`、`auto` 或 `excel-parser`。新电脑建议使用 `auto`；
+它会优先使用增强解析器，能力不可用时安全回退。设置为 `excel-parser` 时，
+增强解析器不可用会明确返回可恢复错误。完整 Workbook Graph 只保存在受控的
+解析产物中，不会整体放进 Agent 上下文；Agent 只接收有界 Chunk 和精确的
+Sheet/A1 证据定位。
+
 ## 新电脑安装
 
 ### 1. 安装基础环境

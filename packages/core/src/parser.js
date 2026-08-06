@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url"
 import JSZip from "jszip"
 import { fail } from "./errors.js"
 import { sha256 } from "./utils.js"
-import { xlsxToMarkdown } from "./xlsx.js"
+import { EXCEL_MEDIA_TYPE, parseSpreadsheet } from "./spreadsheet-parser.js"
 
 export const SUPPORTED_SOURCE_TYPES = Object.freeze({
   ".md": "text/markdown",
@@ -26,14 +26,41 @@ export async function parseManagedSource(filePath, sourceId, mediaType, options 
       const parsed = await docxToMarkdown(await readFile(filePath))
       content = parsed.markdown
       tableMetadata = parsed.tables
-    } else if (mediaType === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") {
-      const parsed = await xlsxToMarkdown(await readFile(filePath), {
-        fileName: path.basename(filePath),
-        maxTableChars: Math.max(1_000, (options.maxChunkChars ?? 8_000) - 500),
+    } else if (mediaType === EXCEL_MEDIA_TYPE) {
+      const parsed = await parseSpreadsheet(filePath, {
+        ...(options.spreadsheet ?? {}),
+        maxChunkChars: options.maxChunkChars,
       })
       content = parsed.markdown
       tableMetadata = parsed.tables
-      documentMetadata = parsed.metadata
+      documentMetadata = {
+        ...(parsed.metadata ?? {}),
+        parser: {
+          ...(parsed.parser ?? parsed.metadata?.parser ?? {}),
+          requestedProvider: parsed.requestedProvider,
+          fallbackUsed: parsed.fallbackUsed === true,
+        },
+        ...(parsed.diagnostics?.length > 0 ? { diagnostics: parsed.diagnostics } : {}),
+      }
+      if (Array.isArray(parsed.chunks) && parsed.chunks.length > 0) {
+        const directChunks = parsed.chunks.map((chunk, ordinal) => ({
+          ...chunk,
+          chunkId: `chunk-${sha256(`${sourceId}:${chunk.chunkId}`).slice(0, 24)}`,
+          sourceId,
+          ordinal,
+          ...(chunk.sheetName ? { sheetName: chunk.sheetName } : {}),
+          ...(chunk.cellRange ? { cellRange: chunk.cellRange } : {}),
+        }))
+        const directDocument = {
+          sourceId,
+          title: inferTitle(content, path.basename(filePath)),
+          mediaType,
+          metadata: documentMetadata,
+          blocks: parseBlocks(content),
+          media: [],
+        }
+        return { document: directDocument, markdown: normalizedContent(content), chunks: directChunks, parser: documentMetadata.parser }
+      }
     } else if (mediaType === "application/pdf") {
       content = await pdfToMarkdown(await readFile(filePath))
     } else {
@@ -48,7 +75,7 @@ export async function parseManagedSource(filePath, sourceId, mediaType, options 
   if (content.includes("\0")) {
     fail("SOURCE_PARSE_FAILED", "The source appears to be binary rather than Markdown or text.")
   }
-  const normalized = content.replace(/\r\n?/g, "\n")
+  const normalized = normalizedContent(content)
   if (!normalized.trim()) fail("SOURCE_PARSE_FAILED", "The source document contains no usable text.")
   const blocks = parseBlocks(normalized)
   if (tableMetadata.length > 0) {
@@ -74,8 +101,15 @@ export async function parseManagedSource(filePath, sourceId, mediaType, options 
   for (const chunk of chunks) {
     const pageHeading = [...chunk.headingPath].reverse().find((heading) => /^Page \d+$/i.test(heading))
     if (pageHeading) chunk.pageNumber = Number(pageHeading.match(/\d+/)?.[0])
+    const tables = Array.isArray(chunk.structuredData) ? chunk.structuredData : []
+    const views = tables.flatMap((table) => Array.isArray(table.retrievalViews) ? table.retrievalViews : [])
+    if (views.length > 0) chunk.retrievalViews = views
   }
-  return { document, markdown: normalized, chunks }
+  return { document, markdown: normalized, chunks, parser: documentMetadata.parser }
+}
+
+function normalizedContent(content) {
+  return String(content).replace(/\r\n?/g, "\n")
 }
 
 async function docxToMarkdown(buffer) {
