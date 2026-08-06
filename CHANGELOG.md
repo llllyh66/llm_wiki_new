@@ -1,6 +1,6 @@
 # 更新日志
 
-## [Unreleased] - 2026-08-05
+## [Unreleased] - 2026-08-06
 
 ### Writer 并行草稿流水线
 
@@ -8,6 +8,20 @@
 - 保留单一 Writer 提交者、路径不可分割约束和原子提交，避免为了提速引入同路径冲突、重复 coverage 或 Related 页面竞争。
 - 串行 `llm-wiki-writer` 明确降级为无法启动 drafter 时的 fallback，不再被误当作默认并行 Writer。
 - 补充 MCP 合约测试，防止后续提示词或工具描述回退到串行页面生成。
+
+### 后台 Agent 优先调度
+
+- `parallel_extraction` 对单 batch 任务也保持 `background-agent-first`，主 Agent 不再因文件较小而直接执行抽取。
+- Skill 明确禁止主 Agent 在启动 worker 前调用 `get_batch` 或 `commit_analysis`；只有实际 worker 创建失败、工具缺失或 MCP 传输错误时才允许前台兜底。
+- import 工具和状态响应增加 `required`、`mode`、`single_batch_background` 调度提示，并补充单 batch 回归测试和 MCP 合约检查。
+
+### MCP 长连接与 STDIO 生命周期修复
+
+- 心跳改用带独立超时预算的标准 `ping` 请求，避免 SDK 默认请求长期挂起后阻塞后续心跳。
+- 移除心跳定时器的 `unref`，保证长时间没有工具调用时 MCP 进程仍保持存活；生产默认仍为每 5 分钟一次。
+- 监听 STDIO 输入/输出的 `end`、`close` 和 `error`，对端退出时主动关闭协议并清理资源，避免出现“Claude 已断开但 Node 进程仍在”的僵尸连接。
+- 未捕获的进程级异常现在会记录后优雅退出并交还给宿主重启；普通工具校验错误仍由路由器转换为可恢复的结构化结果。
+- 增加短周期心跳的真实 STDIO 回归测试，验证连续 ping/pong 后仍可正常调用 `listTools`。
 
 ### 第二轮隐性 Bug 修复
 
@@ -42,4 +56,4 @@
 
 - 更新 Skill、Writer Agent、恢复指南和技术文档，统一采用 manifest → shard → durable commit 流程。
 - 新增 50+ 页面分片写入、提前 finalize 拒绝、上下文恢复和 MCP 错误恢复测试。
-- 全量测试通过：Core 37 项、MCP Server 12 项、CLI 1 项。
+- 全量测试通过：Core 38 项、MCP Server 13 项、CLI 1 项。

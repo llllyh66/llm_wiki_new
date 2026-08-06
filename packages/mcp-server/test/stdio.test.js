@@ -9,6 +9,34 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const textResult = (result) => JSON.parse(result.content[0].text)
 
+test("built MCP server remains usable across idle protocol heartbeats", async (t) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-stdio-idle-"))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const serverPath = fileURLToPath(new URL("../dist/index.js", import.meta.url))
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [serverPath, "--workspace", workspace],
+    stderr: "pipe",
+    env: {
+      // Production remains five minutes; the short test interval proves that
+      // repeated server-initiated ping/pong traffic does not poison STDIO.
+      LLM_WIKI_MCP_KEEPALIVE_MS: "1000",
+      LLM_WIKI_MCP_KEEPALIVE_TIMEOUT_MS: "500",
+    },
+  })
+  let stderr = ""
+  transport.stderr?.on("data", (chunk) => { stderr += String(chunk) })
+  const client = new Client({ name: "llm-wiki-idle-heartbeat-test", version: "1.0.0" })
+  t.after(() => transport.close().catch(() => {}))
+  await client.connect(transport)
+
+  await new Promise((resolve) => setTimeout(resolve, 2_400))
+  const listed = await client.listTools()
+  assert.equal(listed.tools.length, 16)
+  assert.match(stderr, /"event":"keepalive"\s*,"status":"ok"/)
+  assert.doesNotMatch(stderr, /"event":"fatal"/)
+})
+
 test("built MCP server survives errors and completes the full workflow over one STDIO connection", async (t) => {
   const workspace = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-stdio-"))
   t.after(() => rm(workspace, { recursive: true, force: true }))

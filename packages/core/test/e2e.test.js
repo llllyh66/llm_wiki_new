@@ -865,6 +865,22 @@ test("page commits repair legacy quote formatting and prefer requirement-ID Sour
   assert.equal(committed.normalized_page_source_ref_quotes, 1)
 })
 
+test("single-batch tasks still require a background extractor", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  assert.equal(imported.batch_count, 1)
+  assert.equal(imported.parallel_extraction.enabled, true)
+  assert.equal(imported.parallel_extraction.required, true)
+  assert.equal(imported.parallel_extraction.mode, "background-agent-first")
+  assert.equal(imported.parallel_extraction.single_batch_background, true)
+  assert.equal(imported.parallel_extraction.recommended_workers, 1)
+  const status = await f.core.status({ task_id: imported.task_id })
+  assert.equal(status.parallel_extraction.enabled, true)
+  assert.equal(status.parallel_extraction.required, true)
+  assert.equal(status.parallel_extraction.single_batch_background, true)
+})
+
 test("parallel workers lease distinct batches and concurrent commits preserve every result", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))

@@ -49,7 +49,7 @@ Agent 调用 `llm_wiki_import_files`：
 
 ### 2.2 分批和并行抽取
 
-Agent 通过 `llm_wiki_get_batch` 获取一个批次。Core 会：
+导入后主 Agent 只负责读取一次状态并启动后台 `llm-wiki-extractor`。即使文件只形成一个 batch，也保持后台 Agent-first 模式；主 Agent 只有在明确记录了 worker 创建失败、worker MCP 工具缺失或真实 MCP 传输错误后，才允许前台兜底处理。Agent 通过 `llm_wiki_get_batch` 获取一个批次。Core 会：
 
 - 给 batch 加 worker 租约，避免多个 worker 抢同一批次；
 - 返回服务端生成的 exact evidence catalog；
@@ -178,14 +178,15 @@ MCP Server 是 STDIO 长连接适配器。工具业务错误不会使用 MCP `is
 
 - 工具路由统一捕获 Core 异常；
 - MCP handler 最外层兜底；
-- `uncaughtException` 和 `unhandledRejection` 日志保护；
+- `uncaughtException` 和 `unhandledRejection` 记录日志；它们只针对未被工具路由捕获的进程级异常，触发后会优雅关闭当前协议，让宿主重启干净进程；
 - 输入 12 MB、输出 6 MB、STDIO buffer 32 MB 的边界保护；
 - 大结果使用分页而不是一次性返回；
-- 每 5 分钟发送一次标准协议 ping，避免宿主 idle timeout；
+- 每 5 分钟发送一次标准协议 ping，且为 ping 设置独立的 30 秒超时；心跳定时器保持引用，避免 STDIO 空闲时进程被 Node 提前退出；
+- 监听 STDIO 的 `end`、`close` 和 `error`，对端退出时主动关闭协议并清理定时器，避免留下“进程仍在但 MCP 已死”的僵尸连接；
 - batch、page plan、worker lease 和任务状态持久化，可跨 turn 恢复；
 - 页面提交使用幂等键、revision 和目标文件 hash。
 
-如果仍然显示断开，应检查 MCP stderr 中的 `transport-error`、`protocol-error`、`uncaught-exception`、`unhandled-rejection` 和 `keepalive` 日志。
+如果仍然显示断开，应检查 MCP stderr 中的 `transport-error`、`protocol-error`、`uncaught-exception`、`unhandled-rejection`、`shutdown-requested` 和 `keepalive` 日志。`keepalive.status=failed` 只表示宿主没有及时回复 ping，不会单独关闭连接；若出现 `stdin-closed`、`stdout-closed` 或 `transport-closed`，说明宿主已经关闭了 STDIO 管道，需要由 Claude 重新启动 MCP 进程。默认心跳为 5 分钟，可临时用 `LLM_WIKI_MCP_KEEPALIVE_MS` 和 `LLM_WIKI_MCP_KEEPALIVE_TIMEOUT_MS` 缩短诊断周期，生产环境不建议设置为低于 1 分钟。
 
 ## 6. 删除知识库
 
@@ -206,7 +207,7 @@ MCP Server 是 STDIO 长连接适配器。工具业务错误不会使用 MCP `is
 
 ## 7. Claude 配置和基本用法
 
-项目根目录 `.mcp.json` 注册 MCP Server，`.claude/settings.json` 允许主 Agent、extractor 和 writer 使用 Skill 及 14 个 MCP 工具。
+项目根目录 `.mcp.json` 注册 MCP Server，`.claude/settings.json` 允许主 Agent、extractor 和 writer 使用 Skill 及 16 个 MCP 工具。
 
 首次配置后：
 

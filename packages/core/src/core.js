@@ -233,7 +233,15 @@ export class LlmWikiCore {
       rejected: imported.rejected,
       batch_count: batches.length,
       parallel_extraction: {
-        enabled: batches.length > 1,
+        // A one-batch task still runs in a background extractor. The main
+        // Agent remains a coordinator even when there is no parallelism to
+        // exploit; this keeps the user turn responsive and makes scheduling
+        // behavior consistent across small and large files.
+        enabled: batches.length > 0,
+        required: batches.length > 0,
+        mode: "background-agent-first",
+        coordinator_direct_extraction: "fallback-only-after-worker-failure",
+        single_batch_background: batches.length === 1,
         recommended_workers: recommendedWorkers,
         max_workers: 4,
         worker_batch_quantum: workerBatchQuantum,
@@ -3099,7 +3107,11 @@ function statusResponse(task) {
     leased_batches: workerLeases.length,
     leased_batches_semantics: "persisted-reservations-not-live-agents",
     parallel_extraction: {
-      enabled: remainingBatches > 1,
+      enabled: remainingBatches > 0,
+      required: remainingBatches > 0,
+      mode: "background-agent-first",
+      coordinator_direct_extraction: "fallback-only-after-worker-failure",
+      single_batch_background: remainingBatches === 1,
       recommended_workers: recommendedWorkers,
       max_workers: 4,
       worker_batch_quantum: recommendedWorkerBatchQuantum(remainingBatches, recommendedWorkers),

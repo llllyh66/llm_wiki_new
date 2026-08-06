@@ -1,12 +1,30 @@
 #!/usr/bin/env node
 import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js"
+import { CallToolRequestSchema, EmptyResultSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js"
 import { LlmWikiCore } from "../../core/src/index.js"
 import { HeadlessToolRouter } from "./tools.js"
 
 const STDIO_MAX_BUFFER_BYTES = 32 * 1024 * 1024
-const MCP_KEEPALIVE_MS = 5 * 60_000
+const DEFAULT_MCP_KEEPALIVE_MS = 5 * 60_000
+const DEFAULT_MCP_KEEPALIVE_TIMEOUT_MS = 30_000
+
+// Keep the production default at five minutes (the documented host-compatibility
+// setting), while allowing the STDIO smoke test and operators to use a shorter
+// interval without editing the bundled server. The lower bound prevents an
+// accidental environment setting from turning the server into a ping loop.
+function readMilliseconds(name, fallback, { minimum = 1_000, maximum = 30 * 60_000 } = {}) {
+  const parsed = Number(process.env[name])
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback
+  return Math.min(maximum, Math.max(minimum, Math.round(parsed)))
+}
+
+const MCP_KEEPALIVE_MS = readMilliseconds("LLM_WIKI_MCP_KEEPALIVE_MS", DEFAULT_MCP_KEEPALIVE_MS)
+const MCP_KEEPALIVE_TIMEOUT_MS = readMilliseconds(
+  "LLM_WIKI_MCP_KEEPALIVE_TIMEOUT_MS",
+  DEFAULT_MCP_KEEPALIVE_TIMEOUT_MS,
+  { minimum: 250, maximum: 60_000 },
+)
 
 function log(event, details = {}) {
   try {
@@ -17,15 +35,21 @@ function log(event, details = {}) {
   }
 }
 
-// A rejected promise outside the tool router must not terminate the long-lived
-// STDIO process. Tool-level failures are converted to structured results by
-// HeadlessToolRouter; these handlers cover SDK/transport callbacks and late
-// filesystem promises that would otherwise make Claude report "disconnect".
+// Tool-level failures are converted to structured results by HeadlessToolRouter
+// and never reach these process-level hooks. An unexpected exception/rejection
+// means the process may no longer be safe to keep serving; once main() has
+// attached its transport, it performs a graceful close so the host can restart
+// a clean MCP process instead of leaving a silent zombie behind.
+let requestFatalShutdown = null
 process.on("uncaughtException", (error) => {
   log("uncaught-exception", { message: error instanceof Error ? error.message : String(error) })
+  process.exitCode = 1
+  if (requestFatalShutdown) requestFatalShutdown("uncaught-exception", error)
 })
 process.on("unhandledRejection", (reason) => {
   log("unhandled-rejection", { message: reason instanceof Error ? reason.message : String(reason) })
+  process.exitCode = 1
+  if (requestFatalShutdown) requestFatalShutdown("unhandled-rejection", reason)
 })
 
 function parseWorkspace(argv) {
@@ -68,33 +92,90 @@ async function main() {
     }
   })
   const transport = new StdioServerTransport(process.stdin, process.stdout, { maxBufferSize: STDIO_MAX_BUFFER_BYTES })
-  transport.onerror = (error) => log("transport-error", { message: error.message })
+  transport.onerror = (error) => log("transport-error", { message: error instanceof Error ? error.message : String(error) })
   transport.onclose = () => log("transport-closed")
-  server.onerror = (error) => log("protocol-error", { message: error.message })
+  server.onerror = (error) => log("protocol-error", { message: error instanceof Error ? error.message : String(error) })
   let resolveClosed
   const closed = new Promise((resolve) => { resolveClosed = resolve })
+  let closeRequested = false
+  const requestShutdown = (reason, error) => {
+    if (closeRequested) return
+    closeRequested = true
+    log("shutdown-requested", {
+      reason,
+      ...(error ? { message: error instanceof Error ? error.message : String(error) } : {}),
+    })
+    // StdioServerTransport from the SDK does not listen for stdin end/close.
+    // Closing the protocol explicitly prevents a dead child process from
+    // remaining around after Claude has dropped its pipe.
+    Promise.resolve(server.close())
+      .catch((closeError) => log("shutdown-error", { message: closeError instanceof Error ? closeError.message : String(closeError) }))
+      .finally(() => resolveClosed())
+  }
+  requestFatalShutdown = requestShutdown
   server.onclose = () => {
     log("server-closed")
     resolveClosed()
   }
-  await server.connect(transport)
-  log("ready", { workspace: ".", tools: router.listTools().length, maxBufferBytes: STDIO_MAX_BUFFER_BYTES })
-  // Some hosts (including long-running Agent worker sessions) enforce an
-  // idle timeout outside the MCP process. Keep the protocol session active
-  // while extraction continues without tool calls. A failed ping is only
-  // diagnostic; it must never reject the server's main promise.
-  let keepaliveBusy = false
-  const keepalive = setInterval(() => {
-    if (keepaliveBusy) return
-    keepaliveBusy = true
-    Promise.resolve(server.ping())
-      .then(() => log("keepalive", { status: "ok" }))
-      .catch((error) => log("keepalive", { status: "failed", message: error instanceof Error ? error.message : String(error) }))
-      .finally(() => { keepaliveBusy = false })
-  }, MCP_KEEPALIVE_MS)
-  keepalive.unref?.()
-  await closed
-  clearInterval(keepalive)
+
+  // The SDK's StdioServerTransport handles data and error events, but not the
+  // lifecycle events that indicate the other end of a pipe has disappeared.
+  // Watch the streams at the adapter boundary so we never leave a silent,
+  // unusable MCP process behind.
+  const onStdinEnd = () => requestShutdown("stdin-closed")
+  const onStdinError = (error) => requestShutdown("stdin-error", error)
+  const onStdoutClose = () => requestShutdown("stdout-closed")
+  const onStdoutError = (error) => requestShutdown("stdout-error", error)
+  process.stdin.once("end", onStdinEnd)
+  process.stdin.once("close", onStdinEnd)
+  process.stdin.once("error", onStdinError)
+  process.stdout.once("close", onStdoutClose)
+  process.stdout.once("error", onStdoutError)
+
+  let keepalive
+  try {
+    await server.connect(transport)
+    log("ready", {
+      workspace: ".",
+      tools: router.listTools().length,
+      maxBufferBytes: STDIO_MAX_BUFFER_BYTES,
+      keepaliveMs: MCP_KEEPALIVE_MS,
+      keepaliveTimeoutMs: MCP_KEEPALIVE_TIMEOUT_MS,
+    })
+    // Some hosts (including long-running Agent worker sessions) enforce an
+    // idle timeout outside the MCP process. Keep the protocol session active
+    // while extraction continues without tool calls. Use the public request API
+    // with an explicit timeout instead of Server#ping(), whose SDK default is
+    // 60 seconds. A missing pong is diagnostic only; it must not poison the
+    // session or leave an in-flight request that blocks future heartbeats.
+    let keepaliveBusy = false
+    keepalive = setInterval(() => {
+      if (keepaliveBusy || closeRequested || !server.transport) return
+      keepaliveBusy = true
+      const startedAt = Date.now()
+      Promise.resolve(server.request(
+        { method: "ping" },
+        EmptyResultSchema,
+        { timeout: MCP_KEEPALIVE_TIMEOUT_MS, maxTotalTimeout: MCP_KEEPALIVE_TIMEOUT_MS },
+      ))
+        .then(() => log("keepalive", { status: "ok", durationMs: Date.now() - startedAt }))
+        .catch((error) => log("keepalive", {
+          status: "failed",
+          durationMs: Date.now() - startedAt,
+          message: error instanceof Error ? error.message : String(error),
+        }))
+        .finally(() => { keepaliveBusy = false })
+    }, MCP_KEEPALIVE_MS)
+    await closed
+  } finally {
+    if (keepalive) clearInterval(keepalive)
+    process.stdin.off("end", onStdinEnd)
+    process.stdin.off("close", onStdinEnd)
+    process.stdin.off("error", onStdinError)
+    process.stdout.off("close", onStdoutClose)
+    process.stdout.off("error", onStdoutError)
+    requestFatalShutdown = null
+  }
 }
 
 main().catch((error) => {

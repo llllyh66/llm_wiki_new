@@ -120,7 +120,7 @@ llm-wiki: node packages/mcp-server/dist/index.js --workspace . - Connected
 /mcp
 ```
 
-`llm-wiki` 应显示 `Connected` 和 14 个工具。
+`llm-wiki` 应显示 `Connected` 和 16 个工具。
 
 页面规划上下文会自动分页，Skill 会持续读取到 `next_cursor` 为空；大请求和大结果
 也有明确预算，超过限制时会返回可恢复错误，而不是关闭 MCP 连接。
@@ -159,7 +159,7 @@ extractor 数量。`status.next_action` 也会在投影就绪时
 在协调器中重复抽取。
 首次启动和补位都必须显式使用项目 Agent 类型 `llm-wiki-extractor`，不能改用
 `general-purpose`、动态“Worker N”或 Agent Team teammate，因为它们不会加载该
-Agent 文件的 `mcpServers` 配置。项目同时显式允许 14 个 MCP 工具名，每个工具
+Agent 文件的 `mcpServers` 配置。项目同时显式允许 16 个 MCP 工具名，每个工具
 都发布 `anthropic/alwaysLoad` 元数据；如果宿主仍延迟加载，Worker 会先使用
 ToolSearch 发现工具，而不是直接判定 MCP 不可用。
 `.claude/agents/llm-wiki-writer.md` 使用同样的 MCP 复用方式，且每个任务同时
@@ -430,7 +430,7 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
 
 ### MCP 已连接，但工具无法调用
 
-1. 在 Claude Code 中运行 `/mcp`，确认已批准且工具数为 14。
+1. 在 Claude Code 中运行 `/mcp`，确认已批准且工具数为 16。
 2. 运行 `npm run build`，然后重启 Claude Code。
 3. 确保是从项目根目录启动。
 4. 显式测试：
@@ -475,12 +475,19 @@ npm test
 ```
 
 然后完全退出 Claude Code，从该项目根目录重新运行 `claude`，批准项目 MCP，
-并用 `/mcp` 确认 `llm-wiki` 为 `Connected` 且有 14 个工具。最新版包含连续
+并用 `/mcp` 确认 `llm-wiki` 为 `Connected` 且有 16 个工具。最新版包含连续
 `INVALID_ANALYSIS`、错误 SourceRef 和畸形重试后保持同一 STDIO 连接存活的
-回归测试。现在 14 个工具的所有异常都作为普通工具结果返回，不再进入
+回归测试。现在 16 个工具的所有异常都作为普通工具结果返回，不再进入
 MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 `error`、`next_action` 和 `mcp_connection_usable: true`。Agent 应按
 `next_action` 修正或恢复，不需要执行 `/mcp`。
+
+若是在长时间没有工具调用、后台 Agent 仍在工作时断开，查看 MCP stderr：服务默认每
+5 分钟发送一次带 30 秒预算的标准 ping；心跳失败只记录日志，不会因为一次失败主动
+断开。`stdin-closed`、`stdout-closed` 或 `transport-closed` 表示宿主已经关闭了管道，
+需要让 Claude 重新启动 MCP。调试时可用环境变量
+`LLM_WIKI_MCP_KEEPALIVE_MS` 和 `LLM_WIKI_MCP_KEEPALIVE_TIMEOUT_MS` 缩短心跳周期，
+但生产环境建议保持默认值。
 
 ### 已完成多个 batch，但没有生成 Wiki 页面
 

@@ -63,6 +63,7 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(skill, /server has already generated exact quotes/)
   assert.match(skill, /never retype a quote, read the\s+original source file/)
   assert.match(extractor, /cite `evidence_index` values directly/)
+  assert.match(extractor, /including `batch_count: 1`/)
   assert.match(skill, /at most two `commit_analysis` attempts for each batch/)
   assert.match(writer, /view: "manifest"/)
   assert.match(writer, /hard maximum is 50 patches per call/)
@@ -86,6 +87,10 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(skill, /coordinator-owned-parallel-drafters/)
   assert.match(skill, /Never generate an oversized patch set and split it afterward/)
   assert.match(skill, /Do not traverse every manifest\s+shard before drafting/)
+  assert.match(skill, /Background-agent priority \(mandatory\)/)
+  assert.match(skill, /including a task with exactly one batch/)
+  assert.match(skill, /Do not call `llm_wiki_get_batch` or perform semantic extraction in the main/)
+  assert.match(skill, /only after a worker creation was attempted and failed/)
 })
 
 test("MCP publishes the complete Agent-first tool contract without desktop tools", () => {
@@ -111,6 +116,7 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
   assert.equal(names.includes("llm_wiki_projects"), false)
   assert.equal(names.includes("llm_wiki_chat"), false)
   assert.equal(new Set(names).size, names.length)
+  assert.match(TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_import_files").description, /background-agent-first extraction even when batch_count=1/)
   for (const tool of TOOL_DEFINITIONS) {
     assert.match(tool.name, /^llm_wiki_[a-z_]+$/)
     assert.equal(typeof tool.description, "string")

@@ -13,7 +13,9 @@ background: true
 
 Act only as one background extraction worker. The coordinator must provide a
 task ID, an unchanged worker ID, a `worker_batch_quantum` from 1 to 6, and the
-server's `recommended_batch_chars`.
+server's `recommended_batch_chars`. The coordinator launches this worker for
+every non-empty task, including `batch_count: 1`; a small task is not a reason
+to perform extraction in the foreground.
 There is no capability-probe mode: the
 coordinator verifies task status directly before launching workers. Do not
 create, delete, or repair a Team.

@@ -38,6 +38,25 @@ When `workspace_context.domain_schema` is present, also read
 [domain-schema.md](references/domain-schema.md) before extracting the first
 typed entity or any relation.
 
+## Background-agent priority (mandatory)
+
+The main Agent is a coordinator, not the default extractor or page author.
+For every non-empty task, including a task with exactly one batch, launch the
+project `llm-wiki-extractor` in the background before calling `get_batch` or
+`commit_analysis` in the coordinator. When the Wiki projection is ready, launch
+the project `llm-wiki-page-drafter` children and the stable `llm-wiki-writer` in
+the background before drafting or committing pages in the coordinator. Do not
+choose direct foreground work merely because the file is small, one batch is
+available, or a background Agent would take less prompt text.
+
+The only valid foreground fallback is after an actual worker-creation failure,
+an explicitly missing worker MCP tool, or a concrete MCP transport failure.
+An Agent/Team lifecycle warning, a persisted lease, a validation rejection, or
+the expectation that direct work might be faster is not a fallback condition.
+Record the failed worker attempt and state the reason before using the
+coordinator. If the host supports background/run-in-background execution,
+always use it and return control to the user while the worker runs.
+
 ## Workflow
 
 1. Identify every attachment or explicit file reference in the user's request.
@@ -48,15 +67,17 @@ typed entity or any relation.
 2. Call `llm_wiki_import_files` with each Agent-visible local path and a safe
    display name. Let the tool initialize the current workspace.
 3. Record the returned task ID in working context.
-4. Use background parallel extraction by default when
-   `parallel_extraction.enabled` is true. After import, verify the task once by
-   calling `llm_wiki_status` directly in the coordinator. Do not create a
-   throwaway project Agent, Team, or capability-probe worker. The successful
-   import plus a structured status result proves the coordinator's MCP
-   connection; only that actual tool result may be described as "MCP ready".
-   Agent/Team initialization errors do not prove MCP readiness. Do not call
-   `spawnTeam`, `TeamCreate`, or `TeamDelete` for this workflow, and do not try
-   to repair a stale host Team before extraction.
+4. Use background extraction for every non-empty task. After import, verify
+   the task once by calling `llm_wiki_status` directly in the coordinator. Do not call `llm_wiki_get_batch` or perform semantic extraction in the main
+   Agent before launching the worker. The import response and status expose
+   `parallel_extraction.required: true`, `mode: "background-agent-first"`, and
+   `single_batch_background: true` for one-batch tasks; obey those fields even
+   when `enabled` is absent on an older server. Do not create a throwaway
+   project Agent, Team, or capability-probe worker. The successful import plus
+   a structured status result proves the coordinator's MCP connection; only
+   that actual tool result may be described as "MCP ready". Agent/Team initialization errors do not prove MCP readiness. Do not call `spawnTeam`,
+   `TeamCreate`, or `TeamDelete` for this workflow, and do not try to repair a
+   stale host Team before extraction.
 
    After a successful coordinator status call, start exactly
    `parallel_extraction.recommended_workers` background project subagents
@@ -79,9 +100,10 @@ typed entity or any relation.
    launched as success even if it also contains an unrelated Team warning.
    Add those worker IDs to `running_worker_ids` and do not simultaneously run
    the same extraction quantum in the coordinator. Fall back to coordinator
-   extraction only when no worker was created, or when a created worker itself
-   reports that an `llm_wiki_*` tool is absent or raises a real transport error.
-   Never infer worker failure merely from Team lifecycle text.
+   extraction only after a worker creation was attempted and failed, or when a
+   created worker itself reports that an `llm_wiki_*` tool is absent or raises a
+   real transport error. Never infer worker failure merely from Team lifecycle
+   text, a small batch count, or the fact that direct extraction appears faster.
    The coordinator must maintain a local `running_worker_ids` set. Add an ID
    when its subagent invocation starts and remove it immediately when that
    invocation sends any completion notification, before interpreting Core
