@@ -2,6 +2,17 @@
 
 ## [Unreleased] - 2026-08-06
 
+### Projection 状态机与 cursor replay 修复
+
+- 禁止 `projection_complete=false` 的 server-side manifest 空 wave；非最终 shard 必须提交完整 PagePatch 或已校验的 staged draft，避免空提交被错误记入 `committedDraftShardIds`。
+- 对 direct PagePatch 执行 shard 级完整校验：要求覆盖恰好一次、路径属于指定 shard、路径/operation/expectedFileHash 保持 scaffold 一致，且校验失败不会改变任何 projection 状态。
+- `status`、page-plan 和 page commit 会自动审计旧任务的 shard coverage；发现历史空提交或损坏的 committed ledger 时，自动退回对应 shard、清除读取游标并返回可恢复的下一步动作。
+- draft-shard cursor 首次读取后持久化 `max_chars` 与边界；重放 cursor 时固定原分页边界，并为旧任务迁移仅保存 next cursor 的状态，避免改变请求大小导致 tracking 分裂。
+- 状态响应新增 `projection_complete`、`next_draft_shard_id` 和 `retrieved_uncommitted_draft_shards`，明确区分“已读取但未提交”和“已提交”数量。
+- 新增空 wave、shard coverage、损坏任务自动恢复和 cursor replay 回归测试。
+- 旧任务在 `status`、读取 page plan 或提交页面时会自动修复，不需要手工编辑 `task.json` 或反复重连 MCP；修复过程保持原子性，失败时不会部分推进 projection。
+- 最终 coverage 不完整时不再返回“可完成”的假状态，而是重新暴露缺失 shard 及下一步恢复动作，避免 `projection_complete=true` 与 `INCOMPLETE_PAGE_COVERAGE` 相互矛盾。
+
 ### Writer 并行草稿流水线
 
 - 页面 manifest 现在明确声明 `coordinator-owned-parallel-drafters` 执行模式：主协调器必须为互不重叠的 shard 启动最多 4 个 `llm-wiki-page-drafter`。

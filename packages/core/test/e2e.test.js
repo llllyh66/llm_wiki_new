@@ -1966,6 +1966,47 @@ test("server-side page manifests keep 50-plus-page projections in durable bounde
     assert.equal(shard.draft_shard_complete, true)
     assert.equal(shard.page_requirements.length <= 6, true)
     visitedShards.push(shard.shard.shard_id)
+    await assert.rejects(
+      () => f.core.commitPages({
+        task_id: imported.task_id,
+        writer_id: "wiki-writer-1",
+        projection_id: manifest.projection.projection_id,
+        based_on_wiki_revision: revision,
+        projection_complete: false,
+        draft_shard_ids: [shard.shard.shard_id],
+        patches: [],
+        idempotency_key: `many-page-empty-shard-${shard.shard.shard_id}`,
+      }),
+      (error) => error instanceof LlmWikiError
+        && error.code === "INVALID_PAGE_PATCH"
+        && error.details?.atomic_commit_applied === false,
+    )
+    const afterEmpty = await f.core.status({ task_id: imported.task_id })
+    assert.equal(afterEmpty.wiki_projection.committed_draft_shards, visitedShards.length - 1)
+    if (shard.page_requirements.length > 1) {
+      const incompletePatch = {
+        ...shard.page_requirements[0].patch_scaffold,
+        content: `# ${shard.page_requirements[0].title}\n\nIncomplete shard.\n`,
+        summary: "Incomplete shard.",
+      }
+      await assert.rejects(
+        () => f.core.commitPages({
+          task_id: imported.task_id,
+          writer_id: "wiki-writer-1",
+          projection_id: manifest.projection.projection_id,
+          based_on_wiki_revision: revision,
+          projection_complete: false,
+          draft_shard_ids: [shard.shard.shard_id],
+          patches: [incompletePatch],
+          idempotency_key: `many-page-incomplete-shard-${shard.shard.shard_id}`,
+        }),
+        (error) => error instanceof LlmWikiError
+          && error.code === "INCOMPLETE_PAGE_COVERAGE"
+          && error.details?.shard_id === shard.shard.shard_id,
+      )
+      const afterIncomplete = await f.core.status({ task_id: imported.task_id })
+      assert.equal(afterIncomplete.wiki_projection.committed_draft_shards, visitedShards.length - 1)
+    }
     const patches = shard.page_requirements.map((requirement) => ({
       ...requirement.patch_scaffold,
       content: `# ${requirement.title}\n\n## Summary\n\n${requirement.title} is a supported business object.\n`,
@@ -2058,6 +2099,92 @@ test("page drafters stage receipt-only shards and the Writer commits them server
     shard_ids: [shard.shard.shard_id],
   })
   assert.deepEqual(after.missing_shard_ids, [shard.shard.shard_id])
+})
+
+test("status repairs a legacy empty-committed draft shard and resumes it", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  await analyzeAll(f.core, imported)
+  const manifest = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    view: "manifest",
+    cursor: 0,
+    max_chars: 40_000,
+  })
+  const shardId = manifest.draft_manifest.shards[0].shard_id
+  const taskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
+  const persisted = JSON.parse(await readFile(taskPath, "utf8"))
+  persisted.pageProjection.lease.committedDraftShardIds = [shardId]
+  persisted.pageProjection.lease.retrievedDraftShardIds = []
+  persisted.pageProjection.lease.nextDraftShardId = null
+  delete persisted.pageProjection.lease.coverageAuditAt
+  delete persisted.pageProjection.lease.coverageAuditWikiRevision
+  await writeFile(taskPath, JSON.stringify(persisted))
+
+  const recovered = await f.core.status({ task_id: imported.task_id })
+  assert.deepEqual(recovered.projection_recovery.repaired_shard_ids, [shardId])
+  assert.equal(recovered.wiki_projection.committed_draft_shards, 0)
+  assert.equal(recovered.wiki_projection.next_draft_shard_id, shardId)
+  assert.equal(recovered.next_action.tool, "llm_wiki_get_page_plan_context")
+  assert.equal(recovered.next_action.arguments.shard_id, shardId)
+
+  const shard = await f.core.getPagePlanContext(recovered.next_action.arguments)
+  assert.equal(shard.draft_shard_complete, true)
+  const patches = shard.page_requirements.map((requirement) => ({
+    ...requirement.patch_scaffold,
+    content: `# ${requirement.title}\n\nRecovered semantic page.\n`,
+    summary: "Recovered semantic page.",
+  }))
+  const committed = await f.core.commitPages({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: manifest.projection.projection_id,
+    based_on_wiki_revision: manifest.based_on_wiki_revision,
+    projection_complete: false,
+    draft_shard_ids: [shardId],
+    patches,
+    idempotency_key: "recovered-empty-shard-v1",
+  })
+  assert.equal(committed.accepted, true)
+  assert.equal(committed.projection.committed_draft_shards, 1)
+})
+
+test("draft-shard cursor replay preserves the original max_chars boundary", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  await analyzeAll(f.core, imported)
+  await mkdir(path.join(f.workspace, "wiki", "concepts"), { recursive: true })
+  await writeFile(path.join(f.workspace, "wiki", "concepts", "business-entity.md"), `# Business Entity\n\n${"Existing body. ".repeat(2_000)}\n`)
+  await writeFile(path.join(f.workspace, "wiki", "concepts", "aggregate.md"), `# Aggregate\n\n${"Existing body. ".repeat(2_000)}\n`)
+  const manifest = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    view: "manifest",
+    cursor: 0,
+    max_chars: 40_000,
+  })
+  const action = manifest.draft_manifest.draft_actions[0].arguments
+  const first = await f.core.getPagePlanContext({ ...action, max_chars: 1_000 })
+  assert.notEqual(first.next_cursor, null)
+  const replay = await f.core.getPagePlanContext({ ...action, max_chars: 40_000 })
+  assert.equal(replay.next_cursor, first.next_cursor)
+  assert.deepEqual(replay.pagination, first.pagination)
+  let cursor = replay.next_cursor
+  while (cursor !== null) {
+    const page = await f.core.getPagePlanContext({
+      ...action,
+      cursor,
+      max_chars: 40_000,
+    })
+    cursor = page.next_cursor
+  }
+  const taskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
+  const persisted = JSON.parse(await readFile(taskPath, "utf8"))
+  const reads = persisted.pageProjection.lease.draftShardCursorReads[manifest.draft_manifest.shards[0].shard_id]
+  assert.equal(reads["0"].max_chars, 1_000)
 })
 
 test("aborting a task removes uncommitted server-side page drafts", async (t) => {

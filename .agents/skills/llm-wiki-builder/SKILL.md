@@ -448,6 +448,10 @@ always use it and return control to the user while the worker runs.
       an accepted wave. When the server says no shard remains, send the
       returned empty `patches: []`, `projection_complete: true`
       acknowledgement. This final coverage audit completes the projection.
+      For a server-side manifest, a non-final wave must contain a complete
+      PagePatch set for every assigned path, or use `staged_draft_shard_ids`;
+      `projection_complete: false` with `draft_shard_ids` and `patches: []` is
+      invalid and must never be treated as an accepted shard commit.
       `INCOMPLETE_PAGE_COVERAGE` is a normal recoverable result: author the
       listed missing pages or attach their requirement IDs to an appropriate
       existing-page update, then retry without restarting MCP.

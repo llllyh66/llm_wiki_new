@@ -204,6 +204,78 @@ export class LlmWikiCore {
     }
   }
 
+  // A legacy Writer could mark a server-side draft shard committed even when
+  // its page wave was empty. Keep the persisted projection recoverable by
+  // reconciling the durable shard ledger with the actual Wiki coverage before
+  // reporting status or accepting another projection call. This is deliberately
+  // lazy and one-shot per projection revision so normal status polling does not
+  // rescan a large Wiki on every turn.
+  async #repairProjectionState(workspace, record, options = {}) {
+    const state = projectionState(record.task)
+    const projection = state.lease
+    if (!projection || projection.pagePlanTraversal?.serverSideManifest !== true) {
+      return { changed: false, repaired_shard_ids: [] }
+    }
+    const committedShardIds = uniqueStrings(projection.committedDraftShardIds ?? [])
+    if (committedShardIds.length === 0) return { changed: false, repaired_shard_ids: [] }
+    const auditRevision = projection.coverageAuditWikiRevision
+    const currentRevision = record.task.wikiRevision ?? null
+    if (options.force !== true && projection.coverageAuditAt && auditRevision === currentRevision) {
+      return { changed: false, repaired_shard_ids: [] }
+    }
+    const snapshot = await this.#pagePlanSnapshot(record, projection.projectionId)
+    const manifest = Array.isArray(snapshot?.draftManifest) ? snapshot.draftManifest : []
+    const requirements = Array.isArray(snapshot?.context?.required_pages) ? snapshot.context.required_pages : []
+    if (manifest.length === 0 || requirements.length === 0) return { changed: false, repaired_shard_ids: [] }
+    const manifestById = new Map(manifest.map((shard) => [shard.shard_id, shard]))
+    projection.draftShardCount = manifest.length
+    const coverage = await pageRequirementCoverageAudit(workspace.paths.wiki, requirements, [])
+    const missingRequirementIds = new Set(coverage.missing.map((item) => item.requirement_id))
+    const repairedShardIds = committedShardIds.filter((shardId) => {
+      const shard = manifestById.get(shardId)
+      return !shard || shard.requirement_ids.some((requirementId) => missingRequirementIds.has(requirementId))
+    })
+    const validCommittedShardIds = committedShardIds.filter((shardId) => !repairedShardIds.includes(shardId) && manifestById.has(shardId))
+    const pendingShard = manifest.find((shard) => !validCommittedShardIds.includes(shard.shard_id)) ?? null
+    const expectedNextShardId = pendingShard?.shard_id ?? null
+    const changed = repairedShardIds.length > 0
+      || validCommittedShardIds.length !== committedShardIds.length
+      || (projection.nextDraftShardId ?? null) !== expectedNextShardId
+    projection.coverageAuditAt = nowIso()
+    projection.coverageAuditWikiRevision = currentRevision
+    if (changed) {
+      projection.committedDraftShardIds = validCommittedShardIds
+      const repaired = new Set(repairedShardIds)
+      projection.retrievedDraftShardIds = (projection.retrievedDraftShardIds ?? []).filter((shardId) => !repaired.has(shardId))
+      projection.nextDraftShardId = expectedNextShardId
+      projection.draftShardNextCursors = projection.draftShardNextCursors && typeof projection.draftShardNextCursors === "object"
+        ? projection.draftShardNextCursors : {}
+      projection.draftShardSeenCursors = projection.draftShardSeenCursors && typeof projection.draftShardSeenCursors === "object"
+        ? projection.draftShardSeenCursors : {}
+      projection.draftShardCursorReads = projection.draftShardCursorReads && typeof projection.draftShardCursorReads === "object"
+        ? projection.draftShardCursorReads : {}
+      for (const shardId of repairedShardIds) {
+        projection.draftShardNextCursors[shardId] = 0
+        projection.draftShardSeenCursors[shardId] = []
+        delete projection.draftShardCursorReads[shardId]
+      }
+      await Promise.all(repairedShardIds.map((shardId) => rm(pageDraftPath(record.paths, projection.projectionId, shardId), { force: true }).catch(() => {})))
+      if (repairedShardIds.length > 0) {
+        projection.coverageRepair = {
+          repaired_at: projection.coverageAuditAt,
+          repaired_shard_ids: repairedShardIds,
+          missing_requirement_ids: [...missingRequirementIds].filter((requirementId) => repairedShardIds.some((shardId) => manifestById.get(shardId)?.requirement_ids.includes(requirementId))),
+          reason: "committed shard lacked durable Wiki requirement coverage",
+        }
+      }
+    }
+    // Persist the audit marker even when the ledger is already healthy. This
+    // keeps repeated status calls cheap while still forcing a fresh audit after
+    // each accepted page transaction (which updates coverageAuditWikiRevision).
+    await saveTask(record.paths, record.task)
+    return { changed, repaired_shard_ids: repairedShardIds }
+  }
+
   async importFiles(input) {
     return this.#withWorkspaceWriteLock(() => this.#withNamedWorkspaceFileLock("sources.lock", "import", null, () => this.#importFiles(input)))
   }
@@ -612,6 +684,7 @@ export class LlmWikiCore {
   async #getPagePlanContext(input) {
     const workspace = await this.workspace()
     const record = await loadTask(workspace.paths, input?.task_id)
+    await this.#repairProjectionState(workspace, record)
     const requestedCursor = normalizePagePlanCursor(input?.cursor)
     const projectionRequested = input?.writer_id !== undefined || input?.projection_id !== undefined
     const requestedView = normalizePagePlanView(input?.view, projectionRequested)
@@ -863,6 +936,7 @@ export class LlmWikiCore {
 
   async #pagePlanManifestResponse(workspace, record, projection, snapshot) {
     const manifest = snapshot.draftManifest ?? buildPageDraftManifest(snapshot.context.required_pages ?? [])
+    projection.draftShardCount = manifest.length
     const committedShardIds = new Set(projection.committedDraftShardIds ?? [])
     const pendingShards = manifest.filter((shard) => !committedShardIds.has(shard.shard_id))
     const availableShards = pendingShards.slice(0, 4)
@@ -991,9 +1065,18 @@ export class LlmWikiCore {
     const seenCursors = projection.draftShardSeenCursors && typeof projection.draftShardSeenCursors === "object" && !Array.isArray(projection.draftShardSeenCursors)
       ? projection.draftShardSeenCursors
       : {}
+    const cursorReads = projection.draftShardCursorReads && typeof projection.draftShardCursorReads === "object" && !Array.isArray(projection.draftShardCursorReads)
+      ? projection.draftShardCursorReads
+      : {}
     projection.draftShardNextCursors = nextCursors
     projection.draftShardSeenCursors = seenCursors
-    const expectedCursor = Number.isInteger(nextCursors[shard.shard_id]) ? nextCursors[shard.shard_id] : 0
+    projection.draftShardCursorReads = cursorReads
+    const storedNextCursor = Object.prototype.hasOwnProperty.call(nextCursors, shard.shard_id)
+      ? nextCursors[shard.shard_id]
+      : 0
+    const expectedCursor = storedNextCursor === null
+      ? null
+      : Number.isInteger(storedNextCursor) ? storedNextCursor : 0
     const previouslySeen = Array.isArray(seenCursors[shard.shard_id]) && seenCursors[shard.shard_id].includes(requestedCursor)
     if (requestedCursor !== expectedCursor && !previouslySeen) {
       fail("PAGE_PLAN_CURSOR_MISMATCH", "Draft-shard cursors must be requested sequentially before committing the shard.", {
@@ -1008,17 +1091,53 @@ export class LlmWikiCore {
         suggestedAction: `Continue draft shard ${shard.shard_id} with cursor ${expectedCursor}. A previously returned cursor may be replayed after a lost tool response.`,
       })
     }
-    const page = paginatePagePlan(
-      shardContext,
-      requestedCursor,
-      Math.min(Number(input?.max_chars) || DRAFT_SHARD_RESPONSE_MAX_CHARS, DRAFT_SHARD_RESPONSE_MAX_CHARS),
-      DRAFT_SHARD_RESPONSE_MAX_CHARS,
-    )
+    const requestedMaxChars = Math.min(Number(input?.max_chars) || DRAFT_SHARD_RESPONSE_MAX_CHARS, DRAFT_SHARD_RESPONSE_MAX_CHARS)
+    const priorRead = cursorReads[shard.shard_id] && typeof cursorReads[shard.shard_id] === "object"
+      ? cursorReads[shard.shard_id][String(requestedCursor)]
+      : null
+    // Cursor replay must use the original page boundary. Recomputing a page
+    // with a different max_chars value can return a different next_cursor
+    // without advancing the persisted tracking state, which strands the
+    // Writer at PAGE_DRAFT_SHARD_NOT_READY. The first response is authoritative
+    // for all subsequent replays of that cursor.
+    const effectiveMaxChars = Number.isInteger(priorRead?.max_chars) && priorRead.max_chars > 0
+      ? priorRead.max_chars
+      : requestedMaxChars
+    const legacyReplay = previouslySeen && !priorRead && (expectedCursor === null || Number.isInteger(expectedCursor))
+    const page = legacyReplay
+      ? paginatePagePlanThroughCursor(shardContext, requestedCursor, expectedCursor)
+      : paginatePagePlan(
+          shardContext,
+          requestedCursor,
+          effectiveMaxChars,
+          DRAFT_SHARD_RESPONSE_MAX_CHARS,
+        )
     if (!previouslySeen) {
       seenCursors[shard.shard_id] = uniqueIntegers([...(seenCursors[shard.shard_id] ?? []), requestedCursor])
       nextCursors[shard.shard_id] = page.pagination.next_cursor
+      cursorReads[shard.shard_id] = cursorReads[shard.shard_id] && typeof cursorReads[shard.shard_id] === "object"
+        ? cursorReads[shard.shard_id]
+        : {}
+      cursorReads[shard.shard_id][String(requestedCursor)] = {
+        max_chars: effectiveMaxChars,
+        next_cursor: page.pagination.next_cursor,
+        complete: page.pagination.next_cursor === null,
+      }
       if (page.pagination.next_cursor === null) {
         projection.retrievedDraftShardIds = uniqueStrings([...(projection.retrievedDraftShardIds ?? []), shard.shard_id])
+      }
+    } else if (!priorRead && legacyReplay) {
+      // Migrate a projection created before cursorReads existed. Its persisted
+      // next cursor is the only durable boundary we have, so replay exactly
+      // that range and record it for all future replays.
+      cursorReads[shard.shard_id] = cursorReads[shard.shard_id] && typeof cursorReads[shard.shard_id] === "object"
+        ? cursorReads[shard.shard_id]
+        : {}
+      cursorReads[shard.shard_id][String(requestedCursor)] = {
+        max_chars: effectiveMaxChars,
+        next_cursor: expectedCursor,
+        complete: expectedCursor === null,
+        legacy_fixed_boundary: true,
       }
     }
     projection.expiresAt = new Date(Date.now() + PAGE_PROJECTION_LEASE_MS).toISOString()
@@ -1077,7 +1196,7 @@ export class LlmWikiCore {
               view: "draft-shard",
               shard_id: shard.shard_id,
               cursor: page.pagination.next_cursor,
-              max_chars: Math.min(Math.max(Number(input?.max_chars) || 40_000, 20_000), workspace.config.limits.maxPagePlanChars),
+              max_chars: Math.min(Math.max(effectiveMaxChars, 1_000), workspace.config.limits.maxPagePlanChars),
             },
           }
         : {
@@ -1423,6 +1542,10 @@ export class LlmWikiCore {
           details: { shard_id: shard.shard_id },
         })
       }
+      // Accept legacy complete SourceRefs whose quote differs only by a safe
+      // Unicode/whitespace normalization; the canonical quote is resolved
+      // before comparing it with the server scaffold.
+      canonicalizeAnalysisSourceRefQuotes(submittedPatch, record.batches, chunkIndex)
       const covers = uniqueStrings(submittedPatch.covers)
       for (const requirementId of covers) {
         if (!shardRequirementIds.has(requirementId) || !requirementById.has(requirementId)) {
@@ -1460,8 +1583,9 @@ export class LlmWikiCore {
             details: { requirement_id: requirementId, required_related: requiredRelated },
           })
         }
-        if (!submittedPatch.sourceRefs.some((sourceRef) => sourceRef === requirementId)) {
-          fail("INVALID_PAGE_PATCH", `Patch ${submittedPatch.patchId} must preserve requirement-ID sourceRefs for ${requirementId}.`, {
+        const requirementSourceRefs = new Set((requirementById.get(requirementId).source_refs ?? []).map((sourceRef) => stableStringify(sourceRef)))
+        if (!submittedPatch.sourceRefs.some((sourceRef) => sourceRef === requirementId || requirementSourceRefs.has(stableStringify(sourceRef)))) {
+          fail("INVALID_PAGE_PATCH", `Patch ${submittedPatch.patchId} must preserve grounded sourceRefs for ${requirementId}.`, {
             retryable: true,
             taskId: record.task.taskId,
             details: { requirement_id: requirementId },
@@ -1523,6 +1647,17 @@ export class LlmWikiCore {
     const projectionCommit = input?.projection_id !== undefined || input?.writer_id !== undefined
     const stagedDraftShardIds = uniqueStrings((Array.isArray(input?.staged_draft_shard_ids) ? input.staged_draft_shard_ids : []).map(normalizeDraftShardId))
     const submittedPatches = Array.isArray(input?.patches) ? [...input.patches] : []
+    const projectionComplete = input?.projection_complete !== false
+    await this.#repairProjectionState(workspace, record, { force: projectionComplete })
+    if (input?.staged_draft_shard_ids !== undefined && !Array.isArray(input.staged_draft_shard_ids)) {
+      fail("INVALID_INPUT", "staged_draft_shard_ids must be an array of server-generated draft shard IDs.", { retryable: true, taskId: record.task.taskId })
+    }
+    if (input?.draft_shard_ids !== undefined && !Array.isArray(input.draft_shard_ids)) {
+      fail("INVALID_INPUT", "draft_shard_ids must be an array of server-generated draft shard IDs.", { retryable: true, taskId: record.task.taskId })
+    }
+    const explicitlySubmittedShardIds = Array.isArray(input?.draft_shard_ids)
+      ? uniqueStrings(input.draft_shard_ids.map(normalizeDraftShardId))
+      : []
     if (stagedDraftShardIds.length > 0 && submittedPatches.length > 0) {
       fail("INVALID_INPUT", "Provide either patches or staged_draft_shard_ids, not both.", {
         retryable: true,
@@ -1540,6 +1675,13 @@ export class LlmWikiCore {
       fail("PAGE_DRAFT_STAGING_UNAVAILABLE", "staged_draft_shard_ids require an active server-side manifest projection.", {
         retryable: true,
         taskId: record.task.taskId,
+      })
+    }
+    if (explicitlySubmittedShardIds.length > 0 && (!commitProjection || commitProjection.pagePlanTraversal?.serverSideManifest !== true)) {
+      fail("INVALID_INPUT", "draft_shard_ids require an active server-side manifest projection.", {
+        retryable: true,
+        taskId: record.task.taskId,
+        details: { submitted_draft_shard_ids: explicitlySubmittedShardIds, atomic_commit_applied: false },
       })
     }
     if (stagedDraftShardIds.length > 0) {
@@ -1620,6 +1762,94 @@ export class LlmWikiCore {
     const commitBatchIds = commitProjection?.batchIds ?? record.task.completedBatchIds
     const commitAnalyses = await loadAnalyses(record, commitBatchIds)
     const commitRequirements = derivePageRequirements(commitAnalyses)
+    let submittedManifestShardIds = []
+    if (commitProjection?.completed !== true && commitProjection?.pagePlanTraversal?.serverSideManifest === true) {
+      const snapshot = await this.#pagePlanSnapshot(record, commitProjection.projectionId)
+      const manifest = snapshot?.draftManifest ?? []
+      const knownShardIds = new Set(manifest.map((shard) => shard.shard_id))
+      const retrievedShardIds = new Set(commitProjection.retrievedDraftShardIds ?? [])
+      if (stagedDraftShardIds.length > 0 && explicitlySubmittedShardIds.length > 0
+        && stableStringify(stagedDraftShardIds) !== stableStringify(explicitlySubmittedShardIds)) {
+        fail("INVALID_INPUT", "draft_shard_ids and staged_draft_shard_ids must identify the same shards when both are supplied.", {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { draft_shard_ids: explicitlySubmittedShardIds, staged_draft_shard_ids: stagedDraftShardIds },
+        })
+      }
+      submittedManifestShardIds = stagedDraftShardIds.length > 0 ? stagedDraftShardIds : explicitlySubmittedShardIds
+      if (projectionComplete && submittedManifestShardIds.length > 0) {
+        fail("INVALID_INPUT", "draft_shard_ids are only valid for projection_complete=false shard waves.", {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { submitted_draft_shard_ids: submittedManifestShardIds, atomic_commit_applied: false },
+        })
+      }
+      if (!projectionComplete && submittedManifestShardIds.length === 0) {
+        fail("INVALID_PAGE_PATCH", "A non-final manifest wave must identify one or more draft_shard_ids.", {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { submitted_draft_shard_ids: [], atomic_commit_applied: false },
+          suggestedAction: "Copy draft_shard_ids from the shard's returned llm_wiki_commit_pages next_action.",
+        })
+      }
+      if (submittedManifestShardIds.some((shardId) => !knownShardIds.has(shardId))) {
+        fail("INVALID_PAGE_PATCH", "Manifest wave commits must identify only valid draft_shard_ids.", {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { submitted_draft_shard_ids: submittedManifestShardIds, available_draft_shard_ids: [...knownShardIds].slice(0, 100), atomic_commit_applied: false },
+          suggestedAction: "Copy draft_shard_ids from the shard's returned llm_wiki_commit_pages next_action.",
+        })
+      }
+      const alreadyCommitted = submittedManifestShardIds.filter((shardId) => (commitProjection.committedDraftShardIds ?? []).includes(shardId))
+      if (alreadyCommitted.length > 0) {
+        fail("STAGED_DRAFT_EXISTS", "One or more draft shards were already committed; do not resubmit an accepted wave.", {
+          retryable: false,
+          taskId: record.task.taskId,
+          details: { already_committed_shard_ids: alreadyCommitted, atomic_commit_applied: false },
+        })
+      }
+      const unreadShardIds = submittedManifestShardIds.filter((shardId) => !retrievedShardIds.has(shardId))
+      if (unreadShardIds.length > 0) {
+        const nextShard = manifest.find((shard) => shard.shard_id === unreadShardIds[0])
+        fail("PAGE_DRAFT_SHARD_NOT_READY", "A manifest shard can be committed only after all of its context cursors were retrieved.", {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { unread_draft_shard_ids: unreadShardIds, ...(nextShard ? { next_draft_shard: nextShard } : {}), atomic_commit_applied: false },
+          suggestedAction: `Fetch every cursor for draft shard ${unreadShardIds[0]} before committing it; accepted earlier shards remain durable.`,
+        })
+      }
+      if (!projectionComplete && submittedPatches.length === 0) {
+        // This is the state-machine hole that used to mark a shard committed
+        // after accepting an empty direct wave. Empty patches are valid only
+        // for the final acknowledgement after all shard pages are durable.
+        fail("INVALID_PAGE_PATCH", "A non-final manifest wave must contain a complete PagePatch set; empty waves are not committed.", {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { submitted_draft_shard_ids: submittedManifestShardIds, atomic_commit_applied: false },
+          suggestedAction: "Generate one patch for every canonical path in the shard, or stage the complete shard before committing it.",
+        })
+      }
+      if (!projectionComplete) {
+        const shardByPath = new Map(manifest.flatMap((shard) => shard.paths.map((pagePath) => [pagePath, shard])))
+        const selectedShards = manifest.filter((shard) => submittedManifestShardIds.includes(shard.shard_id))
+        for (const patch of submittedPatches) {
+          if (!shardByPath.has(patch?.path) || !submittedManifestShardIds.includes(shardByPath.get(patch.path).shard_id)) {
+            fail("INVALID_PAGE_PATCH", `Patch path is outside the submitted draft shards: ${patch?.path ?? "(missing path)"}.`, {
+              retryable: true,
+              taskId: record.task.taskId,
+              details: { submitted_draft_shard_ids: submittedManifestShardIds, atomic_commit_applied: false },
+            })
+          }
+        }
+        const projectionRequirements = Array.isArray(snapshot?.context?.required_pages)
+          ? snapshot.context.required_pages
+          : pageRequirementsWithPatchScaffolds(commitRequirements, [])
+        for (const shard of selectedShards) {
+          const shardPatches = submittedPatches.filter((patch) => shard.paths.includes(patch?.path))
+          this.#validateAndNormalizeStagedDrafts(shardPatches, shard, projectionRequirements, record, workspace)
+        }
+      }
+    }
     const patchIds = new Set()
     const patchPaths = new Set()
     const patchValidationErrors = []
@@ -1678,53 +1908,17 @@ export class LlmWikiCore {
         suggestedAction: "Correct every listed patch, then resubmit the entire patch set from this rejected atomic call with a new idempotency key.",
       })
     }
-    let submittedManifestShardIds = []
-    if (commitProjection?.completed !== true && commitProjection?.pagePlanTraversal?.serverSideManifest === true && input?.projection_complete === false) {
-      const snapshot = await this.#pagePlanSnapshot(record, commitProjection.projectionId)
-      const manifest = snapshot?.draftManifest ?? []
-      const knownShardIds = new Set(manifest.map((shard) => shard.shard_id))
-      const retrievedShardIds = new Set(commitProjection.retrievedDraftShardIds ?? [])
-      const explicitlySubmittedShardIds = uniqueStrings(input?.draft_shard_ids ?? [])
-      if (stagedDraftShardIds.length > 0 && explicitlySubmittedShardIds.length > 0
-        && stableStringify(stagedDraftShardIds) !== stableStringify(explicitlySubmittedShardIds)) {
-        fail("INVALID_INPUT", "draft_shard_ids and staged_draft_shard_ids must identify the same shards when both are supplied.", {
-          retryable: true,
-          taskId: record.task.taskId,
-          details: { draft_shard_ids: explicitlySubmittedShardIds, staged_draft_shard_ids: stagedDraftShardIds },
-        })
-      }
-      submittedManifestShardIds = stagedDraftShardIds.length > 0 ? stagedDraftShardIds : explicitlySubmittedShardIds
-      if (submittedManifestShardIds.length === 0 || submittedManifestShardIds.some((shardId) => !knownShardIds.has(shardId))) {
-        fail("INVALID_PAGE_PATCH", "Manifest wave commits must identify one or more valid draft_shard_ids.", {
-          retryable: true,
-          taskId: record.task.taskId,
-          details: { submitted_draft_shard_ids: submittedManifestShardIds, available_draft_shard_ids: [...knownShardIds].slice(0, 100), atomic_commit_applied: false },
-          suggestedAction: "Copy draft_shard_ids from the shard's returned llm_wiki_commit_pages next_action.",
-        })
-      }
-      const unreadShardIds = submittedManifestShardIds.filter((shardId) => !retrievedShardIds.has(shardId))
-      if (unreadShardIds.length > 0) {
-        const nextShard = manifest.find((shard) => shard.shard_id === unreadShardIds[0])
-        fail("PAGE_DRAFT_SHARD_NOT_READY", "A manifest shard can be committed only after all of its context cursors were retrieved.", {
-          retryable: true,
-          taskId: record.task.taskId,
-          details: { unread_draft_shard_ids: unreadShardIds, ...(nextShard ? { next_draft_shard: nextShard } : {}), atomic_commit_applied: false },
-          suggestedAction: `Fetch every cursor for draft shard ${unreadShardIds[0]} before committing it; accepted earlier shards remain durable.`,
-        })
-      }
-    }
     const idempotent = await withIdempotency(record.paths, input?.idempotency_key, {
       operation: "commit_pages",
       basedOn: input?.based_on_wiki_revision,
       patches: normalizedPatches,
       projectionId: input?.projection_id,
       writerId: input?.writer_id,
-      projectionComplete: input?.projection_complete !== false,
+      projectionComplete,
       draftShardIds: submittedManifestShardIds,
       stagedDraftShardIds,
     }, async () => {
       let projection = commitProjection
-      const projectionComplete = input?.projection_complete !== false
       if (!projectionCommit) {
         const state = projectionState(record.task)
         if (state.revision > 0 || state.lease || state.provisionalPagePaths.length > 0) {
@@ -1765,6 +1959,7 @@ export class LlmWikiCore {
               missing_count: coverage.missing.length,
               missing_page_requirements: coverage.missing.slice(0, 100),
               truncated: coverage.missing.length > 100,
+              atomic_commit_applied: false,
               ...(nextDraftShard ? { next_draft_shard: nextDraftShard } : {}),
             },
             suggestedAction: nextDraftShard
@@ -1799,6 +1994,8 @@ export class LlmWikiCore {
           const submittedSet = new Set(submittedManifestShardIds)
           projection.retrievedDraftShardIds = (projection.retrievedDraftShardIds ?? []).filter((shardId) => !submittedSet.has(shardId))
         }
+        projection.coverageAuditAt = nowIso()
+        projection.coverageAuditWikiRevision = journal.wikiRevision
         state.provisionalPagePaths = [...new Set([
           ...state.provisionalPagePaths,
           ...journal.patches.map((patch) => patch.path),
@@ -1989,9 +2186,15 @@ export class LlmWikiCore {
   }
 
   async status(input) {
-    const workspace = await this.workspace({ skipWikiRevision: true })
-    const record = await loadTask(workspace.paths, input?.task_id)
-    return statusResponse(record.task)
+    return this.#withTaskLock(input?.task_id, async () => {
+      const workspace = await this.workspace({ skipWikiRevision: true })
+      const record = await loadTask(workspace.paths, input?.task_id)
+      const repair = await this.#repairProjectionState(workspace, record)
+      const response = statusResponse(record.task)
+      return repair.repaired_shard_ids.length > 0
+        ? { ...response, projection_recovery: { repaired: true, repaired_shard_ids: repair.repaired_shard_ids } }
+        : response
+    })
   }
 
   async listTasks(input = {}) {
@@ -2418,6 +2621,7 @@ function pageProjectionStatus(task) {
       commit_strategy: "single-writer-durable-waves",
     },
     final_completed: state.finalCompleted,
+    projection_complete: state.finalCompleted && !state.lease,
     in_progress: Boolean(state.lease),
     ...(state.lease ? {
       projection_id: state.lease.projectionId,
@@ -2429,6 +2633,13 @@ function pageProjectionStatus(task) {
         : 0,
       committed_draft_shards: Array.isArray(state.lease.committedDraftShardIds) ? state.lease.committedDraftShardIds.length : 0,
       retrieved_draft_shards: Array.isArray(state.lease.retrievedDraftShardIds) ? state.lease.retrievedDraftShardIds.length : 0,
+      retrieved_uncommitted_draft_shards: Array.isArray(state.lease.retrievedDraftShardIds)
+        ? state.lease.retrievedDraftShardIds.filter((shardId) => !(state.lease.committedDraftShardIds ?? []).includes(shardId)).length
+        : 0,
+      pending_draft_shards: Number.isInteger(state.lease.draftShardCount)
+        ? Math.max(0, state.lease.draftShardCount - (state.lease.committedDraftShardIds ?? []).length)
+        : null,
+      next_draft_shard_id: state.lease.nextDraftShardId ?? null,
     } : {}),
     ...(nextReadyAt ? { next_ready_at: nextReadyAt } : {}),
   }
@@ -2482,6 +2693,9 @@ function acquirePageProjection(task, input) {
     retrievedDraftShardIds: [],
     draftShardNextCursors: {},
     draftShardSeenCursors: {},
+    draftShardCursorReads: {},
+    coverageAuditAt: null,
+    coverageAuditWikiRevision: null,
   }
   return { lease: state.lease, status: pageProjectionStatus(task) }
 }
@@ -2511,8 +2725,17 @@ function publicProjection(projection) {
     batch_ids: projection.batchIds,
     analysis_revision: projection.analysisRevision,
     lease_expires_at: projection.expiresAt,
+    projection_complete: projection.completed === true,
     committed_draft_shards: Array.isArray(projection.committedDraftShardIds) ? projection.committedDraftShardIds.length : 0,
     retrieved_draft_shards: Array.isArray(projection.retrievedDraftShardIds) ? projection.retrievedDraftShardIds.length : 0,
+    retrieved_uncommitted_draft_shards: Array.isArray(projection.retrievedDraftShardIds)
+      ? projection.retrievedDraftShardIds.filter((shardId) => !(projection.committedDraftShardIds ?? []).includes(shardId)).length
+      : 0,
+    pending_draft_shards: Number.isInteger(projection.draftShardCount)
+      ? Math.max(0, projection.draftShardCount - (projection.committedDraftShardIds ?? []).length)
+      : null,
+    next_draft_shard_id: projection.nextDraftShardId ?? null,
+    ...(projection.coverageRepair ? { coverage_repair: projection.coverageRepair } : {}),
     ...(projection.safelyRepartitioned ? {
       safely_repartitioned: true,
       repartitioned_from_batch_count: projection.repartitionedFromBatchCount,
@@ -2913,6 +3136,44 @@ function paginatePagePlan(context, requestedCursor, requestedMaxChars, configure
       returned_items: index - cursor,
       approximate_chars: usedChars,
       truncated: index < records.length,
+      returned_by_category: Object.fromEntries(categories.map((category) => [category, values[category].length])),
+      total_by_category: Object.fromEntries(categories.map((category) => [category, context[category].length])),
+    },
+  }
+}
+
+// Replay helper for projections persisted by older Core versions, which only
+// stored the next cursor and not the max_chars used to produce it. Rebuilding
+// exactly the recorded record range keeps the tracking ledger aligned even if
+// the replaying Agent asks with a different response-size hint.
+function paginatePagePlanThroughCursor(context, requestedCursor, nextCursor) {
+  const cursor = normalizePagePlanCursor(requestedCursor)
+  const categories = ["batches", "required_pages", "entities", "concepts", "claims", "relations", "candidate_pages", "existing_pages", "existing_page_catalog", "conflicts"]
+  const records = categories.flatMap((category) => context[category].map((value) => ({ category, value })))
+  const end = nextCursor === null ? records.length : Number(nextCursor)
+  if (!Number.isInteger(end) || end < cursor || end > records.length) {
+    fail("PAGE_PLAN_CURSOR_REPLAY_CONFLICT", "The persisted draft-shard cursor boundary is no longer valid for this projection.", {
+      retryable: true,
+      details: { requested_cursor: cursor, persisted_next_cursor: nextCursor, total_items: records.length },
+      suggestedAction: "Restart the same projection's draft shard from cursor 0 so Core can rebuild cursor tracking.",
+    })
+  }
+  const values = Object.fromEntries(categories.map((category) => [category, []]))
+  let approximateChars = 0
+  for (let index = cursor; index < end; index += 1) {
+    const record = records[index]
+    values[record.category].push(record.value)
+    approximateChars += JSON.stringify(record).length
+  }
+  return {
+    values,
+    pagination: {
+      cursor,
+      next_cursor: nextCursor,
+      total_items: records.length,
+      returned_items: end - cursor,
+      approximate_chars: approximateChars,
+      truncated: nextCursor !== null,
       returned_by_category: Object.fromEntries(categories.map((category) => [category, values[category].length])),
       total_by_category: Object.fromEntries(categories.map((category) => [category, context[category].length])),
     },
