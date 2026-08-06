@@ -33,8 +33,29 @@ test("built MCP server remains usable across idle protocol heartbeats", async (t
   await new Promise((resolve) => setTimeout(resolve, 2_400))
   const listed = await client.listTools()
   assert.equal(listed.tools.length, 16)
-  assert.match(stderr, /"event":"keepalive"\s*,"status":"ok"/)
+  assert.match(stderr, /"event":"keepalive".*"status":"ok"/)
   assert.doesNotMatch(stderr, /"event":"fatal"/)
+})
+
+test("an unhandled background rejection is logged without closing the shared STDIO", async (t) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-stdio-unhandled-"))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const serverPath = fileURLToPath(new URL("../dist/index.js", import.meta.url))
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [serverPath, "--workspace", workspace],
+    stderr: "pipe",
+    env: { LLM_WIKI_MCP_TEST_UNHANDLED_REJECTION: "1" },
+  })
+  let stderr = ""
+  transport.stderr?.on("data", (chunk) => { stderr += String(chunk) })
+  const client = new Client({ name: "llm-wiki-unhandled-rejection-test", version: "1.0.0" })
+  t.after(() => transport.close().catch(() => {}))
+  await client.connect(transport)
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  assert.equal((await client.listTools()).tools.length, 16)
+  assert.match(stderr, /"event":"unhandled-rejection"/)
+  assert.doesNotMatch(stderr, /"event":"shutdown-requested".*"reason":"unhandled-rejection"/)
 })
 
 test("built MCP server survives errors and completes the full workflow over one STDIO connection", async (t) => {

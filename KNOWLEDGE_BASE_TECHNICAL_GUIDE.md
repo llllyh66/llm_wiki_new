@@ -85,9 +85,9 @@ Schema 的抽取策略是“抽取时约束”，不是先随意抽取后再静�
 - 精确证据引用；
 - 原子事务和目标页面 hash 校验。
 
-主协调器中的 Writer loop 先请求服务端持久化的 compact manifest。manifest 在生成正文之前明确返回“单次最多 50 个 patch”的硬限制，并按精确的 `patch_scaffold.path` 预先分成最多 6 个路径的 shard；同一路径的全部 requirement 始终留在一个 shard。Writer 每次只取一个 shard 的必要事实、关系和现有页面，生成后立即持久化提交，不再把整个 page plan 和几百个 patch 放入模型上下文。已接受的 shard 是恢复检查点，即使 context compaction 或 Writer 重启，也会从第一个未覆盖 shard 继续，不重做前 50 页。
+主协调器的投影编排 loop 只请求服务端持久化的 compact manifest、启动 page drafter 并校验 receipt；它不调用 `llm_wiki_get_staged_page_drafts` 或 `llm_wiki_commit_pages`。manifest 在生成正文之前明确返回“单次最多 50 个 patch”的硬限制，并按精确的 `patch_scaffold.path` 预先分成最多 6 个路径的 shard；同一路径的全部 requirement 始终留在一个 shard。稳定 Writer 是唯一提交者，每次通过服务端暂存处理一个 bounded wave，不再把整个 page plan 和几百个 patch 放入模型上下文。已接受的 shard 是恢复检查点，即使 context compaction 或 Writer 重启，也会从第一个未覆盖 shard 继续，不重做前 50 页。
 
-页面 drafter 不把 PagePatch 正文返回给主协调器：它通过 `llm_wiki_stage_page_drafts` 将一个路径互斥的 shard 写入任务级临时 staging，只返回 `draft_hash`、数量和字符数等 receipt。稳定 Writer 通过 `llm_wiki_get_staged_page_drafts` 获取元数据，再用 `llm_wiki_commit_pages(staged_draft_shard_ids, patches=[])` 让 Core 在服务端读取、校验并原子提交。提交成功并完成任务状态持久化后，Core 才删除暂存文件。
+页面 drafter 不把 PagePatch 正文返回给主协调器：它通过 `llm_wiki_stage_page_drafts` 将一个路径互斥的 shard 写入任务级临时 staging，只返回 `draft_hash`、数量和字符数等 receipt。主协调器收到 receipt 后只负责启动或恢复稳定 Writer。稳定 Writer 通过 `llm_wiki_get_staged_page_drafts` 获取元数据，再用 `llm_wiki_commit_pages(staged_draft_shard_ids, patches=[])` 让 Core 在服务端读取、校验并原子提交；该形式不需要调用方携带实际 PagePatch。提交成功并完成任务状态持久化后，Core 才删除暂存文件。
 
 draft-shard 的服务端响应硬上限约为 40K 字符；对既有超大页面只提供确定性的头尾摘要并保留 hash，完整正文不离开服务端。这样即使调用方误传 200K 的旧 `max_chars`，也不会把大页面或整批 patch 带入主 Agent 上下文。
 
@@ -111,10 +111,11 @@ draft-shard 的服务端响应硬上限约为 40K 字符；对既有超大页面
 Related 不是在单一阶段一次性生成，而是分三步完成：
 
 1. 抽取阶段：Extractor 将有证据支持的实体关系写入 `AnalysisEnvelope.relations`；
-2. 投影阶段：Core 根据关系两端的 requirement，生成 `related_requirement_ids`，并在页面 patch 的 `related`、正文关系段落和 Wiki 链接中写入；
-3. Finalize 阶段：Core 扫描页面 frontmatter 与正文 Wiki 链接，补齐双向 Related 关系。
+2. 投影阶段：Core 根据关系两端的 requirement，生成 `related_requirement_ids`，并在页面 patch 的 `related`、正文关系段落和 Wiki 链接中写入；同 batch localId 优先，跨 batch localId 只在全局唯一时解析，并可安全回退到唯一页面名称；
+3. 写盘阶段：Core 合并 frontmatter、`patch.related` 和正文中的 `[[...]]`、指向 Wiki 页面的 Markdown 链接、`## Related` 下的 `wiki/...md` 旧路径，统一输出为 frontmatter canonical slug 与正文 `[[collection/slug]]`；
+4. Finalize 阶段：Core 扫描统一后的关联并补齐双向 Related 关系。
 
-因此，增量页面可以先看到部分 Related；全部 batch 和语义分片完成后，Finalize 才是最终一致的双向关系结果。
+因此，增量页面可以先看到部分 Related；全部 batch 和语义分片完成后，Finalize 才是最终一致的双向关系结果。普通叙述中的“Related to”不会被自动猜测为页面链接，必须由结构化 relation 或明确的 canonical Wiki 链接支持。
 
 ### 2.7 Finalize
 
@@ -178,8 +179,11 @@ MCP Server 是 STDIO 长连接适配器。工具业务错误不会使用 MCP `is
 
 - 工具路由统一捕获 Core 异常；
 - MCP handler 最外层兜底；
-- `uncaughtException` 和 `unhandledRejection` 记录日志；它们只针对未被工具路由捕获的进程级异常，触发后会优雅关闭当前协议，让宿主重启干净进程；
-- 输入 12 MB、输出 6 MB、STDIO buffer 32 MB 的边界保护；
+- `uncaughtException` 记录日志并优雅关闭当前协议；`unhandledRejection` 只记录并标记运行时 degraded，不会关闭共享 STDIO；
+- 输入 12 MB、输出约 450 KiB、STDIO buffer 32 MB 的边界保护；工具元数据额外声明 80–120 KiB 的宿主结果建议；
+- 全局最多 8 个、单任务最多 4 个活动工具调用；超限返回 `MCP_BUSY`/`TASK_BUSY` 和 `retry_after_ms`，宿主取消的排队请求返回 `MCP_REQUEST_CANCELLED`；
+- Schema、analysis、batch、page-plan 和 draft-shard 缓存按条数与字节双重淘汰，避免大型任务通过重复快照耗尽 Node 堆；
+- `.llm-wiki/logs/mcp-runtime.jsonl` 持久化记录 request ID、字节数、活跃调用、内存、构建提交、心跳和退出原因；`dist/build-info.json` 用于确认实际运行构建；
 - 大结果使用分页而不是一次性返回；
 - 每 5 分钟发送一次标准协议 ping，且为 ping 设置独立的 30 秒超时；心跳定时器保持引用，避免 STDIO 空闲时进程被 Node 提前退出；
 - 监听 STDIO 的 `end`、`close` 和 `error`，对端退出时主动关闭协议并清理定时器，避免留下“进程仍在但 MCP 已死”的僵尸连接；
@@ -201,7 +205,7 @@ MCP Server 是 STDIO 长连接适配器。工具业务错误不会使用 MCP `is
 
 1. `tool-call` 后仍能看到 `keepalive.status=ok`：MCP Server 和 STDIO 管道仍然存活，问题更可能在宿主 Agent 的 worker 生命周期或跨 turn 调度，不需要重启 MCP。
 2. 出现 `keepalive.status=failed` 但之后仍能调用工具：这是一次宿主 pong 延迟或丢失，只记录诊断，不会触发断开；继续观察下一次心跳。
-3. 出现 `uncaught-exception`、`unhandled-rejection` 或 `shutdown-requested`：服务发现进程级异常后主动优雅关闭，避免继续返回不可信结果；让 Claude 重新启动 MCP 后再按任务状态恢复。
+3. 出现 `uncaught-exception` 或 `shutdown-requested`：服务发现致命异常后主动优雅关闭，避免继续返回不可信结果；让 Claude 重新启动 MCP 后再按任务状态恢复。单独的 `unhandled-rejection` 只表示运行时进入 degraded，服务不会主动断开；先继续调用 `llm_wiki_status` 并检查后续工具结果。
 4. 出现 `stdin-closed`、`stdout-closed` 或 `transport-closed`：对端已经关闭了 STDIO 管道，服务端无法阻止外部进程终止；重新启动 MCP 后使用原 `task_id` 和 `worker_id` 恢复，不要重新导入源文件。
 
 升级代码后必须重新生成实际运行的 `dist`：

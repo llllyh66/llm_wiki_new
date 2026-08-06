@@ -55,7 +55,7 @@ changing these files.
 Every initial and replacement extraction slot explicitly uses the named project
 Agent type `llm-wiki-extractor`. Generic "Worker N", `general-purpose`, and
 Agent Team teammates are not used because they do not apply that Agent file's
-`mcpServers` declaration. Permissions list all 14 MCP tools explicitly, every
+`mcpServers` declaration. Permissions list all 16 MCP tools explicitly, every
 published tool carries `anthropic/alwaysLoad`, and ToolSearch provides a
 deferred-discovery fallback. Claude Code 2.1.121 or later is recommended for
 the documented always-load behavior.
@@ -71,10 +71,14 @@ coordinator extraction. When a commit makes a Wiki projection
 ready, that extractor returns immediately with `writer_required: true` so the
 coordinator starts `wiki-writer-1` before leasing more work. Page-plan responses
 never include the full extraction Schema and default to roughly 40K-character
-pages, even when the task Schema is several MiB. The main Agent remains available for questions and coordinates page
-generation through exactly one background Wiki writer. After four new batches,
-or after a 30-second debounce, that writer incrementally updates affected
-pages while extractors continue. Each projection is capped at eight batches;
+pages, even when the task Schema is several MiB. The main Agent remains
+available for questions and coordinates page generation without authoring or
+committing pages itself. It fetches only the compact manifest, launches
+path-disjoint drafters, and hands their receipts to exactly one stable
+background Wiki Writer; only that Writer calls the staged-draft and page-commit
+tools. After four new batches, or after a 30-second debounce, the pipeline
+incrementally updates affected pages while extractors continue. Each projection
+is capped at eight batches;
 one Writer invocation drains up to six ready projections (48 batches) immediately when a
 backlog exists. Incremental plans include full content only for affected pages
 and compact catalog metadata for unrelated pages. A final all-batch reconciliation stabilizes
@@ -111,6 +115,12 @@ grouped index and knowledge-map overview pages. Expanded page types include
 research, business, reading, and personal-knowledge variants such as query,
 synthesis, finding, methodology, thesis, project, decision, chapter,
 character, theme, plot-thread, reflection, and journal.
+
+Related navigation is normalized at the Core boundary. Drafters should emit
+the same canonical slug in `patch.related` and as `[[collection/slug]]` in the
+body. Legacy `wiki/collection/slug.md` bullets inside a Related section and
+Markdown links to Wiki pages are accepted and rewritten deterministically, so
+frontmatter and body navigation cannot diverge.
 
 ## Architecture
 
@@ -151,7 +161,7 @@ opens are files explicitly passed to `llm_wiki_import_files`; after a safe,
 streaming import, all later work uses the managed copy.
 
 The Claude Code registration uses `CLAUDE_PROJECT_DIR` rather than a mutable
-shell working directory and keeps this bounded 14-tool server loaded for the
+shell working directory and keeps this bounded 16-tool server loaded for the
 session. MCP input/output budgets and paginated page-plan context prevent a
 single oversized request or response from closing the STDIO transport.
 Every tool exception is returned as a normal result (`ok: false`,

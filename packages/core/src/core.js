@@ -39,7 +39,7 @@ import {
 import { ensureWorkspace, resolveWorkspaceRoot } from "./workspace.js"
 import {
   canonicalPageSlug,
-  extractWikiLinks,
+  extractRelatedReferences,
   normalizePageKind,
   normalizeRelatedSlug,
   pageKindForPath,
@@ -72,6 +72,76 @@ const PAGE_PROJECTION_LEASE_MS = 60 * 60 * 1_000
 // full page bodies remain available to Core through the patch scaffold/hash
 // contract and never need to cross the drafter or coordinator context.
 const DRAFT_SHARD_RESPONSE_MAX_CHARS = 40_000
+const MCP_SIGNAL = Symbol.for("llm-wiki.mcp.signal")
+const CACHE_LIMITS = Object.freeze({
+  domainSchema: { maxEntries: 2, maxBytes: 16 * 1024 * 1024 },
+  domainSchemaSelection: { maxEntries: 64, maxBytes: 4 * 1024 * 1024 },
+  chunkIndex: { maxEntries: 2, maxBytes: 32 * 1024 * 1024 },
+  analyses: { maxEntries: 2, maxBytes: 64 * 1024 * 1024 },
+  pagePlan: { maxEntries: 2, maxBytes: 24 * 1024 * 1024 },
+  draftShards: { maxEntries: 16, maxBytes: 8 * 1024 * 1024 },
+})
+
+// Caches contain parsed task state, not just small lookup keys. Entry-count
+// limits alone allow one 10 MB Schema or a growing analysis snapshot to be
+// retained several times and push the shared MCP process into OOM. Trim by
+// both age (Map insertion order) and an approximate serialized byte budget.
+// Promises are deliberately counted as zero until their value resolves; the
+// resolved insertion is trimmed again before it becomes reusable.
+function approximateCacheBytes(value) {
+  if (value === null || value === undefined || typeof value?.then === "function") return 0
+  if (value instanceof Map) {
+    try {
+      let total = 0
+      for (const [key, item] of value.entries()) {
+        total += Buffer.byteLength(String(key)) + approximateCacheBytes(item)
+      }
+      return total
+    } catch {
+      return Number.MAX_SAFE_INTEGER
+    }
+  }
+  if (value instanceof Set) {
+    try {
+      let total = 0
+      for (const item of value.values()) total += approximateCacheBytes(item)
+      return total
+    } catch {
+      return Number.MAX_SAFE_INTEGER
+    }
+  }
+  try {
+    return Buffer.byteLength(JSON.stringify(value))
+  } catch {
+    return Number.MAX_SAFE_INTEGER
+  }
+}
+
+function trimCache(map, limits) {
+  if (!(map instanceof Map)) return
+  const entries = [...map.entries()].map(([key, value]) => ({ key, bytes: approximateCacheBytes(value) }))
+  let totalBytes = entries.reduce((total, entry) => total + entry.bytes, 0)
+  let index = 0
+  while (map.size > limits.maxEntries || (totalBytes > limits.maxBytes && map.size > 1)) {
+    const entry = entries[index++]
+    if (!entry || !map.has(entry.key)) break
+    map.delete(entry.key)
+    totalBytes -= entry.bytes
+  }
+}
+
+function operationSignal(input) {
+  return input && typeof input === "object" ? input[MCP_SIGNAL] : undefined
+}
+
+function assertOperationActive(signal) {
+  if (signal?.aborted) {
+    fail("MCP_REQUEST_CANCELLED", "The host cancelled this MCP request before the queued operation started.", {
+      retryable: true,
+      suggestedAction: "Retry the same operation with its existing task, worker, and idempotency identifiers.",
+    })
+  }
+}
 
 export class LlmWikiCore {
   static async open(workspaceRoot = process.cwd()) {
@@ -122,9 +192,13 @@ export class LlmWikiCore {
       if (this.domainSchemaCache.get(cacheKey) === pending) this.domainSchemaCache.delete(cacheKey)
       throw error
     }
-    while (this.domainSchemaCache.size > 8) {
-      this.domainSchemaCache.delete(this.domainSchemaCache.keys().next().value)
+    // A task always uses one immutable Schema snapshot. Retaining multiple
+    // revisions of multi-megabyte Schemas provides no lookup benefit and can
+    // multiply RSS when several background workers share one MCP process.
+    for (const key of this.domainSchemaCache.keys()) {
+      if (key.startsWith(`${record.task.taskId}:`) && key !== cacheKey) this.domainSchemaCache.delete(key)
     }
+    trimCache(this.domainSchemaCache, CACHE_LIMITS.domainSchema)
     return schema
   }
 
@@ -135,9 +209,7 @@ export class LlmWikiCore {
     if (this.domainSchemaSelectionCache.has(cacheKey)) return this.domainSchemaSelectionCache.get(cacheKey)
     const selection = automaticBatchDomainSchemaSelection(schema, batch)
     this.domainSchemaSelectionCache.set(cacheKey, selection)
-    while (this.domainSchemaSelectionCache.size > 64) {
-      this.domainSchemaSelectionCache.delete(this.domainSchemaSelectionCache.keys().next().value)
-    }
+    trimCache(this.domainSchemaSelectionCache, CACHE_LIMITS.domainSchemaSelection)
     return selection
   }
 
@@ -146,9 +218,10 @@ export class LlmWikiCore {
     if (this.taskChunkIndexCache.has(cacheKey)) return this.taskChunkIndexCache.get(cacheKey)
     const index = new Map(record.batches.flatMap((batch) => batch.chunks).map((chunk) => [chunk.chunkId, chunk]))
     this.taskChunkIndexCache.set(cacheKey, index)
-    while (this.taskChunkIndexCache.size > 8) {
-      this.taskChunkIndexCache.delete(this.taskChunkIndexCache.keys().next().value)
+    for (const key of this.taskChunkIndexCache.keys()) {
+      if (key.startsWith(`${record.task.taskId}:`) && key !== cacheKey) this.taskChunkIndexCache.delete(key)
     }
+    trimCache(this.taskChunkIndexCache, CACHE_LIMITS.chunkIndex)
     return index
   }
 
@@ -165,9 +238,13 @@ export class LlmWikiCore {
       if (this.taskAnalysisCache.get(cacheKey) === pending) this.taskAnalysisCache.delete(cacheKey)
       throw error
     }
-    while (this.taskAnalysisCache.size > 4) {
-      this.taskAnalysisCache.delete(this.taskAnalysisCache.keys().next().value)
+    // Analysis snapshots grow monotonically as batches complete. Keep only the
+    // newest snapshot for each task; old revisions are durable on disk and can
+    // be reloaded if an idempotent replay ever needs them.
+    for (const key of this.taskAnalysisCache.keys()) {
+      if (key.startsWith(`${record.task.taskId}:`) && key !== cacheKey) this.taskAnalysisCache.delete(key)
     }
+    trimCache(this.taskAnalysisCache, CACHE_LIMITS.analyses)
     return analyses
   }
 
@@ -183,7 +260,10 @@ export class LlmWikiCore {
         return snapshot
       }
       this.pagePlanSnapshotCache.set(cacheKey, snapshot)
-      while (this.pagePlanSnapshotCache.size > 4) this.pagePlanSnapshotCache.delete(this.pagePlanSnapshotCache.keys().next().value)
+      for (const key of this.pagePlanSnapshotCache.keys()) {
+        if (key.startsWith(`${record.task.taskId}:`) && key !== cacheKey) this.pagePlanSnapshotCache.delete(key)
+      }
+      trimCache(this.pagePlanSnapshotCache, CACHE_LIMITS.pagePlan)
       return snapshot
     } catch (error) {
       if (this.pagePlanSnapshotCache.get(cacheKey) === pending) this.pagePlanSnapshotCache.delete(cacheKey)
@@ -194,7 +274,10 @@ export class LlmWikiCore {
   #cachePagePlanSnapshot(taskId, snapshot) {
     const cacheKey = `${taskId}:${snapshot.projectionId}`
     this.pagePlanSnapshotCache.set(cacheKey, snapshot)
-    while (this.pagePlanSnapshotCache.size > 4) this.pagePlanSnapshotCache.delete(this.pagePlanSnapshotCache.keys().next().value)
+    for (const key of this.pagePlanSnapshotCache.keys()) {
+      if (key.startsWith(`${taskId}:`) && key !== cacheKey) this.pagePlanSnapshotCache.delete(key)
+    }
+    trimCache(this.pagePlanSnapshotCache, CACHE_LIMITS.pagePlan)
   }
 
   #clearPagePlanCaches(taskId, projectionId) {
@@ -277,7 +360,7 @@ export class LlmWikiCore {
   }
 
   async importFiles(input) {
-    return this.#withWorkspaceWriteLock(() => this.#withNamedWorkspaceFileLock("sources.lock", "import", null, () => this.#importFiles(input)))
+    return this.#withWorkspaceWriteLock(() => this.#withNamedWorkspaceFileLock("sources.lock", "import", null, () => this.#importFiles(input)), operationSignal(input))
   }
 
   async #importFiles(input) {
@@ -338,7 +421,9 @@ export class LlmWikiCore {
           max_paths_per_shard: 6,
           minimum_paths: 4,
           pipeline_background_budget: 4,
+          max_background_agents_total: 4,
           extraction_workers_during_drafting: 2,
+          max_drafters_when_extraction_overlaps: 2,
           partition_key: "patch_scaffold.path",
           drafter_handoff: "server-side-temporary-draft-receipt",
           stage_tool: "llm_wiki_stage_page_drafts",
@@ -353,7 +438,7 @@ export class LlmWikiCore {
   }
 
   async getBatch(input) {
-    const leased = await this.#withTaskLock(input?.task_id, () => this.#leaseBatch(input))
+    const leased = await this.#withTaskLock(input?.task_id, () => this.#leaseBatch(input), operationSignal(input))
     if (leased.terminalResponse) return leased.terminalResponse
     return this.#buildBatchResponse(leased)
   }
@@ -582,7 +667,7 @@ export class LlmWikiCore {
   }
 
   async commitAnalysis(input) {
-    return this.#withTaskLock(input?.task_id, () => this.#commitAnalysis(input))
+    return this.#withTaskLock(input?.task_id, () => this.#commitAnalysis(input), operationSignal(input))
   }
 
   async #commitAnalysis(input) {
@@ -678,7 +763,7 @@ export class LlmWikiCore {
     // Planning writes only this task's lease/snapshot. Target-path hashes in
     // commitPageTransaction protect concurrent Wiki updates, so a global
     // workspace writer lock here would only stall unrelated tasks.
-    return this.#withTaskLock(input?.task_id, () => this.#getPagePlanContext(input))
+    return this.#withTaskLock(input?.task_id, () => this.#getPagePlanContext(input), operationSignal(input))
   }
 
   async #getPagePlanContext(input) {
@@ -1056,7 +1141,12 @@ export class LlmWikiCore {
     if (!shardContext) {
       shardContext = boundDraftShardContext(pageDraftShardContext(snapshot.context, shard), shard)
       this.pageDraftShardCache.set(shardCacheKey, shardContext)
-      while (this.pageDraftShardCache.size > 32) this.pageDraftShardCache.delete(this.pageDraftShardCache.keys().next().value)
+      for (const key of this.pageDraftShardCache.keys()) {
+        if (key.startsWith(`${record.task.taskId}:`) && !key.startsWith(`${record.task.taskId}:${projection.projectionId}:`)) {
+          this.pageDraftShardCache.delete(key)
+        }
+      }
+      trimCache(this.pageDraftShardCache, CACHE_LIMITS.draftShards)
     }
     const requestedCursor = normalizePagePlanCursor(input?.cursor)
     const nextCursors = projection.draftShardNextCursors && typeof projection.draftShardNextCursors === "object" && !Array.isArray(projection.draftShardNextCursors)
@@ -1298,7 +1388,7 @@ export class LlmWikiCore {
   }
 
   async commitPages(input) {
-    return this.#withWorkspaceWriteLock(() => this.#withTaskLock(input?.task_id, () => this.#commitPages(input)))
+    return this.#withWorkspaceWriteLock(() => this.#withTaskLock(input?.task_id, () => this.#commitPages(input), operationSignal(input)), operationSignal(input))
   }
 
   // Page drafters never need to return a full PagePatch payload to the
@@ -1307,7 +1397,7 @@ export class LlmWikiCore {
   // staged shard server-side. This keeps large page bodies out of the parent
   // Agent context and makes a lost drafter response recoverable.
   async stagePageDrafts(input) {
-    return this.#withTaskLock(input?.task_id, () => this.#stagePageDrafts(input))
+    return this.#withTaskLock(input?.task_id, () => this.#stagePageDrafts(input), operationSignal(input))
   }
 
   async #stagePageDrafts(input) {
@@ -1426,7 +1516,7 @@ export class LlmWikiCore {
   }
 
   async getStagedPageDrafts(input) {
-    return this.#withTaskLock(input?.task_id, () => this.#getStagedPageDrafts(input))
+    return this.#withTaskLock(input?.task_id, () => this.#getStagedPageDrafts(input), operationSignal(input))
   }
 
   async #getStagedPageDrafts(input) {
@@ -1638,7 +1728,7 @@ export class LlmWikiCore {
         max_chars: input?.max_chars ?? 40_000,
       })
       return { ...context, accepted: true, automated: false, renderer: "agent-semantic-writer-v1", writer_mode: "legacy-semantic", semantic_writer_required: true }
-    })
+    }, operationSignal(input))
   }
 
   async #commitPages(input) {
@@ -2120,7 +2210,7 @@ export class LlmWikiCore {
   async finalize(input) {
     return this.#withWorkspaceWriteLock(() => this.#withTaskLock(input?.task_id, () => (
       this.#withWorkspaceFileLock("finalize", input?.task_id, () => this.#finalize(input))
-    )))
+    ), operationSignal(input)), operationSignal(input))
   }
 
   async #finalize(input) {
@@ -2194,7 +2284,7 @@ export class LlmWikiCore {
       return repair.repaired_shard_ids.length > 0
         ? { ...response, projection_recovery: { repaired: true, repaired_shard_ids: repair.repaired_shard_ids } }
         : response
-    })
+    }, operationSignal(input))
   }
 
   async listTasks(input = {}) {
@@ -2216,7 +2306,7 @@ export class LlmWikiCore {
   }
 
   async abort(input) {
-    return this.#withTaskLock(input?.task_id, () => this.#abort(input))
+    return this.#withTaskLock(input?.task_id, () => this.#abort(input), operationSignal(input))
   }
 
   async #abort(input) {
@@ -2254,7 +2344,7 @@ export class LlmWikiCore {
   async deleteKnowledgeBase(input) {
     return this.#withWorkspaceWriteLock(() => this.#withNamedWorkspaceFileLock("sources.lock", "delete-sources", null, () => (
       this.#withWorkspaceFileLock("delete", null, () => this.#deleteKnowledgeBase(input))
-    )))
+    )), operationSignal(input))
   }
 
   async #deleteKnowledgeBase(input) {
@@ -2375,12 +2465,17 @@ export class LlmWikiCore {
     }
   }
 
-  async #withTaskLock(taskId, operation) {
+  async #withTaskLock(taskId, operation, signal) {
     const key = typeof taskId === "string" ? taskId : "invalid-task"
+    assertOperationActive(signal)
     const previous = this.taskLocks.get(key) ?? Promise.resolve()
     const guardedOperation = async () => {
+      // Do not let a request cancelled while waiting behind another task
+      // operation execute later and mutate persisted state unexpectedly.
+      assertOperationActive(signal)
       const release = await this.#acquireTaskFileLock(key)
       try {
+        assertOperationActive(signal)
         return await operation()
       } finally {
         await release()
@@ -2411,9 +2506,15 @@ export class LlmWikiCore {
     }
   }
 
-  async #withWorkspaceWriteLock(operation) {
+  async #withWorkspaceWriteLock(operation, signal) {
     const previous = this.workspaceWriteTail
-    const run = previous.then(operation, operation)
+    const guardedOperation = async () => {
+      // Workspace writes are intentionally serialized, but cancellation must
+      // remove a queued request before it reaches import/commit/finalize.
+      assertOperationActive(signal)
+      return operation()
+    }
+    const run = previous.then(guardedOperation, guardedOperation)
     this.workspaceWriteTail = run.then(() => undefined, () => undefined)
     return run
   }
@@ -2457,6 +2558,20 @@ function recommendedWorkerCount(batchCount) {
   // Large Schemas are selected server-side per batch, so their full byte size
   // no longer needs to reduce semantic worker parallelism.
   return Math.min(4, batchCount)
+}
+
+function pipelineConcurrencyPlan({ remainingBatches, extractionOverlaps }) {
+  const maxBackgroundAgentsTotal = 4
+  const recommendedExtractors = extractionOverlaps
+    ? Math.min(2, Math.max(0, remainingBatches))
+    : Math.min(4, Math.max(0, remainingBatches))
+  const maxDrafters = extractionOverlaps ? 2 : 4
+  return {
+    max_background_agents_total: maxBackgroundAgentsTotal,
+    recommended_extractors: recommendedExtractors,
+    max_drafters: maxDrafters,
+    recommended_drafters: maxDrafters,
+  }
 }
 
 function recommendedWorkerBatchQuantum(batchCount, workerCount) {
@@ -2586,6 +2701,11 @@ function pageProjectionStatus(task) {
   const incrementalReady = catchupReady
     || (!allComplete && unprojected.length > 0 && (countReady || (cooldownReady && ageReady)))
   const ready = !state.lease && (finalReady || incrementalReady)
+  const extractionOverlaps = !allComplete && (Boolean(state.lease) || ready)
+  const pipelineConcurrency = pipelineConcurrencyPlan({
+    remainingBatches: Math.max(0, task.batchCount - completed.length),
+    extractionOverlaps,
+  })
   let nextReadyAt = null
   if (!ready && !state.lease && !allComplete && unprojected.length > 0) {
     const ageBoundary = oldestUnprojectedAt + state.debounceMs
@@ -2612,8 +2732,11 @@ function pageProjectionStatus(task) {
       max_drafters: 4,
       max_paths_per_shard: 6,
       minimum_paths: 4,
-      pipeline_background_budget: 4,
-      extraction_workers_during_drafting: 2,
+      pipeline_background_budget: pipelineConcurrency.max_background_agents_total,
+      max_background_agents_total: pipelineConcurrency.max_background_agents_total,
+      extraction_workers_during_drafting: pipelineConcurrency.recommended_extractors,
+      max_drafters_when_extraction_overlaps: pipelineConcurrency.max_drafters,
+      recommended_drafters: pipelineConcurrency.recommended_drafters,
       partition_key: "patch_scaffold.path",
       drafter_handoff: "server-side-temporary-draft-receipt",
       stage_tool: "llm_wiki_stage_page_drafts",
@@ -2863,6 +2986,7 @@ async function loadAnalyses(record, batchIds) {
 function derivePageRequirements(analyses) {
   const requirements = new Map()
   const localRequirements = new Map()
+  const globalLocalRequirements = new Map()
   const ensureRequirement = (candidate, pageKind, collection, batchId, overrideKind = false) => {
     if (!shouldMaterialize(candidate)) return null
     const title = candidateTitle(candidate)
@@ -2892,7 +3016,12 @@ function derivePageRequirements(analyses) {
     requirement.batch_ids = uniqueStrings([...requirement.batch_ids, batchId])
     requirements.set(requirementId, requirement)
     const localId = candidate.localId ?? candidate.local_id
-    if (typeof localId === "string" && localId) localRequirements.set(`${batchId}:${localId}`, requirementId)
+    if (typeof localId === "string" && localId) {
+      localRequirements.set(`${batchId}:${localId}`, requirementId)
+      const globalMatches = globalLocalRequirements.get(localId) ?? new Set()
+      globalMatches.add(requirementId)
+      globalLocalRequirements.set(localId, globalMatches)
+    }
     return requirement
   }
 
@@ -2904,12 +3033,18 @@ function derivePageRequirements(analyses) {
     }
   }
 
+  const uniqueGlobalRequirement = (localId) => {
+    const matches = globalLocalRequirements.get(localId)
+    return matches?.size === 1 ? [...matches][0] : null
+  }
   for (const analysis of analyses) {
     for (const relation of analysis.relations ?? []) {
       const sourceId = relation.sourceEntityLocalId ?? relation.source_entity_local_id ?? relation.sourceLocalId
       const targetId = relation.targetEntityLocalId ?? relation.target_entity_local_id ?? relation.targetLocalId
-      const sourceRequirementId = sourceId ? localRequirements.get(`${analysis.batchId}:${sourceId}`) : requirementIdByName(requirements, relation.source ?? relation.from ?? relation.subject)
-      const targetRequirementId = targetId ? localRequirements.get(`${analysis.batchId}:${targetId}`) : requirementIdByName(requirements, relation.target ?? relation.to ?? relation.object)
+      const sourceRequirementId = (sourceId ? localRequirements.get(`${analysis.batchId}:${sourceId}`) ?? uniqueGlobalRequirement(sourceId) : null)
+        ?? requirementIdByName(requirements, relation.source ?? relation.from ?? relation.subject ?? relation.sourceName ?? relation.sourceEntityName)
+      const targetRequirementId = (targetId ? localRequirements.get(`${analysis.batchId}:${targetId}`) ?? uniqueGlobalRequirement(targetId) : null)
+        ?? requirementIdByName(requirements, relation.target ?? relation.to ?? relation.object ?? relation.targetName ?? relation.targetEntityName)
       if (!sourceRequirementId || !targetRequirementId || sourceRequirementId === targetRequirementId) continue
       for (const [left, right] of [[sourceRequirementId, targetRequirementId], [targetRequirementId, sourceRequirementId]]) {
         const requirement = requirements.get(left)
@@ -3056,7 +3191,7 @@ async function enrichWikiRelations(wikiRoot, requirements) {
     return exactSlugs.get(normalized) ?? uniqueAlias(path.posix.basename(normalized))
   }
   pages.forEach((page, sourceIndex) => {
-    for (const link of uniqueStrings([...page.parsed.related, ...extractWikiLinks(page.parsed.body)])) {
+    for (const link of uniqueStrings([...page.parsed.related, ...extractRelatedReferences(page.parsed.body)])) {
       const targetIndex = resolvePage(link)
       if (targetIndex === undefined || targetIndex === sourceIndex) continue
       edges[sourceIndex].add(targetIndex)
@@ -3353,7 +3488,12 @@ function pagePlanDomainSchemaMetadata(metadata) {
 function statusResponse(task) {
   const wikiProjection = pageProjectionStatus(task)
   const remainingBatches = Math.max(0, task.batchCount - task.completedBatchIds.length)
-  const recommendedWorkers = recommendedWorkerCount(remainingBatches)
+  const extractionOverlaps = !wikiProjection.projection_complete
+    && !wikiProjection.final_completed
+    && (wikiProjection.in_progress || wikiProjection.ready)
+    && remainingBatches > 0
+  const pipelineConcurrency = pipelineConcurrencyPlan({ remainingBatches, extractionOverlaps })
+  const recommendedWorkers = pipelineConcurrency.recommended_extractors
   const workerLeases = Object.entries(validBatchLeases(task)).map(([batchId, lease]) => ({
     worker_id: lease.workerId,
     batch_id: batchId,
@@ -3375,6 +3515,8 @@ function statusResponse(task) {
       single_batch_background: remainingBatches === 1,
       recommended_workers: recommendedWorkers,
       max_workers: 4,
+      max_background_agents_total: pipelineConcurrency.max_background_agents_total,
+      extraction_workers_during_drafting: pipelineConcurrency.recommended_extractors,
       worker_batch_quantum: recommendedWorkerBatchQuantum(remainingBatches, recommendedWorkers),
       recommended_batch_chars: Math.min(Number(task.options?.maxBatchChars) || 6_000, 9_000),
       checkpoint_each_batch: true,
@@ -3390,6 +3532,7 @@ function statusResponse(task) {
     updated_at: task.updatedAt,
     domain_schema: task.domainSchema ?? null,
     wiki_projection: wikiProjection,
+    pipeline_concurrency: pipelineConcurrency,
     ...(task.lastError ? { last_error: task.lastError } : {}),
     next_action: nextAction(task, wikiProjection),
   }
@@ -3494,7 +3637,7 @@ async function buildOverview(wikiRoot, task, pageRecords) {
     const entries = groups.get(type) ?? []
     entries.push({ title: parsed.title || path.basename(file, ".md"), slug: relative.replace(/\.md$/i, "") })
     groups.set(type, entries)
-    if (parsed.related.length > 0 || extractWikiLinks(parsed.body).length > 0) linkedPages += 1
+    if (parsed.related.length > 0 || extractRelatedReferences(parsed.body).length > 0) linkedPages += 1
   }
   const lines = [
     "# Knowledge Base Overview",

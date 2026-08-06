@@ -88,7 +88,7 @@ export function prepareWikiPageContent(patch, existingContent = "", date = new D
   const pageKind = normalizePageKind(patch.pageKind) ?? pageKindForPath(patch.path) ?? "topic"
   let body = incoming.body.trim()
   if (!/^#\s+/m.test(body)) body = `# ${patch.title}\n\n${body}`.trim()
-  const bodyLinks = extractWikiLinks(body)
+  const bodyLinks = extractRelatedReferences(body)
   const related = uniqueStrings([
     ...existing.related,
     ...incoming.related,
@@ -109,13 +109,15 @@ export function prepareWikiPageContent(patch, existingContent = "", date = new D
   const covers = uniqueStrings([...existing.covers, ...incoming.covers, ...(Array.isArray(patch.covers) ? patch.covers : [])])
   const created = scalarValue(existing.fields.created) || scalarValue(incoming.fields.created) || date
   const summary = String(patch.summary ?? incoming.summary ?? existing.summary ?? firstSummary(body)).trim().slice(0, 500)
+  const normalizedRelated = related.filter((slug) => !selfSlugs.has(slug))
+  body = withRelatedSection(body, normalizedRelated)
   const standard = {
     type: pageKind,
     title: patch.title,
     created,
     updated: date,
     tags,
-    related: related.filter((slug) => !selfSlugs.has(slug)),
+    related: normalizedRelated,
     sources,
     covers,
     summary,
@@ -167,7 +169,7 @@ function withRelatedSection(body, related) {
   const normalizedBody = String(body ?? "").trim()
   if (related.length === 0) return normalizedBody
   const section = `## Related\n\n${related.map((slug) => `- [[${slug}]]`).join("\n")}`
-  const match = normalizedBody.match(/^## Related\s*$/im)
+  const match = normalizedBody.match(/^#{2,6}\s+(?:Related(?:\s+Pages?)?|相关页面|关联页面)\s*$/im)
   if (!match || match.index === undefined) return `${normalizedBody}\n\n${section}`.trim()
   const start = match.index
   const afterHeading = start + match[0].length
@@ -183,6 +185,30 @@ export function extractWikiLinks(content) {
     .filter(Boolean)
 }
 
+// Page authors and older Writer prompts have emitted three equivalent link
+// forms over time. Accept all of them at the deterministic Core boundary, but
+// only treat plain paths as relationships inside an explicit Related section.
+// This avoids turning incidental source-file mentions into graph edges.
+export function extractRelatedReferences(content) {
+  const text = String(content ?? "").replace(/\r\n?/g, "\n")
+  const references = [...extractWikiLinks(text)]
+
+  for (const match of text.matchAll(/\[[^\]]*\]\(\s*<?([^\s)>]+)>?(?:\s+["'][^"']*["'])?\s*\)/g)) {
+    const slug = canonicalRelatedPath(match[1])
+    if (slug) references.push(slug)
+  }
+
+  const section = relatedSectionBody(text)
+  for (const line of section.split("\n")) {
+    const item = line.match(/^\s*[-*+]\s+(.+?)\s*$/)?.[1]
+    if (!item || /^\[\[/.test(item) || /^\[[^\]]*\]\(/.test(item)) continue
+    const slug = canonicalRelatedPath(item)
+    if (slug) references.push(slug)
+  }
+
+  return uniqueStrings(references.map(normalizeRelatedSlug).filter(Boolean))
+}
+
 export function normalizeRelatedSlug(value) {
   const normalized = String(value ?? "")
     .normalize("NFKC")
@@ -193,6 +219,35 @@ export function normalizeRelatedSlug(value) {
     .replace(/\.md$/i, "")
     .trim()
   return normalized.split("|")[0].trim()
+}
+
+function canonicalRelatedPath(value) {
+  let candidate = String(value ?? "")
+    .normalize("NFKC")
+    .trim()
+    .replace(/^<|>$/g, "")
+    .replace(/^`|`$/g, "")
+    .replace(/\\/g, "/")
+    .replace(/[?#].*$/, "")
+    .replace(/^\/+/, "")
+    .replace(/^\.\//, "")
+  if (!candidate || /^[a-z][a-z\d+.-]*:/i.test(candidate) || candidate.includes(" ")) return ""
+  if (candidate.toLowerCase().startsWith("wiki/")) candidate = candidate.slice(5)
+  const [root, ...rest] = candidate.split("/")
+  const normalizedRoot = root.toLowerCase()
+  if (!AGENT_PAGE_ROOTS.includes(normalizedRoot)
+    || rest.length === 0
+    || rest.some((segment) => !segment || segment === "." || segment === "..")) return ""
+  return normalizeRelatedSlug([normalizedRoot, ...rest].join("/"))
+}
+
+function relatedSectionBody(content) {
+  const heading = String(content ?? "").match(/^#{2,6}\s+(?:Related(?:\s+Pages?)?|相关页面|关联页面)\s*$/im)
+  if (!heading || heading.index === undefined) return ""
+  const start = heading.index + heading[0].length
+  const remainder = content.slice(start)
+  const nextHeading = remainder.search(/^#{1,6}\s+/m)
+  return nextHeading < 0 ? remainder : remainder.slice(0, nextHeading)
 }
 
 function scalarValue(value) {

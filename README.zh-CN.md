@@ -38,6 +38,11 @@ Core 会同时创建 `.llm-wiki/` 运行状态目录，保存受管理的原文�
 来源诉源的丰富来源页，并按页面类型重建 `index.md` 和知识地图式
 `overview.md`。
 
+Related 的 canonical 格式是 frontmatter 中的 `collection/slug`，以及正文中的
+`[[collection/slug]]`。Core 兼容 Related 章节中的旧式 `wiki/collection/slug.md`
+路径和指向 Wiki 页面的 Markdown 链接，写盘时会统一两处格式；普通叙述中的
+“Related to”不会被猜测成链接。
+
 ## 支持的文件
 
 - Markdown：`.md`、`.markdown`
@@ -135,17 +140,19 @@ Claude Code。
 Agent，当前最多 4 个；大型 Schema 也不再降为 2 个，因为每个 worker 只获取服务端选中的
 相关类型。每个 Agent 使用固定 `worker_id` 租约不同批次，Core
 串行保护同一任务的状态提交，因此不会抢同一批次或覆盖其他 Agent 的结果。
-主 Agent 负责轻量的 page-plan 协调和唯一提交，后台抽取 Agent 与 page drafter
+主 Agent 只负责轻量的 page-plan 编排、启动后台 Agent 和校验 receipt；它不生成页面，也不调用
+`llm_wiki_get_staged_page_drafts` 或 `llm_wiki_commit_pages`。后台抽取 Agent 与 page drafter
 形成流水线，每新增 4 个 batch 或等待满 30 秒后增量更新受影响页面。
 每个增量 projection 最多租约 8 个 batch，一次 Writer 后台调用最多连续处理 6 个
-projection。协调器 Writer loop 会分页读取完整 page plan；当 canonical page 达到 4 个时，按
-`patch_scaffold.path` 分成互斥 shard，最多使用 4 个无 MCP 权限的 page drafter
-并行生成语义正文，再由唯一 Writer 校验并提交。小计划直接生成，避免 Agent 启动
-开销。Core 只负责
+projection。协调器投影 loop 只读取 compact manifest；Core 按
+`patch_scaffold.path` 分成互斥 shard，最多使用 4 个仅具备 page-plan/staging MCP 权限的 page drafter
+并行生成语义正文并暂存，再由唯一稳定 Writer 使用
+`staged_draft_shard_ids + patches=[]` 在服务端校验并提交。小计划也由一个 drafter 或稳定 Writer
+串行 fallback 处理，不把提交转移给主 Agent。Core 只负责
 校验 SourceRef、页面结构、哈希和事务，不自动替代 Agent 写作。
 任一 `commit_analysis` 使投影就绪时，该 extractor 会立即返回
 `writer_required: true`，而不是继续领取 batch；主 Agent 随即启动
-协调器 Writer loop，再按需补充 extractor。抽取与写入重叠时使用总计 4 个后台
+协调器投影编排，收到 drafter receipt 后立即启动或恢复稳定 Writer，再按需补充 extractor。抽取与写入重叠时使用总计 4 个后台
 Agent 的预算，通常保留 2 个 extractor 和 2 个 page drafter；投影提交后恢复完整
 extractor 数量。`status.next_action` 也会在投影就绪时
 优先指向 `llm_wiki_get_page_plan_context`，因此不需要等用户追问才生成页面。
@@ -493,12 +500,13 @@ MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 
 运行 `llm_wiki_status`。当 `wiki_projection.ready` 为 `true` 时，最新版会让
 `next_action.tool` 直接返回 `llm_wiki_get_page_plan_context`，并带上固定的
-`writer_id: wiki-writer-1`。Writer 会读取完整 page plan 后逐页生成并提交语义页面。
+`writer_id: wiki-writer-1`。主协调器读取 compact manifest 后启动 page drafter，
+再将 receipt 交给稳定 Writer 提交语义页面。
 后台 extractor 也会停止并向主 Agent 返回
 `writer_required: true`，从而触发 Writer；不要继续等待更多 batch，也不要启动
 第二个 projection 提交者。主协调器启动的 `llm-wiki-page-drafter` 只生成互斥
-页面草稿，不持有 lease，也不属于第二个 Writer；串行后台 Writer 是无法启动
-drafter 时的回退，不能与协调器 Writer loop 同时运行。
+页面草稿，不持有提交权，也不属于第二个 Writer；稳定后台 Writer 始终是唯一提交者，
+无法启动 drafter 时由它执行串行回退，主协调器也不能代替提交。
 
 页面规划不会内联完整 Schema。即使领域 Schema 接近 5 MiB，
 传统 `llm_wiki_get_page_plan_context` 也只返回 Schema ID、版本、哈希和大小元数据，

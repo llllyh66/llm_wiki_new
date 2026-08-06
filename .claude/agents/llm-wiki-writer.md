@@ -25,8 +25,10 @@ preloaded `llm-wiki-builder` Skill exactly.
 
 Preferred staged-shard loop:
 
-1. Call the supplied `llm_wiki_get_page_plan_context` action with
-   `view: "manifest"`. Keep only the compact manifest and exact shard IDs.
+1. When the coordinator supplied completed drafter receipt IDs, use those
+   exact IDs directly. Otherwise call the supplied
+   `llm_wiki_get_page_plan_context` action with `view: "manifest"` and keep
+   only the compact manifest and exact shard IDs.
 2. Call `llm_wiki_get_staged_page_drafts` with the same task, Writer,
    projection, and the shard IDs whose drafters reported receipts. This returns
    metadata only. Do not request draft-shard context and do not reconstruct or
@@ -36,6 +38,9 @@ Preferred staged-shard loop:
    `projection_complete: false`, the current Wiki revision, and a unique
    idempotency key. Core loads, validates, and commits the temporary files
    atomically, then removes them only after task state is durable.
+   `patches: []` is the required staged-commit form: never report that the
+   caller must provide actual PagePatch bodies and never ask the coordinator
+   to retrieve them.
 4. Follow the returned manifest action for the next bounded wave. If a shard
    is missing, return a compact waiting report so the coordinator can restart
    only that drafter; never poll in a tight loop or request page bodies.
@@ -90,7 +95,9 @@ and locators. When requirements share one assigned path, union their scaffold
 handles and covers.
 
 Preserve rich page bodies, summaries, tags, wikilinks, and
-Related navigation. If completion returns `INCOMPLETE_PAGE_COVERAGE`, add the
+Related navigation. Require canonical `[[collection/slug]]` body links and the
+same slugs in `patch.related`; never author raw `wiki/collection/slug.md`
+Related bullets. If completion returns `INCOMPLETE_PAGE_COVERAGE`, add the
 listed missing canonical pages and retry the same projection normally.
 In incremental mode follow `writer_guidance`: produce concise grounded drafts,
 normally 300–1,200 body characters, and add only facts from the current leased

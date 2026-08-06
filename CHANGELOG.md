@@ -2,6 +2,25 @@
 
 ## [Unreleased] - 2026-08-06
 
+### Writer 职责与 Related 一致性修复
+
+- 消除 Skill 中“协调器 Writer loop 直接提交”与“稳定 Writer 是唯一提交者”的冲突：主 Agent 只获取 compact manifest、启动 drafter、校验 receipt 并唤醒 Writer；只有 `llm-wiki-writer` 调用 `llm_wiki_get_staged_page_drafts` 和 `llm_wiki_commit_pages`。
+- 明确 `staged_draft_shard_ids + patches=[]` 是服务端暂存提交的正确形式，禁止 Writer 误报“必须由主 Agent 提供实际 PagePatch”。
+- Related 解析同时支持 canonical `[[...]]`、指向 Wiki 页面的 Markdown 链接，以及 Related 章节中的旧式 `wiki/...md` 路径；写盘时统一同步 frontmatter 与正文 canonical wikilink。
+- Finalize、lint 和知识库概览使用同一套 Related 解析，避免页面正文有链接但 frontmatter 仍为 `related: []`。
+- 跨 batch relation 优先使用同 batch localId，并仅在全局 localId 唯一或页面名称唯一时安全补全关联，避免漏链和误链。
+- 新增 Related 格式归一化、非关系正文防误识别、self-link 清理和跨 batch 双向 scaffold 回归测试。
+- 验证通过：Core 45 项、MCP Server 16 项、CLI 1 项测试全部通过。
+
+### MCP 运行时稳定性与大任务背压
+
+- 普通 `unhandledRejection` 不再调用 `server.close()` 或设置退出码；服务只记录 `unhandled-rejection` 并标记运行时 degraded，避免一个后台 Agent 的遗漏 Promise 关闭共享 STDIO。同步 `uncaughtException` 仍按致命异常优雅退出。
+- MCP 路由增加全局 8 个、单任务 4 个并发上限，超限返回结构化 `MCP_BUSY`/`TASK_BUSY` 与 `retry_after_ms`，不再让 Core 的任务锁和工作区写锁无限排队；宿主取消的请求在进入排队操作前返回 `MCP_REQUEST_CANCELLED`。
+- Schema、chunk index、analysis、page-plan 和 draft-shard 缓存增加字节水位与条数双重淘汰，batch 文件缓存增加 32 MiB 总水位，降低大 Schema/大任务触发 OOM 后表现为“Connection closed”的概率。
+- MCP 结果默认限制为约 450 KiB，并在工具元数据声明 80–120 KiB 的宿主结果建议；大型 batch、Schema、page plan 继续使用分页，不再把完整上下文复制到 `structuredContent`。
+- 运行时写入 `.llm-wiki/logs/mcp-runtime.jsonl`，记录 request ID、输入/输出字节、活跃调用计数、RSS/heap、构建提交号、心跳、信号和退出原因；构建时生成 `dist/build-info.json`，便于确认 Claude 实际运行的构建。
+- `status`/`import` 明确 `pipeline_concurrency`：提取与投影重叠时总预算为 4（2 extractors + 2 drafters），提取结束后才释放到 4 个 drafters，避免把 `recommended_workers` 与 `max_drafters` 相加。
+
 ### Projection 状态机与 cursor replay 修复
 
 - 禁止 `projection_complete=false` 的 server-side manifest 空 wave；非最终 shard 必须提交完整 PagePatch 或已校验的 staged draft，避免空提交被错误记入 `committedDraftShardIds`。
@@ -31,7 +50,7 @@
 - 心跳改用带独立超时预算的标准 `ping` 请求，避免 SDK 默认请求长期挂起后阻塞后续心跳。
 - 移除心跳定时器的 `unref`，保证长时间没有工具调用时 MCP 进程仍保持存活；生产默认仍为每 5 分钟一次。
 - 监听 STDIO 输入/输出的 `end`、`close` 和 `error`，对端退出时主动关闭协议并清理资源，避免出现“Claude 已断开但 Node 进程仍在”的僵尸连接。
-- 未捕获的进程级异常现在会记录后优雅退出并交还给宿主重启；普通工具校验错误仍由路由器转换为可恢复的结构化结果。
+- 未捕获的同步进程级异常现在会记录后优雅退出并交还给宿主重启；普通 `unhandledRejection` 只进入 degraded 日志，不关闭共享 STDIO；工具校验错误仍由路由器转换为可恢复的结构化结果。
 - 增加短周期心跳的真实 STDIO 回归测试，验证连续 ping/pong 后仍可正常调用 `listTools`。
 
 ### 技术文档与运维说明
@@ -73,4 +92,4 @@
 
 - 更新 Skill、Writer Agent、恢复指南和技术文档，统一采用 manifest → shard → durable commit 流程。
 - 新增 50+ 页面分片写入、提前 finalize 拒绝、上下文恢复和 MCP 错误恢复测试。
-- 全量测试通过：Core 38 项、MCP Server 13 项、CLI 1 项。
+- 全量测试通过：Core 40 项、MCP Server 16 项、CLI 1 项。

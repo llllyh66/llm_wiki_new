@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { listFilesRecursive, relativePosix } from "./utils.js"
-import { extractWikiLinks, parseWikiPage } from "./wiki-page.js"
+import { extractRelatedReferences, parseWikiPage } from "./wiki-page.js"
 
 export async function lintWiki(workspace, selectedPaths) {
   const allFiles = await listFilesRecursive(workspace.paths.wiki, (candidate) => candidate.endsWith(".md"))
@@ -14,7 +14,7 @@ export async function lintWiki(workspace, selectedPaths) {
     const content = await readFile(file, "utf8")
     const parsed = parseWikiPage(content)
     const title = parsed.title || path.basename(file, ".md")
-    const links = [...new Set([...parsed.related, ...extractWikiLinks(parsed.body)].map(normalizeLink))]
+    const links = [...new Set([...parsed.related, ...extractRelatedReferences(parsed.body)].map(normalizeLink))]
     pages.push({ relative, slug: relative.replace(/^wiki\//, "").replace(/\.md$/i, ""), basename: path.basename(file, ".md"), title, links, content, parsed, selected: !selected || selected.has(relative) })
   }
   const exact = new Map()

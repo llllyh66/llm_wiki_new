@@ -2,12 +2,12 @@
 
 The project root `.mcp.json` starts the Headless `llm-wiki` STDIO MCP server.
 It resolves the executable and workspace from `CLAUDE_PROJECT_DIR` and marks
-the small 14-tool server as `alwaysLoad`, so changing the shell working
+the small 16-tool server as `alwaysLoad`, so changing the shell working
 directory or deferred tool discovery cannot detach the workflow. Claude Code
 asks for project-server trust the first time it reads this file.
 
 `.claude/settings.json` approves the project `llm-wiki` server, every tool from
-that server (both server-wide and all 14 explicit tool names), the builder
+that server (both server-wide and all 16 explicit tool names), the builder
 Skill, the named extractor/writer Agents, ToolSearch, all subagents, and
 read-only repository tools.
 It uses `dontAsk`, so background agents never pause for permission: tools not
@@ -37,7 +37,7 @@ llm-wiki: node packages/mcp-server/dist/index.js --workspace . - Connected
 ```
 
 Start Claude Code from the repository root, approve the project MCP server if
-prompted, and confirm `/mcp` reports `Connected` with 14 tools. Attach or
+prompted, and confirm `/mcp` reports `Connected` with 16 tools. Attach or
 reference documents, then ask:
 
 ```text
@@ -72,9 +72,15 @@ stabilization commit instead of regenerating the entire Wiki.
 Every initial and replacement slot must use the exact project Agent type
 `llm-wiki-extractor`; a generic "Worker N", `general-purpose` Agent, or Team
 teammate does not apply that file's `mcpServers` field. The MCP server and all
-14 tools are marked always-load, with ToolSearch as a deferred-discovery
+16 tools are marked always-load, with ToolSearch as a deferred-discovery
 fallback. Claude Code 2.1.121 or later is recommended because that release adds
 the documented `alwaysLoad` behavior; fully restart Claude Code after updating.
+
+The server enforces a total four-Agent pipeline budget (normally two
+extractors plus two page drafters while extraction overlaps), and its router
+returns `MCP_BUSY`/`TASK_BUSY` rather than allowing unbounded tool queues. For
+long runs, inspect `.llm-wiki/logs/mcp-runtime.jsonl` after a real transport
+error; it records build, memory, request, heartbeat, and shutdown events.
 
 The extraction hot path does not invoke retrieval for every batch. `get_batch`
 automatically includes bounded domain-Schema definitions matched from canonical

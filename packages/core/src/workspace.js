@@ -43,7 +43,10 @@ normalizes these fields deterministically: \`type\`, \`title\`, \`created\`,
 Use \`covers\` to list every \`page_requirements.requirement_id\` materialized by
 the canonical page. Important entities and concepts are page requirements even
 when the Agent emitted only a small \`candidatePages\` list. Preserve useful
-body wikilinks; Finalize makes valid Related links bidirectional.
+body wikilinks. Put every Related slug in frontmatter and render the same link
+as \`[[collection/slug]]\`; do not use raw \`wiki/collection/slug.md\` paths.
+The Core accepts legacy path and Markdown-link forms, normalizes them, and
+Finalize makes valid Related links bidirectional.
 
 Every important factual statement must be backed by a SourceRef submitted with
 the page patch. \`wiki/index.md\`, \`wiki/overview.md\`, and \`wiki/log.md\` are

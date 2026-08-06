@@ -117,7 +117,12 @@ export const pagePatchSchema = Object.freeze({
     content: { type: "string", minLength: 1 },
     summary: { type: "string", maxLength: 500 },
     tags: { type: "array", items: { type: "string", minLength: 1, maxLength: 200 }, maxItems: 100 },
-    related: { type: "array", items: { type: "string", minLength: 1, maxLength: 500 }, maxItems: 500 },
+    related: {
+      type: "array",
+      items: { type: "string", minLength: 1, maxLength: 500 },
+      maxItems: 500,
+      description: "Canonical Wiki slugs such as entities/customer. Mirror each entry in the body as [[entities/customer]]; do not use wiki/entities/customer.md paths.",
+    },
     covers: { type: "array", items: { type: "string", minLength: 1, maxLength: 300 }, maxItems: 1000, description: "page_requirements requirement_id values materialized by this canonical page." },
     sourceRefs: {
       type: "array",

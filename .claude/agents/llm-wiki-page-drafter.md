@@ -33,7 +33,10 @@ Return one patch per assigned canonical path with no duplicate paths.
 
 Write coherent semantic pages rather than concatenating chunks. Include a
 clear H1, concise summary, grounded key facts, meaningful relations, and
-Related navigation when supported. Merge relevant existing grounded content
+Related navigation when supported. Put every Related slug in `patch.related`
+and render the same link as `[[collection/slug]]` in the body; never use a raw
+`wiki/collection/slug.md` path or a Markdown link for canonical Wiki
+navigation. Merge relevant existing grounded content
 instead of replacing it with only the newest batch. In incremental mode keep
 the body normally within 300–1,200 characters; in final mode reconcile all
 facts supplied for the assigned paths and preserve contradictions as

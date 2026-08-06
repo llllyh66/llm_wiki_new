@@ -2,9 +2,17 @@ import { LlmWikiError, asLlmWikiError } from "@llm-wiki/core"
 import { TOOL_DEFINITIONS } from "./tool-definitions.js"
 
 const MAX_MCP_INPUT_BYTES = 12 * 1024 * 1024
-const MAX_MCP_OUTPUT_BYTES = 6 * 1024 * 1024
+// Claude Code persists oversized MCP results to disk and feeds only a file
+// reference back to the Agent. Keep the wire result below its documented hard
+// per-tool annotation ceiling so large task state cannot trigger context
+// compaction or a one-line reader failure.
+const MAX_MCP_OUTPUT_BYTES = 450 * 1024
 const STRUCTURED_CONTENT_DUPLICATION_LIMIT = 128 * 1024
 const MAX_ERROR_MESSAGE_CHARS = 2_000
+const MAX_MCP_IN_FLIGHT = 8
+const MAX_TASK_IN_FLIGHT = 4
+const BUSY_RETRY_AFTER_MS = 1_500
+const MCP_SIGNAL = Symbol.for("llm-wiki.mcp.signal")
 const RECOVERABLE_ANALYSIS_CODES = new Set(["INVALID_ANALYSIS", "INVALID_DOMAIN_ANALYSIS", "INVALID_SOURCE_REF", "ANALYSIS_TOO_LARGE"])
 const ATOMIC_PAGE_REJECTION_CODES = new Set([
   "INVALID_PAGE_PATCH",
@@ -49,6 +57,9 @@ function emergencyMcpResult() {
 function serializeResult(data) {
   let text
   try {
+    // Keep indentation so large string fields are not emitted as one opaque
+    // line in host-persisted MCP result files. The byte budget below still
+    // bounds the complete response.
     text = JSON.stringify(data, null, 2)
   } catch {
     return serializeResult(errorResult(new LlmWikiError("MCP_SERIALIZATION_FAILED", "Tool result could not be serialized as JSON.")))
@@ -138,6 +149,12 @@ function pageCommitRetryInstruction(code) {
 }
 
 function recoveryAction(tool, args, error) {
+  if (error.code === "TASK_BUSY") {
+    return typeof args?.task_id === "string"
+      ? { tool: "llm_wiki_status", arguments: { task_id: args.task_id } }
+      : { tool: "llm_wiki_list_tasks", arguments: {} }
+  }
+  if (error.code === "MCP_BUSY") return { tool: "llm_wiki_list_tasks", arguments: {} }
   if (tool === "llm_wiki_commit_analysis" && RECOVERABLE_ANALYSIS_CODES.has(error.code)) {
     return { tool, arguments: { task_id: args?.task_id, batch_id: args?.batch_id } }
   }
@@ -222,16 +239,33 @@ function recoveryAction(tool, args, error) {
   return { tool: "llm_wiki_list_tasks", arguments: {} }
 }
 
+function attachSignal(args, signal) {
+  if (!signal || !args || typeof args !== "object") return args
+  // Keep the signal out of JSON payloads and idempotency hashes. A frozen
+  // client argument object is copied once rather than mutated in place.
+  if (Object.isExtensible(args)) {
+    try {
+      Object.defineProperty(args, MCP_SIGNAL, { value: signal, enumerable: false, configurable: true })
+      return args
+    } catch {
+      // Fall through to a shallow copy for exotic host objects.
+    }
+  }
+  return { ...args, [MCP_SIGNAL]: signal }
+}
+
 export class HeadlessToolRouter {
   constructor(core) {
     this.core = core
+    this.activeCalls = 0
+    this.activeCallsByTask = new Map()
   }
 
   listTools() {
     return TOOL_DEFINITIONS
   }
 
-  async call(name, args = {}) {
+  async call(name, args = {}, options = {}) {
     switch (name) {
       case "llm_wiki_import_files": return this.core.importFiles(args)
       case "llm_wiki_get_batch": return this.core.getBatch(args)
@@ -253,13 +287,59 @@ export class HeadlessToolRouter {
     }
   }
 
-  async callMcp(name, args = {}) {
+  runtimeStats() {
+    return {
+      activeCalls: this.activeCalls,
+      activeTasks: this.activeCallsByTask.size,
+      maxInFlight: MAX_MCP_IN_FLIGHT,
+      maxTaskInFlight: MAX_TASK_IN_FLIGHT,
+    }
+  }
+
+  #reserve(name, args, signal) {
+    if (signal?.aborted) {
+      throw new LlmWikiError("MCP_REQUEST_CANCELLED", "The host cancelled this MCP request before execution.", {
+        retryable: true,
+        details: { tool: name },
+      })
+    }
+    const taskId = typeof args?.task_id === "string" ? args.task_id : null
+    const taskActive = taskId ? (this.activeCallsByTask.get(taskId) ?? 0) : 0
+    if (this.activeCalls >= MAX_MCP_IN_FLIGHT) {
+      throw new LlmWikiError("MCP_BUSY", "The MCP server is handling its maximum number of concurrent tool calls.", {
+        retryable: true,
+        details: { retry_after_ms: BUSY_RETRY_AFTER_MS, active_calls: this.activeCalls, max_in_flight: MAX_MCP_IN_FLIGHT },
+        suggestedAction: "Retry the same tool after retry_after_ms; do not restart MCP.",
+      })
+    }
+    if (taskId && taskActive >= MAX_TASK_IN_FLIGHT) {
+      throw new LlmWikiError("TASK_BUSY", `Task ${taskId} already has the maximum number of in-flight tool calls.`, {
+        retryable: true,
+        taskId,
+        details: { retry_after_ms: BUSY_RETRY_AFTER_MS, active_calls: taskActive, max_task_in_flight: MAX_TASK_IN_FLIGHT },
+        suggestedAction: "Retry after retry_after_ms; persisted leases and idempotency keys remain valid.",
+      })
+    }
+    this.activeCalls += 1
+    if (taskId) this.activeCallsByTask.set(taskId, taskActive + 1)
+    return () => {
+      this.activeCalls = Math.max(0, this.activeCalls - 1)
+      if (!taskId) return
+      const remaining = Math.max(0, (this.activeCallsByTask.get(taskId) ?? 1) - 1)
+      if (remaining === 0) this.activeCallsByTask.delete(taskId)
+      else this.activeCallsByTask.set(taskId, remaining)
+    }
+  }
+
+  async callMcp(name, args = {}, options = {}) {
+    let release
     try {
       const inputBytes = Buffer.byteLength(JSON.stringify(args))
       if (inputBytes > MAX_MCP_INPUT_BYTES) {
         throw new LlmWikiError("MCP_INPUT_TOO_LARGE", `Tool input exceeds the ${MAX_MCP_INPUT_BYTES}-byte MCP limit. Submit smaller batches.`, { retryable: true })
       }
-      return serializeResult(await this.call(name, args))
+      release = this.#reserve(name, args, options.signal)
+      return serializeResult(await this.call(name, attachSignal(args, options.signal), options))
     } catch (error) {
       try {
         return serializeResult(errorResult(error, { tool: name, args }))
@@ -269,6 +349,8 @@ export class HeadlessToolRouter {
         // destabilize the long-lived STDIO transport.
         return emergencyMcpResult()
       }
+    } finally {
+      release?.()
     }
   }
 }

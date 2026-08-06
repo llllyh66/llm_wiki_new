@@ -97,7 +97,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_staged_page_drafts",
-    description: "Return metadata-only receipts for staged PagePatch shards. It never returns page bodies, so the coordinator can hand off to the stable Writer without retaining draft content in its context.",
+    description: "Return metadata-only receipts for staged PagePatch shards. The stable Writer calls this with receipt IDs supplied by the coordinator; it never returns page bodies and the coordinator must not substitute itself as committer.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
@@ -107,7 +107,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_commit_pages",
-    description: "Atomically commit one bounded semantic Wiki wave. Hard maximum: 50 patches and the returned page_commit_limits may recommend a smaller wave. Use staged_draft_shard_ids with patches:[] to let the stable Writer commit drafter-created temporary shards server-side without loading page bodies into the coordinator. Partition paths before drafting, commit accepted waves with projection_complete=false, and never regenerate accepted waves. Finish with projection_complete=true after every manifest shard is covered.",
+    description: "Atomically commit one bounded semantic Wiki wave. The stable Writer is the only Agent that calls this tool. Hard maximum: 50 patches and the returned page_commit_limits may recommend a smaller wave. Use staged_draft_shard_ids with patches:[] to commit drafter-created temporary shards server-side; actual PagePatch bodies are neither required nor returned to the coordinator. Partition paths before drafting, commit accepted waves with projection_complete=false, and never regenerate accepted waves. Finish with projection_complete=true after every manifest shard is covered.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
@@ -155,7 +155,20 @@ const toolDefinitions = [
   },
 ]
 
+const TOOL_RESULT_LIMITS = Object.freeze({
+  llm_wiki_get_batch: 80_000,
+  llm_wiki_get_domain_schema: 120_000,
+  llm_wiki_retrieve_context: 120_000,
+  llm_wiki_get_page_plan_context: 120_000,
+  llm_wiki_status: 120_000,
+  llm_wiki_list_tasks: 80_000,
+})
+
 export const TOOL_DEFINITIONS = Object.freeze(toolDefinitions.map((tool) => Object.freeze({
   ...tool,
-  _meta: { ...(tool._meta ?? {}), "anthropic/alwaysLoad": true },
+  _meta: {
+    ...(tool._meta ?? {}),
+    "anthropic/alwaysLoad": true,
+    "anthropic/maxResultSizeChars": TOOL_RESULT_LIMITS[tool.name] ?? 80_000,
+  },
 })))

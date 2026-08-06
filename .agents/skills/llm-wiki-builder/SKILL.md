@@ -40,12 +40,42 @@ typed entity or any relation.
 
 ## Background-agent priority (mandatory)
 
-The main Agent is a coordinator, not the default extractor or page author.
+### MCP health proof (mandatory after compaction or a worker notification)
+
+Do not infer an MCP disconnect from context compaction, a missing tool in the
+model's current tool list, a background Agent completion, or a failed shell
+probe. The project configuration is `.mcp.json`; never inspect `.mcp` and never
+use Bash to decide whether MCP is connected. If the required tool is not
+visible, use `ToolSearch` once for `llm_wiki_status` (or the host's
+`WaitForMcpServers` equivalent), then call `llm_wiki_status` from the
+coordinator. Only a real transport error such as `Connection closed`, `MCP
+error -32000`, or an explicit failed MCP server status permits reporting a
+disconnect or asking for `/mcp`. A structured result with `ok: false`,
+`accepted: false`, or `mcp_connection_usable: true` is a live connection and
+must be recovered through its `next_action`.
+
+When extraction overlaps Wiki drafting, the total background-agent budget is
+four: use at most two extractors plus two drafters. After extraction finishes,
+the four slots may be used by drafters. Do not interpret
+`recommended_workers: 4` and `max_drafters: 4` as additive; follow the current
+`pipeline_concurrency` fields from `status`.
+
+The MCP router also applies backpressure: at most eight tool calls are active
+globally and four for one task. `MCP_BUSY` and `TASK_BUSY` are structured,
+recoverable results; wait for the returned `retry_after_ms` and retry the exact
+operation without restarting MCP. A host-cancelled request returns
+`MCP_REQUEST_CANCELLED` before a queued Core lock can mutate state. Do not
+launch extra workers to work around a busy response.
+
+The main Agent is a coordinator, not the default extractor, page author, or
+Wiki committer.
 For every non-empty task, including a task with exactly one batch, launch the
 project `llm-wiki-extractor` in the background before calling `get_batch` or
 `commit_analysis` in the coordinator. When the Wiki projection is ready, launch
 the project `llm-wiki-page-drafter` children and the stable `llm-wiki-writer` in
-the background before drafting or committing pages in the coordinator. Do not
+the background. The coordinator may fetch a compact manifest to launch those
+children, but it never fetches staged page bodies and never invokes
+`llm_wiki_get_staged_page_drafts` or `llm_wiki_commit_pages`. Do not
 choose direct foreground work merely because the file is small, one batch is
 available, or a background Agent would take less prompt text.
 
@@ -288,7 +318,8 @@ always use it and return control to the user while the worker runs.
      next bounded worker invocation in that freed slot with the same stable ID;
      `get_batch` will lease the next available batch or return `waiting` when
      all remaining work is already reserved.
-   - If `wiki_projection.ready: true`, start the coordinator Writer loop
+   - If `wiki_projection.ready: true`, start the coordinator-owned projection
+     orchestration loop
      immediately. Use a total background budget of four project Agents while
      page drafting is active: keep at most two extraction workers and reserve
      up to two slots for page drafters. Do not interrupt an extractor in the
@@ -323,12 +354,16 @@ always use it and return control to the user while the worker runs.
    without an actual transport exception from a tool call. Background-agent
    disappearance is an orchestration event, not task-state or MCP data loss.
 7. Inspect `wiki_projection` in every analysis commit report and status result.
-   When `ready: true` and `in_progress: false`, run the bounded Writer loop in
-   the main coordinator with stable writer ID `wiki-writer-1`, starting from
-   the exact `next_action` returned by status or `commit_analysis`. The
-   coordinator performs only fast manifest coordination and receipt validation;
-   page bodies are staged server-side and the stable Writer commits them, so
-   the main Agent never receives generated PagePatch content. Semantic
+   When `ready: true` and `in_progress: false`, run the bounded projection
+   orchestration loop in the main coordinator with stable writer ID
+   `wiki-writer-1`, starting from the exact `next_action` returned by status or
+   `commit_analysis`. The coordinator performs only fast manifest coordination,
+   background-Agent lifecycle management, and compact receipt validation. It
+   may call `llm_wiki_get_page_plan_context` with `view: "manifest"` to obtain
+   bounded drafter actions, but it must never call
+   `llm_wiki_get_staged_page_drafts` or `llm_wiki_commit_pages`. Page bodies are
+   staged server-side and the stable Writer alone commits them, so the main
+   Agent never receives generated PagePatch content. Semantic
    drafting is delegated in step 8 so the main Agent remains responsive while
    drafts run. This placement is intentional:
    Claude background subagents cannot reliably spawn nested subagents, so a
@@ -336,18 +371,23 @@ always use it and return control to the user while the worker runs.
    Never run two projection coordinators or MCP committers for one task. When
    the returned `parallel_drafting.execution_mode` is
    `coordinator-owned-parallel-drafters`, the main coordinator must launch
-   the available `llm-wiki-page-drafter` children before drafting locally. Use
-   project `llm-wiki-writer` only as a serial background fallback when the host
-   cannot launch `llm-wiki-page-drafter`; do not run it at the same time as the
-   coordinator Writer loop. The Core normally opens a
+   the available `llm-wiki-page-drafter` children and never draft locally. Use
+   project `llm-wiki-writer` as the sole committer after drafter receipts
+   arrive. When the host cannot launch `llm-wiki-page-drafter`, the same stable
+   Writer owns the documented serial drafting fallback; the coordinator still
+   does not draft or commit. Never run two stable Writers for one task. The
+   Core normally opens a
    projection after four new batches, after the 30-second debounce, or
    immediately for final reconciliation when all batches finish. Each
    incremental projection leases at most eight batches. The Writer
    processes each projection independently and commits semantic pages before
    continuing; if extraction finishes with unprojected batches, drain those
    projections before opening the final full reconciliation.
-8. The coordinator Writer loop uses `llm_wiki_get_page_plan_context` and
-   `llm_wiki_commit_pages` for every projection. `llm_wiki_apply_projection`
+8. The coordinator projection loop uses only
+   `llm_wiki_get_page_plan_context` with `view: "manifest"` for every
+   projection. The stable `llm-wiki-writer` is the only caller of
+   `llm_wiki_get_staged_page_drafts` and `llm_wiki_commit_pages`.
+   `llm_wiki_apply_projection`
    is only a compatibility redirect to the same page-plan action and never
    writes pages automatically. Call the exact
    action supplied by status or `commit_analysis`, with stable Writer ID
@@ -356,12 +396,14 @@ always use it and return control to the user while the worker runs.
    returns bounded context for the Agent to author semantic pages. The Core
    validates evidence, page shape, hashes, and atomic transactions; it never
    invents semantic facts. Return the
-   compact projection report after that call; if its next action is another
-   page-plan or commit action, follow the exact returned action. Do not infer
-   a new cursor or restart the projection from an earlier page.
+   compact projection report after that call. If its next action is a commit or
+   staged-draft action, hand that exact action to the stable Writer instead of
+   executing it in the coordinator. Do not infer a new cursor or restart the
+   projection from an earlier page.
 
-   One bounded coordinator Writer invocation processes up to six projections,
-   committing each projection independently:
+   One bounded coordinator orchestration invocation processes up to six
+   projections, with the stable Writer committing each projection
+   independently:
    1. Call `llm_wiki_get_page_plan_context` with task ID, stable writer ID,
       `view: "manifest"`, cursor `0`, and `max_chars: 40000`. Follow the exact
       status action when it already contains those arguments. The server builds
@@ -384,15 +426,21 @@ always use it and return control to the user while the worker runs.
       sequential cursors, and calls `llm_wiki_stage_page_drafts` after
       generating its patches. It returns a compact receipt containing a shard
       ID and draft hash, never PagePatch bodies. Validate only those receipts
-      in the coordinator. Then launch or resume the stable `llm-wiki-writer`,
-      which calls `llm_wiki_get_staged_page_drafts` and commits with
+      in the coordinator. On every successful receipt notification,
+      immediately launch or resume the stable `llm-wiki-writer` with the exact
+      task, projection, Writer, and staged shard IDs. That Writer calls
+      `llm_wiki_get_staged_page_drafts` and commits with
       `staged_draft_shard_ids` and `patches: []`; page bodies remain in the
       task-scoped temporary staging area. If fewer than two disjoint shards are
       available, launch one drafter or use the serial Writer fallback; never
       fetch PagePatch bodies into the coordinator just because the wave has one shard.
-      Each child receives exactly one shard and never the full manifest or
-      another shard. If that project Agent is unavailable, use the explicitly
-      documented serial fallback; never launch a general-purpose replacement.
+      The coordinator must not interpret a receipt as permission to commit and
+      must not claim that a staged commit needs PagePatch bodies. Each child
+      receives exactly one shard and never the full manifest or
+      another shard. If that project Agent is unavailable, instruct the stable
+      Writer to use the explicitly documented serial fallback; never launch a
+      general-purpose replacement and never move the commit into the
+      coordinator.
       Respect the four-Agent pipeline budget: normally two extractors plus two
       drafters while extraction overlaps, then up to four drafters afterward.
    3. For `incremental` mode, update only pages affected by the projection's
@@ -424,7 +472,10 @@ always use it and return control to the user while the worker runs.
       one canonical page, union their scaffold `covers`, `sourceRefs`, and
       related values before adding content.
       Supply `summary`, useful `tags`, `related` canonical Wiki slugs, and
-      `covers`. Author a clear H1 and a self-contained source-grounded body.
+      `covers`. Every Related entry in the body must use
+      `[[collection/slug]]` and must also appear in `patch.related`; never emit
+      a raw `wiki/collection/slug.md` path. Author a clear H1 and a
+      self-contained source-grounded body.
       The Core deterministically normalizes the full standard frontmatter
       (`type`, `title`, `created`, `updated`, `tags`, `related`, `sources`,
       `covers`, `summary`) and makes valid Related links bidirectional during
@@ -440,7 +491,7 @@ always use it and return control to the user while the worker runs.
       patches or the content-character ceiling. Pass task ID, writer ID,
       projection ID, current Wiki revision, and a unique idempotency key. Set
       `projection_complete: false` for every staged shard/wave commit. Each accepted
-      call must copy the returned `draft_shard_ids`; these IDs, rather than
+      Writer call must copy the returned `draft_shard_ids`; these IDs, rather than
       pre-existing page coverage, are the durable proof that final semantic
       rewriting actually processed the shard. Each accepted
       wave is a durable checkpoint; immediately follow its returned
@@ -475,8 +526,9 @@ always use it and return control to the user while the worker runs.
       the same writer ID; do not call status or wait for the 30-second debounce.
       Return after the reported projection quantum (currently six), when no backlog is ready, after a final
       projection, or on a recoverable error. The coordinator then calls status
-      and immediately starts another bounded Writer invocation if backlog
-      remains ready.
+      and immediately starts another bounded stable Writer invocation if
+      backlog remains ready. It never substitutes a direct coordinator commit
+      while restarting that Writer.
 9. Continue extraction and Wiki projections as a pipeline. A Wiki writer may
    run while extractors process later batches. Multiple tasks may each have one
    Writer committer, and one Writer may parallelize path-disjoint drafting:

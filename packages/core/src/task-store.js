@@ -19,7 +19,8 @@ const MAX_AGENT_BATCH_CHARS = LARGE_AGENT_BATCH_CHARS
 const MAX_AGENT_NESTED_STRING_CHARS = 3_000
 const TASK_BATCH_BOUNDS_VERSION = 3
 const TASK_CHUNK_PAYLOAD_VERSION = 3
-const BATCH_FILE_CACHE_LIMIT = 12
+const BATCH_FILE_CACHE_LIMIT = 4
+const BATCH_FILE_CACHE_MAX_BYTES = 32 * 1024 * 1024
 const batchFileCache = new Map()
 
 export function taskPaths(workspacePaths, taskId) {
@@ -362,11 +363,20 @@ async function readBatchesCached(filePath) {
   const cached = batchFileCache.get(filePath)
   if (cached?.signature === signature) return cached.value
   const value = await readJson(filePath)
-  batchFileCache.set(filePath, { signature, value })
-  while (batchFileCache.size > BATCH_FILE_CACHE_LIMIT) {
+  batchFileCache.set(filePath, { signature, value, sizeBytes: Number(info.size) || 0 })
+  while (batchFileCache.size > BATCH_FILE_CACHE_LIMIT || batchCacheBytes() > BATCH_FILE_CACHE_MAX_BYTES) {
+    // Keep one oversized active task cached; otherwise every call would
+    // immediately evict and reparse the same large batches.json file.
+    if (batchFileCache.size <= 1) break
     batchFileCache.delete(batchFileCache.keys().next().value)
   }
   return value
+}
+
+function batchCacheBytes() {
+  let total = 0
+  for (const entry of batchFileCache.values()) total += Number(entry.sizeBytes) || 0
+  return total
 }
 
 export async function saveTask(paths, task) {

@@ -740,6 +740,58 @@ test("Wiki title and bidirectional link neighbors participate in RRF", async (t)
   assert.equal(retrieval.hits.some((hit) => hit.path === "wiki/topics/hidden-neighbor.md"), true)
 })
 
+test("page planning resolves safe cross-batch local IDs into bidirectional Related scaffolds", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const alphaSource = path.join(f.incoming, "alpha.md")
+  const betaSource = path.join(f.incoming, "beta.md")
+  await writeFile(alphaSource, `# Alpha\n\nAlpha service is defined. ${"alpha ".repeat(150)}\n`)
+  await writeFile(betaSource, `# Beta\n\nBeta depends on Alpha service. ${"beta ".repeat(150)}\n`)
+  const imported = await f.core.importFiles({
+    files: [{ path: alphaSource }, { path: betaSource }],
+    options: { max_batch_chars: 1_000 },
+  })
+  assert.equal(imported.batch_count >= 2, true)
+
+  while (true) {
+    const batch = await f.core.getBatch({ task_id: imported.task_id })
+    if (batch.completed) break
+    const alphaEvidence = batch.evidence_catalog.find((entry) => entry.quote.includes("Alpha service is defined"))
+    const betaEvidence = batch.evidence_catalog.find((entry) => entry.quote.includes("Beta depends on Alpha service"))
+    const analysis = { ...batch.analysis_scaffold, batchSummary: "Cross-batch relation fixture." }
+    if (alphaEvidence) {
+      analysis.entities = [{ localId: "stable-alpha", name: "Alpha service", sourceRefs: [alphaEvidence.evidence_index] }]
+    }
+    if (betaEvidence) {
+      analysis.entities = [{ localId: "stable-beta", name: "Beta", sourceRefs: [betaEvidence.evidence_index] }]
+      analysis.relations = [{
+        localId: "beta-depends-alpha",
+        content: "Beta depends on Alpha service.",
+        sourceEntityLocalId: "stable-beta",
+        targetEntityLocalId: "stable-alpha",
+        sourceRefs: [betaEvidence.evidence_index],
+      }]
+    }
+    const committed = await f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      analysis,
+      idempotency_key: `cross-batch-related-${batch.batch_id}`,
+    })
+    assert.equal(committed.accepted, true)
+  }
+
+  const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
+  const alpha = plan.page_requirements.find((requirement) => requirement.title === "Alpha service")
+  const beta = plan.page_requirements.find((requirement) => requirement.title === "Beta")
+  assert.ok(alpha)
+  assert.ok(beta)
+  assert.deepEqual(alpha.related_requirement_ids, [beta.requirement_id])
+  assert.deepEqual(beta.related_requirement_ids, [alpha.requirement_id])
+  assert.deepEqual(alpha.patch_scaffold.related, ["entities/beta"])
+  assert.deepEqual(beta.patch_scaffold.related, ["entities/alpha-service"])
+})
+
 test("Markdown attachment completes the model-free vertical slice", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
@@ -779,10 +831,10 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
       operation: "create",
       title: "Business Entity",
       pageKind: "concept",
-      content: "# Business Entity\n\nA canonical business object. See [[concepts/aggregate]].",
+      content: "# Business Entity\n\nA canonical business object.\n\n## Related\n\n- wiki/concepts/aggregate.md",
       summary: "The canonical business object.",
       tags: ["domain-model"],
-      related: ["concepts/aggregate"],
+      related: [],
       covers: [businessRequirement.requirement_id],
       sourceRefs: [businessRequirement.requirement_id],
       rationale: "The source explicitly defines this concept.",
@@ -792,10 +844,10 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
       operation: "create",
       title: "Aggregate",
       pageKind: "concept",
-      content: "# Aggregate\n\nAn Aggregate groups related [[concepts/business-entity|Business Entities]].",
+      content: "# Aggregate\n\nAn Aggregate groups related Business Entities.",
       summary: "Groups related Business Entities.",
       tags: ["domain-model"],
-      related: ["concepts/business-entity"],
+      related: [],
       covers: [aggregateRequirement.requirement_id],
       sourceRefs: [aggregateRequirement.requirement_id],
       rationale: "The source explicitly defines Aggregate.",
@@ -816,7 +868,10 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
   const businessPage = await readFile(path.join(f.workspace, "wiki", "concepts", "business-entity.md"), "utf8")
   const aggregatePage = await readFile(path.join(f.workspace, "wiki", "concepts", "aggregate.md"), "utf8")
   assert.match(businessPage, /related: \["concepts\/aggregate"/)
+  assert.doesNotMatch(businessPage, /wiki\/concepts\/aggregate\.md/)
+  assert.match(businessPage, /\[\[concepts\/aggregate\]\]/)
   assert.match(businessPage, /covers: \["page-/)
+  assert.match(aggregatePage, /related: \["concepts\/business-entity"/)
   assert.match(aggregatePage, /\[\[concepts\/business-entity\]\]/)
   assert.equal((await readFile(path.join(f.workspace, imported.sources[0].managed_path), "utf8")).includes("Product Model"), true)
   const completedRetrieval = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["Business Entity"] })
@@ -1088,7 +1143,9 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
     max_paths_per_shard: 6,
     minimum_paths: 4,
     pipeline_background_budget: 4,
+    max_background_agents_total: 4,
     extraction_workers_during_drafting: 2,
+    max_drafters_when_extraction_overlaps: 2,
     partition_key: "patch_scaffold.path",
     drafter_handoff: "server-side-temporary-draft-receipt",
     stage_tool: "llm_wiki_stage_page_drafts",
@@ -1144,6 +1201,13 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(ready.wiki_projection.mode, "incremental")
   assert.equal(ready.next_action.tool, "llm_wiki_get_page_plan_context")
   assert.equal(ready.next_action.arguments.writer_id, "wiki-writer-1")
+  assert.deepEqual(ready.pipeline_concurrency, {
+    max_background_agents_total: 4,
+    recommended_extractors: 2,
+    max_drafters: 2,
+    recommended_drafters: 2,
+  })
+  assert.equal(ready.parallel_extraction.recommended_workers, 2)
   assert.equal(projectionSignal.next_action.tool, "llm_wiki_get_page_plan_context")
   assert.equal(projectionSignal.worker_next_action.tool, "llm_wiki_get_batch")
 

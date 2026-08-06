@@ -75,7 +75,9 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(writer, /stable server-side Wiki committer/)
   assert.match(writer, /main coordinator launches path-disjoint/)
   assert.match(skill, /incremental projection leases at most eight batches/)
-  assert.match(skill, /coordinator Writer loop uses `llm_wiki_get_page_plan_context`/)
+  assert.match(skill, /coordinator projection loop uses only\s+`llm_wiki_get_page_plan_context`/)
+  assert.match(skill, /must never call\s+`llm_wiki_get_staged_page_drafts` or `llm_wiki_commit_pages`/)
+  assert.match(writer, /`patches: \[\]` is the required staged-commit form/)
   assert.match(writer, /`llm_wiki_apply_projection` for compatibility/)
   assert.match(writer, /stable Wiki Writer and only committer/)
   assert.match(writer, /^disallowedTools: Agent,/m)
@@ -125,6 +127,8 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
     assert.equal(tool.inputSchema.additionalProperties, false)
     assert.equal(Array.isArray(tool.inputSchema.required), true)
     assert.equal(tool._meta["anthropic/alwaysLoad"], true)
+    assert.equal(Number.isInteger(tool._meta["anthropic/maxResultSizeChars"]), true)
+    assert.equal(tool._meta["anthropic/maxResultSizeChars"] >= 80_000, true)
   }
   const pagePlan = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_get_page_plan_context")
   assert.deepEqual(pagePlan.inputSchema.properties.view.enum, ["plan", "manifest", "draft-shard"])
@@ -411,4 +415,44 @@ test("large MCP results cross the wire once and over-budget results become recov
   assert.equal(excessiveError.structuredContent.error.code, "INVALID_ANALYSIS")
   assert.equal(excessiveError.structuredContent.error.details.truncated, true)
   assert.equal(excessiveError.structuredContent.mcp_connection_usable, true)
+})
+
+test("MCP backpressure returns a recoverable busy result without growing an unbounded task queue", async () => {
+  let releasePending
+  const pending = new Promise((resolve) => { releasePending = resolve })
+  const router = new HeadlessToolRouter({
+    listTasks: async () => {
+      await pending
+      return { tasks: [] }
+    },
+  })
+  const calls = Array.from({ length: 5 }, () => router.callMcp("llm_wiki_list_tasks", { task_id: "task-backpressure" }))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(router.runtimeStats().activeCalls, 4)
+  const busy = await calls[4]
+  assert.equal(busy.isError, undefined)
+  assert.equal(busy.structuredContent.error.code, "TASK_BUSY")
+  assert.equal(busy.structuredContent.mcp_connection_usable, true)
+  assert.equal(busy.structuredContent.error.details.retry_after_ms, 1_500)
+  releasePending()
+  const completed = await Promise.all(calls.slice(0, 4))
+  assert.equal(completed.every((result) => result.structuredContent.tasks.length === 0), true)
+  assert.equal(router.runtimeStats().activeCalls, 0)
+})
+
+test("a pre-cancelled MCP request is rejected before it can enter Core", async () => {
+  let called = false
+  const router = new HeadlessToolRouter({
+    listTasks: async () => {
+      called = true
+      return { tasks: [] }
+    },
+  })
+  const controller = new AbortController()
+  controller.abort()
+  const response = await router.callMcp("llm_wiki_list_tasks", { task_id: "task-cancelled" }, { signal: controller.signal })
+  assert.equal(response.isError, undefined)
+  assert.equal(response.structuredContent.error.code, "MCP_REQUEST_CANCELLED")
+  assert.equal(response.structuredContent.mcp_connection_usable, true)
+  assert.equal(called, false)
 })
