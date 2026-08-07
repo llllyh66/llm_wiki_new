@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { spawn } from "node:child_process"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
@@ -151,6 +152,42 @@ test("MCP router returns structured Core errors", async (t) => {
   assert.equal(response.structuredContent.ok, false)
   assert.equal(response.structuredContent.error.code, "TASK_NOT_FOUND")
   assert.equal(response.structuredContent.mcp_connection_usable, true)
+})
+
+test("oversized next_action is reduced once and cannot OOM the MCP process", async () => {
+  const huge = {
+    ok: false,
+    accepted: false,
+    error: { code: "TOOL_FAILED", message: "large result" },
+    next_action: { tool: "llm_wiki_list_tasks", arguments: { payload: "x".repeat(600_000) } },
+  }
+  const router = new HeadlessToolRouter({ listTasks: async () => huge })
+  const response = await router.callMcp("llm_wiki_list_tasks", {})
+  const result = JSON.parse(response.content[0].text)
+  assert.equal(result.error.code, "TOOL_FAILED")
+  assert.deepEqual(result.next_action, { tool: "llm_wiki_list_tasks", arguments: {} })
+  assert.equal(Buffer.byteLength(response.content[0].text) < 450 * 1024, true)
+  assert.equal((await router.callMcp("llm_wiki_list_tasks", {})).content.length, 1)
+
+  const toolsModuleUrl = new URL("../src/tools.js", import.meta.url).href
+  const childScript = [
+    `import { HeadlessToolRouter } from ${JSON.stringify(toolsModuleUrl)}`,
+    'const huge = { next_action: { tool: "llm_wiki_list_tasks", arguments: { payload: "x".repeat(600000) } }, ok: true }',
+    'const router = new HeadlessToolRouter({ listTasks: async () => huge })',
+    'const response = await router.callMcp("llm_wiki_list_tasks", {})',
+    'process.stdout.write(response.content[0].text)',
+  ].join(";")
+  const child = spawn(process.execPath, ["--max-old-space-size=128", "--input-type=module", "-e", childScript], {
+    cwd: process.cwd(),
+    stdio: ["ignore", "pipe", "pipe"],
+  })
+  let stdout = ""
+  let stderr = ""
+  child.stdout.on("data", (chunk) => { stdout += String(chunk) })
+  child.stderr.on("data", (chunk) => { stderr += String(chunk) })
+  const exitCode = await new Promise((resolve) => child.once("close", resolve))
+  assert.equal(exitCode, 0, stderr)
+  assert.equal(JSON.parse(stdout).error.code, "MCP_OUTPUT_TOO_LARGE")
 })
 
 test("commit_analysis validation failures are recoverable business results, not MCP errors", async () => {
@@ -396,8 +433,10 @@ test("large MCP results cross the wire once and over-budget results become recov
   })
   const excessive = await excessiveRouter.callMcp("llm_wiki_list_tasks", {})
   assert.equal(excessive.isError, undefined)
-  assert.equal(excessive.structuredContent.error.code, "MCP_OUTPUT_TOO_LARGE")
-  assert.equal(excessive.structuredContent.mcp_connection_usable, true)
+  const excessiveData = JSON.parse(excessive.content[0].text)
+  assert.equal(excessive.structuredContent, undefined)
+  assert.equal(excessiveData.error.code, "MCP_OUTPUT_TOO_LARGE")
+  assert.equal(excessiveData.mcp_connection_usable, true)
 
   const largeErrorRouter = new HeadlessToolRouter({
     listTasks: async () => { throw new LlmWikiError("INVALID_ANALYSIS", "Invalid analysis.", { details: { validation_errors: ["x".repeat(160 * 1024)] } }) },
@@ -412,9 +451,11 @@ test("large MCP results cross the wire once and over-budget results become recov
   })
   const excessiveError = await excessiveErrorRouter.callMcp("llm_wiki_list_tasks", {})
   assert.equal(excessiveError.isError, undefined)
-  assert.equal(excessiveError.structuredContent.error.code, "INVALID_ANALYSIS")
-  assert.equal(excessiveError.structuredContent.error.details.truncated, true)
-  assert.equal(excessiveError.structuredContent.mcp_connection_usable, true)
+  const excessiveErrorData = JSON.parse(excessiveError.content[0].text)
+  assert.equal(excessiveError.structuredContent, undefined)
+  assert.equal(excessiveErrorData.error.code, "INVALID_ANALYSIS")
+  assert.equal(excessiveErrorData.error.details.truncated, true)
+  assert.equal(excessiveErrorData.mcp_connection_usable, true)
 })
 
 test("MCP backpressure returns a recoverable busy result without growing an unbounded task queue", async () => {

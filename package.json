@@ -9,6 +9,10 @@
     "packages/mcp-server",
     "packages/cli"
   ],
+  "overrides": {
+    "fast-uri": "3.1.5",
+    "hono": "4.12.34"
+  },
   "scripts": {
     "build": "npm run build --workspace=@llm-wiki/core && npm run build --workspace=@llm-wiki/mcp-server && npm run build --workspace=@llm-wiki/cli",
     "test": "npm run test --workspace=@llm-wiki/core && npm run build --workspace=@llm-wiki/mcp-server && npm run test --workspace=@llm-wiki/mcp-server && npm run test --workspace=@llm-wiki/cli",
@@ -16,7 +20,11 @@
     "cli": "node packages/cli/src/index.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13.0"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "fast-uri": "3.1.5",
+    "hono": "4.12.34"
+  }
 }

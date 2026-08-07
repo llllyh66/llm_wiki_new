@@ -82,6 +82,8 @@ export function workspacePaths(root) {
     sourceManifests: path.join(state, "sources", "manifests"),
     tasks: path.join(state, "tasks"),
     indexes: path.join(state, "indexes"),
+    generations: path.join(state, "generations"),
+    currentGeneration: path.join(state, "current-generation.json"),
     locks: path.join(state, "locks"),
     journal: path.join(state, "journal"),
     importStaging: path.join(state, "import-staging"),
@@ -99,6 +101,7 @@ export async function ensureWorkspace(root, options = {}) {
     paths.sourceManifests,
     paths.tasks,
     paths.indexes,
+    paths.generations,
     paths.locks,
     paths.journal,
     paths.importStaging,
@@ -115,13 +118,15 @@ export async function ensureWorkspace(root, options = {}) {
       stateDir: ".llm-wiki",
       targetLanguage: options.targetLanguage || "zh-CN",
       schemaPath: "llm-wiki.schema.md",
-      retrieval: { bm25: true, embedding: { provider: "none", maxDocuments: 1_000 }, wiki: true, vectorFallback: true, rrfK: 60, maxDocuments: 10_000 },
+      retrieval: { bm25: true, embedding: { provider: "none", maxDocuments: 1_000, maxCacheBytes: 512 * 1024 * 1024, maxCacheFiles: 50_000, cacheTtlDays: 30 }, wiki: true, vectorFallback: true, rrfK: 60, maxDocuments: 10_000 },
+      journal: { retentionDays: 7, maxBackupBytes: 512 * 1024 * 1024 },
       limits: { ...DEFAULT_LIMITS },
     })
     await writeJsonAtomic(paths.config, {
       schemaVersion: 1,
       targetLanguage: options.targetLanguage || "zh-CN",
-      retrieval: { bm25: true, embedding: { provider: "none", maxDocuments: 1_000 }, wiki: true, vectorFallback: true, rrfK: 60, maxDocuments: 10_000 },
+      retrieval: { bm25: true, embedding: { provider: "none", maxDocuments: 1_000, maxCacheBytes: 512 * 1024 * 1024, maxCacheFiles: 50_000, cacheTtlDays: 30 }, wiki: true, vectorFallback: true, rrfK: 60, maxDocuments: 10_000 },
+      journal: { retentionDays: 7, maxBackupBytes: 512 * 1024 * 1024 },
       limits: { ...DEFAULT_LIMITS },
     })
     if (!(await pathExists(paths.schema))) await writeTextAtomic(paths.schema, DEFAULT_SCHEMA)
@@ -138,9 +143,10 @@ export async function ensureWorkspace(root, options = {}) {
       retrieval: {
         ...workspace.retrieval,
         ...(config.retrieval ?? {}),
-        embedding: { provider: "none", maxDocuments: 1_000, ...(workspace.retrieval?.embedding ?? {}), ...(config.retrieval?.embedding ?? {}) },
+        embedding: { provider: "none", maxDocuments: 1_000, maxCacheBytes: 512 * 1024 * 1024, maxCacheFiles: 50_000, cacheTtlDays: 30, ...(workspace.retrieval?.embedding ?? {}), ...(config.retrieval?.embedding ?? {}) },
       },
       limits: { ...DEFAULT_LIMITS, ...workspace.limits, ...(config.limits ?? {}) },
+      journal: { retentionDays: 7, maxBackupBytes: 512 * 1024 * 1024, ...(workspace.journal ?? {}), ...(config.journal ?? {}) },
     },
     revision: options.skipWikiRevision === true ? null : await hashDirectory(paths.wiki),
   }

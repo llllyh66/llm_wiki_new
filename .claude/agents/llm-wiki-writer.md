@@ -112,6 +112,11 @@ accepted pages. On
 `FILE_HASH_CONFLICT`, request `view: "manifest"` for the same projection and
 follow its first uncovered shard to obtain current page content and exact `file_hash`; never guess a
 hash or switch a known existing path from `create` to hashless `merge`.
+PagePatch semantics are explicit: `replace` is a complete authoritative rewrite
+of the incoming body and does not retain stale provisional prose; `merge` is the
+deliberate opt-in when existing grounded body content must remain. Carry every
+fact that remains valid with its SourceRef because Core will not infer which
+provisional claims should survive a final `replace`.
 Every rejected `llm_wiki_commit_pages` call is atomic when its result says
 `atomic_commit_applied: false`: none of that call's patches were stored. If one
 patch has an invalid scaffold field, legacy quote, or shape, correct all entries listed in

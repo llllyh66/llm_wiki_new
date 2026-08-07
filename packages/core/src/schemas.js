@@ -111,8 +111,11 @@ export const pagePatchSchema = Object.freeze({
   properties: {
     patchId: { type: "string", minLength: 1, maxLength: 200 },
     path: { type: "string", pattern: "^wiki/(sources|entities|concepts|topics|comparisons|queries|synthesis|findings|methodology|thesis|meetings|decisions|projects|stakeholders|goals|habits|reflections|chapters|characters|themes|plot-threads|journal)/.+\\.md$" },
-    operation: { enum: ["create", "replace", "merge"] },
-    expectedFileHash: { type: "string", pattern: "^[0-9a-f]{64}$" },
+    operation: {
+      enum: ["create", "replace", "merge"],
+      description: "create requires an absent path; replace is a complete incoming body rewrite; merge explicitly retains existing grounded body content.",
+    },
+    expectedFileHash: { type: "string", pattern: "^[0-9a-f]{64}$", description: "Required for replace and merge when the path already exists; copy the exact current file hash." },
     title: { type: "string", minLength: 1, maxLength: 500 },
     pageKind: { type: "string", minLength: 1, maxLength: 100 },
     content: { type: "string", minLength: 1 },

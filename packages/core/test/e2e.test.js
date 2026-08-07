@@ -5,6 +5,7 @@ import path from "node:path"
 import test from "node:test"
 import { fileURLToPath } from "node:url"
 import { LlmWikiCore, LlmWikiError } from "../src/index.js"
+import { matchDomainSchemaTypesForText } from "../src/domain-schema.js"
 
 const domainSchemaPath = fileURLToPath(new URL("../../../llm-wiki.domain-schema.json", import.meta.url))
 
@@ -58,6 +59,26 @@ function analysisFor(taskId, batch) {
     },
   }
 }
+
+test("domain schema matching respects word boundaries and CJK longest matches", () => {
+  const schema = {
+    entityTypes: [
+      { id: "cat_type", name: "Cat", aliases: ["cat"], properties: [] },
+      { id: "customer_type", name: "Customer", aliases: ["客户"], properties: [] },
+      { id: "customer_info_type", name: "Customer Information", aliases: ["客户信息"], properties: [] },
+    ],
+    conceptTypes: [],
+    relationTypes: [],
+  }
+  const falsePositive = matchDomainSchemaTypesForText(schema, "concatenate values", 12)
+  assert.equal(falsePositive.entityTypeIds.includes("cat_type"), false)
+  const cjk = matchDomainSchemaTypesForText(schema, "客户信息系统需要升级", 12)
+  assert.equal(cjk.entityTypeIds.includes("customer_info_type"), true)
+  assert.equal(cjk.entityTypeIds.includes("customer_type"), false)
+  const mixedCjk = matchDomainSchemaTypesForText(schema, "客户信息系统与客户服务", 12)
+  assert.equal(mixedCjk.entityTypeIds.includes("customer_info_type"), true)
+  assert.equal(mixedCjk.entityTypeIds.includes("customer_type"), true)
+})
 
 async function analyzeAll(core, imported) {
   let lastRef
@@ -421,7 +442,7 @@ test("domain entity types are projected into Wiki frontmatter and body", async (
     }],
   })
   assert.equal(committed.accepted, true)
-  await f.core.finalize({ task_id: imported.task_id })
+  const initialFinalize = await f.core.finalize({ task_id: imported.task_id })
   const page = await readFile(path.join(f.workspace, "wiki", "entities", "张三.md"), "utf8")
   assert.match(page, /domain_schema_id: "your-domain-schema"/)
   assert.match(page, /domain_type_ids: \["business_subject"\]/)
@@ -431,6 +452,8 @@ test("domain entity types are projected into Wiki frontmatter and body", async (
   await writeFile(path.join(f.workspace, "wiki", "entities", "张三.md"), `---\ntype: "entity"\ntitle: "张三"\ncreated: "2026-08-07"\nupdated: "2026-08-07"\ntags: []\nrelated: []\nsources: ["${sourceRef.sourceId}"]\ncovers: ["${requirement.requirement_id}"]\nsummary: "旧页面"\n---\n\n# 张三\n\n旧页面。\n`)
   const refreshed = await f.core.finalize({ task_id: imported.task_id, refresh_page_metadata: true })
   assert.equal(refreshed.domain_metadata_refresh.updated_pages, 1)
+  assert.match(refreshed.generation_id, /^generation-/)
+  assert.notEqual(refreshed.generation_id, initialFinalize.generation_id)
   assert.match(await readFile(path.join(f.workspace, "wiki", "entities", "张三.md"), "utf8"), /domain_type_ids: \["business_subject"\]/)
 })
 
@@ -772,11 +795,13 @@ test("real embedding recall is cached and endpoint failures degrade without fail
   let requests = 0
   let endpointUnavailable = false
   let endpointMalformed = false
+  let endpointNonStreaming = false
   const originalFetch = globalThis.fetch
   t.after(() => { globalThis.fetch = originalFetch })
   globalThis.fetch = async (_url, options) => {
     requests += 1
     if (endpointUnavailable) throw new Error("endpoint unavailable")
+    if (endpointNonStreaming) return { ok: true, status: 200, headers: { get: () => null }, body: null }
     const payload = JSON.parse(options.body)
     const inputs = Array.isArray(payload.input) ? payload.input : [payload.input]
     return new Response(JSON.stringify({
@@ -819,6 +844,12 @@ test("real embedding recall is cached and endpoint failures degrade without fail
   assert.equal(degraded.channel_status.embedding.mode, "feature-hash-fallback")
   assert.equal(degraded.channel_status.embedding.degraded, true)
   assert.equal(Array.isArray(degraded.hits), true)
+
+  endpointUnavailable = false
+  endpointNonStreaming = true
+  const nonStreaming = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: batch.batch_id, queries: ["car"], channels: ["embedding"] })
+  assert.equal(nonStreaming.channel_status.embedding.mode, "feature-hash-fallback")
+  assert.equal(nonStreaming.channel_status.embedding.reason, "EMBEDDING_INVALID_RESPONSE")
 })
 
 test("Wiki title and bidirectional link neighbors participate in RRF", async (t) => {
@@ -962,6 +993,14 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
   assert.equal(result.status, "completed")
   assert.equal(result.indexing.bm25, "completed")
   assert.equal(result.indexing.vector, "completed")
+  assert.match(result.generation_id, /^generation-/)
+  const generationPointer = JSON.parse(await readFile(path.join(f.workspace, ".llm-wiki", "current-generation.json"), "utf8"))
+  assert.equal(generationPointer.generation_id, result.generation_id)
+  assert.equal(generationPointer.wiki_revision, result.wiki_revision)
+  const generationManifest = JSON.parse(await readFile(path.join(f.workspace, ".llm-wiki", "generations", result.generation_id, "manifest.json"), "utf8"))
+  assert.equal(generationManifest.wikiRevision, result.wiki_revision)
+  assert.equal(generationManifest.taskId, imported.task_id)
+  assert.deepEqual(Object.keys(generationManifest.artifacts).sort(), ["bm25.json", "embedding.json", "graph.json", "lint.json", "page-source-refs.json", "vector.json"])
   assert.deepEqual(result.created_pages, ["wiki/concepts/business-entity.md", "wiki/concepts/aggregate.md"])
   assert.equal((await f.core.status({ task_id: imported.task_id })).status, "completed")
   assert.match(await readFile(path.join(f.workspace, "wiki", "index.md"), "utf8"), /Business Entity/)
@@ -1487,10 +1526,30 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   const finalized = await f.core.finalize({ task_id: imported.task_id })
   assert.deepEqual(finalized.created_pages, ["wiki/topics/projected-entity.md"])
   assert.deepEqual(finalized.updated_pages, [])
-  const completed = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["ProvisionalOnlyMarker"] })
+  // replace is a complete final-body rewrite. Provisional-only content must
+  // be intentionally reintroduced by the final Writer if it remains valid.
+  const completed = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["reconciled cross-batch summary"] })
   assert.equal(completed.retrieval_phase, "knowledge-base-complete")
   assert.deepEqual(completed.available_channels, ["bm25", "embedding", "wiki"])
   assert.equal(completed.hits.some((hit) => hit.path === "wiki/topics/projected-entity.md"), true)
+  const provisionalAfterReplace = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["ProvisionalOnlyMarker"] })
+  assert.equal(provisionalAfterReplace.hits.some((hit) => hit.path === "wiki/topics/projected-entity.md"), false)
+
+  // Simulate a process exit after the generation pointer was durable but
+  // before task/result completion. A fresh Core instance must repair only the
+  // task ledger and replay the exact published result.
+  const recoveryTaskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
+  const recoveryResultPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "result.json")
+  const recoveryFinalizationPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "finalization.json")
+  const taskRecord = JSON.parse(await readFile(recoveryTaskPath, "utf8"))
+  const finalizationRecord = JSON.parse(await readFile(recoveryFinalizationPath, "utf8"))
+  taskRecord.status = "finalizing"
+  await writeFile(recoveryTaskPath, `${JSON.stringify(taskRecord)}\n`)
+  await rm(recoveryResultPath, { force: true })
+  await writeFile(recoveryFinalizationPath, `${JSON.stringify({ ...finalizationRecord, state: "published", result: finalized })}\n`)
+  const recoveredCore = await LlmWikiCore.open(f.workspace)
+  assert.equal((await recoveredCore.status({ task_id: imported.task_id })).status, "completed")
+  assert.deepEqual(JSON.parse(await readFile(recoveryResultPath, "utf8")), finalized)
 })
 
 test("Wiki writer drains a backlog in bounded projections without resending unrelated page bodies", async (t) => {

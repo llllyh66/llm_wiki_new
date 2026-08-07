@@ -1,4 +1,4 @@
-import { stat } from "node:fs/promises"
+import { rm, stat } from "node:fs/promises"
 import path from "node:path"
 import { fail } from "./errors.js"
 import { ensureDir, newId, nowIso, pathExists, readJson, sha256, stableStringify, writeJsonAtomic } from "./utils.js"
@@ -396,18 +396,81 @@ export async function withIdempotency(paths, key, requestValue, operation, optio
   }
   await ensureShardedIdempotency(paths)
   const shardPath = path.join(paths.idempotencyDir, `${sha256(key)}.json`)
+  const responsePath = `${shardPath}.response.json`
   const requestHash = sha256(stableStringify(requestValue))
   const existing = await readJson(shardPath, null)
   if (existing) {
     if (existing.key !== key) fail("IDEMPOTENCY_CONFLICT", "The idempotency key hash collides with another stored key.")
     if (existing.requestHash !== requestHash) fail("IDEMPOTENCY_CONFLICT", "The idempotency key was already used with a different request.")
-    return { replayed: true, response: existing.response }
+    if (existing.status === "pending") {
+      const durableResponse = await readJson(responsePath, null)
+      if (durableResponse !== null) {
+        await writeJsonAtomic(shardPath, {
+          ...existing,
+          status: "committed",
+          response: durableResponse,
+          committedAt: nowIso(),
+        })
+        await rm(responsePath, { force: true }).catch(() => {})
+        return { replayed: true, response: durableResponse }
+      }
+      fail("IDEMPOTENCY_RECOVERY_REQUIRED", "The previous operation may have applied its side effect but has no durable response yet.", {
+        retryable: true,
+        details: {
+          operation_id: existing.operationId,
+          request_hash: requestHash,
+          recovery_state: "pending",
+        },
+        suggestedAction: "Restart or resume the task recovery flow before retrying this idempotency key; do not submit a new key.",
+      })
+    }
+    if (existing.status === "failed") {
+      // A normal business error is retryable with the same key. A process
+      // crash never reaches this branch and therefore leaves PENDING state.
+      await rm(shardPath, { force: true }).catch(() => {})
+      await rm(responsePath, { force: true }).catch(() => {})
+    } else {
+      return { replayed: true, response: existing.response }
+    }
   }
-  const response = await operation()
   const exactRequestHash = options.exactRequestValue === undefined
     ? undefined
     : sha256(stableStringify(options.exactRequestValue))
-  await writeJsonAtomic(shardPath, { key, requestHash, ...(exactRequestHash ? { exactRequestHash } : {}), response, createdAt: nowIso() })
+  const pending = {
+    schemaVersion: 2,
+    status: "pending",
+    operationId: `op-${requestHash.slice(0, 32)}`,
+    key,
+    requestHash,
+    ...(exactRequestHash ? { exactRequestHash } : {}),
+    createdAt: nowIso(),
+  }
+  await writeJsonAtomic(shardPath, pending)
+  const persistResponse = async (response) => {
+    await writeJsonAtomic(responsePath, response)
+  }
+  let response
+  try {
+    response = await operation({ operationId: pending.operationId, persistResponse })
+  } catch (error) {
+    // A normal validation/business failure did not complete the operation.
+    // Keep a retryable FAILED marker so a crash cannot be confused with a
+    // handled exception; the next same-key call clears FAILED and starts a
+    // new attempt. A process kill skips this branch and leaves PENDING state.
+    await writeJsonAtomic(shardPath, {
+      ...pending,
+      status: "failed",
+      failedAt: nowIso(),
+      error: {
+        code: typeof error?.code === "string" ? error.code : "OPERATION_FAILED",
+        message: String(error?.message ?? error).slice(0, 2_000),
+      },
+    }).catch(() => {})
+    await rm(responsePath, { force: true }).catch(() => {})
+    throw error
+  }
+  await writeJsonAtomic(shardPath, { ...pending, status: "committed", response, committedAt: nowIso() })
+  await rm(responsePath, { force: true }).catch(() => {})
   return { replayed: false, response }
 }
 
@@ -420,6 +483,22 @@ export async function readExactIdempotencyReplay(paths, key, requestValue) {
   if (!existing) return null
   if (existing.key !== key) fail("IDEMPOTENCY_CONFLICT", "The idempotency key hash collides with another stored key.")
   const exactRequestHash = sha256(stableStringify(requestValue))
+  if (typeof existing.exactRequestHash === "string" && existing.exactRequestHash !== exactRequestHash) {
+    fail("IDEMPOTENCY_CONFLICT", "The idempotency key was already used with a different request.")
+  }
+  if (existing.status === "pending") {
+    const responsePath = path.join(paths.idempotencyDir, `${sha256(key)}.json.response.json`)
+    const durableResponse = await readJson(responsePath, null)
+    if (durableResponse === null) return null
+    await writeJsonAtomic(path.join(paths.idempotencyDir, `${sha256(key)}.json`), {
+      ...existing,
+      status: "committed",
+      response: durableResponse,
+      committedAt: nowIso(),
+    })
+    await rm(responsePath, { force: true }).catch(() => {})
+    return durableResponse
+  }
   if (typeof existing.exactRequestHash !== "string") return null
   if (existing.exactRequestHash !== exactRequestHash) {
     fail("IDEMPOTENCY_CONFLICT", "The idempotency key was already used with a different request.")

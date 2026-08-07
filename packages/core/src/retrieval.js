@@ -1,7 +1,7 @@
 import { readFile, readdir } from "node:fs/promises"
 import path from "node:path"
 import { embedQueryAndDocuments, warmEmbeddingCache } from "./embedding.js"
-import { listFilesRecursive, readJson, relativePosix, sha256, tokenize } from "./utils.js"
+import { listFilesRecursive, pathExists, readJson, relativePosix, sha256, tokenize } from "./utils.js"
 
 const DEFAULT_RRF_K = 60
 const VECTOR_DIMENSIONS = 256
@@ -196,12 +196,13 @@ async function workspaceProvisionalPaths(workspace, currentTask) {
   return paths
 }
 
-async function wikiDocuments(workspace, limit = MAX_RETRIEVAL_DOCUMENTS, excludedPaths = new Set()) {
+async function wikiDocuments(workspace, limit = MAX_RETRIEVAL_DOCUMENTS, excludedPaths = new Set(), options = {}) {
   const documents = []
-  const files = await listFilesRecursive(workspace.paths.wiki, (candidate) => candidate.endsWith(".md"))
+  const wikiRoot = options.wikiRoot ?? await activeWikiRoot(workspace)
+  const files = await listFilesRecursive(wikiRoot, (candidate) => candidate.endsWith(".md"))
   let truncated = false
   for (const [fileIndex, file] of files.entries()) {
-    const relative = `wiki/${relativePosix(workspace.paths.wiki, file)}`
+    const relative = `wiki/${relativePosix(wikiRoot, file)}`
     if (excludedPaths.has(relative)) continue
     if (documents.length >= limit) {
       truncated = fileIndex < files.length
@@ -226,6 +227,14 @@ async function wikiDocuments(workspace, limit = MAX_RETRIEVAL_DOCUMENTS, exclude
     }
   }
   return { documents, truncated }
+}
+
+async function activeWikiRoot(workspace) {
+  const pointer = await readJson(workspace.paths.currentGeneration, null)
+  const generationId = pointer?.generation_id
+  if (typeof generationId !== "string" || !/^generation-[0-9a-f-]+$/i.test(generationId)) return workspace.paths.wiki
+  const generationWikiRoot = path.join(workspace.paths.generations, generationId, "wiki")
+  return await pathExists(generationWikiRoot) ? generationWikiRoot : workspace.paths.wiki
 }
 
 function scoreBm25(documents, queryTerms) {
@@ -497,8 +506,8 @@ export async function buildBm25Index(workspace) {
   }
 }
 
-export async function buildVectorIndex(workspace) {
-  const loaded = await wikiDocuments(workspace, configuredDocumentLimit(workspace))
+export async function buildVectorIndex(workspace, options = {}) {
+  const loaded = await wikiDocuments(workspace, configuredDocumentLimit(workspace), new Set(), options)
   const pages = loaded.documents
   return {
     schemaVersion: 2,
@@ -509,13 +518,13 @@ export async function buildVectorIndex(workspace) {
   }
 }
 
-export async function buildEmbeddingIndex(workspace) {
-  const loaded = await wikiDocuments(workspace, configuredDocumentLimit(workspace))
+export async function buildEmbeddingIndex(workspace, options = {}) {
+  const loaded = await wikiDocuments(workspace, configuredDocumentLimit(workspace), new Set(), options)
   return { schemaVersion: 1, generatedAt: new Date().toISOString(), truncated: loaded.truncated, ...(await warmEmbeddingCache(workspace, loaded.documents)) }
 }
 
-export async function buildRetrievalIndexes(workspace) {
-  const loaded = await wikiDocuments(workspace, configuredDocumentLimit(workspace))
+export async function buildRetrievalIndexes(workspace, options = {}) {
+  const loaded = await wikiDocuments(workspace, configuredDocumentLimit(workspace), new Set(), options)
   const pages = loaded.documents
   const generatedAt = new Date().toISOString()
   const embedding = { schemaVersion: 1, generatedAt, truncated: loaded.truncated, ...(await warmEmbeddingCache(workspace, pages)) }

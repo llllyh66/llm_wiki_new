@@ -185,7 +185,17 @@ async function pdfToMarkdown(buffer) {
   try {
     const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs")
     const standardFontDataUrl = fileURLToPath(new URL("./standard_fonts/", import.meta.resolve("pdfjs-dist/package.json")))
-    const document = await pdfjs.getDocument({ data: new Uint8Array(buffer), useWorkerFetch: false, isEvalSupported: false, disableFontFace: true, standardFontDataUrl }).promise
+    const loadingTask = pdfjs.getDocument({
+      data: new Uint8Array(buffer),
+      useWorkerFetch: false,
+      // PDF imports are text extraction only. Never execute document-level
+      // JavaScript even if a future PDF.js default changes.
+      enableScripting: false,
+      isEvalSupported: false,
+      disableFontFace: true,
+      standardFontDataUrl,
+    })
+    const document = await loadingTask.promise
     const pages = []
     for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
       const page = await document.getPage(pageNumber)
@@ -203,7 +213,10 @@ async function pdfToMarkdown(buffer) {
       if (line.trim()) lines.push(line.trim())
       pages.push(`# Page ${pageNumber}\n\n${lines.join("\n")}`)
     }
-    await document.destroy()
+    // PDF.js 6 moved destruction to the LoadingTask. Keeping lifecycle
+    // ownership here prevents a successful extraction from being converted
+    // into SOURCE_PARSE_FAILED by a version-specific cleanup call.
+    await loadingTask.destroy()
     return pages.join("\n\n")
   } catch (error) {
     fail("SOURCE_PARSE_FAILED", "The PDF could not be safely parsed.", { details: { reason: error instanceof Error ? error.message : String(error) } })
@@ -225,8 +238,17 @@ function parseBlocks(content) {
 
   const flushParagraph = () => {
     if (paragraph.length === 0) return
-    const text = paragraph.join("\n").trim()
-    if (text) blocks.push({ kind: "paragraph", text, startOffset: paragraphStart, endOffset: paragraphStart + text.length })
+    const rawText = paragraph.join("\n")
+    const text = rawText.trim()
+    if (text) {
+      const leading = rawText.length - rawText.trimStart().length
+      blocks.push({
+        kind: "paragraph",
+        text,
+        startOffset: paragraphStart + leading,
+        endOffset: paragraphStart + leading + text.length,
+      })
+    }
     paragraph = []
   }
 
@@ -385,13 +407,13 @@ function chunkDocument(document, options) {
     const text = block.text || block.markdown || ""
     if (pending.length > 0 && pending.join("\n\n").length + text.length + 2 > maxChars) emit()
     if (text.length > maxChars) {
-      const pieces = splitText(text, maxChars)
+      const pieces = splitTextWithOffsets(text, maxChars)
       for (const piece of pieces) {
-        pending = [piece]
+        pending = [piece.text]
         pendingKinds = [block.kind]
-        pendingStructured = block.kind === "table" ? [tableFragment(block, piece)] : []
-        pendingStart = block.startOffset
-        pendingEnd = block.endOffset
+        pendingStructured = block.kind === "table" ? [tableFragment(block, piece.text)] : []
+        pendingStart = block.startOffset + piece.relativeStart
+        pendingEnd = block.startOffset + piece.relativeEnd
         emit()
       }
       continue
@@ -419,15 +441,41 @@ function tableFragment(block, markdown) {
 }
 
 function splitText(text, maxChars) {
+  return splitTextWithOffsets(text, maxChars).map((piece) => piece.text)
+}
+
+function splitTextWithOffsets(text, maxChars) {
   const result = []
-  let rest = text
-  while (rest.length > maxChars) {
-    const window = rest.slice(0, maxChars + 1)
+  let cursor = 0
+  while (text.length - cursor > maxChars) {
+    const window = text.slice(cursor, cursor + maxChars + 1)
     const candidates = [window.lastIndexOf("\n\n"), window.lastIndexOf("\n"), window.lastIndexOf("。"), window.lastIndexOf(". "), window.lastIndexOf(" ")]
     const cut = Math.max(...candidates, Math.floor(maxChars * 0.6))
-    result.push(rest.slice(0, cut).trim())
-    rest = rest.slice(cut).trimStart()
+    const rawEnd = cursor + cut
+    const rawPiece = text.slice(cursor, rawEnd)
+    const piece = rawPiece.trim()
+    if (piece) {
+      const leading = rawPiece.length - rawPiece.trimStart().length
+      const trailing = rawPiece.length - rawPiece.trimEnd().length
+      result.push({
+        text: piece,
+        relativeStart: cursor + leading,
+        relativeEnd: rawEnd - trailing,
+      })
+    }
+    const remainder = text.slice(rawEnd)
+    cursor = rawEnd + (remainder.length - remainder.trimStart().length)
   }
-  if (rest.trim()) result.push(rest.trim())
+  const rawRemainder = text.slice(cursor)
+  const remainder = rawRemainder.trim()
+  if (remainder) {
+    const leading = rawRemainder.length - rawRemainder.trimStart().length
+    const trailing = rawRemainder.length - rawRemainder.trimEnd().length
+    result.push({
+      text: remainder,
+      relativeStart: cursor + leading,
+      relativeEnd: text.length - trailing,
+    })
+  }
   return result
 }

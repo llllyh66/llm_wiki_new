@@ -5,6 +5,7 @@ import path from "node:path"
 import test from "node:test"
 import JSZip from "jszip"
 import { LlmWikiCore } from "../src/index.js"
+import { parseManagedSource } from "../src/parser.js"
 
 async function formatFixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-formats-"))
@@ -24,6 +25,25 @@ test("HTML headings and tables normalize into structured blocks", async (t) => {
   assert.equal(document.title, "Data Dictionary")
   assert.equal(document.blocks.some((block) => block.kind === "table" && block.headers[0] === "Name" && block.rows[0][0] === "id"), true)
   assert.equal(JSON.stringify(document).includes("ignore()"), false)
+})
+
+test("materialized source extension controls parsing instead of display_name", async (t) => {
+  const fixture = await formatFixture()
+  t.after(() => rm(fixture.root, { recursive: true, force: true }))
+  const html = path.join(fixture.incoming, "real.html")
+  await writeFile(html, "<h1>Real HTML</h1><script>alert(1)</script><p>Safe body</p>")
+  const importedHtml = await fixture.core.importFiles({ files: [{ path: html, display_name: "spoof.md" }] })
+  assert.equal(importedHtml.rejected.length, 0)
+  const htmlDocument = await managedDocument(fixture.workspace, importedHtml.sources[0].content_hash)
+  assert.equal(htmlDocument.mediaType, "text/html")
+  assert.equal(JSON.stringify(htmlDocument).includes("alert(1)"), false)
+
+  const markdown = path.join(fixture.incoming, "real.md")
+  await writeFile(markdown, "# Real Markdown\n\n<script>literal markdown</script>")
+  const importedMarkdown = await fixture.core.importFiles({ files: [{ path: markdown, display_name: "spoof.html" }] })
+  assert.equal(importedMarkdown.rejected.length, 0)
+  const markdownDocument = await managedDocument(fixture.workspace, importedMarkdown.sources[0].content_hash)
+  assert.equal(markdownDocument.mediaType, "text/markdown")
 })
 
 test("DOCX tables retain headers, rows, and merge metadata without executing active content", async (t) => {
@@ -183,6 +203,25 @@ test("very large Markdown tables and code blocks produce complete payload-bounde
   assert.equal(retrieval.corpus.truncated, true)
   assert.equal(retrieval.channel_status.embedding.mode, "feature-hash-fallback")
   assert.equal(Buffer.byteLength(JSON.stringify(retrieval)) < 20_000, true)
+})
+
+test("long block chunks retain piece-level source locators", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-locator-"))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const sourcePath = path.join(root, "locator-fixture.md")
+  const source = `${"word ".repeat(2_500)}\n`
+  await writeFile(sourcePath, source)
+  const parsed = await parseManagedSource(sourcePath, "source-locator-test", "text/markdown", { maxChunkChars: 1_000 })
+  const chunks = parsed.chunks.filter((chunk) => chunk.blockKinds.includes("paragraph"))
+  assert.equal(chunks.length > 1, true)
+  assert.equal(new Set(chunks.map((chunk) => `${chunk.startOffset}:${chunk.endOffset}`)).size, chunks.length)
+  for (const chunk of chunks) {
+    assert.equal(chunk.endOffset > chunk.startOffset, true)
+    assert.equal(source.slice(chunk.startOffset, chunk.endOffset).includes(chunk.text), true)
+  }
+  for (let index = 1; index < chunks.length; index += 1) {
+    assert.equal(chunks[index - 1].startOffset < chunks[index].startOffset, true)
+  }
 })
 
 test("PDF text is normalized page by page with traceable page numbers", async (t) => {

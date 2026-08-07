@@ -93,6 +93,13 @@ export function prepareWikiPageContent(patch, existingContent = "", date = new D
   const pageKind = normalizePageKind(patch.pageKind) ?? pageKindForPath(patch.path) ?? "topic"
   let body = incoming.body.trim()
   if (!/^#\s+/m.test(body)) body = `# ${patch.title}\n\n${body}`.trim()
+  if (patch.operation === "merge" && existing.body.trim() && existing.body.trim() !== body) {
+    // replace is intentionally authoritative for the incoming body. Merge is
+    // the explicit opt-in for retaining the existing grounded body; callers
+    // still provide the current file hash so this concatenation cannot race a
+    // concurrent edit.
+    body = `${existing.body.trim()}\n\n${body}`.trim()
+  }
   const bodyLinks = extractRelatedReferences(body)
   const related = uniqueStrings([
     ...existing.related,
@@ -265,7 +272,7 @@ function withRelatedSection(body, related) {
 }
 
 export function extractWikiLinks(content) {
-  return [...String(content ?? "").matchAll(/\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g)]
+  return [...maskMarkdownContexts(String(content ?? "")).matchAll(/\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g)]
     .map((match) => normalizeRelatedSlug(match[1]))
     .filter(Boolean)
 }
@@ -276,14 +283,17 @@ export function extractWikiLinks(content) {
 // This avoids turning incidental source-file mentions into graph edges.
 export function extractRelatedReferences(content) {
   const text = String(content ?? "").replace(/\r\n?/g, "\n")
-  const references = [...extractWikiLinks(text)]
+  const relationshipText = maskMarkdownContexts(text)
+  const references = [...relationshipText.matchAll(/\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g)]
+    .map((match) => normalizeRelatedSlug(match[1]))
+    .filter(Boolean)
 
-  for (const match of text.matchAll(/\[[^\]]*\]\(\s*<?([^\s)>]+)>?(?:\s+["'][^"']*["'])?\s*\)/g)) {
+  for (const match of relationshipText.matchAll(/\[[^\]]*\]\(\s*<?([^\s)>]+)>?(?:\s+["'][^"']*["'])?\s*\)/g)) {
     const slug = canonicalRelatedPath(match[1])
     if (slug) references.push(slug)
   }
 
-  const section = relatedSectionBody(text)
+  const section = relatedSectionBody(relationshipText)
   for (const line of section.split("\n")) {
     const item = line.match(/^\s*[-*+]\s+(.+?)\s*$/)?.[1]
     if (!item || /^\[\[/.test(item) || /^\[[^\]]*\]\(/.test(item)) continue
@@ -292,6 +302,47 @@ export function extractRelatedReferences(content) {
   }
 
   return uniqueStrings(references.map(normalizeRelatedSlug).filter(Boolean))
+}
+
+function maskMarkdownContexts(content) {
+  const normalized = String(content ?? "").replace(/\r\n?/g, "\n")
+  let masked = normalized
+    .replace(/<!--[\s\S]*?-->/g, (value) => value.replace(/[^\n]/g, " "))
+    .replace(/<(pre|code)\b[^>]*>[\s\S]*?<\/\1>/gi, (value) => value.replace(/[^\n]/g, " "))
+  const lines = masked.split(/(?<=\n)/)
+  const originalLines = normalized.split(/(?<=\n)/)
+  let fence = null
+  let frontmatter = originalLines[0]?.trim() === "---"
+  for (let index = 0; index < lines.length; index += 1) {
+    const original = originalLines[index] ?? ""
+    const line = lines[index] ?? ""
+    if (frontmatter) {
+      lines[index] = blankMarkdownLine(line)
+      if (index > 0 && original.trim() === "---") frontmatter = false
+      continue
+    }
+    const fenceMatch = original.match(/^ {0,3}(`{3,}|~{3,})/)
+    if (fence) {
+      lines[index] = blankMarkdownLine(line)
+      if (new RegExp(`^ {0,3}${fence}{3,}\\s*$`).test(original)) fence = null
+      continue
+    }
+    if (fenceMatch) {
+      lines[index] = blankMarkdownLine(line)
+      fence = fenceMatch[1][0]
+      continue
+    }
+    if (/^(?: {4}|\t)/.test(original) || /^\s*>/.test(original)) {
+      lines[index] = blankMarkdownLine(line)
+      continue
+    }
+    lines[index] = line.replace(/(`+)[^`\n]*?\1/g, (value) => value.replace(/[^\n]/g, " "))
+  }
+  return lines.join("")
+}
+
+function blankMarkdownLine(value) {
+  return String(value).replace(/[^\n]/g, " ")
 }
 
 export function normalizeRelatedSlug(value) {

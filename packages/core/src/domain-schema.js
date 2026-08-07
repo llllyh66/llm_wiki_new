@@ -188,7 +188,8 @@ export function matchDomainSchemaTypesForText(schema, text, maxMatches = 12) {
   const limit = Math.min(Math.max(Number(maxMatches) || 12, 1), 50)
   const matchIndex = domainSchemaMatchIndex(schema)
   const ranked = new Map()
-  for (const term of scanSchemaTerms(matchIndex.automaton, haystack)) {
+  const scannedTerms = contextAwareSchemaTerms(haystack, scanSchemaTerms(matchIndex.automaton, haystack))
+  for (const term of scannedTerms) {
     for (const entry of matchIndex.entries.get(term) ?? []) {
       const key = `${entry.kind}:${entry.typeId}`
       const current = ranked.get(key) ?? { id: entry.typeId, score: 0, identityScore: 0, propertyMatches: 0, matches: [] }
@@ -299,6 +300,45 @@ function scanSchemaTerms(nodes, text) {
     for (const term of nodes[state].outputs) matched.add(term)
   }
   return matched
+}
+
+function contextAwareSchemaTerms(text, terms) {
+  const occurrences = []
+  for (const term of terms) {
+    for (const start of schemaTermStarts(text, term)) occurrences.push({ term, start, end: start + term.length })
+  }
+  const retained = occurrences.filter((occurrence) => !containsCjk(occurrence.term)
+    || !occurrences.some((candidate) => candidate.term.length > occurrence.term.length
+      && candidate.start < occurrence.end && candidate.end > occurrence.start))
+  return new Set(retained.map((occurrence) => occurrence.term))
+}
+
+function schemaTermStarts(text, term) {
+  const starts = []
+  let cursor = text.indexOf(term)
+  while (cursor >= 0) {
+    const end = cursor + term.length
+    if (containsCjk(term) || isWordBoundary(text, cursor, end)) starts.push(cursor)
+    cursor = text.indexOf(term, cursor + Math.max(1, term.length))
+  }
+  return starts
+}
+
+function isWordBoundary(text, start, end) {
+  const first = text[start]
+  const last = text[end - 1]
+  const previous = start > 0 ? text[start - 1] : ""
+  const next = end < text.length ? text[end] : ""
+  const word = (value) => Boolean(value) && /[\p{L}\p{N}_]/u.test(value)
+  return !(word(first) && word(previous)) && !(word(last) && word(next))
+}
+
+function containsCjk(value) {
+  return /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(value)
+}
+
+function hasSchemaTermMatch(text, term) {
+  return schemaTermStarts(text, term).length > 0
 }
 
 export function paginateDomainSchema(schema, requestedCursor, requestedMaxChars, selection = {}) {
@@ -738,8 +778,8 @@ function rankedSchemaMatches(types, queries, limit) {
     let score = 0
     for (const term of terms) {
       if (identity === term) score += 100
-      else if (identity.includes(term)) score += 20
-      else if (searchable.includes(term)) score += 3
+      else if (hasSchemaTermMatch(identity, term)) score += 20
+      else if (hasSchemaTermMatch(searchable, term)) score += 3
     }
     return { id: type.id, score }
   }).filter((item) => item.score > 0)

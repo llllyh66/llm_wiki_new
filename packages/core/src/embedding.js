@@ -1,6 +1,7 @@
+import { readdir, rm, stat, utimes } from "node:fs/promises"
 import path from "node:path"
 import { LlmWikiError } from "./errors.js"
-import { ensureDir, pathExists, readJson, sha256, stableStringify, writeJsonAtomic } from "./utils.js"
+import { acquireProcessFileLock, ensureDir, pathExists, readJson, sha256, stableStringify, writeJsonAtomic } from "./utils.js"
 
 const MAX_EMBEDDING_DIMENSIONS = 8_192
 const MAX_EMBEDDING_BATCH = 32
@@ -11,6 +12,13 @@ const MAX_EMBEDDING_BATCH = 32
 const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_TOTAL_TIMEOUT_MS = 600_000
 const MAX_EMBEDDING_RESPONSE_BYTES = 16 * 1024 * 1024
+const DEFAULT_CACHE_MAX_BYTES = 512 * 1024 * 1024
+const DEFAULT_CACHE_MAX_FILES = 50_000
+const DEFAULT_CACHE_TTL_DAYS = 30
+const MAX_CACHE_MAX_BYTES = 8 * 1024 * 1024 * 1024
+const MAX_CACHE_MAX_FILES = 250_000
+const MAX_CACHE_TTL_DAYS = 3_650
+const CACHE_GC_GRACE_MS = 5 * 60 * 1_000
 const SUPPORTED_PROVIDERS = new Set(["none", "openai-compatible", "ollama"])
 
 export function resolveEmbeddingConfig(workspace) {
@@ -23,6 +31,9 @@ export function resolveEmbeddingConfig(workspace) {
   const totalTimeoutMs = clampInteger(configured.totalTimeoutMs, 5_000, 900_000, DEFAULT_TOTAL_TIMEOUT_MS)
   const maxInputChars = clampInteger(configured.maxInputChars, 1_000, 32_000, 8_000)
   const maxDocuments = clampInteger(configured.maxDocuments, 10, 10_000, 1_000)
+  const maxCacheBytes = clampInteger(configured.maxCacheBytes, 1_024, MAX_CACHE_MAX_BYTES, DEFAULT_CACHE_MAX_BYTES)
+  const maxCacheFiles = clampInteger(configured.maxCacheFiles, 10, MAX_CACHE_MAX_FILES, DEFAULT_CACHE_MAX_FILES)
+  const cacheTtlDays = clampInteger(configured.cacheTtlDays, 1, MAX_CACHE_TTL_DAYS, DEFAULT_CACHE_TTL_DAYS)
   const supported = SUPPORTED_PROVIDERS.has(provider)
   const enabled = supported && provider !== "none" && Boolean(model && endpoint)
   return {
@@ -36,6 +47,9 @@ export function resolveEmbeddingConfig(workspace) {
     totalTimeoutMs,
     maxInputChars,
     maxDocuments,
+    maxCacheBytes,
+    maxCacheFiles,
+    cacheTtlDays,
     apiKey: process.env.LLM_WIKI_EMBEDDING_API_KEY || "",
     // The endpoint is part of the embedding identity. Two compatible servers
     // may use the same provider/model names while producing different vector
@@ -74,6 +88,9 @@ export async function embedQueryAndDocuments(workspace, query, documents) {
       await Promise.all(cacheWrites)
     }
     const [queryVector] = await requestWithinBudget([String(query).slice(0, config.maxInputChars)], config, deadline)
+    // Cache maintenance is best effort. A transient GC failure must not turn
+    // an otherwise valid embedding response into retrieval degradation.
+    await pruneEmbeddingCache(path.join(workspace.paths.indexes, "embeddings"), cacheRoot, selected.map((document) => document.hash), config).catch(() => {})
     return {
       available: true,
       queryVector: normalizeVector(queryVector),
@@ -203,25 +220,26 @@ async function requestEmbeddings(inputs, config) {
 
 async function readBoundedResponseText(response, maximumBytes) {
   if (!response.body?.getReader) {
-    const text = await response.text()
-    if (Buffer.byteLength(text) > maximumBytes) throw responseTooLarge()
-    return text
+    // A response.text() fallback reads the entire body before this function
+    // can enforce the byte budget. Native fetch provides a stream; custom
+    // adapters must do the same or fail closed.
+    throw new LlmWikiError("EMBEDDING_INVALID_RESPONSE", "Embedding endpoint returned a non-streaming response body.", { retryable: true })
   }
   const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let text = ""
+  const chunks = []
   let bytes = 0
   while (true) {
     const { done, value } = await reader.read()
     if (done) break
-    bytes += value.byteLength
+    const chunk = Buffer.from(value)
+    bytes += chunk.byteLength
     if (bytes > maximumBytes) {
       await reader.cancel().catch(() => {})
       throw responseTooLarge()
     }
-    text += decoder.decode(value, { stream: true })
+    chunks.push(chunk)
   }
-  return text + decoder.decode()
+  return Buffer.concat(chunks, bytes).toString("utf8")
 }
 
 function responseTooLarge() {
@@ -233,10 +251,16 @@ async function readCachedVector(root, hash) {
   if (!(await pathExists(file))) return null
   try {
     const value = await readJson(file)
-    return Array.isArray(value.vector) && value.vector.length > 0 && value.vector.length <= MAX_EMBEDDING_DIMENSIONS
+    const valid = value.documentHash === hash
+      && Array.isArray(value.vector)
+      && value.vector.length > 0
+      && value.vector.length <= MAX_EMBEDDING_DIMENSIONS
       && value.vector.every((item) => typeof item === "number" && Number.isFinite(item))
-      ? value.vector
-      : null
+    if (!valid) return null
+    // mtime is the small, bounded LRU signal. It avoids rewriting every JSON
+    // entry on a read while still allowing old fingerprints to be collected.
+    await utimes(file, new Date(), new Date()).catch(() => {})
+    return value.vector
   } catch {
     return null
   }
@@ -247,12 +271,86 @@ async function writeCachedVector(root, hash, vector, config) {
   await ensureDir(path.dirname(file))
   await writeJsonAtomic(file, {
     schemaVersion: 1,
+    createdAt: new Date().toISOString(),
+    lastUsedAt: new Date().toISOString(),
     provider: config.provider,
     model: config.model,
     documentHash: hash,
     dimensions: vector.length,
     vector,
   })
+}
+
+async function pruneEmbeddingCache(embeddingRoot, activeRoot, protectedHashes, config) {
+  await ensureDir(embeddingRoot)
+  let release
+  try {
+    release = await acquireProcessFileLock(path.join(embeddingRoot, "gc.lock"), { kind: "embedding-cache-gc" }, { waitMs: 0 })
+  } catch {
+    // Another process is writing or collecting the cache. It is safer to
+    // leave excess entries for the next maintenance pass than to race it.
+    return { skipped: true, removedFiles: 0, removedBytes: 0 }
+  }
+  try {
+    const files = await embeddingCacheFiles(embeddingRoot)
+    const protectedRoot = path.resolve(activeRoot)
+    const protectedSet = new Set(protectedHashes)
+    const now = Date.now()
+    const entries = files.map((entry) => ({
+      ...entry,
+      protected: path.resolve(entry.file).startsWith(`${protectedRoot}${path.sep}`) && protectedSet.has(entry.hash),
+      fresh: now - entry.mtimeMs < CACHE_GC_GRACE_MS,
+    }))
+    let totalBytes = entries.reduce((sum, entry) => sum + entry.bytes, 0)
+    let totalFiles = entries.length
+    const removed = []
+    const removeEntry = async (entry) => {
+      await rm(entry.file, { force: true })
+      totalBytes -= entry.bytes
+      totalFiles -= 1
+      removed.push(entry)
+    }
+    // Expired, unreachable entries are removed first. Protected entries and
+    // recently written entries are never selected by GC.
+    for (const entry of entries
+      .filter((candidate) => !candidate.protected && !candidate.fresh && now - candidate.mtimeMs >= config.cacheTtlDays * 86_400_000)
+      .sort((left, right) => left.mtimeMs - right.mtimeMs)) await removeEntry(entry)
+    for (const entry of entries
+      .filter((candidate) => !removed.includes(candidate) && !candidate.protected && !candidate.fresh)
+      .sort((left, right) => left.mtimeMs - right.mtimeMs)) {
+      if (totalBytes <= config.maxCacheBytes && totalFiles <= config.maxCacheFiles) break
+      await removeEntry(entry)
+    }
+    return {
+      skipped: false,
+      removedFiles: removed.length,
+      removedBytes: removed.reduce((sum, entry) => sum + entry.bytes, 0),
+      overBudget: totalBytes > config.maxCacheBytes || totalFiles > config.maxCacheFiles,
+    }
+  } finally {
+    await release?.().catch(() => {})
+  }
+}
+
+async function embeddingCacheFiles(root) {
+  const files = []
+  const fingerprints = await readdir(root, { withFileTypes: true })
+  for (const fingerprint of fingerprints) {
+    if (!fingerprint.isDirectory() || fingerprint.name === "gc.lock" || !/^[a-f0-9]{8,64}$/i.test(fingerprint.name)) continue
+    const prefixes = await readdir(path.join(root, fingerprint.name), { withFileTypes: true }).catch(() => [])
+    for (const prefix of prefixes) {
+      if (!prefix.isDirectory() || !/^[a-f0-9]{2}$/i.test(prefix.name)) continue
+      const entries = await readdir(path.join(root, fingerprint.name, prefix.name), { withFileTypes: true }).catch(() => [])
+      for (const entry of entries) {
+        if (!entry.isFile() || !/^[a-f0-9]{64}\.json$/i.test(entry.name)) continue
+        const file = path.join(root, fingerprint.name, prefix.name, entry.name)
+        const info = await stat(file).catch(() => null)
+        if (!info?.isFile()) continue
+        files.push({ file, hash: entry.name.slice(0, -5), bytes: info.size, mtimeMs: info.mtimeMs })
+      }
+    }
+  }
+  return files
 }
 
 function cachePath(root, hash) {
@@ -280,6 +378,9 @@ function publicConfig(config) {
     endpoint_configured: Boolean(config.endpoint),
     max_documents: config.maxDocuments,
     total_timeout_ms: config.totalTimeoutMs,
+    max_cache_bytes: config.maxCacheBytes,
+    max_cache_files: config.maxCacheFiles,
+    cache_ttl_days: config.cacheTtlDays,
   }
 }
 

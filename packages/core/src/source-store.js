@@ -59,7 +59,14 @@ async function importOne(workspace, input, displayName) {
   }
   if (linkInfo.isSymbolicLink()) fail("SOURCE_NOT_READABLE", "Symbolic-link attachments are not accepted.")
   if (!linkInfo.isFile()) fail("SOURCE_NOT_READABLE", "The attachment must be a regular file.")
-  const extension = path.extname(displayName).toLowerCase() || path.extname(sourcePath).toLowerCase()
+  // display_name is presentation metadata supplied by the caller. It must
+  // never select a parser for a materialized file: doing so lets an HTML
+  // source be mislabeled as Markdown and bypass htmlToMarkdown sanitization.
+  // A materialized path with no extension remains compatible with the legacy
+  // attachment contract and falls back to its display label.
+  const sourceExtension = path.extname(sourcePath).toLowerCase()
+  const displayExtension = path.extname(displayName).toLowerCase()
+  const extension = sourceExtension || displayExtension
   const mediaType = SUPPORTED_SOURCE_TYPES[extension]
   if (!mediaType) {
     if (extension === ".xls") fail("UNSUPPORTED_FILE_TYPE", "Legacy .xls workbooks are not supported; save the workbook as .xlsx and retry.")

@@ -1,5 +1,31 @@
 # 更新日志
 
+## [V1.0.2] - 2026-08-07
+
+### Bug 修复
+
+- 修复 MCP 超大结果在 `next_action` 或错误详情过大时递归序列化导致 OOM 的问题；超限响应现在使用固定大小的恢复提示。
+- 修复附件 `display_name` 伪造扩展名导致 HTML/Markdown 解析器选错的问题；以实际物理文件扩展名为准。
+- 修复长 Markdown 块切片后所有 chunk 共用同一 locator 的问题；分片现在保留准确、单调的 UTF-16 偏移范围。
+- 修复代码块、引用、frontmatter、inline code 和 HTML `pre/code` 中的示例链接污染 Related、Graph 和 lint 的问题。
+- 明确 PagePatch 的 `replace`/`merge` 契约：`replace` 完整替换正文，`merge` 显式保留已有正文；补充页面关系和最终投影回归测试。
+- 修复 Schema 类型短词误匹配长单词、CJK 重叠别名和同一文本多处 CJK 匹配的边界问题。
+
+### 可靠性与恢复
+
+- 页面事务升级为可恢复 journal 状态机：在 rename 前持久化 intent，记录目标旧/新 hash，并在启动时安全完成、回滚或报告 `RECOVERY_REQUIRED`。
+- 幂等操作改为 `PENDING → COMMITTED/FAILED` WAL；副作用响应先写入 durable sidecar，重启后支持精确 replay，无法证明安全时 fail-closed。
+- Finalize 引入 generation 发布协议：页面快照、BM25、vector、embedding、graph、lint 和 result 绑定同一 `wikiRevision`，通过 `current-generation.json` 原子切换。
+- 增加 embedding 缓存 TTL/LRU、文件数和字节预算；终态 journal 的 backup/staging 按保留策略清理，恢复中的证据不会被 GC 删除。
+- Embedding 响应取消非 streaming `response.text()` 回退，所有响应均在读取过程中执行字节上限。
+
+### 依赖与验证
+
+- 升级 `pdfjs-dist` 至 `6.2.108`，禁用 PDF scripting/eval，并将项目 Node.js 最低版本调整为 `22.13.0`。
+- 固定 `fast-uri` `3.1.5` 与 `hono` `4.12.34`，同步更新 CI 构建环境。
+- 增加事务恢复、幂等恢复、Finalize generation、embedding 响应上限和 replace/merge 回归测试。
+- 验证通过：Core 56 项、MCP Server 17 项、CLI 1 项测试，生产依赖离线 audit 为 0 vulnerabilities。
+
 ## [V1.0.1] - 2026-08-07
 
 ### 领域 Schema 类型投影

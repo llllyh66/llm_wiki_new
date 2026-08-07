@@ -54,6 +54,42 @@ function emergencyMcpResult() {
   }
 }
 
+function compactMcpError(code, message, originalOutputBytes = undefined) {
+  return {
+    ok: false,
+    accepted: false,
+    rejected: true,
+    error: {
+      code,
+      message,
+      retryable: true,
+      ...(originalOutputBytes === undefined ? {} : { details: { truncated: true, original_output_bytes: originalOutputBytes } }),
+      suggested_action: "Submit a smaller payload and retry; the MCP connection remains usable.",
+    },
+    next_action: { tool: "llm_wiki_list_tasks", arguments: {} },
+    mcp_connection_usable: true,
+  }
+}
+
+function serializeCompactMcpError(data) {
+  const error = data?.error
+  const code = typeof error?.code === "string" && error.code.length <= 120 ? error.code : "MCP_OUTPUT_TOO_LARGE"
+  const message = error
+    ? `${String(error.message ?? "Tool call failed.").slice(0, MAX_ERROR_MESSAGE_CHARS)} (Error details were truncated to keep the MCP connection usable.)`
+    : `Tool output exceeds the ${MAX_MCP_OUTPUT_BYTES}-byte MCP limit. Use pagination or a smaller result limit.`
+  const compact = compactMcpError(code, message, data?.__serializedOutputBytes)
+  let text
+  try {
+    text = JSON.stringify(compact, null, 2)
+  } catch {
+    return emergencyMcpResult()
+  }
+  // This is a fixed internal object and should always fit. Keep a final hard
+  // guard so a future constant change cannot reintroduce recursive fallback.
+  if (Buffer.byteLength(text) > MAX_MCP_OUTPUT_BYTES) return emergencyMcpResult()
+  return { content: [{ type: "text", text }], _meta: { llmWikiStatus: "rejected" } }
+}
+
 function serializeResult(data) {
   let text
   try {
@@ -62,28 +98,19 @@ function serializeResult(data) {
     // bounds the complete response.
     text = JSON.stringify(data, null, 2)
   } catch {
-    return serializeResult(errorResult(new LlmWikiError("MCP_SERIALIZATION_FAILED", "Tool result could not be serialized as JSON.")))
+    const compact = compactMcpError("MCP_SERIALIZATION_FAILED", "Tool result could not be serialized as JSON.")
+    try {
+      const compactText = JSON.stringify(compact, null, 2)
+      return { content: [{ type: "text", text: compactText }], _meta: { llmWikiStatus: "rejected" } }
+    } catch {
+      return emergencyMcpResult()
+    }
   }
   const outputBytes = Buffer.byteLength(text)
   if (outputBytes > MAX_MCP_OUTPUT_BYTES) {
-    const original = data?.error
-    return serializeResult({
-      ok: false,
-      accepted: false,
-      rejected: true,
-      error: {
-        code: typeof original?.code === "string" ? original.code : "MCP_OUTPUT_TOO_LARGE",
-        message: original
-          ? `${String(original.message ?? "Tool call failed.").slice(0, MAX_ERROR_MESSAGE_CHARS)} (Error details were truncated to keep the MCP connection usable.)`
-          : `Tool output exceeds the ${MAX_MCP_OUTPUT_BYTES}-byte MCP limit. Use pagination or a smaller result limit.`,
-        retryable: true,
-        ...(original?.task_id ? { task_id: original.task_id } : {}),
-        details: { truncated: true, original_output_bytes: outputBytes },
-        suggested_action: "Submit a smaller payload and retry; the MCP connection remains usable.",
-      },
-      next_action: data?.next_action ?? { tool: "llm_wiki_list_tasks", arguments: {} },
-      mcp_connection_usable: true,
-    })
+    // Never carry next_action or arbitrary error details into the fallback:
+    // those fields are exactly where an oversized result commonly lives.
+    return serializeCompactMcpError({ ...data, __serializedOutputBytes: outputBytes })
   }
   const result = { content: [{ type: "text", text }] }
   if (outputBytes <= STRUCTURED_CONTENT_DUPLICATION_LIMIT) result.structuredContent = data

@@ -476,6 +476,11 @@ always use it and return control to the user while the worker runs.
       `[[collection/slug]]` and must also appear in `patch.related`; never emit
       a raw `wiki/collection/slug.md` path. Author a clear H1 and a
       self-contained source-grounded body.
+      `replace` is a complete authoritative body rewrite: it does not retain
+      stale provisional prose. Use `merge` only when the existing grounded
+      body is intentionally being retained, and carry every retained fact with
+      its SourceRef. Core cannot infer which provisional claims survive a final
+      `replace`.
       When a page requirement carries `domain_classifications`, preserve the
       scaffold and describe the supplied entity or concept type in the page.
       Core recomputes and writes the authoritative type metadata from `covers`,

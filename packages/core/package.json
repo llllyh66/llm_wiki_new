@@ -8,14 +8,14 @@
   ],
   "dependencies": {
     "jszip": "^3.10.1",
-    "pdfjs-dist": "^5.7.284"
+    "pdfjs-dist": "6.2.108"
   },
   "scripts": {
     "build": "node --check src/index.js && node --check src/core.js",
     "test": "node --test test/*.test.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13.0"
   },
   "license": "MIT"
 }

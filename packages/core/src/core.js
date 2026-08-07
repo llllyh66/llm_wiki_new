@@ -25,7 +25,7 @@ import {
   taskPaths,
   withIdempotency,
 } from "./task-store.js"
-import { commitPageTransaction, committedPageRecords } from "./transaction.js"
+import { cleanupTransactionArtifacts, commitPageTransaction, committedPageRecords, markPageTransactionCommitted, recoverPendingPageTransactions } from "./transaction.js"
 import {
   canonicalizeAnalysisSourceRefQuotes,
   collectSourceRefs,
@@ -37,7 +37,7 @@ import {
   validatePagePatchShape,
   validateSourceRefs,
 } from "./validation.js"
-import { ensureWorkspace, resolveWorkspaceRoot } from "./workspace.js"
+import { ensureWorkspace, resolveWorkspaceRoot, workspacePaths } from "./workspace.js"
 import {
   canonicalPageSlug,
   extractRelatedReferences,
@@ -61,6 +61,7 @@ import {
   readJson,
   relativePosix,
   sha256,
+  sha256File,
   stableStringify,
   writeJsonAtomic,
   writeTextAtomic,
@@ -147,7 +148,9 @@ function assertOperationActive(signal) {
 export class LlmWikiCore {
   static async open(workspaceRoot = process.cwd()) {
     const root = await resolveWorkspaceRoot(workspaceRoot)
-    return new LlmWikiCore(root)
+    const core = new LlmWikiCore(root)
+    await core.#recoverPendingState()
+    return core
   }
 
   constructor(workspaceRoot) {
@@ -160,6 +163,17 @@ export class LlmWikiCore {
     this.taskAnalysisCache = new Map()
     this.pagePlanSnapshotCache = new Map()
     this.pageDraftShardCache = new Map()
+  }
+
+  async #recoverPendingState() {
+    const paths = workspacePaths(this.workspaceRoot)
+    // Keep LlmWikiCore.open lazy: the first mutating operation owns initial
+    // workspace creation and its workspace_initialized=true signal.
+    if (!(await pathExists(paths.workspace))) return
+    const workspace = await ensureWorkspace(this.workspaceRoot, { skipWikiRevision: true })
+    await recoverPendingPageTransactions(workspace)
+    await recoverPendingFinalizations(workspace)
+    await cleanupTransactionArtifacts(workspace)
   }
 
   async workspace(options = {}) {
@@ -724,7 +738,7 @@ export class LlmWikiCore {
     }
     validateSourceRefs(collectSourceRefs(domainApplied.analysis), record.task, record.batches, workspace.config.limits, chunkIndex)
     validateGroundingQuality(domainApplied.analysis)
-    const idempotent = await withIdempotency(record.paths, input?.idempotency_key, { operation: "commit_analysis", batchId: batch.batchId, analysis: normalized.analysis, acceptDroppedCandidates: input?.accept_dropped_candidates === true }, async () => {
+    const idempotent = await withIdempotency(record.paths, input?.idempotency_key, { operation: "commit_analysis", batchId: batch.batchId, analysis: normalized.analysis, acceptDroppedCandidates: input?.accept_dropped_candidates === true }, async ({ persistResponse }) => {
       if (record.task.completedBatchIds.includes(batch.batchId)) fail("BATCH_ALREADY_COMPLETED", `Batch is already completed: ${batch.batchId}`)
       assertTaskStatus(record.task, ["prepared", "extracting"])
       await writeJsonAtomic(path.join(record.paths.analysis, `${batch.batchId}.json`), domainApplied.analysis)
@@ -744,7 +758,7 @@ export class LlmWikiCore {
         ? projectionAction(record.task, wikiProjection)
         : null
       await saveTask(record.paths, record.task)
-      return {
+      const response = {
         accepted: true,
         analysis_revision: record.task.analysisRevision,
         batch_completed: true,
@@ -757,6 +771,11 @@ export class LlmWikiCore {
         next_action: projectionNextAction ?? extractionNextAction,
         worker_next_action: extractionNextAction,
       }
+      // Persist the replay payload before leaving the side-effecting
+      // operation. If the process dies before the idempotency shard is
+      // promoted to COMMITTED, the next call can recover this exact response.
+      await persistResponse(response)
+      return response
     }, { exactRequestValue: exactIdempotencyRequest })
     return { ...idempotent.response, idempotent_replay: idempotent.replayed }
   }
@@ -1472,7 +1491,7 @@ export class LlmWikiCore {
         shardId,
         patches: normalizedPatches,
       },
-      async () => {
+      async ({ persistResponse }) => {
         const previous = await readJson(draftPath, null)
         if (previous?.draft_hash && previous.draft_hash !== draftHash
           && projection.committedDraftShardIds?.includes(shardId)) {
@@ -1497,7 +1516,7 @@ export class LlmWikiCore {
           content_chars: contentChars,
           patches: normalizedPatches,
         })
-        return {
+        const response = {
           accepted: true,
           staged: true,
           task_id: record.task.taskId,
@@ -1519,6 +1538,8 @@ export class LlmWikiCore {
             },
           },
         }
+        await persistResponse(response)
+        return response
       },
       { exactRequestValue: { operation: "stage_page_drafts", projectionId: projection.projectionId, shardId, patches: input?.patches } },
     )
@@ -2018,7 +2039,7 @@ export class LlmWikiCore {
       projectionComplete,
       draftShardIds: submittedManifestShardIds,
       stagedDraftShardIds,
-    }, async () => {
+    }, async ({ persistResponse }) => {
       let projection = commitProjection
       if (!projectionCommit) {
         const state = projectionState(record.task)
@@ -2127,6 +2148,7 @@ export class LlmWikiCore {
         record.task.status = "committing"
       }
       await saveTask(record.paths, record.task)
+      await markPageTransactionCommitted(workspace, journal.transactionId)
       // Keep staged files until task state is durable. A crash before this
       // point must leave the Writer's server-side input replayable.
       if (stagedDraftShardIds.length > 0) {
@@ -2145,7 +2167,7 @@ export class LlmWikiCore {
         projection.nextDraftShardId = nextDraftShard?.shard_id ?? null
         await saveTask(record.paths, record.task)
       }
-      return {
+      const response = {
         accepted: true,
         transaction_id: journal.transactionId,
         commit_revision: record.task.commitRevision,
@@ -2214,6 +2236,8 @@ export class LlmWikiCore {
           ? { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: record.task.taskId, writer_id: projection.writerId, view: "manifest" } }
           : null,
       }
+      await persistResponse(response)
+      return response
     })
     return { ...idempotent.response, idempotent_replay: idempotent.replayed }
   }
@@ -2234,14 +2258,61 @@ export class LlmWikiCore {
       const requirements = derivePageRequirements(analyses, await this.#taskDomainSchema(record), record.task.domainSchema)
       const refresh = await this.#refreshDomainPageMetadata(workspace, record, requirements)
       if (refresh.updated_pages > 0) {
-        const retrievalIndexes = await buildRetrievalIndexes(workspace)
-        await writeJsonAtomic(path.join(workspace.paths.indexes, "bm25.json"), retrievalIndexes.bm25)
-        await writeJsonAtomic(path.join(workspace.paths.indexes, "vector.json"), retrievalIndexes.vector)
-        await writeJsonAtomic(path.join(workspace.paths.indexes, "embedding.json"), retrievalIndexes.embedding)
-        await writeJsonAtomic(path.join(workspace.paths.indexes, "graph.json"), await buildGraph(workspace.paths.wiki))
-        await writeJsonAtomic(path.join(workspace.paths.state, "lint.json"), await lintWiki(workspace))
-        record.task.wikiRevision = await hashDirectory(workspace.paths.wiki)
+        const generationId = newId("generation")
+        const finalizationPath = path.join(record.paths.root, "finalization.json")
+        const refreshFinalization = {
+          schemaVersion: 1,
+          state: "pages_published",
+          taskId: record.task.taskId,
+          generationId,
+          createdAt: nowIso(),
+        }
+        await writeJsonAtomic(finalizationPath, refreshFinalization)
+        const pageSourceRefs = await readJson(path.join(workspace.paths.indexes, "page-source-refs.json"), { schemaVersion: 1, pages: {} })
+        const built = await buildGenerationArtifacts(workspace, { generationId, taskId: record.task.taskId, pageSourceRefs: pageSourceRefs.pages ?? {} })
+        const refreshedResult = {
+          ...result,
+          domain_metadata_refresh: refresh,
+          wiki_revision: built.wikiRevision,
+          generation_id: generationId,
+        }
+        await writeJsonAtomic(finalizationPath, {
+          ...refreshFinalization,
+          state: "ready_to_publish",
+          wikiRevision: built.wikiRevision,
+          manifestSha256: built.manifestSha256,
+          result: refreshedResult,
+        })
+        await writeJsonAtomic(workspace.paths.currentGeneration, {
+          schemaVersion: 1,
+          generation_id: generationId,
+          task_id: record.task.taskId,
+          wiki_revision: built.wikiRevision,
+          manifest_sha256: built.manifestSha256,
+          published_at: nowIso(),
+        })
+        await writeJsonAtomic(finalizationPath, {
+          ...refreshFinalization,
+          state: "published",
+          wikiRevision: built.wikiRevision,
+          manifestSha256: built.manifestSha256,
+          result: refreshedResult,
+          publishedAt: nowIso(),
+        })
+        record.task.generationId = generationId
+        record.task.generationManifestSha256 = built.manifestSha256
+        record.task.wikiRevision = built.wikiRevision
         await saveTask(record.paths, record.task)
+        await writeJsonAtomic(record.paths.result, refreshedResult)
+        await writeJsonAtomic(finalizationPath, {
+          ...refreshFinalization,
+          state: "task_completed",
+          wikiRevision: built.wikiRevision,
+          manifestSha256: built.manifestSha256,
+          result: refreshedResult,
+          completedAt: nowIso(),
+        })
+        return refreshedResult
       }
       const refreshedResult = { ...result, domain_metadata_refresh: refresh, wiki_revision: record.task.wikiRevision }
       await writeJsonAtomic(record.paths.result, refreshedResult)
@@ -2260,6 +2331,18 @@ export class LlmWikiCore {
     }
     record.task.status = "finalizing"
     await saveTask(record.paths, record.task)
+    const generationId = newId("generation")
+    const generationRoot = path.join(workspace.paths.generations, generationId)
+    const finalizationPath = path.join(record.paths.root, "finalization.json")
+    const finalization = {
+      schemaVersion: 1,
+      state: "prepared",
+      taskId: record.task.taskId,
+      generationId,
+      createdAt: nowIso(),
+      inputWikiRevision: workspace.revision,
+    }
+    await writeJsonAtomic(finalizationPath, finalization)
     const commits = await readJson(record.paths.commits, [])
     const pageHistory = await committedPageRecords(workspace, commits)
     const pageRecords = latestPageRecords(pageHistory)
@@ -2271,26 +2354,77 @@ export class LlmWikiCore {
     await writeTextAtomic(path.join(workspace.paths.wiki, "index.md"), await buildIndex(workspace.paths.wiki))
     await writeTextAtomic(path.join(workspace.paths.wiki, "overview.md"), await buildOverview(workspace.paths.wiki, record.task, pageRecords))
     await appendLog(path.join(workspace.paths.wiki, "log.md"), record.task, pageRecords)
+    const wikiRevision = await hashDirectory(workspace.paths.wiki)
+    const pages = await snapshotWikiGeneration(workspace.paths.wiki, path.join(generationRoot, "wiki"))
+    await writeJsonAtomic(finalizationPath, {
+      ...finalization,
+      state: "pages_published",
+      wikiRevision,
+      pageCount: pages.length,
+    })
     const pageSourceRefs = Object.fromEntries(pageRecords.map((page) => [page.path, page.sourceRefs]))
-    await writeJsonAtomic(path.join(workspace.paths.indexes, "page-source-refs.json"), { schemaVersion: 1, pages: pageSourceRefs })
-    const retrievalIndexes = await buildRetrievalIndexes(workspace)
+    const pageSourceRefsArtifact = { schemaVersion: 1, pages: pageSourceRefs }
+    const retrievalIndexes = await buildRetrievalIndexes(workspace, { wikiRoot: workspace.paths.wiki })
+    const graph = await buildGraph(workspace.paths.wiki)
+    const embeddingIndex = retrievalIndexes.embedding
+    const lint = await lintWiki(workspace)
+    const artifactValues = {
+      "page-source-refs.json": pageSourceRefsArtifact,
+      "bm25.json": retrievalIndexes.bm25,
+      "vector.json": retrievalIndexes.vector,
+      "embedding.json": embeddingIndex,
+      "graph.json": graph,
+      "lint.json": lint,
+    }
+    const artifacts = {}
+    for (const [name, value] of Object.entries(artifactValues)) {
+      const artifactPath = path.join(generationRoot, name)
+      await writeJsonAtomic(artifactPath, value)
+      artifacts[name] = { path: name, sha256: await sha256File(artifactPath) }
+    }
+    const manifest = {
+      schemaVersion: 1,
+      generationId,
+      taskId: record.task.taskId,
+      wikiRevision,
+      generatedAt: nowIso(),
+      pages,
+      artifacts,
+    }
+    const manifestPath = path.join(generationRoot, "manifest.json")
+    await writeJsonAtomic(manifestPath, manifest)
+    const manifestSha256 = await sha256File(manifestPath)
+    await writeJsonAtomic(finalizationPath, {
+      ...finalization,
+      state: "indexes_ready",
+      wikiRevision,
+      manifestSha256,
+      artifacts,
+      lint: { errors: lint.errors, warnings: lint.warnings, info: lint.info },
+    })
+    // Keep V1.0.1 fixed paths as a read-only compatibility projection. New
+    // readers use current-generation.json and never observe these writes as a
+    // generation boundary.
+    await writeJsonAtomic(path.join(workspace.paths.indexes, "page-source-refs.json"), pageSourceRefsArtifact)
     await writeJsonAtomic(path.join(workspace.paths.indexes, "bm25.json"), retrievalIndexes.bm25)
     await writeJsonAtomic(path.join(workspace.paths.indexes, "vector.json"), retrievalIndexes.vector)
-    const embeddingIndex = retrievalIndexes.embedding
     await writeJsonAtomic(path.join(workspace.paths.indexes, "embedding.json"), embeddingIndex)
-    await writeJsonAtomic(path.join(workspace.paths.indexes, "graph.json"), await buildGraph(workspace.paths.wiki))
-    const lint = await lintWiki(workspace)
+    await writeJsonAtomic(path.join(workspace.paths.indexes, "graph.json"), graph)
     await writeJsonAtomic(path.join(workspace.paths.state, "lint.json"), lint)
     if (lint.errors > 0) {
+      await writeJsonAtomic(finalizationPath, {
+        ...finalization,
+        state: "failed",
+        wikiRevision,
+        manifestSha256,
+        lint: { errors: lint.errors, warnings: lint.warnings, info: lint.info },
+        failedAt: nowIso(),
+      })
       record.task.status = "failed"
       record.task.lastError = new LlmWikiError("FINALIZE_BLOCKED_BY_LINT", "Finalize found critical lint errors.", { retryable: true, taskId: record.task.taskId }).toJSON()
       await saveTask(record.paths, record.task)
       fail("FINALIZE_BLOCKED_BY_LINT", "Finalize found critical lint errors.", { retryable: true, taskId: record.task.taskId, details: { lint } })
     }
-    record.task.status = "completed"
-    record.task.completedAt = nowIso()
-    record.task.wikiRevision = await hashDirectory(workspace.paths.wiki)
-    await saveTask(record.paths, record.task)
     const result = {
       task_id: record.task.taskId,
       status: "completed",
@@ -2300,10 +2434,48 @@ export class LlmWikiCore {
       review_items: await countReviewItems(record),
       lint: { errors: lint.errors, warnings: lint.warnings, info: lint.info, findings: lint.findings },
       indexing: { bm25: "completed", embedding: embeddingIndex.status, vector: "completed", vector_fallback: "completed", graph: "completed" },
-      wiki_revision: record.task.wikiRevision,
+      wiki_revision: wikiRevision,
+      generation_id: generationId,
       ...(domainMetadataRefresh.updated_pages > 0 ? { domain_metadata_refresh: domainMetadataRefresh } : {}),
     }
+    await writeJsonAtomic(finalizationPath, {
+      ...finalization,
+      state: "ready_to_publish",
+      wikiRevision,
+      manifestSha256,
+      result,
+    })
+    await writeJsonAtomic(workspace.paths.currentGeneration, {
+      schemaVersion: 1,
+      generation_id: generationId,
+      task_id: record.task.taskId,
+      wiki_revision: wikiRevision,
+      manifest_sha256: manifestSha256,
+      published_at: nowIso(),
+    })
+    await writeJsonAtomic(finalizationPath, {
+      ...finalization,
+      state: "published",
+      wikiRevision,
+      manifestSha256,
+      result,
+      publishedAt: nowIso(),
+    })
+    record.task.status = "completed"
+    record.task.completedAt = nowIso()
+    record.task.wikiRevision = wikiRevision
+    record.task.generationId = generationId
+    record.task.generationManifestSha256 = manifestSha256
+    await saveTask(record.paths, record.task)
     await writeJsonAtomic(record.paths.result, result)
+    await writeJsonAtomic(finalizationPath, {
+      ...finalization,
+      state: "task_completed",
+      wikiRevision,
+      manifestSha256,
+      result,
+      completedAt: nowIso(),
+    })
     return result
   }
 
@@ -2465,6 +2637,8 @@ export class LlmWikiCore {
 
     await clear(workspace.paths.wiki, "wiki")
     await clear(workspace.paths.indexes, "indexes")
+    await clear(workspace.paths.generations, "generations")
+    await rm(workspace.paths.currentGeneration, { force: true })
     await rm(path.join(workspace.paths.state, "lint.json"), { force: true })
     if (scope === "knowledge_base") {
       await clear(workspace.paths.tasks, "tasks")
@@ -3044,6 +3218,140 @@ async function workspaceTaskRecords(tasksRoot) {
     }
   }
   return records
+}
+
+async function snapshotWikiGeneration(wikiRoot, generationWikiRoot) {
+  const pages = []
+  const files = await listFilesRecursive(wikiRoot, (candidate) => candidate.endsWith(".md"))
+  for (const file of files) {
+    const relative = relativePosix(wikiRoot, file)
+    const content = await readFile(file, "utf8")
+    const target = path.join(generationWikiRoot, relative)
+    await writeTextAtomic(target, content)
+    pages.push({
+      path: `wiki/${relative}`,
+      sha256: sha256(content),
+      bytes: Buffer.byteLength(content),
+    })
+  }
+  return pages
+}
+
+async function buildGenerationArtifacts(workspace, { generationId, taskId, pageSourceRefs }) {
+  const generationRoot = path.join(workspace.paths.generations, generationId)
+  const wikiRevision = await hashDirectory(workspace.paths.wiki)
+  const pages = await snapshotWikiGeneration(workspace.paths.wiki, path.join(generationRoot, "wiki"))
+  const pageSourceRefsArtifact = { schemaVersion: 1, pages: pageSourceRefs }
+  const retrievalIndexes = await buildRetrievalIndexes(workspace, { wikiRoot: workspace.paths.wiki })
+  const graph = await buildGraph(workspace.paths.wiki)
+  const lint = await lintWiki(workspace)
+  const values = {
+    "page-source-refs.json": pageSourceRefsArtifact,
+    "bm25.json": retrievalIndexes.bm25,
+    "vector.json": retrievalIndexes.vector,
+    "embedding.json": retrievalIndexes.embedding,
+    "graph.json": graph,
+    "lint.json": lint,
+  }
+  const artifacts = {}
+  for (const [name, value] of Object.entries(values)) {
+    const artifactPath = path.join(generationRoot, name)
+    await writeJsonAtomic(artifactPath, value)
+    artifacts[name] = { path: name, sha256: await sha256File(artifactPath) }
+  }
+  const manifestPath = path.join(generationRoot, "manifest.json")
+  await writeJsonAtomic(manifestPath, {
+    schemaVersion: 1,
+    generationId,
+    taskId,
+    wikiRevision,
+    generatedAt: nowIso(),
+    pages,
+    artifacts,
+  })
+  const manifestSha256 = await sha256File(manifestPath)
+  // Preserve the V1.0.1 fixed-path projection for older readers. The
+  // generation pointer is published by the caller only after these writes.
+  await writeJsonAtomic(path.join(workspace.paths.indexes, "page-source-refs.json"), pageSourceRefsArtifact)
+  await writeJsonAtomic(path.join(workspace.paths.indexes, "bm25.json"), retrievalIndexes.bm25)
+  await writeJsonAtomic(path.join(workspace.paths.indexes, "vector.json"), retrievalIndexes.vector)
+  await writeJsonAtomic(path.join(workspace.paths.indexes, "embedding.json"), retrievalIndexes.embedding)
+  await writeJsonAtomic(path.join(workspace.paths.indexes, "graph.json"), graph)
+  await writeJsonAtomic(path.join(workspace.paths.state, "lint.json"), lint)
+  return { generationRoot, wikiRevision, manifestSha256, retrievalIndexes, lint, artifacts }
+}
+
+async function recoverPendingFinalizations(workspace) {
+  let entries = []
+  try {
+    entries = await readdir(workspace.paths.tasks, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("task-")) continue
+    const taskRoot = path.join(workspace.paths.tasks, entry.name)
+    const finalizationPath = path.join(taskRoot, "finalization.json")
+    const finalization = await readJson(finalizationPath, null)
+    if (!finalization || finalization.state === "task_completed" || finalization.state === "failed") continue
+    const taskPath = path.join(taskRoot, "task.json")
+    const resultPath = path.join(taskRoot, "result.json")
+    const task = await readJson(taskPath, null)
+    if (!task) continue
+    const generationId = finalization.generationId
+    const generationRoot = typeof generationId === "string" && /^generation-[0-9a-f-]+$/i.test(generationId)
+      ? path.join(workspace.paths.generations, generationId)
+      : null
+    const manifestPath = generationRoot ? path.join(generationRoot, "manifest.json") : null
+    const manifestExists = Boolean(manifestPath && await pathExists(manifestPath))
+    const manifestSha256 = manifestExists ? await sha256File(manifestPath) : null
+    if (finalization.state === "ready_to_publish" && manifestSha256 === finalization.manifestSha256) {
+      await writeJsonAtomic(workspace.paths.currentGeneration, {
+        schemaVersion: 1,
+        generation_id: generationId,
+        task_id: task.taskId,
+        wiki_revision: finalization.wikiRevision,
+        manifest_sha256: manifestSha256,
+        published_at: nowIso(),
+      })
+      await writeJsonAtomic(finalizationPath, { ...finalization, state: "published", publishedAt: nowIso() })
+      finalization.state = "published"
+    }
+    if (finalization.state === "published") {
+      const pointer = await readJson(workspace.paths.currentGeneration, null)
+      const pointerValid = pointer?.generation_id === generationId
+        && pointer?.task_id === task.taskId
+        && pointer?.manifest_sha256 === finalization.manifestSha256
+        && manifestSha256 === finalization.manifestSha256
+      if (!pointerValid || !finalization.result) {
+        await writeJsonAtomic(finalizationPath, {
+          ...finalization,
+          state: "recovery_required",
+          recoveryReason: "published generation pointer or manifest is missing",
+          recoveryAt: nowIso(),
+        })
+        continue
+      }
+      task.status = "completed"
+      task.completedAt = task.completedAt ?? nowIso()
+      task.wikiRevision = finalization.wikiRevision
+      task.generationId = generationId
+      task.generationManifestSha256 = finalization.manifestSha256
+      task.updatedAt = nowIso()
+      await writeJsonAtomic(taskPath, task)
+      await writeJsonAtomic(resultPath, finalization.result)
+      await writeJsonAtomic(finalizationPath, { ...finalization, state: "task_completed", completedAt: nowIso() })
+      continue
+    }
+    if (["prepared", "pages_published", "indexes_ready", "recovery_required"].includes(finalization.state)) {
+      if (task.status !== "completed") {
+        task.status = "failed"
+        task.lastError = new LlmWikiError("FINALIZE_RECOVERY_REQUIRED", "Finalize was interrupted before generation publication; rerun Finalize to rebuild the generation.", { retryable: true, taskId: task.taskId }).toJSON()
+        task.updatedAt = nowIso()
+        await writeJsonAtomic(taskPath, task)
+      }
+    }
+  }
 }
 
 function deduplicateExact(values) {
@@ -3675,6 +3983,7 @@ function statusResponse(task) {
       note: "A lease is a persisted batch reservation, not proof that a SubAgent process is running. After a worker completion notification, if that worker_id still has a lease, restart the same worker_id immediately; do not wait for other workers.",
     },
     updated_at: task.updatedAt,
+    ...(task.generationId ? { generation_id: task.generationId, generation_manifest_sha256: task.generationManifestSha256 } : {}),
     domain_schema: task.domainSchema ?? null,
     wiki_projection: wikiProjection,
     pipeline_concurrency: pipelineConcurrency,
@@ -3849,7 +4158,7 @@ async function buildGraph(wikiRoot) {
     const relative = relativePosix(wikiRoot, file).replace(/\.md$/i, "")
     const content = await readFile(file, "utf8")
     nodes.push({ id: relative, title: content.match(/^#\s+(.+)$/m)?.[1]?.trim() || path.basename(file, ".md") })
-    for (const match of content.matchAll(/\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g)) edges.push({ source: relative, target: match[1].replace(/^wiki\//, "").replace(/\.md$/i, "") })
+    for (const target of extractRelatedReferences(content)) edges.push({ source: relative, target })
   }
   return { schemaVersion: 1, generatedAt: nowIso(), nodes, edges }
 }

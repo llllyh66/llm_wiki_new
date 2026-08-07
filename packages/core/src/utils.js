@@ -62,6 +62,7 @@ export async function writeJsonAtomic(filePath, value) {
       await handle.close().catch(() => {})
     }
     await rename(temp, filePath)
+    await syncDirectory(path.dirname(filePath))
   } catch (error) {
     await rm(temp, { force: true }).catch(() => {})
     throw error
@@ -80,9 +81,25 @@ export async function writeTextAtomic(filePath, content) {
       await handle.close().catch(() => {})
     }
     await rename(temp, filePath)
+    await syncDirectory(path.dirname(filePath))
   } catch (error) {
     await rm(temp, { force: true }).catch(() => {})
     throw error
+  }
+}
+
+async function syncDirectory(directory) {
+  let handle
+  try {
+    handle = await open(directory, "r")
+    await handle.sync()
+  } catch (error) {
+    // Directory fsync is supported on POSIX filesystems but can be rejected
+    // on Windows. File contents are still fsynced; tolerate only the known
+    // platform limitations and surface all other durability failures.
+    if (!new Set(["EINVAL", "EPERM", "ENOTSUP"]).has(error?.code)) throw error
+  } finally {
+    await handle?.close().catch(() => {})
   }
 }
 
