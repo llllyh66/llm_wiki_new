@@ -40,7 +40,11 @@ export async function resolveDomainSchema(workspace, options = {}) {
 
 export async function loadTaskDomainSchema(record) {
   if (!record.task.domainSchema) return null
-  return readJson(record.paths.domainSchema)
+  const schema = await readJson(record.paths.domainSchema)
+  // Tasks created before V1.0.1 do not have the optional conceptTypes array.
+  // Normalize that missing field at the read boundary so all downstream
+  // selection and projection code remains backward compatible.
+  return { ...schema, conceptTypes: Array.isArray(schema?.conceptTypes) ? schema.conceptTypes : [] }
 }
 
 export function domainSchemaContext(schema, inlineBytes = INLINE_DOMAIN_SCHEMA_BYTES, knownBytes) {
@@ -59,6 +63,7 @@ export function domainSchemaContext(schema, inlineBytes = INLINE_DOMAIN_SCHEMA_B
       language: schema.language,
       policy: schema.policy,
       entityTypeCount: schema.entityTypes.length,
+      conceptTypeCount: schema.conceptTypes.length,
       relationTypeCount: schema.relationTypes.length,
       inline: false,
       totalBytes: bytes,
@@ -77,7 +82,7 @@ export function domainSchemaContext(schema, inlineBytes = INLINE_DOMAIN_SCHEMA_B
 
 export function compactDomainSchemaSelectionForText(schema, text, maxBytes = 6 * 1024) {
   const matched = matchDomainSchemaTypesForText(schema, text, 12)
-  if (matched.entityTypeIds.length === 0 && matched.relationTypeIds.length === 0) {
+  if (matched.entityTypeIds.length === 0 && matched.conceptTypeIds.length === 0 && matched.relationTypeIds.length === 0) {
     return {
       ready: false,
       mode: "batch-text-compact",
@@ -86,6 +91,7 @@ export function compactDomainSchemaSelectionForText(schema, text, maxBytes = 6 *
     }
   }
   const entityIds = new Set(matched.entityTypeIds)
+  const conceptIds = new Set(matched.conceptTypeIds ?? [])
   const relationIds = new Set(matched.relationTypeIds)
   for (const relation of schema.relationTypes) {
     if (!relationIds.has(relation.id)) continue
@@ -119,6 +125,15 @@ export function compactDomainSchemaSelectionForText(schema, text, maxBytes = 6 *
         properties: type.properties.map(compactProperty),
       },
     })),
+    ...schema.conceptTypes.filter((type) => conceptIds.has(type.id)).map((type) => ({
+      kind: "concept_type",
+      concept_type: {
+        id: type.id,
+        name: type.name,
+        ...(type.aliases.length > 0 ? { aliases: type.aliases } : {}),
+        properties: type.properties.map(compactProperty),
+      },
+    })),
     ...schema.relationTypes.filter((type) => relationIds.has(type.id)).map((type) => ({
       kind: "relation_type",
       relation_type: {
@@ -141,7 +156,8 @@ export function compactDomainSchemaSelectionForText(schema, text, maxBytes = 6 *
   }
   const includedEntityIds = items.filter((item) => item.kind === "entity_type").map((item) => item.entity_type.id)
   const includedRelationIds = items.filter((item) => item.kind === "relation_type").map((item) => item.relation_type.id)
-  const complete = includedEntityIds.length === entityIds.size && includedRelationIds.length === relationIds.size
+  const includedConceptIds = items.filter((item) => item.kind === "concept_type").map((item) => item.concept_type.id)
+  const complete = includedEntityIds.length === entityIds.size && includedConceptIds.length === conceptIds.size && includedRelationIds.length === relationIds.size
   return {
     ready: complete,
     mode: "batch-text-compact",
@@ -151,8 +167,10 @@ export function compactDomainSchemaSelectionForText(schema, text, maxBytes = 6 *
       mode: "types",
       full_schema_scan: false,
       matched_entity_type_ids: [...entityIds],
+      matched_concept_type_ids: [...conceptIds],
       matched_relation_type_ids: [...relationIds],
       included_entity_type_ids: includedEntityIds,
+      included_concept_type_ids: includedConceptIds,
       included_relation_type_ids: includedRelationIds,
       complete_for_selection: complete,
     },
@@ -164,7 +182,7 @@ export function compactDomainSchemaSelectionForText(schema, text, maxBytes = 6 *
 
 export function matchDomainSchemaTypesForText(schema, text, maxMatches = 12) {
   if (!schema || typeof text !== "string" || !text.trim()) {
-    return { entityTypeIds: [], relationTypeIds: [], matchedTerms: [], matcher: "cached-multi-pattern" }
+    return { entityTypeIds: [], conceptTypeIds: [], relationTypeIds: [], matchedTerms: [], matcher: "cached-multi-pattern" }
   }
   const haystack = text.normalize("NFKC").toLowerCase()
   const limit = Math.min(Math.max(Number(maxMatches) || 12, 1), 50)
@@ -192,6 +210,10 @@ export function matchDomainSchemaTypesForText(schema, text, maxMatches = 12) {
     .sort((left, right) => right.score - left.score || left.id.localeCompare(right.id))
     .slice(0, limit)
   const entityIds = new Set(entities.map((item) => item.id))
+  const concepts = schema.conceptTypes.map((type) => resultFor("concept", type.id))
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score || left.id.localeCompare(right.id))
+    .slice(0, limit)
   const relations = schema.relationTypes.map((type) => {
     const result = resultFor("relation", type.id)
     const connectsSelectedTypes = type.sourceEntityTypeIds.some((id) => entityIds.has(id))
@@ -202,8 +224,9 @@ export function matchDomainSchemaTypesForText(schema, text, maxMatches = 12) {
     .slice(0, limit)
   return {
     entityTypeIds: entities.map((item) => item.id),
+    conceptTypeIds: concepts.map((item) => item.id),
     relationTypeIds: relations.map((item) => item.id),
-    matchedTerms: [...new Set([...entities, ...relations].flatMap((item) => item.matches))].slice(0, 50),
+    matchedTerms: [...new Set([...entities, ...concepts, ...relations].flatMap((item) => item.matches))].slice(0, 50),
     matcher: "cached-multi-pattern",
   }
 }
@@ -219,7 +242,7 @@ function domainSchemaMatchIndex(schema) {
     values.push({ kind, typeId, value, weight, identity })
     entries.set(term, values)
   }
-  for (const [kind, types] of [["entity", schema.entityTypes], ["relation", schema.relationTypes]]) {
+  for (const [kind, types] of [["entity", schema.entityTypes], ["concept", schema.conceptTypes], ["relation", schema.relationTypes]]) {
     for (const type of types) {
       add(kind, type.id, type.id, 60, true)
       add(kind, type.id, type.name, 50, true)
@@ -345,6 +368,10 @@ export function validateDomainSchema(input) {
   const entityTypes = normalizeTypes(input.entityTypes, "entityTypes", errors)
   validateLookupKeys(entityTypes, "entityTypes", errors)
   const entityIds = new Set(entityTypes.map((item) => item.id))
+  const conceptTypes = input.conceptTypes === undefined
+    ? []
+    : normalizeTypes(input.conceptTypes, "conceptTypes", errors, true)
+  validateLookupKeys(conceptTypes, "conceptTypes", errors)
   const relationTypes = normalizeTypes(input.relationTypes, "relationTypes", errors, true)
   validateLookupKeys(relationTypes, "relationTypes", errors)
   for (const [index, relation] of relationTypes.entries()) {
@@ -363,6 +390,7 @@ export function validateDomainSchema(input) {
     language: input.language,
     policy,
     entityTypes,
+    conceptTypes,
     relationTypes,
   }
 }
@@ -372,6 +400,7 @@ export function applyDomainSchema(analysis, schema) {
   const mode = schema.policy.extractionMode
   const runtime = domainSchemaRuntime(schema)
   const entityLookup = runtime.entityLookup
+  const conceptLookup = runtime.conceptLookup
   const relationLookup = runtime.relationLookup
   const violations = []
   const entityTypesByLocalId = new Map()
@@ -392,6 +421,7 @@ export function applyDomainSchema(analysis, schema) {
     entityLocalIds.add(result.value.localId)
     entityTypesByLocalId.set(result.value.localId ?? result.value.local_id, result.value.entityTypeId)
   }
+  const concepts = analysis.concepts.map((concept) => normalizeConcept(concept, conceptLookup, schema.policy.extractionMode))
   const relations = []
   const relationLocalIds = new Set()
   const relationUniqueValues = new Map()
@@ -429,7 +459,7 @@ export function applyDomainSchema(analysis, schema) {
   if (violations.length > 0 && schema.policy.validationFailurePolicy === "reject-batch") {
     fail("INVALID_DOMAIN_ANALYSIS", "Analysis does not conform to the task domain schema.", { details: report })
   }
-  return { analysis: { ...analysis, entities, relations }, report }
+  return { analysis: { ...analysis, entities, concepts, relations }, report }
 }
 
 function domainSchemaRecord(input) {
@@ -549,7 +579,7 @@ function normalizeEndpointIds(value, field, errors) {
   return value
 }
 
-function domainSchemaItems(schema, entityTypeIds, relationTypeIds) {
+function domainSchemaItems(schema, entityTypeIds, relationTypeIds, conceptTypeIds) {
   const items = [{
     kind: "schema",
     schema: {
@@ -566,6 +596,11 @@ function domainSchemaItems(schema, entityTypeIds, relationTypeIds) {
     const { properties, ...definition } = entity
     items.push({ kind: "entity_type", entity_type: definition })
     for (const property of properties) items.push({ kind: "entity_property", entity_type_id: entity.id, property })
+  }
+  for (const concept of schema.conceptTypes.filter((item) => !conceptTypeIds || conceptTypeIds.has(item.id))) {
+    const { properties, ...definition } = concept
+    items.push({ kind: "concept_type", concept_type: definition })
+    for (const property of properties) items.push({ kind: "concept_property", concept_type_id: concept.id, property })
   }
   for (const relation of schema.relationTypes.filter((item) => !relationTypeIds || relationTypeIds.has(item.id))) {
     const { properties, ...definition } = relation
@@ -588,26 +623,31 @@ function selectDomainSchemaItems(schema, selection) {
         mode: "catalog",
         full_schema_scan: false,
         entity_type_count: schema.entityTypes.length,
+        concept_type_count: schema.conceptTypes.length,
         relation_type_count: schema.relationTypes.length,
       },
     }
   }
 
   const requestedEntityIds = new Set(normalizeSelectionStrings(selection.entityTypeIds, "entity_type_ids"))
+  const requestedConceptIds = new Set(normalizeSelectionStrings(selection.conceptTypeIds, "concept_type_ids"))
   const requestedRelationIds = new Set(normalizeSelectionStrings(selection.relationTypeIds, "relation_type_ids"))
   const knownEntityIds = new Set(schema.entityTypes.map((item) => item.id))
+  const knownConceptIds = new Set(schema.conceptTypes.map((item) => item.id))
   const knownRelationIds = new Set(schema.relationTypes.map((item) => item.id))
   const unknownEntityIds = [...requestedEntityIds].filter((id) => !knownEntityIds.has(id))
+  const unknownConceptIds = [...requestedConceptIds].filter((id) => !knownConceptIds.has(id))
   const unknownRelationIds = [...requestedRelationIds].filter((id) => !knownRelationIds.has(id))
   const queries = normalizeSelectionStrings(selection.queries, "queries", 20, 2_000)
   const maximumMatches = Math.min(Math.max(Number(selection.maxMatches) || 12, 1), 50)
   if (mode === "search" && queries.length === 0) fail("INVALID_INPUT", "search mode requires at least one query.")
-  if (mode === "types" && requestedEntityIds.size === 0 && requestedRelationIds.size === 0) {
-    fail("INVALID_INPUT", "types mode requires entity_type_ids or relation_type_ids.")
+  if (mode === "types" && requestedEntityIds.size === 0 && requestedConceptIds.size === 0 && requestedRelationIds.size === 0) {
+    fail("INVALID_INPUT", "types mode requires entity_type_ids, concept_type_ids, or relation_type_ids.")
   }
 
   if (mode === "search") {
     for (const match of rankedSchemaMatches(schema.entityTypes, queries, maximumMatches)) requestedEntityIds.add(match.id)
+    for (const match of rankedSchemaMatches(schema.conceptTypes, queries, maximumMatches)) requestedConceptIds.add(match.id)
     for (const match of rankedSchemaMatches(schema.relationTypes, queries, maximumMatches)) requestedRelationIds.add(match.id)
   }
   // A selected relation is unusable without its endpoint entity definitions.
@@ -618,16 +658,19 @@ function selectDomainSchemaItems(schema, selection) {
   }
 
   const entityTypeIds = new Set([...requestedEntityIds].filter((id) => knownEntityIds.has(id)))
+  const conceptTypeIds = new Set([...requestedConceptIds].filter((id) => knownConceptIds.has(id)))
   const relationTypeIds = new Set([...requestedRelationIds].filter((id) => knownRelationIds.has(id)))
   return {
-    items: domainSchemaItems(schema, entityTypeIds, relationTypeIds),
+    items: domainSchemaItems(schema, entityTypeIds, relationTypeIds, conceptTypeIds),
     metadata: {
       mode,
       full_schema_scan: false,
       queries,
       matched_entity_type_ids: [...entityTypeIds],
+      matched_concept_type_ids: [...conceptTypeIds],
       matched_relation_type_ids: [...relationTypeIds],
       unknown_entity_type_ids: unknownEntityIds,
+      unknown_concept_type_ids: unknownConceptIds,
       unknown_relation_type_ids: unknownRelationIds,
       complete_for_selection: true,
     },
@@ -654,6 +697,17 @@ function domainSchemaCatalogItems(schema) {
       description: entity.description.slice(0, 500),
       property_count: entity.properties.length,
       required_property_ids: entity.properties.filter((property) => property.required).map((property) => property.id),
+    })
+  }
+  for (const concept of schema.conceptTypes) {
+    items.push({
+      kind: "concept_type_summary",
+      id: concept.id,
+      name: concept.name,
+      aliases: concept.aliases,
+      description: concept.description.slice(0, 500),
+      property_count: concept.properties.length,
+      required_property_ids: concept.properties.filter((property) => property.required).map((property) => property.id),
     })
   }
   for (const relation of schema.relationTypes) {
@@ -748,10 +802,21 @@ function domainSchemaRuntime(schema) {
   if (cached) return cached
   const runtime = {
     entityLookup: typeLookup(schema.entityTypes, schema.policy.extractionMode),
+    conceptLookup: typeLookup(schema.conceptTypes, schema.policy.extractionMode),
     relationLookup: typeLookup(schema.relationTypes, schema.policy.extractionMode),
   }
   domainSchemaRuntimeCache.set(schema, runtime)
   return runtime
+}
+
+function normalizeConcept(original, lookup, mode) {
+  if (!original || typeof original !== "object" || Array.isArray(original)) return original
+  const rawType = original.conceptTypeId ?? (mode === "compatible" ? original.concept_type_id : undefined)
+  if (typeof rawType !== "string" || !rawType.trim()) return original
+  const type = resolveType(rawType, lookup, mode)
+  const value = { ...original, conceptTypeId: type?.id ?? rawType }
+  if (mode === "compatible") delete value.concept_type_id
+  return value
 }
 
 function resolveType(value, lookup, mode) {

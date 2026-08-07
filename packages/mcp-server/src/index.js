@@ -132,7 +132,7 @@ async function main() {
   const buildInfo = await loadBuildInfo()
   log("startup", { workspace: workspaceRoot, build: buildInfo, runtimeLogPath })
   const router = new HeadlessToolRouter(core)
-  const server = new Server({ name: "llm-wiki", version: "1.0.0" }, { capabilities: { tools: {} } })
+  const server = new Server({ name: "llm-wiki", version: "1.0.1" }, { capabilities: { tools: {} } })
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: router.listTools() }))
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const startedAt = Date.now()

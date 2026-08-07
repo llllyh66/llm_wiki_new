@@ -37,6 +37,7 @@ const toolDefinitions = [
       mode: { enum: ["page", "catalog", "search", "types"], description: "Use search for batch terms, catalog only when search is insufficient, types for exact IDs, or page for backward-compatible full scanning." },
       queries: { type: "array", minItems: 1, maxItems: 20, items: { type: "string", minLength: 1, maxLength: 2000 } },
       entity_type_ids: { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 200 } },
+      concept_type_ids: { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 200 } },
       relation_type_ids: { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 200 } },
       max_matches: { type: "integer", minimum: 1, maximum: 50 },
       cursor: { type: ["integer", "null"], minimum: 0 },
@@ -122,8 +123,8 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_finalize",
-    description: "Idempotently generate Core-owned source/index/overview/log pages, update deterministic indexes, lint, and complete a task.",
-    inputSchema: closedObject({ task_id: taskId }, ["task_id"]),
+    description: "Idempotently generate Core-owned source/index/overview/log pages, update deterministic indexes, lint, and complete a task. For a completed domain-Schema task, set refresh_page_metadata=true to backfill type frontmatter and Domain Classification sections without re-running extraction.",
+    inputSchema: closedObject({ task_id: taskId, refresh_page_metadata: { type: "boolean", description: "Refresh existing Wiki pages from the persisted task Schema and page coverage metadata." } }, ["task_id"]),
   },
   {
     name: "llm_wiki_status",

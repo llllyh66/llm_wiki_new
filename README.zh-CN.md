@@ -30,6 +30,12 @@ wiki/
 Core 会同时创建 `.llm-wiki/` 运行状态目录，保存受管理的原文、任务、
 索引、锁和事务日志。
 
+使用领域 Schema 时，实体或概念页面还会显示其领域分类。例如实体页面会在
+frontmatter 中加入 `domain_schema_id`、`domain_schema_version`、
+`domain_type_ids` 和 `domain_type_names`，正文中同步生成“领域分类”章节。
+类型由 Core 根据已校验的分析结果和任务 Schema 快照确定，Writer 不能自行
+修改。一个页面覆盖多个 requirement 时会保留全部合法类型。
+
 页面规划会把每个重要实体、概念和 Agent 提议页转成
 `page_requirements`。Writer 完成投影前必须逐项覆盖，所以不会再因
 `candidatePages` 过少而静默丢失实体或概念页。Core 会统一补齐
@@ -276,6 +282,9 @@ Agent 在 `entities` 中提交 `entityTypeId` 和 `properties`，在
 `relations` 中提交 `relationTypeId`、`sourceEntityLocalId` 和
 `targetEntityLocalId`。`compatible` 模式允许 Agent 使用中文名称或别名，
 Core 会将它们规范化为 Schema 中的稳定 ID。
+如果 Schema 提供可选的 `conceptTypes`，概念可以提交 `conceptTypeId`，对应的
+概念页面会使用同一套领域分类字段；未定义 `conceptTypes` 时，概念仍按通用
+概念抽取，不会被拒绝。
 允许使用 `"relationTypes": []`；这表示不启用领域级关系约束，Agent 仍按通用
 AnalysisEnvelope 抽取并保存关系，不检查关系类型、端点类型或关系属性。
 `entityTypes` 仍必须至少包含一个实体类型。只有 `relationTypes` 非空时，Core
@@ -296,6 +305,15 @@ AnalysisEnvelope 抽取并保存关系，不检查关系类型、端点类型或
 必填值在源文档中缺失时，Agent 不应编造。默认模板使用
 `"validationFailurePolicy": "reject-batch"`；该策略始终以
 可恢复的 `accepted: false` 返回，不会断开 MCP。
+
+为旧知识库补齐领域类型，可以让 Agent 调用：
+
+```text
+对任务 task-xxx 执行 finalize，并设置 refresh_page_metadata=true，
+为已有 Wiki 页面补齐领域 Schema 类型，不重新抽取正文。
+```
+
+该刷新是确定性的、可重复执行的，只更新页面元数据、领域分类章节和检索索引。
 
 也可显式指定其他 Schema：
 

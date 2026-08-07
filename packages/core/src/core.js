@@ -30,6 +30,7 @@ import {
   canonicalizeAnalysisSourceRefQuotes,
   collectSourceRefs,
   normalizeAnalysisEnvelope,
+  normalizePagePatchDomainClassifications,
   normalizePagePatchSourceRefs,
   validateAnalysisShape,
   validateGroundingQuality,
@@ -550,7 +551,7 @@ export class LlmWikiCore {
         domain_schema_pagination: schemaContext.pagination,
         domain_schema_auto_selection: automaticSchemaSelection,
         domain_extraction_instructions: domainSchema
-          ? `${automaticSchemaSelection?.ready ? "Use domain_schema_auto_selection directly; no Schema tool call is needed for this batch unless classification remains ambiguous. " : schemaContext.pagination ? "The automatic Schema selection was insufficient; use llm_wiki_get_domain_schema mode=search with focused batch terms, never a full scan. " : ""}Extract entities under this domain schema with localId, entityTypeId, properties, and sourceRefs. ${domainSchema.relationTypes.length > 0 ? "Relations require localId, relationTypeId, sourceEntityLocalId, targetEntityLocalId, properties, and sourceRefs." : "relationTypes is empty, so relations use the general AnalysisEnvelope format and are not constrained by the domain schema."} Do not infer missing required properties.`
+          ? `${automaticSchemaSelection?.ready ? "Use domain_schema_auto_selection directly; no Schema tool call is needed for this batch unless classification remains ambiguous. " : schemaContext.pagination ? "The automatic Schema selection was insufficient; use llm_wiki_get_domain_schema mode=search with focused batch terms, never a full scan. " : ""}Extract entities under this domain schema with localId, entityTypeId, properties, and sourceRefs. ${domainSchema.conceptTypes.length > 0 ? "When a concept matches a defined conceptTypes entry, include conceptTypeId; otherwise keep concepts untyped." : "No conceptTypes are defined, so concepts remain general knowledge concepts."} ${domainSchema.relationTypes.length > 0 ? "Relations require localId, relationTypeId, sourceEntityLocalId, targetEntityLocalId, properties, and sourceRefs." : "relationTypes is empty, so relations use the general AnalysisEnvelope format and are not constrained by the domain schema."} Do not infer missing required properties.`
           : null,
       },
       analysis_contract: {
@@ -646,6 +647,7 @@ export class LlmWikiCore {
         mode: input?.mode,
         queries: input?.queries,
         entityTypeIds: input?.entity_type_ids,
+        conceptTypeIds: input?.concept_type_ids,
         relationTypeIds: input?.relation_type_ids,
         maxMatches: input?.max_matches,
       }),
@@ -825,7 +827,8 @@ export class LlmWikiCore {
     }
     const analysisBatchIds = projection?.batchIds ?? record.batches.map((batch) => batch.batchId)
     const analyses = await loadAnalyses(record, analysisBatchIds)
-    const requirements = derivePageRequirements(analyses)
+    const domainSchema = await this.#taskDomainSchema(record)
+    const requirements = derivePageRequirements(analyses, domainSchema, record.task.domainSchema)
     const requirementIds = new Set(requirements.map((item) => item.requirement_id))
     const requirementTitles = new Set(requirements.map((item) => canonicalPageSlug(item.title)))
     const preferredPaths = new Set(requirements.map((item) => item.preferred_path))
@@ -846,6 +849,13 @@ export class LlmWikiCore {
         page_kind: parsed.type || null,
         summary: parsed.summary,
         covers: parsed.covers,
+        ...(parsed.domainSchemaId ? { domain_schema_id: parsed.domainSchemaId } : {}),
+        ...(parsed.domainSchemaVersion ? { domain_schema_version: parsed.domainSchemaVersion } : {}),
+        ...(parsed.domainTypeIds.length > 0 ? {
+          domain_type_kinds: parsed.domainTypeKinds,
+          domain_type_ids: parsed.domainTypeIds,
+          domain_type_names: parsed.domainTypeNames,
+        } : {}),
         file_hash: sha256(content),
         provisional: provisionalOwners.has(relative),
         ...(provisionalOwners.has(relative) ? { provisional_task_id: provisionalOwners.get(relative) } : {}),
@@ -1440,7 +1450,7 @@ export class LlmWikiCore {
     const requirements = Array.isArray(snapshot?.context?.required_pages)
       ? snapshot.context.required_pages
       : pageRequirementsWithPatchScaffolds(
-          derivePageRequirements(await loadAnalyses(record, projection.batchIds)),
+          derivePageRequirements(await loadAnalyses(record, projection.batchIds), await this.#taskDomainSchema(record), record.task.domainSchema),
           snapshot?.context?.existing_pages ?? [],
         )
     const normalizedPatches = this.#validateAndNormalizeStagedDrafts(
@@ -1609,10 +1619,11 @@ export class LlmWikiCore {
     const covered = new Map()
     const normalizedPatches = []
     const chunkIndex = this.#taskChunkIndex(record)
-    for (const submittedPatch of rawPatches) {
-      if (!submittedPatch || typeof submittedPatch !== "object" || Array.isArray(submittedPatch)) {
+    for (const rawPatch of rawPatches) {
+      if (!rawPatch || typeof rawPatch !== "object" || Array.isArray(rawPatch)) {
         fail("INVALID_PAGE_PATCH", "Each staged PagePatch must be an object.", { retryable: true, taskId: record.task.taskId })
       }
+      const submittedPatch = normalizePagePatchDomainClassifications(rawPatch, requirements).patch
       validatePagePatchShape(submittedPatch, workspace.config.limits)
       if (!shardPaths.has(submittedPatch.path)) {
         fail("INVALID_PAGE_PATCH", `Patch path is outside its assigned draft shard: ${submittedPatch.path}`, {
@@ -1684,7 +1695,7 @@ export class LlmWikiCore {
         }
       }
       const normalized = normalizePagePatchSourceRefs(submittedPatch, requirements)
-      const patch = normalized.patch
+      const patch = normalizePagePatchDomainClassifications(normalized.patch, requirements).patch
       canonicalizeAnalysisSourceRefQuotes(patch, record.batches, chunkIndex)
       validatePagePatchShape(patch, workspace.config.limits)
       validateSourceRefs(patch.sourceRefs, record.task, record.batches, workspace.config.limits, chunkIndex)
@@ -1851,7 +1862,7 @@ export class LlmWikiCore {
     }
     const commitBatchIds = commitProjection?.batchIds ?? record.task.completedBatchIds
     const commitAnalyses = await loadAnalyses(record, commitBatchIds)
-    const commitRequirements = derivePageRequirements(commitAnalyses)
+    const commitRequirements = derivePageRequirements(commitAnalyses, await this.#taskDomainSchema(record), record.task.domainSchema)
     let submittedManifestShardIds = []
     if (commitProjection?.completed !== true && commitProjection?.pagePlanTraversal?.serverSideManifest === true) {
       const snapshot = await this.#pagePlanSnapshot(record, commitProjection.projectionId)
@@ -1952,7 +1963,7 @@ export class LlmWikiCore {
       let patch = submittedPatch
       try {
         const normalized = normalizePagePatchSourceRefs(submittedPatch, commitRequirements)
-        patch = normalized.patch
+        patch = normalizePagePatchDomainClassifications(normalized.patch, commitRequirements).patch
         resolvedPageRequirementSourceRefs += normalized.resolvedRequirementSourceRefs
         normalizedPageSourceRefQuotes += canonicalizeAnalysisSourceRefQuotes(patch, record.batches, chunkIndex)
         validatePagePatchShape(patch, workspace.config.limits)
@@ -2216,7 +2227,26 @@ export class LlmWikiCore {
   async #finalize(input) {
     const workspace = await this.workspace()
     const record = await loadTask(workspace.paths, input?.task_id)
-    if (record.task.status === "completed") return readJson(record.paths.result)
+    if (record.task.status === "completed") {
+      const result = await readJson(record.paths.result)
+      if (input?.refresh_page_metadata !== true || !record.task.domainSchema) return result
+      const analyses = await loadAnalyses(record, record.task.completedBatchIds)
+      const requirements = derivePageRequirements(analyses, await this.#taskDomainSchema(record), record.task.domainSchema)
+      const refresh = await this.#refreshDomainPageMetadata(workspace, record, requirements)
+      if (refresh.updated_pages > 0) {
+        const retrievalIndexes = await buildRetrievalIndexes(workspace)
+        await writeJsonAtomic(path.join(workspace.paths.indexes, "bm25.json"), retrievalIndexes.bm25)
+        await writeJsonAtomic(path.join(workspace.paths.indexes, "vector.json"), retrievalIndexes.vector)
+        await writeJsonAtomic(path.join(workspace.paths.indexes, "embedding.json"), retrievalIndexes.embedding)
+        await writeJsonAtomic(path.join(workspace.paths.indexes, "graph.json"), await buildGraph(workspace.paths.wiki))
+        await writeJsonAtomic(path.join(workspace.paths.state, "lint.json"), await lintWiki(workspace))
+        record.task.wikiRevision = await hashDirectory(workspace.paths.wiki)
+        await saveTask(record.paths, record.task)
+      }
+      const refreshedResult = { ...result, domain_metadata_refresh: refresh, wiki_revision: record.task.wikiRevision }
+      await writeJsonAtomic(record.paths.result, refreshedResult)
+      return refreshedResult
+    }
     assertTaskStatus(record.task, ["planning", "committing", "finalizing", "failed"])
     const pageProjection = projectionState(record.task)
     const projectionUsed = pageProjection.revision > 0 || pageProjection.lease || pageProjection.provisionalPagePaths.length > 0
@@ -2234,7 +2264,8 @@ export class LlmWikiCore {
     const pageHistory = await committedPageRecords(workspace, commits)
     const pageRecords = latestPageRecords(pageHistory)
     const analyses = await loadAnalyses(record, record.task.completedBatchIds)
-    const requirements = derivePageRequirements(analyses)
+    const requirements = derivePageRequirements(analyses, await this.#taskDomainSchema(record), record.task.domainSchema)
+    const domainMetadataRefresh = await this.#refreshDomainPageMetadata(workspace, record, requirements)
     await this.#writeSourcePages(workspace, record, analyses, pageRecords)
     await enrichWikiRelations(workspace.paths.wiki, requirements)
     await writeTextAtomic(path.join(workspace.paths.wiki, "index.md"), await buildIndex(workspace.paths.wiki))
@@ -2270,9 +2301,58 @@ export class LlmWikiCore {
       lint: { errors: lint.errors, warnings: lint.warnings, info: lint.info, findings: lint.findings },
       indexing: { bm25: "completed", embedding: embeddingIndex.status, vector: "completed", vector_fallback: "completed", graph: "completed" },
       wiki_revision: record.task.wikiRevision,
+      ...(domainMetadataRefresh.updated_pages > 0 ? { domain_metadata_refresh: domainMetadataRefresh } : {}),
     }
     await writeJsonAtomic(record.paths.result, result)
     return result
+  }
+
+  async #refreshDomainPageMetadata(workspace, record, requirements) {
+    if (!record.task.domainSchema) return { updated_pages: 0, paths: [], skipped: "no_domain_schema" }
+    const requirementById = new Map((requirements ?? []).map((requirement) => [requirement.requirement_id, requirement]))
+    const files = await listFilesRecursive(workspace.paths.wiki, (candidate) => candidate.endsWith(".md"))
+    const updated = []
+    for (const file of files) {
+      const relative = `wiki/${relativePosix(workspace.paths.wiki, file)}`
+      if (["wiki/index.md", "wiki/overview.md", "wiki/log.md"].includes(relative)) continue
+      const content = await readFile(file, "utf8")
+      const parsed = parseWikiPage(content)
+      const matched = (parsed.covers ?? [])
+        .map((requirementId) => requirementById.get(requirementId))
+        .filter(Boolean)
+      const fallback = matched.length > 0 ? matched : (requirements ?? []).filter((requirement) => (
+        requirement.preferred_path === relative
+        || (pageKindForPath(relative) === requirement.page_kind && canonicalPageSlug(requirement.title) === canonicalPageSlug(parsed.title))
+      ))
+      if (fallback.length === 0) continue
+      const classifications = uniqueDomainClassifications(fallback.flatMap((requirement) => requirement.domain_classifications ?? []))
+      const patch = {
+        path: relative,
+        pageKind: normalizePageKind(parsed.type) ?? pageKindForPath(relative) ?? "topic",
+        title: parsed.title || path.basename(file, ".md"),
+        content,
+        sourceRefs: parsed.sources.map((sourceId) => ({ sourceId })),
+        tags: parsed.tags,
+        related: parsed.related,
+        covers: parsed.covers,
+        summary: parsed.summary,
+        domainSchemaId: classifications[0]?.schema_id ?? "",
+        domainSchemaVersion: classifications[0]?.schema_version ?? "",
+        domainClassifications: classifications.map((classification) => ({
+          kind: classification.kind,
+          typeId: classification.type_id,
+          typeName: classification.type_name,
+          schemaId: classification.schema_id,
+          schemaVersion: classification.schema_version,
+          ...(classification.resolved === false ? { resolved: false } : {}),
+        })),
+      }
+      const prepared = prepareWikiPageContent(patch, content)
+      if (prepared === content) continue
+      await writeTextAtomic(file, prepared)
+      updated.push(relative)
+    }
+    return { updated_pages: updated.length, paths: updated }
   }
 
   async status(input) {
@@ -2983,7 +3063,7 @@ async function loadAnalyses(record, batchIds) {
   return mapWithConcurrency(batchIds, 16, (batchId) => readJson(path.join(record.paths.analysis, `${batchId}.json`)))
 }
 
-function derivePageRequirements(analyses) {
+function derivePageRequirements(analyses, domainSchema = null, domainSchemaMetadata = null) {
   const requirements = new Map()
   const localRequirements = new Map()
   const globalLocalRequirements = new Map()
@@ -3005,6 +3085,9 @@ function derivePageRequirements(analyses) {
       collections: [],
       batch_ids: [],
       related_requirement_ids: [],
+      ...(domainSchemaMetadata?.schema_id ? { domain_schema_id: domainSchemaMetadata.schema_id } : {}),
+      ...(domainSchemaMetadata?.schema_version ? { domain_schema_version: domainSchemaMetadata.schema_version } : {}),
+      domain_classifications: [],
     }
     if (overrideKind && requirement.page_kind !== normalizedKind) {
       requirement.page_kind = normalizedKind
@@ -3014,6 +3097,10 @@ function derivePageRequirements(analyses) {
     requirement.source_refs = uniqueByStable([...requirement.source_refs, ...(candidate.sourceRefs ?? [])])
     requirement.collections = uniqueStrings([...requirement.collections, collection])
     requirement.batch_ids = uniqueStrings([...requirement.batch_ids, batchId])
+    requirement.domain_classifications = uniqueDomainClassifications([
+      ...(requirement.domain_classifications ?? []),
+      ...domainClassificationsForCandidate(candidate, collection, domainSchema, domainSchemaMetadata),
+    ])
     requirements.set(requirementId, requirement)
     const localId = candidate.localId ?? candidate.local_id
     if (typeof localId === "string" && localId) {
@@ -3081,6 +3168,18 @@ function pageRequirementsWithPatchScaffolds(requirements, existingPages) {
         pageKind: normalizePageKind(existing?.page_kind) ?? pageKindForPath(existing?.path) ?? requirement.page_kind,
         covers: [requirement.requirement_id],
         sourceRefs: [requirement.requirement_id],
+        ...(requirement.domain_classifications?.length > 0 ? {
+          domainSchemaId: requirement.domain_schema_id,
+          domainSchemaVersion: requirement.domain_schema_version,
+          domainClassifications: requirement.domain_classifications.map((classification) => ({
+            kind: classification.kind,
+            typeId: classification.type_id,
+            typeName: classification.type_name,
+            schemaId: classification.schema_id,
+            schemaVersion: classification.schema_version,
+            ...(classification.resolved === false ? { resolved: false } : {}),
+          })),
+        } : {}),
         ...(related.length > 0 ? { related } : {}),
         rationale: `Materialize page requirement ${requirement.requirement_id}.`,
       },
@@ -3090,6 +3189,52 @@ function pageRequirementsWithPatchScaffolds(requirements, existingPages) {
 
 function candidateTitle(candidate) {
   return String(candidate?.title ?? candidate?.name ?? "").normalize("NFKC").trim()
+}
+
+function domainClassificationsForCandidate(candidate, collection, domainSchema, domainSchemaMetadata) {
+  if (!domainSchema || !candidate || typeof candidate !== "object") return []
+  const candidates = []
+  const entityTypeId = candidate.entityTypeId ?? candidate.entity_type_id ?? (collection === "entities" ? candidate.entityType : undefined)
+  if (typeof entityTypeId === "string" && entityTypeId.trim()) {
+    const normalizedId = entityTypeId.normalize("NFKC").trim()
+    const definition = domainSchema.entityTypes.find((item) => item.id === normalizedId)
+      ?? domainSchema.entityTypes.find((item) => [item.id, item.name, ...item.aliases].some((value) => value.normalize("NFKC").toLowerCase() === normalizedId.toLowerCase()))
+    candidates.push({
+      kind: "entity",
+      type_id: definition?.id ?? normalizedId,
+      type_name: definition?.name ?? normalizedId,
+      schema_id: domainSchemaMetadata?.schema_id ?? domainSchema.schemaId,
+      schema_version: domainSchemaMetadata?.schema_version ?? domainSchema.schemaVersion,
+      ...(definition ? {} : { resolved: false }),
+    })
+  }
+  const conceptTypeId = candidate.conceptTypeId ?? candidate.concept_type_id
+  const conceptTypes = Array.isArray(domainSchema.conceptTypes) ? domainSchema.conceptTypes : []
+  if (typeof conceptTypeId === "string" && conceptTypeId.trim()) {
+    const normalizedId = conceptTypeId.normalize("NFKC").trim()
+    const definition = conceptTypes.find((item) => item.id === normalizedId)
+      ?? conceptTypes.find((item) => [item.id, item.name, ...item.aliases].some((value) => value.normalize("NFKC").toLowerCase() === normalizedId.toLowerCase()))
+    candidates.push({
+      kind: "concept",
+      type_id: definition?.id ?? normalizedId,
+      type_name: definition?.name ?? normalizedId,
+      schema_id: domainSchemaMetadata?.schema_id ?? domainSchema.schemaId,
+      schema_version: domainSchemaMetadata?.schema_version ?? domainSchema.schemaVersion,
+      ...(definition ? {} : { resolved: false }),
+    })
+  }
+  return candidates
+}
+
+function uniqueDomainClassifications(values) {
+  const seen = new Set()
+  return values.filter((item) => {
+    if (!item || typeof item.type_id !== "string" || !item.type_id || typeof item.type_name !== "string" || !item.type_name) return false
+    const key = `${item.kind}:${item.type_id}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
 }
 
 function shouldMaterialize(candidate) {

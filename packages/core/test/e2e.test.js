@@ -374,6 +374,108 @@ test("domain schema is snapshotted, exposed to the Agent, and normalizes or drop
   assert.equal(plan.analysis_summary.relations[0].relationTypeId, "subject_owns_object")
 })
 
+test("domain entity types are projected into Wiki frontmatter and body", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const domainSource = path.join(f.incoming, "typed-page.md")
+  await writeFile(domainSource, "# 业务记录\n\n客户 C-001 的名称为张三。\n")
+  const domainSchema = JSON.parse(await readFile(domainSchemaPath, "utf8"))
+  const imported = await f.core.importFiles({
+    files: [{ path: domainSource }],
+    options: { domain_schema: domainSchema },
+  })
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  const chunk = batch.chunks[0]
+  const sourceRef = {
+    sourceId: chunk.sourceId,
+    chunkId: chunk.chunkId,
+    quote: "客户 C-001 的名称为张三。",
+    locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
+  }
+  await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    analysis: {
+      ...batch.analysis_scaffold,
+      sourceRefs: [sourceRef],
+      entities: [{ localId: "subject-1", name: "张三", entityTypeId: "business_subject", properties: { subject_id: "C-001", subject_name: "张三" }, sourceRefs: [0] }],
+      batchSummary: "客户记录。",
+    },
+    idempotency_key: "domain-page-type-analysis-v1",
+  })
+  const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
+  const requirement = plan.page_requirements.find((item) => item.title === "张三")
+  assert.ok(requirement)
+  assert.deepEqual(requirement.domain_classifications.map((item) => item.type_id), ["business_subject"])
+  assert.deepEqual(requirement.patch_scaffold.domainClassifications.map((item) => item.typeName), ["业务主体"])
+  const committed = await f.core.commitPages({
+    task_id: imported.task_id,
+    based_on_wiki_revision: plan.based_on_wiki_revision,
+    idempotency_key: "domain-page-type-commit-v1",
+    patches: [{
+      ...requirement.patch_scaffold,
+      content: "# 张三\n\n客户主体。\n",
+      summary: "客户主体。",
+      domainClassifications: [{ kind: "entity", typeId: "spoofed_type", typeName: "错误类型" }],
+      rationale: "领域 Schema 将该实体分类为业务主体。",
+    }],
+  })
+  assert.equal(committed.accepted, true)
+  await f.core.finalize({ task_id: imported.task_id })
+  const page = await readFile(path.join(f.workspace, "wiki", "entities", "张三.md"), "utf8")
+  assert.match(page, /domain_schema_id: "your-domain-schema"/)
+  assert.match(page, /domain_type_ids: \["business_subject"\]/)
+  assert.match(page, /domain_type_names: \["业务主体"\]/)
+  assert.match(page, /## 领域分类/)
+  assert.match(page, /业务主体（`business_subject`）/)
+  await writeFile(path.join(f.workspace, "wiki", "entities", "张三.md"), `---\ntype: "entity"\ntitle: "张三"\ncreated: "2026-08-07"\nupdated: "2026-08-07"\ntags: []\nrelated: []\nsources: ["${sourceRef.sourceId}"]\ncovers: ["${requirement.requirement_id}"]\nsummary: "旧页面"\n---\n\n# 张三\n\n旧页面。\n`)
+  const refreshed = await f.core.finalize({ task_id: imported.task_id, refresh_page_metadata: true })
+  assert.equal(refreshed.domain_metadata_refresh.updated_pages, 1)
+  assert.match(await readFile(path.join(f.workspace, "wiki", "entities", "张三.md"), "utf8"), /domain_type_ids: \["business_subject"\]/)
+})
+
+test("optional concept types are normalized and projected into concept pages", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const domainSource = path.join(f.incoming, "typed-concept.md")
+  await writeFile(domainSource, "# 概念\n\n用户体验属于服务质量。\n")
+  const domainSchema = JSON.parse(await readFile(domainSchemaPath, "utf8"))
+  domainSchema.conceptTypes = [{ id: "service_quality", name: "服务质量", properties: [] }]
+  const imported = await f.core.importFiles({ files: [{ path: domainSource }], options: { domain_schema: domainSchema } })
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  const chunk = batch.chunks[0]
+  const sourceRef = {
+    sourceId: chunk.sourceId,
+    chunkId: chunk.chunkId,
+    quote: "用户体验属于服务质量。",
+    locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
+  }
+  await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    analysis: {
+      ...batch.analysis_scaffold,
+      sourceRefs: [sourceRef],
+      concepts: [{ localId: "concept-1", name: "用户体验", conceptTypeId: "service_quality", sourceRefs: [0] }],
+      batchSummary: "用户体验概念。",
+    },
+    idempotency_key: "domain-concept-type-analysis-v1",
+  })
+  const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
+  const requirement = plan.page_requirements.find((item) => item.title === "用户体验")
+  assert.deepEqual(requirement.domain_classifications.map((item) => item.type_id), ["service_quality"])
+  await f.core.commitPages({
+    task_id: imported.task_id,
+    based_on_wiki_revision: plan.based_on_wiki_revision,
+    idempotency_key: "domain-concept-type-commit-v1",
+    patches: [{ ...requirement.patch_scaffold, content: "# 用户体验\n\n服务质量相关概念。\n", rationale: "Schema concept type." }],
+  })
+  await f.core.finalize({ task_id: imported.task_id })
+  const page = await readFile(path.join(f.workspace, "wiki", "concepts", "用户体验.md"), "utf8")
+  assert.match(page, /domain_type_kinds: \["concept"\]/)
+  assert.match(page, /domain_type_names: \["服务质量"\]/)
+})
+
 test("large domain schemas are summarized in batches and retrieved through bounded pages", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))

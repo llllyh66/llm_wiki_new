@@ -41,6 +41,14 @@ available only through the explicit `accept_dropped_candidates` commit option;
 constraints and keeps general relation extraction enabled. `entityTypes` must
 still contain at least one type.
 
+Typed Wiki pages are projected from the validated task Schema. Entity and
+optional concept pages receive `domain_schema_id`, `domain_schema_version`,
+`domain_type_ids`, and `domain_type_names` in frontmatter, plus a generated
+Domain Classification section. The Core derives these fields from covered page
+requirements, so a Writer cannot invent or silently omit a type. Existing pages
+can be backfilled by calling `llm_wiki_finalize` with
+`refresh_page_metadata: true`.
+
 No desktop application, separate HTTP server, project creation, Provider API
 key, or `raw/sources/` directory is required.
 

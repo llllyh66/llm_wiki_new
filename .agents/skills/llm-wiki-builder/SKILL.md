@@ -476,6 +476,10 @@ always use it and return control to the user while the worker runs.
       `[[collection/slug]]` and must also appear in `patch.related`; never emit
       a raw `wiki/collection/slug.md` path. Author a clear H1 and a
       self-contained source-grounded body.
+      When a page requirement carries `domain_classifications`, preserve the
+      scaffold and describe the supplied entity or concept type in the page.
+      Core recomputes and writes the authoritative type metadata from `covers`,
+      so do not invent a different type or manually rewrite its IDs.
       The Core deterministically normalizes the full standard frontmatter
       (`type`, `title`, `created`, `updated`, `tags`, `related`, `sources`,
       `covers`, `summary`) and makes valid Related links bidirectional during

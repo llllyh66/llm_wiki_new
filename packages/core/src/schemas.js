@@ -80,6 +80,7 @@ export const analysisSchema = Object.freeze({
         content: { type: "string" },
         confidence: { type: "number", minimum: 0, maximum: 1 },
         entityTypeId: { type: "string", description: "Domain entity type ID. Required for entities when a domain schema is active." },
+        conceptTypeId: { type: "string", description: "Optional domain concept type ID when the active Schema defines conceptTypes." },
         relationTypeId: { type: "string", description: "Domain relation type ID. Required only when the active domain schema defines non-empty relationTypes." },
         sourceEntityLocalId: { type: "string", description: "localId of the source entity in a constrained domain relation." },
         targetEntityLocalId: { type: "string", description: "localId of the target entity in a constrained domain relation." },
@@ -116,6 +117,25 @@ export const pagePatchSchema = Object.freeze({
     pageKind: { type: "string", minLength: 1, maxLength: 100 },
     content: { type: "string", minLength: 1 },
     summary: { type: "string", maxLength: 500 },
+    domainSchemaId: { type: "string", minLength: 1, maxLength: 200 },
+    domainSchemaVersion: { type: "string", minLength: 1, maxLength: 200 },
+    domainClassifications: {
+      type: "array",
+      maxItems: 100,
+      items: {
+        type: "object",
+        required: ["kind", "typeId", "typeName"],
+        properties: {
+          kind: { type: "string", enum: ["entity", "concept"] },
+          typeId: { type: "string", minLength: 1, maxLength: 200 },
+          typeName: { type: "string", minLength: 1, maxLength: 500 },
+          schemaId: { type: "string", maxLength: 200 },
+          schemaVersion: { type: "string", maxLength: 200 },
+          resolved: { type: "boolean" },
+        },
+        additionalProperties: false,
+      },
+    },
     tags: { type: "array", items: { type: "string", minLength: 1, maxLength: 200 }, maxItems: 100 },
     related: {
       type: "array",

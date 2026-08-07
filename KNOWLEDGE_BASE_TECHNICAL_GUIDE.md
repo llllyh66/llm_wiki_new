@@ -47,6 +47,28 @@ Agent 调用 `llm_wiki_import_files`：
 
 领域 Schema 会被校验并快照到任务中。之后即使外部 Schema 文件改变，本次任务仍使用原快照。
 
+### 2.2a 页面领域分类投影
+
+分析结果中的 `entities[].entityTypeId`（以及定义了可选 `conceptTypes` 时的
+`concepts[].conceptTypeId`）会在 page requirement 阶段解析为稳定的领域分类：
+
+```yaml
+domain_schema_id: "your-domain-schema"
+domain_schema_version: "1.0.0"
+domain_type_kinds: ["entity"]
+domain_type_ids: ["business_subject"]
+domain_type_names: ["业务主体"]
+```
+
+Core 将同样的信息写入正文的“领域分类”章节。类型名称和 ID 来自任务 Schema
+快照，不来自 Writer 自由生成的字段；一个页面覆盖多个 requirement 时取合法类型
+的并集。没有 Schema 或没有对应类型的旧页面保持兼容。
+
+页面重写和 staged PagePatch 提交时，Core 会根据 `covers` 重新计算领域分类，
+避免 Writer 漏填、伪造或在跨 batch 合并时覆盖类型。已完成任务可使用
+`llm_wiki_finalize({task_id, refresh_page_metadata: true})` 对已有页面执行幂等
+元数据刷新；刷新不重新调用模型，只更新 frontmatter、分类章节和检索索引。
+
 ### 2.2 分批和并行抽取
 
 导入后主 Agent 只负责读取一次状态并启动后台 `llm-wiki-extractor`。即使文件只形成一个 batch，也保持后台 Agent-first 模式；主 Agent 只有在明确记录了 worker 创建失败、worker MCP 工具缺失或真实 MCP 传输错误后，才允许前台兜底处理。Agent 通过 `llm_wiki_get_batch` 获取一个批次。Core 会：

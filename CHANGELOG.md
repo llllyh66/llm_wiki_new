@@ -1,5 +1,17 @@
 # 更新日志
 
+## [V1.0.1] - 2026-08-07
+
+### 领域 Schema 类型投影
+
+- 实体页面现在从已验证的 `entityTypeId` 自动生成领域 Schema 元数据和“领域分类”正文章节。
+- 可选 `conceptTypes` 与 `conceptTypeId` 获得同样的兼容式页面投影支持；未配置时不改变原有概念抽取行为。
+- Page Requirement、PagePatch scaffold、staged draft 和最终提交统一携带领域分类，Core 根据 `covers` 重新计算，避免 Writer 漏填或伪造类型。
+- 页面 frontmatter 新增 `domain_schema_id`、`domain_schema_version`、`domain_type_kinds`、`domain_type_ids`、`domain_type_names`。
+- `llm_wiki_finalize` 增加 `refresh_page_metadata=true`，可对已完成任务的旧 Wiki 页面幂等补齐领域类型，并重建检索索引。
+- 保持 `V1.0.0` 的领域 Schema、RelationTypes 为空、MCP 错误恢复和旧 PagePatch 格式兼容。
+- 新增领域类型页面投影与旧页面刷新回归测试。
+
 ## [Unreleased] - 2026-08-06
 
 ### Writer 职责与 Related 一致性修复

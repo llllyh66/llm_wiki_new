@@ -79,6 +79,11 @@ export function parseWikiPage(content) {
     sources: arrayValue(fields.sources),
     covers: arrayValue(fields.covers),
     summary: scalarValue(fields.summary),
+    domainSchemaId: scalarValue(fields.domain_schema_id),
+    domainSchemaVersion: scalarValue(fields.domain_schema_version),
+    domainTypeKinds: arrayValue(fields.domain_type_kinds),
+    domainTypeIds: arrayValue(fields.domain_type_ids),
+    domainTypeNames: arrayValue(fields.domain_type_names),
   }
 }
 
@@ -109,8 +114,20 @@ export function prepareWikiPageContent(patch, existingContent = "", date = new D
   const covers = uniqueStrings([...existing.covers, ...incoming.covers, ...(Array.isArray(patch.covers) ? patch.covers : [])])
   const created = scalarValue(existing.fields.created) || scalarValue(incoming.fields.created) || date
   const summary = String(patch.summary ?? incoming.summary ?? existing.summary ?? firstSummary(body)).trim().slice(0, 500)
+  const incomingDomain = domainClassificationsFromPage(incoming)
+  const existingDomain = domainClassificationsFromPage(existing)
+  const patchDomain = normalizeDomainClassifications(patch.domainClassifications)
+  // When Core supplies domainClassifications, it is authoritative: the page
+  // must not retain a stale or model-invented type from the incoming body.
+  // For legacy patches that omit the field, preserve existing metadata.
+  const domainClassifications = Array.isArray(patch.domainClassifications)
+    ? patchDomain
+    : uniqueDomainClassifications([...existingDomain, ...incomingDomain])
+  const domainSchemaId = String(patch.domainSchemaId ?? incoming.domainSchemaId ?? existing.domainSchemaId ?? domainClassifications[0]?.schemaId ?? "").trim()
+  const domainSchemaVersion = String(patch.domainSchemaVersion ?? incoming.domainSchemaVersion ?? existing.domainSchemaVersion ?? domainClassifications[0]?.schemaVersion ?? "").trim()
   const normalizedRelated = related.filter((slug) => !selfSlugs.has(slug))
   body = withRelatedSection(body, normalizedRelated)
+  body = withDomainClassificationSection(body, domainClassifications)
   const standard = {
     type: pageKind,
     title: patch.title,
@@ -121,6 +138,13 @@ export function prepareWikiPageContent(patch, existingContent = "", date = new D
     sources,
     covers,
     summary,
+  }
+  if (domainSchemaId) standard.domain_schema_id = domainSchemaId
+  if (domainSchemaVersion) standard.domain_schema_version = domainSchemaVersion
+  if (domainClassifications.length > 0) {
+    standard.domain_type_kinds = domainClassifications.map((item) => item.kind)
+    standard.domain_type_ids = domainClassifications.map((item) => item.typeId)
+    standard.domain_type_names = domainClassifications.map((item) => item.typeName)
   }
   const preserved = Object.entries(incoming.fields)
     .filter(([key]) => !Object.hasOwn(standard, key))
@@ -136,12 +160,73 @@ export function prepareWikiPageContent(patch, existingContent = "", date = new D
     `sources: ${yamlArray(standard.sources)}`,
     `covers: ${yamlArray(standard.covers)}`,
     `summary: ${yamlScalar(standard.summary)}`,
+    ...(standard.domain_schema_id ? [`domain_schema_id: ${yamlScalar(standard.domain_schema_id)}`] : []),
+    ...(standard.domain_schema_version ? [`domain_schema_version: ${yamlScalar(standard.domain_schema_version)}`] : []),
+    ...(standard.domain_type_kinds ? [`domain_type_kinds: ${yamlArray(standard.domain_type_kinds)}`] : []),
+    ...(standard.domain_type_ids ? [`domain_type_ids: ${yamlArray(standard.domain_type_ids)}`] : []),
+    ...(standard.domain_type_names ? [`domain_type_names: ${yamlArray(standard.domain_type_names)}`] : []),
     ...preserved,
     "---",
     "",
     body,
   ]
   return `${lines.join("\n").trimEnd()}\n`
+}
+
+function domainClassificationsFromPage(page) {
+  const ids = page.domainTypeIds ?? []
+  const names = page.domainTypeNames ?? []
+  const kinds = page.domainTypeKinds ?? []
+  return uniqueDomainClassifications(ids.map((typeId, index) => ({
+    kind: kinds[index] || "entity",
+    typeId,
+    typeName: names[index] || typeId,
+    schemaId: page.domainSchemaId,
+    schemaVersion: page.domainSchemaVersion,
+  })))
+}
+
+function normalizeDomainClassifications(values) {
+  if (!Array.isArray(values)) return []
+  return uniqueDomainClassifications(values.map((item) => ({
+    kind: String(item?.kind ?? "entity").trim().toLowerCase() || "entity",
+    typeId: String(item?.typeId ?? item?.type_id ?? "").trim(),
+    typeName: String(item?.typeName ?? item?.type_name ?? item?.typeId ?? item?.type_id ?? "").trim(),
+    schemaId: String(item?.schemaId ?? item?.schema_id ?? "").trim(),
+    schemaVersion: String(item?.schemaVersion ?? item?.schema_version ?? "").trim(),
+    ...(item?.resolved === false ? { resolved: false } : {}),
+  })).filter((item) => item.typeId && item.typeName))
+}
+
+function uniqueDomainClassifications(values) {
+  const seen = new Set()
+  return values.filter((item) => {
+    if (!item?.typeId || !item?.typeName) return false
+    const key = `${item.kind}:${item.typeId}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function withDomainClassificationSection(body, classifications) {
+  const normalizedBody = String(body ?? "").trim()
+  const headings = /^#{2,6}\s+(?:Domain Classification|领域分类|领域类型)\s*$/im
+  const match = normalizedBody.match(headings)
+  if (classifications.length === 0) return normalizedBody
+  const language = classifications.some((item) => /[\u3400-\u9fff]/u.test(item.typeName)) ? "zh" : "en"
+  const heading = language === "zh" ? "## 领域分类" : "## Domain Classification"
+  const lines = classifications.map((item) => {
+    const unresolved = item.resolved === false ? "（未解析）" : ""
+    return `- ${item.typeName}（\`${item.typeId}\`）${unresolved}`
+  })
+  const section = `${heading}\n\n${lines.join("\n")}`
+  if (!match || match.index === undefined) return `${normalizedBody}\n\n${section}`.trim()
+  const afterHeading = match.index + match[0].length
+  const remainder = normalizedBody.slice(afterHeading)
+  const nextHeading = remainder.search(/^#{1,6}\s+/m)
+  const end = nextHeading < 0 ? normalizedBody.length : afterHeading + nextHeading
+  return `${normalizedBody.slice(0, match.index).trimEnd()}\n\n${section}\n\n${normalizedBody.slice(end).trimStart()}`.trim()
 }
 
 export function setWikiPageRelated(content, related) {

@@ -17,7 +17,7 @@ const ANALYSIS_TOP_LEVEL_FIELDS = new Set([
   "claims", "relations", "contradictions", "candidatePages", "reviewItems", "batchSummary", "unresolvedQuestions",
 ])
 const ANALYSIS_ARRAY_LIMITS = Object.freeze({ sourceRefs: 500, entities: 500, concepts: 500, claims: 1_000, relations: 1_000, contradictions: 500, candidatePages: 500, reviewItems: 500, unresolvedQuestions: 200 })
-const PAGE_PATCH_FIELDS = new Set(["patchId", "path", "operation", "expectedFileHash", "title", "pageKind", "content", "summary", "tags", "related", "covers", "sourceRefs", "rationale"])
+const PAGE_PATCH_FIELDS = new Set(["patchId", "path", "operation", "expectedFileHash", "title", "pageKind", "content", "summary", "domainSchemaId", "domainSchemaVersion", "domainClassifications", "tags", "related", "covers", "sourceRefs", "rationale"])
 
 export function normalizeAnalysisEnvelope(analysis, options = {}) {
   if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) {
@@ -513,12 +513,83 @@ export function validatePagePatchShape(patch, limits) {
     }
   }
   if (patch.summary !== undefined && (typeof patch.summary !== "string" || patch.summary.length > 500)) fail("INVALID_PAGE_PATCH", "Patch summary must not exceed 500 characters.")
+  for (const field of ["domainSchemaId", "domainSchemaVersion"]) {
+    if (patch[field] !== undefined && (typeof patch[field] !== "string" || patch[field].length === 0 || patch[field].length > 200)) {
+      fail("INVALID_PAGE_PATCH", `${field} must be a non-empty string no longer than 200 characters.`)
+    }
+  }
+  if (patch.domainClassifications !== undefined) {
+    if (!Array.isArray(patch.domainClassifications) || patch.domainClassifications.length > 100) {
+      fail("INVALID_PAGE_PATCH", "domainClassifications must be an array with at most 100 items.")
+    }
+    for (const [index, classification] of patch.domainClassifications.entries()) {
+      if (!classification || typeof classification !== "object" || Array.isArray(classification)) {
+        fail("INVALID_PAGE_PATCH", `domainClassifications[${index}] must be an object.`)
+      }
+      if (!["entity", "concept"].includes(classification.kind)
+        || typeof classification.typeId !== "string" || !classification.typeId.trim()
+        || typeof classification.typeName !== "string" || !classification.typeName.trim()) {
+        fail("INVALID_PAGE_PATCH", `domainClassifications[${index}] requires kind, typeId, and typeName.`)
+      }
+      for (const field of ["schemaId", "schemaVersion"]) {
+        if (classification[field] !== undefined && (typeof classification[field] !== "string" || classification[field].length > 200)) {
+          fail("INVALID_PAGE_PATCH", `domainClassifications[${index}].${field} is invalid.`)
+        }
+      }
+      if (classification.typeId.length > 200 || classification.typeName.length > 500) {
+        fail("INVALID_PAGE_PATCH", `domainClassifications[${index}] exceeds its length limit.`)
+      }
+    }
+  }
   validatePagePath(patch.path)
   const normalizedKind = normalizePageKind(patch.pageKind)
   const pathKind = pageKindForPath(patch.path)
   if (!normalizedKind || !pathKind || normalizedKind !== pathKind) fail("INVALID_PAGE_PATCH", "pageKind must match the Wiki collection in path.")
   if (patch.content.length > limits.maxPageChars) fail("INVALID_PAGE_PATCH", "Page content exceeds the workspace limit.")
   if (patch.expectedFileHash !== undefined && !/^[0-9a-f]{64}$/i.test(patch.expectedFileHash)) fail("INVALID_PAGE_PATCH", "expectedFileHash must be a SHA256 value.")
+}
+
+// Domain classifications are derived from the server-side page requirements.
+// A Writer may receive them as scaffolding for prose generation, but it cannot
+// change the classification that Core persists. Tasks without a domain Schema
+// retain legacy patch behavior for compatibility.
+export function normalizePagePatchDomainClassifications(patch, requirements) {
+  if (!patch || typeof patch !== "object" || Array.isArray(patch) || !Array.isArray(requirements)) {
+    return { patch, derived: false }
+  }
+  const hasDomainSchema = requirements.some((requirement) => typeof requirement?.domain_schema_id === "string" && requirement.domain_schema_id)
+  if (!hasDomainSchema) return { patch, derived: false }
+  const requirementById = new Map(requirements.map((requirement) => [requirement?.requirement_id, requirement]))
+  const coveredIds = Array.isArray(patch.covers) ? patch.covers : []
+  const classifications = []
+  const seen = new Set()
+  for (const requirementId of coveredIds) {
+    const requirement = requirementById.get(requirementId)
+    for (const classification of requirement?.domain_classifications ?? []) {
+      const key = `${classification.kind}:${classification.type_id}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      classifications.push({
+        kind: classification.kind,
+        typeId: classification.type_id,
+        typeName: classification.type_name,
+        schemaId: classification.schema_id,
+        schemaVersion: classification.schema_version,
+        ...(classification.resolved === false ? { resolved: false } : {}),
+      })
+    }
+  }
+  const schemaId = classifications.find((item) => item.schemaId)?.schemaId
+  const schemaVersion = classifications.find((item) => item.schemaVersion)?.schemaVersion
+  return {
+    patch: {
+      ...patch,
+      domainClassifications: classifications,
+      ...(schemaId ? { domainSchemaId: schemaId } : {}),
+      ...(schemaVersion ? { domainSchemaVersion: schemaVersion } : {}),
+    },
+    derived: true,
+  }
 }
 
 export function normalizePagePatchSourceRefs(patch, requirements) {

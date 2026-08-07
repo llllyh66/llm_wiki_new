@@ -45,6 +45,23 @@ For every domain entity, emit:
 - If required evidence is absent, omit that entity and add an unsourced concern
   to `unresolvedQuestions`; do not submit a knowingly invalid placeholder.
 
+## Optional concept types
+
+When the task Schema exposes `conceptTypes`, a sourced concept may include its
+canonical `conceptTypeId`:
+
+```json
+{
+  "localId": "concept-service-quality",
+  "name": "服务质量",
+  "conceptTypeId": "service_quality",
+  "sourceRefs": [0]
+}
+```
+
+Concepts remain valid and general when no `conceptTypes` are defined. Do not
+invent a concept type merely to populate a page.
+
 ## Relation output
 
 If `relationTypes` is empty, skip all domain-level relation validation rules in
