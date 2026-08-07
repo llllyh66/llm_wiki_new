@@ -1,4 +1,4 @@
-import { readFile, readdir, rm } from "node:fs/promises"
+import { lstat, readFile, readdir, rm } from "node:fs/promises"
 import path from "node:path"
 import { LlmWikiError, asLlmWikiError, fail } from "./errors.js"
 import {
@@ -27,6 +27,7 @@ import {
 } from "./task-store.js"
 import { cleanupTransactionArtifacts, commitPageTransaction, committedPageRecords, markPageTransactionCommitted, recoverPendingPageTransactions } from "./transaction.js"
 import {
+  assertNoSymlinkEscape,
   canonicalizeAnalysisSourceRefQuotes,
   collectSourceRefs,
   normalizeAnalysisEnvelope,
@@ -35,18 +36,22 @@ import {
   validateAnalysisShape,
   validateGroundingQuality,
   validatePagePatchShape,
+  validatePagePath,
   validateSourceRefs,
 } from "./validation.js"
 import { ensureWorkspace, resolveWorkspaceRoot, workspacePaths } from "./workspace.js"
 import {
+  applyWikiPageSectionChanges,
   canonicalPageSlug,
   extractRelatedReferences,
+  listWikiPageSections,
   normalizePageKind,
   normalizeRelatedSlug,
   pageKindForPath,
   parseWikiPage,
   preferredPagePath,
   prepareWikiPageContent,
+  readWikiPageSection,
   setWikiPageRelated,
 } from "./wiki-page.js"
 import {
@@ -1420,6 +1425,11 @@ export class LlmWikiCore {
     return this.#withWorkspaceWriteLock(() => this.#withTaskLock(input?.task_id, () => this.#commitPages(input), operationSignal(input)), operationSignal(input))
   }
 
+  async updatePages(input) {
+    if (input?.action === "inspect") return this.#inspectWikiPages(input)
+    return this.#withWorkspaceWriteLock(() => this.#withTaskLock(input?.task_id, () => this.#updateWikiPages(input), operationSignal(input)), operationSignal(input))
+  }
+
   // Page drafters never need to return a full PagePatch payload to the
   // coordinator. They stage one validated, path-disjoint shard in the task's
   // private draft area; the stable Writer later asks Core to commit that
@@ -1761,6 +1771,279 @@ export class LlmWikiCore {
       })
       return { ...context, accepted: true, automated: false, renderer: "agent-semantic-writer-v1", writer_mode: "legacy-semantic", semantic_writer_required: true }
     }, operationSignal(input))
+  }
+
+  async #inspectWikiPages(input) {
+    const workspace = await this.workspace()
+    const record = await loadTask(workspace.paths, input?.task_id)
+    assertTaskStatus(record.task, ["completed"])
+    const targets = Array.isArray(input?.targets) ? input.targets : []
+    if (targets.length === 0 || targets.length > 20) {
+      fail("INVALID_INPUT", "inspect requires 1 to 20 page targets.", { retryable: true, taskId: record.task.taskId })
+    }
+    const maxChars = Math.min(Math.max(Number(input?.max_chars) || 120_000, 1_000), 240_000)
+    const pageSourceRefs = await readJson(path.join(workspace.paths.indexes, "page-source-refs.json"), { schemaVersion: 1, pages: {} })
+    const pages = []
+    const seenPaths = new Set()
+    let returnedChars = 0
+    for (const target of targets) {
+      const page = await readManagedWikiPage(workspace, target?.path)
+      if (seenPaths.has(page.path)) fail("INVALID_INPUT", `Duplicate inspect target path: ${page.path}`, { retryable: true, taskId: record.task.taskId })
+      seenPaths.add(page.path)
+      const heading = typeof target?.heading === "string" && target.heading.trim() ? target.heading.trim() : null
+      const selected = heading ? readWikiPageSection(page.content, heading) : null
+      if (selected?.ambiguous) {
+        fail("WIKI_SECTION_AMBIGUOUS", `Section heading is duplicated in ${page.path}: ${heading}`, {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { path: page.path, heading },
+        })
+      }
+      if (heading && !selected?.found) {
+        fail("WIKI_SECTION_NOT_FOUND", `Section does not exist in ${page.path}: ${heading}`, {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { path: page.path, heading },
+        })
+      }
+      const selectedContent = heading ? selected.content : page.content
+      const includeContent = returnedChars + selectedContent.length <= maxChars
+      if (includeContent) returnedChars += selectedContent.length
+      pages.push({
+        path: page.path,
+        file_hash: page.fileHash,
+        title: page.parsed.title,
+        page_kind: normalizePageKind(page.parsed.type) ?? pageKindForPath(page.path),
+        sections: listWikiPageSections(page.content).map((section) => ({ heading: section.heading, level: section.level, content_chars: section.content.length })),
+        source_ref_count: Array.isArray(pageSourceRefs.pages?.[page.path]) ? pageSourceRefs.pages[page.path].length : 0,
+        ...(heading
+          ? { section: { heading: selected.heading, level: selected.level, content_chars: selected.content.length, ...(includeContent ? { content: selected.content } : { content_omitted: true }) } }
+          : { content_chars: page.content.length, ...(includeContent ? { content: page.content } : { content_omitted: true }) }),
+      })
+    }
+    return {
+      accepted: true,
+      action: "inspect",
+      task_id: record.task.taskId,
+      wiki_revision: workspace.revision,
+      generation_id: record.task.generationId ?? null,
+      returned_content_chars: returnedChars,
+      max_chars: maxChars,
+      pages,
+      next_action: {
+        tool: "llm_wiki_update_pages",
+        arguments: { task_id: record.task.taskId, action: "apply", based_on_wiki_revision: workspace.revision, updates: [] },
+      },
+    }
+  }
+
+  async #updateWikiPages(input) {
+    if (input?.action !== "apply") fail("INVALID_INPUT", "action must be inspect or apply.", { retryable: true })
+    const workspace = await this.workspace()
+    const record = await loadTask(workspace.paths, input?.task_id)
+    const requestValue = {
+      operation: "update_pages",
+      basedOn: input?.based_on_wiki_revision,
+      updates: input?.updates,
+    }
+    const exactReplay = await readExactIdempotencyReplay(record.paths, input?.idempotency_key, requestValue)
+    if (exactReplay) return { ...exactReplay, idempotent_replay: true }
+    assertTaskStatus(record.task, ["completed"])
+    if (typeof input?.based_on_wiki_revision !== "string" || !/^[0-9a-f]{64}$/.test(input.based_on_wiki_revision)) {
+      fail("INVALID_INPUT", "apply requires the exact based_on_wiki_revision returned by inspect.", { retryable: true, taskId: record.task.taskId })
+    }
+    const updates = Array.isArray(input?.updates) ? input.updates : []
+    if (updates.length === 0 || updates.length > 20) {
+      fail("INVALID_INPUT", "apply requires 1 to 20 page updates.", { retryable: true, taskId: record.task.taskId })
+    }
+    const sourceRefArtifact = await readJson(path.join(workspace.paths.indexes, "page-source-refs.json"), { schemaVersion: 1, pages: {} })
+    const existingSourceRefsByPath = sourceRefArtifact.pages && typeof sourceRefArtifact.pages === "object" ? sourceRefArtifact.pages : {}
+    const provisionalOwners = await workspaceProvisionalPageOwners(workspace, record.task)
+    const chunkIndex = this.#taskChunkIndex(record)
+    const updateIds = new Set()
+    const updatePaths = new Set()
+    const normalizedPatches = []
+    let normalizedSourceRefQuotes = 0
+    for (const [updateIndex, update] of updates.entries()) {
+      const updateId = String(update?.update_id ?? "").trim()
+      if (!updateId || updateId.length > 200) fail("INVALID_WIKI_UPDATE", `updates[${updateIndex}].update_id must contain 1 to 200 characters.`, { retryable: true, taskId: record.task.taskId })
+      if (updateIds.has(updateId)) fail("INVALID_WIKI_UPDATE", `Duplicate update_id: ${updateId}`, { retryable: true, taskId: record.task.taskId })
+      updateIds.add(updateId)
+      const page = await readManagedWikiPage(workspace, update?.path)
+      if (updatePaths.has(page.path)) fail("INVALID_WIKI_UPDATE", `Duplicate page path in one atomic update: ${page.path}`, { retryable: true, taskId: record.task.taskId })
+      updatePaths.add(page.path)
+      if (typeof update?.expected_file_hash !== "string" || update.expected_file_hash !== page.fileHash) {
+        fail("FILE_HASH_CONFLICT", `Page hash changed: ${page.path}`, {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { path: page.path, expected_file_hash: update?.expected_file_hash ?? null, actual_file_hash: page.fileHash },
+          suggestedAction: "Inspect the page again, rebase the section changes, and retry the whole atomic update with a new idempotency key.",
+        })
+      }
+      const provisionalOwner = provisionalOwners.get(page.path)
+      if (provisionalOwner && provisionalOwner !== record.task.taskId) {
+        fail("PROVISIONAL_PAGE_CONFLICT", `Page is provisional in another task: ${page.path}`, {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { path: page.path, provisional_task_id: provisionalOwner },
+        })
+      }
+      const changes = validateIncrementalSectionChanges(update?.changes, workspace.config.limits, updateIndex)
+      const addsContent = changes.some((change) => change.operation !== "remove_section")
+      const submittedSourceRefs = Array.isArray(update?.source_refs) ? update.source_refs : []
+      if (addsContent && submittedSourceRefs.length === 0) {
+        fail("INVALID_SOURCE_REF", `updates[${updateIndex}].source_refs must ground every added or replaced section.`, {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { path: page.path },
+        })
+      }
+      const sourceRefHolder = { sourceRefs: submittedSourceRefs }
+      normalizedSourceRefQuotes += canonicalizeAnalysisSourceRefQuotes(sourceRefHolder, record.batches, chunkIndex)
+      validateSourceRefs(sourceRefHolder.sourceRefs, record.task, record.batches, workspace.config.limits, chunkIndex)
+      let changed
+      try {
+        changed = applyWikiPageSectionChanges(page.content, changes)
+      } catch (error) {
+        fail(typeof error?.code === "string" ? error.code : "INVALID_WIKI_UPDATE", String(error?.message ?? error), {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { path: page.path, update_id: updateId },
+        })
+      }
+      const sourceRefs = deduplicateExact([
+        ...(Array.isArray(existingSourceRefsByPath[page.path]) ? existingSourceRefsByPath[page.path] : []),
+        ...sourceRefHolder.sourceRefs,
+      ])
+      if (sourceRefs.length === 0) {
+        fail("INVALID_SOURCE_REF", `No durable SourceRefs are available for ${page.path}.`, {
+          retryable: true,
+          taskId: record.task.taskId,
+          suggestedAction: "Supply exact SourceRefs from this task when applying the update.",
+        })
+      }
+      const patch = {
+        patchId: updateId,
+        path: page.path,
+        operation: "replace",
+        expectedFileHash: page.fileHash,
+        title: page.parsed.title,
+        pageKind: normalizePageKind(page.parsed.type) ?? pageKindForPath(page.path) ?? "topic",
+        content: changed.content,
+        sourceRefs,
+        rationale: String(update?.rationale ?? "Incremental Wiki section update.").trim().slice(0, 2_000),
+      }
+      validatePagePatchShape(patch, workspace.config.limits)
+      normalizedPatches.push({ ...patch, changedSections: changed.changed_sections })
+    }
+    const commitChars = normalizedPatches.reduce((sum, patch) => sum + patch.content.length, 0)
+    if (commitChars > workspace.config.limits.maxCommitChars) {
+      fail("PAGE_COMMIT_TOO_LARGE", `Updated page content exceeds the ${workspace.config.limits.maxCommitChars}-character commit limit.`, { retryable: true, taskId: record.task.taskId })
+    }
+    const idempotent = await withIdempotency(record.paths, input?.idempotency_key, requestValue, async ({ persistResponse }) => {
+      const previousStatus = record.task.status
+      record.task.status = "finalizing"
+      await saveTask(record.paths, record.task)
+      let journal = null
+      try {
+        journal = await commitPageTransaction(workspace, record.task, normalizedPatches, input.based_on_wiki_revision)
+      } catch (error) {
+        record.task.status = previousStatus
+        await saveTask(record.paths, record.task).catch(() => {})
+        throw error
+      }
+      try {
+        const commits = await readJson(record.paths.commits, [])
+        if (!commits.includes(journal.transactionId)) commits.push(journal.transactionId)
+        await writeJsonAtomic(record.paths.commits, commits)
+        record.task.commitRevision = (Number(record.task.commitRevision) || 0) + 1
+        record.task.wikiRevision = journal.wikiRevision
+        await saveTask(record.paths, record.task)
+        await markPageTransactionCommitted(workspace, journal.transactionId)
+
+        const latestSourceRefs = await readJson(path.join(workspace.paths.indexes, "page-source-refs.json"), { schemaVersion: 1, pages: {} })
+        const pageSourceRefs = { ...(latestSourceRefs.pages ?? {}) }
+        for (const patch of normalizedPatches) pageSourceRefs[patch.path] = patch.sourceRefs
+        const generationId = newId("generation")
+        const finalizationPath = path.join(record.paths.root, "finalization.json")
+        const finalization = {
+          schemaVersion: 1,
+          state: "pages_published",
+          kind: "incremental_wiki_update",
+          taskId: record.task.taskId,
+          generationId,
+          transactionId: journal.transactionId,
+          createdAt: nowIso(),
+          inputWikiRevision: input.based_on_wiki_revision,
+          wikiRevision: journal.wikiRevision,
+        }
+        await writeJsonAtomic(finalizationPath, finalization)
+        const built = await buildStableGenerationArtifacts(workspace, { generationId, taskId: record.task.taskId, pageSourceRefs })
+        const previousResult = await readJson(record.paths.result, {})
+        const updatedPaths = normalizedPatches.map((patch) => patch.path)
+        const taskResult = {
+          ...previousResult,
+          status: "completed",
+          updated_pages: uniqueStrings([...(previousResult.updated_pages ?? []), ...updatedPaths]),
+          lint: { errors: built.lint.errors, warnings: built.lint.warnings, info: built.lint.info, findings: built.lint.findings },
+          indexing: { bm25: "completed", embedding: built.retrievalIndexes.embedding.status, vector: "completed", vector_fallback: "completed", graph: "completed" },
+          wiki_revision: built.wikiRevision,
+          generation_id: generationId,
+        }
+        const response = {
+          accepted: true,
+          action: "apply",
+          task_id: record.task.taskId,
+          transaction_id: journal.transactionId,
+          commit_revision: record.task.commitRevision,
+          wiki_revision: built.wikiRevision,
+          generation_id: generationId,
+          transaction_base_revision: journal.actualBaseRevision,
+          unrelated_wiki_changes_accepted: journal.concurrentWikiChange,
+          normalized_source_ref_quotes: normalizedSourceRefQuotes,
+          written_pages: journal.patches.map((patch) => ({
+            path: patch.path,
+            file_hash: patch.fileHash,
+            changed_sections: normalizedPatches.find((candidate) => candidate.path === patch.path)?.changedSections ?? [],
+          })),
+          lint: { errors: built.lint.errors, warnings: built.lint.warnings, info: built.lint.info },
+          indexing: { bm25: "completed", embedding: built.retrievalIndexes.embedding.status, vector: "completed", graph: "completed" },
+          next_action: null,
+        }
+        await writeJsonAtomic(finalizationPath, { ...finalization, state: "ready_to_publish", wikiRevision: built.wikiRevision, manifestSha256: built.manifestSha256, result: taskResult })
+        await writeJsonAtomic(workspace.paths.currentGeneration, {
+          schemaVersion: 1,
+          generation_id: generationId,
+          task_id: record.task.taskId,
+          wiki_revision: built.wikiRevision,
+          manifest_sha256: built.manifestSha256,
+          published_at: nowIso(),
+        })
+        await writeJsonAtomic(finalizationPath, { ...finalization, state: "published", wikiRevision: built.wikiRevision, manifestSha256: built.manifestSha256, result: taskResult, publishedAt: nowIso() })
+        record.task.status = "completed"
+        record.task.completedAt = record.task.completedAt ?? nowIso()
+        record.task.wikiRevision = built.wikiRevision
+        record.task.generationId = generationId
+        record.task.generationManifestSha256 = built.manifestSha256
+        delete record.task.lastError
+        await saveTask(record.paths, record.task)
+        await writeJsonAtomic(record.paths.result, taskResult)
+        await writeJsonAtomic(finalizationPath, { ...finalization, state: "task_completed", wikiRevision: built.wikiRevision, manifestSha256: built.manifestSha256, result: taskResult, completedAt: nowIso() })
+        await persistResponse(response)
+        return response
+      } catch (error) {
+        record.task.status = "failed"
+        record.task.lastError = new LlmWikiError("WIKI_UPDATE_PUBLISH_FAILED", "Incremental Wiki pages were committed but generation publication did not complete.", {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { transaction_id: journal.transactionId, cause: String(error?.message ?? error).slice(0, 1_000) },
+          suggestedAction: "Call llm_wiki_finalize for this task to rebuild and publish a consistent generation.",
+        }).toJSON()
+        await saveTask(record.paths, record.task).catch(() => {})
+        throw error
+      }
+    }, { exactRequestValue: requestValue })
+    return { ...idempotent.response, idempotent_replay: idempotent.replayed }
   }
 
   async #commitPages(input) {
@@ -3235,6 +3518,61 @@ async function snapshotWikiGeneration(wikiRoot, generationWikiRoot) {
     })
   }
   return pages
+}
+
+async function readManagedWikiPage(workspace, requestedPath) {
+  const relative = validatePagePath(requestedPath)
+  const target = await assertNoSymlinkEscape(workspace.paths.root, relative)
+  if (!(await pathExists(target))) {
+    fail("WIKI_PAGE_NOT_FOUND", `Wiki page does not exist: ${relative}`, {
+      retryable: true,
+      details: { path: relative },
+    })
+  }
+  const info = await lstat(target)
+  if (!info.isFile() || info.isSymbolicLink()) fail("INVALID_PAGE_PATH", `Wiki page is not a regular file: ${relative}`)
+  const content = await readFile(target, "utf8")
+  return { path: relative, target, content, fileHash: sha256(content), parsed: parseWikiPage(content) }
+}
+
+function validateIncrementalSectionChanges(value, limits, updateIndex) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 20) {
+    fail("INVALID_WIKI_UPDATE", `updates[${updateIndex}].changes must contain 1 to 20 section changes.`, { retryable: true })
+  }
+  const operations = new Set(["upsert_section", "replace_section", "append_to_section", "remove_section"])
+  const reserved = new Set(["related", "related pages", "相关页面", "关联页面", "domain classification", "领域分类", "领域类型"])
+  const headings = new Set()
+  return value.map((change, changeIndex) => {
+    const operation = String(change?.operation ?? "").trim()
+    const heading = String(change?.heading ?? "").normalize("NFKC").trim()
+    const normalizedHeading = heading.replace(/\s+/g, " ").toLowerCase()
+    const level = change?.level === undefined ? 2 : Number(change.level)
+    const content = String(change?.content ?? "").replace(/\r\n?/g, "\n").trim()
+    if (!operations.has(operation)) fail("INVALID_WIKI_UPDATE", `Unsupported updates[${updateIndex}].changes[${changeIndex}].operation: ${operation}`, { retryable: true })
+    if (!heading || heading.length > 300 || /[\r\n]/.test(heading)) fail("INVALID_WIKI_UPDATE", `Invalid section heading at updates[${updateIndex}].changes[${changeIndex}].`, { retryable: true })
+    if (reserved.has(normalizedHeading)) {
+      fail("INVALID_WIKI_UPDATE", `Section ${heading} is maintained by Core and cannot be edited directly.`, { retryable: true })
+    }
+    if (headings.has(normalizedHeading)) fail("INVALID_WIKI_UPDATE", `Duplicate section change in one page update: ${heading}`, { retryable: true })
+    headings.add(normalizedHeading)
+    if (!Number.isInteger(level) || level < 2 || level > 6) fail("INVALID_WIKI_UPDATE", `Section level must be an integer from 2 to 6 for ${heading}.`, { retryable: true })
+    if (operation !== "remove_section" && (!content || content.length > limits.maxPageChars)) {
+      fail("INVALID_WIKI_UPDATE", `Section content for ${heading} must contain 1 to ${limits.maxPageChars} characters.`, { retryable: true })
+    }
+    return { operation, heading, level, ...(operation === "remove_section" ? {} : { content }) }
+  })
+}
+
+async function buildStableGenerationArtifacts(workspace, options) {
+  let built
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    built = await buildGenerationArtifacts(workspace, options)
+    if (await hashDirectory(workspace.paths.wiki) === built.wikiRevision) return built
+  }
+  fail("WORKSPACE_CHANGED_DURING_INDEXING", "Wiki pages changed repeatedly while rebuilding the incremental update generation.", {
+    retryable: true,
+    suggestedAction: "Wait for the active Wiki writer to finish, then call llm_wiki_finalize to publish a stable generation.",
+  })
 }
 
 async function buildGenerationArtifacts(workspace, { generationId, taskId, pageSourceRefs }) {

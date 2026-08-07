@@ -1022,6 +1022,79 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
   assert.deepEqual(again, result)
 })
 
+test("completed Wiki supports inspected, grounded, idempotent section updates with generation publication", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const sourceRef = await analyzeAll(f.core, imported)
+  const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
+  const businessRequirement = plan.page_requirements.find((requirement) => requirement.title === "Business Entity")
+  assert.ok(businessRequirement)
+  await f.core.commitPages({
+    task_id: imported.task_id,
+    based_on_wiki_revision: plan.based_on_wiki_revision,
+    idempotency_key: "incremental-update-pages-v1",
+    patches: plan.page_requirements.map((requirement) => ({
+      ...requirement.patch_scaffold,
+      content: `# ${requirement.title}\n\n## Details\n\nInitial ${requirement.title} details.`,
+      rationale: `Create ${requirement.title} for incremental update testing.`,
+    })),
+  })
+  const finalized = await f.core.finalize({ task_id: imported.task_id })
+  const targetPath = businessRequirement.patch_scaffold.path
+  const inspected = await f.core.updatePages({
+    task_id: imported.task_id,
+    action: "inspect",
+    targets: [{ path: targetPath, heading: "Details" }],
+  })
+  assert.equal(inspected.action, "inspect")
+  assert.equal(inspected.wiki_revision, finalized.wiki_revision)
+  assert.match(inspected.pages[0].section.content, /Initial Business Entity details/)
+  assert.match(inspected.pages[0].file_hash, /^[0-9a-f]{64}$/)
+
+  const applyInput = {
+    task_id: imported.task_id,
+    action: "apply",
+    based_on_wiki_revision: inspected.wiki_revision,
+    idempotency_key: "incremental-section-apply-v1",
+    updates: [{
+      update_id: "business-details-v2",
+      path: targetPath,
+      expected_file_hash: inspected.pages[0].file_hash,
+      changes: [
+        { operation: "replace_section", heading: "Details", content: "Updated grounded Business Entity details." },
+        { operation: "upsert_section", heading: "Operations", level: 2, content: "Operational guidance for Business Entity." },
+      ],
+      source_refs: [sourceRef],
+      rationale: "Incrementally refresh the completed Wiki page.",
+    }],
+  }
+  const updated = await f.core.updatePages(applyInput)
+  assert.equal(updated.accepted, true)
+  assert.equal(updated.idempotent_replay, false)
+  assert.notEqual(updated.generation_id, finalized.generation_id)
+  assert.notEqual(updated.wiki_revision, inspected.wiki_revision)
+  assert.deepEqual(updated.written_pages[0].changed_sections.map((item) => item.operation), ["replace_section", "upsert_section"])
+  const page = await readFile(path.join(f.workspace, targetPath), "utf8")
+  assert.match(page, /## Details\n\nUpdated grounded Business Entity details\./)
+  assert.doesNotMatch(page, /Initial Business Entity details/)
+  assert.match(page, /## Operations\n\nOperational guidance for Business Entity\./)
+  const pointer = JSON.parse(await readFile(path.join(f.workspace, ".llm-wiki", "current-generation.json"), "utf8"))
+  assert.equal(pointer.generation_id, updated.generation_id)
+  assert.equal(pointer.wiki_revision, updated.wiki_revision)
+
+  const replay = await f.core.updatePages(applyInput)
+  assert.equal(replay.idempotent_replay, true)
+  assert.equal(replay.transaction_id, updated.transaction_id)
+  await assert.rejects(
+    () => f.core.updatePages({
+      ...applyInput,
+      idempotency_key: "incremental-section-stale-v1",
+    }),
+    (error) => error instanceof LlmWikiError && error.code === "FILE_HASH_CONFLICT",
+  )
+})
+
 test("page commits repair legacy quote formatting and prefer requirement-ID SourceRefs", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))

@@ -1,5 +1,19 @@
 const taskId = { type: "string", description: "Task ID in the current workspace." }
 const closedObject = (properties, required = []) => ({ type: "object", properties, required, additionalProperties: false })
+const wikiSectionChange = closedObject({
+  operation: { enum: ["upsert_section", "replace_section", "append_to_section", "remove_section"], description: "Apply one deterministic Markdown section edit. Core-owned Related and Domain Classification sections cannot be edited directly." },
+  heading: { type: "string", minLength: 1, maxLength: 300, description: "Exact Markdown heading text without leading # characters." },
+  level: { type: "integer", minimum: 2, maximum: 6, description: "Heading level for a newly inserted upsert_section; existing sections retain their current level." },
+  content: { type: "string", description: "Section body without the heading. Required except for remove_section." },
+}, ["operation", "heading"])
+const incrementalWikiUpdate = closedObject({
+  update_id: { type: "string", minLength: 1, maxLength: 200 },
+  path: { type: "string", pattern: "^wiki/(sources|entities|concepts|topics|comparisons|queries|synthesis|findings|methodology|thesis|meetings|decisions|projects|stakeholders|goals|habits|reflections|chapters|characters|themes|plot-threads|journal)/.+\\.md$" },
+  expected_file_hash: { type: "string", pattern: "^[0-9a-f]{64}$", description: "Exact file_hash returned by action=inspect." },
+  changes: { type: "array", minItems: 1, maxItems: 20, items: wikiSectionChange },
+  source_refs: { type: "array", maxItems: 500, items: { type: "object" }, description: "Exact SourceRefs from this task that ground every added, replaced, or appended section." },
+  rationale: { type: "string", minLength: 1, maxLength: 2000 },
+}, ["update_id", "path", "expected_file_hash", "changes", "rationale"])
 
 const toolDefinitions = [
   {
@@ -122,6 +136,25 @@ const toolDefinitions = [
     }, ["task_id", "based_on_wiki_revision", "patches", "idempotency_key"]),
   },
   {
+    name: "llm_wiki_update_pages",
+    description: "Inspect or atomically update selected sections of existing pages in a completed Wiki without reopening the semantic Writer projection. Call action=inspect first to obtain the current wiki_revision, exact file hashes, page content or one named section, and section manifest. Then call action=apply with optimistic hashes, grounded SourceRefs, bounded section operations, and an idempotency key. A successful apply rebuilds retrieval indexes and atomically publishes a new generation.",
+    inputSchema: closedObject({
+      task_id: taskId,
+      action: { enum: ["inspect", "apply"] },
+      targets: {
+        type: "array", minItems: 1, maxItems: 20,
+        items: closedObject({
+          path: { type: "string", pattern: "^wiki/(sources|entities|concepts|topics|comparisons|queries|synthesis|findings|methodology|thesis|meetings|decisions|projects|stakeholders|goals|habits|reflections|chapters|characters|themes|plot-threads|journal)/.+\\.md$" },
+          heading: { type: "string", minLength: 1, maxLength: 300, description: "Optional exact section heading. When supplied, inspect returns only that section body." },
+        }, ["path"]),
+      },
+      max_chars: { type: "integer", minimum: 1000, maximum: 240000, description: "Maximum combined page or section content returned by inspect. Oversized content is omitted while hashes and section manifests remain available." },
+      based_on_wiki_revision: { type: "string", pattern: "^[0-9a-f]{64}$", description: "Exact wiki_revision returned by inspect." },
+      updates: { type: "array", minItems: 1, maxItems: 20, items: incrementalWikiUpdate },
+      idempotency_key: { type: "string", minLength: 8, maxLength: 200 },
+    }, ["task_id", "action"]),
+  },
+  {
     name: "llm_wiki_finalize",
     description: "Idempotently generate Core-owned source/index/overview/log pages, update deterministic indexes, lint, and complete a task. For a completed domain-Schema task, set refresh_page_metadata=true to backfill type frontmatter and Domain Classification sections without re-running extraction.",
     inputSchema: closedObject({ task_id: taskId, refresh_page_metadata: { type: "boolean", description: "Refresh existing Wiki pages from the persisted task Schema and page coverage metadata." } }, ["task_id"]),
@@ -161,6 +194,7 @@ const TOOL_RESULT_LIMITS = Object.freeze({
   llm_wiki_get_domain_schema: 120_000,
   llm_wiki_retrieve_context: 120_000,
   llm_wiki_get_page_plan_context: 120_000,
+  llm_wiki_update_pages: 240_000,
   llm_wiki_status: 120_000,
   llm_wiki_list_tasks: 80_000,
 })

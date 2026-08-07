@@ -16,8 +16,12 @@ const MCP_SIGNAL = Symbol.for("llm-wiki.mcp.signal")
 const RECOVERABLE_ANALYSIS_CODES = new Set(["INVALID_ANALYSIS", "INVALID_DOMAIN_ANALYSIS", "INVALID_SOURCE_REF", "ANALYSIS_TOO_LARGE"])
 const ATOMIC_PAGE_REJECTION_CODES = new Set([
   "INVALID_PAGE_PATCH",
+  "INVALID_WIKI_UPDATE",
   "INVALID_PAGE_PATH",
   "INVALID_SOURCE_REF",
+  "WIKI_PAGE_NOT_FOUND",
+  "WIKI_SECTION_NOT_FOUND",
+  "WIKI_SECTION_AMBIGUOUS",
   "PAGE_COMMIT_TOO_LARGE",
   "PAGE_PLAN_INCOMPLETE",
   "INCOMPLETE_PAGE_COVERAGE",
@@ -121,7 +125,8 @@ function serializeResult(data) {
 function errorResult(error, context = {}) {
   const normalized = asLlmWikiError(error)
   const analysisRetry = context.tool === "llm_wiki_commit_analysis" && RECOVERABLE_ANALYSIS_CODES.has(normalized.code)
-  const atomicPageRejection = context.tool === "llm_wiki_commit_pages" && ATOMIC_PAGE_REJECTION_CODES.has(normalized.code)
+  const atomicPageRejection = ["llm_wiki_commit_pages", "llm_wiki_update_pages"].includes(context.tool) && ATOMIC_PAGE_REJECTION_CODES.has(normalized.code)
+  const submittedItems = context.tool === "llm_wiki_update_pages" ? context.args?.updates : context.args?.patches
   const errorData = { ...normalized.toJSON(), retryable: normalized.retryable || analysisRetry }
   return {
     ok: false,
@@ -136,11 +141,11 @@ function errorResult(error, context = {}) {
       page_commit_recovery: {
         changes_applied: false,
         retry_scope: pageCommitRetryScope(normalized.code),
-        submitted_patch_count: Array.isArray(context.args?.patches) ? context.args.patches.length : 0,
-        submitted_patch_ids: Array.isArray(context.args?.patches)
-          ? context.args.patches.map((patch) => patch?.patchId).filter((value) => typeof value === "string").slice(0, 50)
+        submitted_patch_count: Array.isArray(submittedItems) ? submittedItems.length : 0,
+        submitted_patch_ids: Array.isArray(submittedItems)
+          ? submittedItems.map((patch) => patch?.patchId ?? patch?.update_id).filter((value) => typeof value === "string").slice(0, 50)
           : [],
-        preserve_projection_complete: context.args?.projection_complete !== false,
+        ...(context.tool === "llm_wiki_commit_pages" ? { preserve_projection_complete: context.args?.projection_complete !== false } : {}),
         instruction: pageCommitRetryInstruction(normalized.code),
       },
     } : {}),
@@ -150,6 +155,7 @@ function errorResult(error, context = {}) {
 }
 
 function pageCommitRetryScope(code) {
+  if (["WIKI_PAGE_NOT_FOUND", "WIKI_SECTION_NOT_FOUND", "WIKI_SECTION_AMBIGUOUS", "INVALID_WIKI_UPDATE"].includes(code)) return "entire_rejected_update_set_after_reinspection"
   if (code === "PAGE_PLAN_INCOMPLETE") return "prepare_server_manifest_then_process_one_bounded_shard"
   if (code === "PAGE_DRAFT_SHARDS_INCOMPLETE") return "process_next_uncommitted_server_shard"
   if (code === "PAGE_DRAFT_SHARD_NOT_READY") return "retrieve_all_cursors_for_the_reported_server_shard"
@@ -163,6 +169,7 @@ function pageCommitRetryScope(code) {
 }
 
 function pageCommitRetryInstruction(code) {
+  if (["WIKI_PAGE_NOT_FOUND", "WIKI_SECTION_NOT_FOUND", "WIKI_SECTION_AMBIGUOUS", "INVALID_WIKI_UPDATE"].includes(code)) return "Inspect every target page again, correct the section operations, and resubmit the entire rejected update set with a new idempotency key."
   if (code === "PAGE_PLAN_INCOMPLETE") return "Request view=manifest, then generate and commit one bounded draft shard at a time."
   if (code === "PAGE_DRAFT_SHARDS_INCOMPLETE") return "Process the returned next draft shard; accepted earlier shards are durable and must not be regenerated."
   if (code === "PAGE_DRAFT_SHARD_NOT_READY") return "Retrieve every cursor for the returned draft shard before committing it; accepted earlier shards remain durable."
@@ -193,6 +200,21 @@ function recoveryAction(tool, args, error) {
   }
   if (tool === "llm_wiki_get_batch" && error.code === "MCP_OUTPUT_TOO_LARGE") {
     return { tool, arguments: { task_id: args?.task_id, batch_id: args?.batch_id } }
+  }
+  if (tool === "llm_wiki_update_pages" && ["FILE_HASH_CONFLICT", "PROVISIONAL_PAGE_CONFLICT", "INVALID_WIKI_UPDATE", "WIKI_PAGE_NOT_FOUND", "WIKI_SECTION_NOT_FOUND", "WIKI_SECTION_AMBIGUOUS"].includes(error.code)) {
+    return {
+      tool,
+      arguments: {
+        task_id: args?.task_id,
+        action: "inspect",
+        targets: Array.isArray(args?.updates)
+          ? args.updates.map((update) => ({ path: update?.path })).filter((target) => typeof target.path === "string").slice(0, 20)
+          : [],
+      },
+    }
+  }
+  if (tool === "llm_wiki_update_pages" && ["WIKI_UPDATE_PUBLISH_FAILED", "WORKSPACE_CHANGED_DURING_INDEXING"].includes(error.code)) {
+    return { tool: "llm_wiki_finalize", arguments: { task_id: args?.task_id } }
   }
   if (tool === "llm_wiki_commit_pages" && error.code === "PAGE_PLAN_INCOMPLETE") {
     return {
@@ -304,6 +326,7 @@ export class HeadlessToolRouter {
       case "llm_wiki_get_staged_page_drafts": return this.core.getStagedPageDrafts(args)
       case "llm_wiki_apply_projection": return this.core.applyWikiProjection(args)
       case "llm_wiki_commit_pages": return this.core.commitPages(args)
+      case "llm_wiki_update_pages": return this.core.updatePages(args)
       case "llm_wiki_finalize": return this.core.finalize(args)
       case "llm_wiki_status": return this.core.status(args)
       case "llm_wiki_list_tasks": return this.core.listTasks(args)

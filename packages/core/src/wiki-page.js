@@ -87,6 +87,129 @@ export function parseWikiPage(content) {
   }
 }
 
+export function listWikiPageSections(content) {
+  const parsed = parseWikiPage(content)
+  return markdownSectionRanges(parsed.body).map((section) => ({
+    heading: section.heading,
+    level: section.level,
+    content: parsed.body.slice(section.bodyStart, section.end).trim(),
+  }))
+}
+
+export function readWikiPageSection(content, heading) {
+  const parsed = parseWikiPage(content)
+  const matches = markdownSectionRanges(parsed.body)
+    .filter((section) => normalizedSectionHeading(section.heading) === normalizedSectionHeading(heading))
+  if (matches.length !== 1) return { found: false, ambiguous: matches.length > 1, heading: String(heading ?? "").trim() }
+  const section = matches[0]
+  return {
+    found: true,
+    ambiguous: false,
+    heading: section.heading,
+    level: section.level,
+    content: parsed.body.slice(section.bodyStart, section.end).trim(),
+  }
+}
+
+export function applyWikiPageSectionChanges(content, changes) {
+  const parsed = parseWikiPage(content)
+  let body = parsed.body.trim()
+  const changedSections = []
+  for (const change of changes) {
+    const operation = String(change?.operation ?? "").trim()
+    const heading = String(change?.heading ?? "").normalize("NFKC").trim()
+    const level = Number.isInteger(change?.level) ? change.level : 2
+    const sectionContent = String(change?.content ?? "").replace(/\r\n?/g, "\n").trim()
+    const matches = markdownSectionRanges(body)
+      .filter((section) => normalizedSectionHeading(section.heading) === normalizedSectionHeading(heading))
+    if (matches.length > 1) throw sectionChangeError("WIKI_SECTION_AMBIGUOUS", `Section heading is duplicated: ${heading}`)
+    const section = matches[0]
+    if (["replace_section", "append_to_section", "remove_section"].includes(operation) && !section) {
+      throw sectionChangeError("WIKI_SECTION_NOT_FOUND", `Section does not exist: ${heading}`)
+    }
+    if (!new Set(["upsert_section", "replace_section", "append_to_section", "remove_section"]).has(operation)) {
+      throw sectionChangeError("INVALID_WIKI_UPDATE", `Unsupported section operation: ${operation}`)
+    }
+    if (operation !== "remove_section" && !sectionContent) {
+      throw sectionChangeError("INVALID_WIKI_UPDATE", `Section content is required for ${operation}: ${heading}`)
+    }
+    if (operation === "upsert_section" && !section) {
+      const appended = `${"#".repeat(level)} ${heading}\n\n${sectionContent}`
+      body = joinMarkdownRanges(body, appended, "")
+    } else if (operation === "replace_section" || operation === "upsert_section") {
+      const replacement = `${"#".repeat(section.level)} ${section.heading}\n\n${sectionContent}`
+      body = joinMarkdownRanges(body.slice(0, section.start), replacement, body.slice(section.end))
+    } else if (operation === "append_to_section") {
+      const current = body.slice(section.start, section.end).trimEnd()
+      body = joinMarkdownRanges(body.slice(0, section.start), `${current}\n\n${sectionContent}`, body.slice(section.end))
+    } else {
+      body = joinMarkdownRanges(body.slice(0, section.start), "", body.slice(section.end))
+    }
+    changedSections.push({ operation, heading, level: section?.level ?? level })
+  }
+  return {
+    content: `${parsed.frontmatter}${body.trim()}\n`,
+    changed_sections: changedSections,
+    sections: listWikiPageSections(`${parsed.frontmatter}${body}`),
+  }
+}
+
+function markdownSectionRanges(body) {
+  const normalized = String(body ?? "").replace(/\r\n?/g, "\n")
+  const lines = normalized.split(/(?<=\n)/)
+  const headings = []
+  let offset = 0
+  let fence = null
+  for (const lineWithEnding of lines) {
+    const line = lineWithEnding.replace(/\n$/, "")
+    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})\s*.*$/)
+    if (fence) {
+      if (fenceMatch && fenceMatch[1][0] === fence.marker && fenceMatch[1].length >= fence.length) fence = null
+      offset += lineWithEnding.length
+      continue
+    }
+    if (fenceMatch) {
+      fence = { marker: fenceMatch[1][0], length: fenceMatch[1].length }
+      offset += lineWithEnding.length
+      continue
+    }
+    const heading = line.match(/^ {0,3}(#{2,6})[ \t]+(.+?)[ \t]*#*[ \t]*$/)
+    if (heading) {
+      headings.push({
+        heading: heading[2].trim(),
+        level: heading[1].length,
+        start: offset,
+        bodyStart: offset + lineWithEnding.length,
+        end: normalized.length,
+      })
+    }
+    offset += lineWithEnding.length
+  }
+  for (let index = 0; index < headings.length; index += 1) {
+    const current = headings[index]
+    const next = headings.slice(index + 1).find((candidate) => candidate.level <= current.level)
+    current.end = next?.start ?? normalized.length
+  }
+  return headings
+}
+
+function normalizedSectionHeading(value) {
+  return String(value ?? "").normalize("NFKC").trim().replace(/\s+/g, " ").toLowerCase()
+}
+
+function joinMarkdownRanges(before, middle, after) {
+  return [String(before ?? "").trimEnd(), String(middle ?? "").trim(), String(after ?? "").trimStart()]
+    .filter(Boolean)
+    .join("\n\n")
+    .trim()
+}
+
+function sectionChangeError(code, message) {
+  const error = new Error(message)
+  error.code = code
+  return error
+}
+
 export function prepareWikiPageContent(patch, existingContent = "", date = new Date().toISOString().slice(0, 10)) {
   const incoming = parseWikiPage(patch.content)
   const existing = parseWikiPage(existingContent)

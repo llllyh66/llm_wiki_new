@@ -156,6 +156,7 @@ for custom prose workflows, but is no longer on the default ingestion path.
 - `llm_wiki_apply_projection` (fast default Writer path)
 - `llm_wiki_get_page_plan_context`
 - `llm_wiki_commit_pages`
+- `llm_wiki_update_pages`
 - `llm_wiki_finalize`
 - `llm_wiki_status`
 - `llm_wiki_list_tasks`
@@ -169,12 +170,23 @@ opens are files explicitly passed to `llm_wiki_import_files`; after a safe,
 streaming import, all later work uses the managed copy.
 
 The Claude Code registration uses `CLAUDE_PROJECT_DIR` rather than a mutable
-shell working directory and keeps this bounded 16-tool server loaded for the
+shell working directory and keeps this bounded 17-tool server loaded for the
 session. MCP input/output budgets and paginated page-plan context prevent a
 single oversized request or response from closing the STDIO transport.
 Every tool exception is returned as a normal result (`ok: false`,
 `accepted: false`, `error`, `next_action`, and `mcp_connection_usable: true`)
 instead of entering MCP's `isError` channel.
+
+`llm_wiki_update_pages` performs bounded post-Finalize maintenance without
+reopening a semantic Writer projection. Call it first with `action=inspect` to
+obtain the current Wiki revision, exact target file hashes, and either complete
+page content or one named Markdown section. Then call `action=apply` with the
+same revision, each exact file hash, grounded SourceRefs, section operations,
+and an idempotency key. The apply call updates only existing Agent-writable
+pages, publishes all changes atomically, rebuilds retrieval/graph/lint
+artifacts, and switches `current-generation.json` only after the new generation
+is complete. Core-owned Related and Domain Classification sections remain
+deterministic and cannot be edited through this tool.
 
 Large tables, code blocks, and legacy oversized chunks are split before
 `get_batch`. Batches are bounded by both text and serialized payload size and

@@ -559,6 +559,15 @@ BM25 + embedding over imported sources and completed analyses and may be
 incomplete. After Finalize, use the same call without channels; it becomes
 BM25 + embedding + Wiki multi-route RRF automatically.
 
+For an explicit user-requested change to an already completed Wiki, use
+`llm_wiki_update_pages` instead of reopening the Writer projection. First call
+`action: "inspect"` for every target path (and optionally one exact section
+heading), then call `action: "apply"` with the returned Wiki revision and file
+hashes, exact SourceRefs for added or replaced content, bounded section
+operations, and one idempotency key. Re-inspect and rebase the entire rejected
+update set after any hash or section conflict. Never use this maintenance tool
+to edit Core-owned Related or Domain Classification sections.
+
 For a large page plan, keep the same projection lease and submit bounded page
 commits as described above. Do not recollect the plan between those commits;
 advance `based_on_wiki_revision` from each successful response.

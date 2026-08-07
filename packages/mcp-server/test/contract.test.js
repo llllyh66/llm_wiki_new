@@ -109,6 +109,7 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
     "llm_wiki_stage_page_drafts",
     "llm_wiki_get_staged_page_drafts",
     "llm_wiki_commit_pages",
+    "llm_wiki_update_pages",
     "llm_wiki_finalize",
     "llm_wiki_status",
     "llm_wiki_list_tasks",
@@ -139,6 +140,11 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
   assert.equal(pageCommit.inputSchema.properties.staged_draft_shard_ids.maxItems, 8)
   assert.match(pageCommit.description, /Hard maximum: 50 patches/)
   assert.match(pageCommit.description, /staged_draft_shard_ids/)
+  const pageUpdate = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_update_pages")
+  assert.deepEqual(pageUpdate.inputSchema.properties.action.enum, ["inspect", "apply"])
+  assert.equal(pageUpdate.inputSchema.properties.updates.maxItems, 20)
+  assert.deepEqual(pageUpdate.inputSchema.properties.updates.items.properties.changes.items.properties.operation.enum, ["upsert_section", "replace_section", "append_to_section", "remove_section"])
+  assert.match(pageUpdate.description, /rebuilds retrieval indexes/i)
   assert.match(pagePlan.description, /parallel drafting.*coordinator/i)
   assert.match(pagePlan.description, /sole committer/i)
 })
@@ -401,6 +407,7 @@ test("every registered MCP tool routes errors without terminating the router", a
     getStagedPageDrafts: failing,
     applyWikiProjection: failing,
     commitPages: failing,
+    updatePages: failing,
     finalize: failing,
     status: failing,
     listTasks: failing,

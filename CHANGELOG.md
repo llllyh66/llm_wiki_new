@@ -1,5 +1,27 @@
 # 更新日志
 
+## [V1.0.3] - 2026-08-07
+
+### 增量 Wiki 更新
+
+- 新增 `llm_wiki_update_pages` MCP 工具，用于已完成 Wiki 的页面级增量维护，无需重新开启语义 Writer 投影。
+- 工具采用 `inspect → apply` 两阶段协议：先返回当前 `wiki_revision`、目标文件 hash、页面或指定章节内容及章节清单，再使用这些乐观并发凭据提交更新。
+- 支持 `upsert_section`、`replace_section`、`append_to_section` 和 `remove_section` 四种 Markdown 章节操作；同一次调用最多原子更新 20 个页面。
+- 成功更新后自动重建 BM25、vector、embedding、graph 与 lint 工件，并通过 `current-generation.json` 原子发布新 generation。
+
+### 安全性与可靠性
+
+- 仅允许修改已经存在的 Agent 可写页面；拒绝路径穿越、符号链接、重复页面、重复章节、歧义章节和陈旧文件 hash。
+- 新增或替换内容必须提交当前任务中的精确 SourceRef；既有页面 SourceRef 会从已发布索引中保留并合并。
+- Related 与 Domain Classification 等 Core 管理章节禁止直接修改，仍由确定性投影维护。
+- 更新复用页面事务 journal、任务级幂等 WAL、SourceRef 校验和稳定 generation 发布流程；精确重放不会重复写入。
+
+### 版本与验证
+
+- 根包、Core、MCP Server 和 CLI 版本统一升级至 `1.0.3`。
+- MCP 工具总数增加至 17；新增章节解析、代码围栏隔离、增量更新、冲突拒绝、幂等重放和 generation 发布测试。
+- 验证通过：Core 59 项、MCP Server 17 项、CLI 1 项测试。
+
 ## [V1.0.2] - 2026-08-07
 
 ### Bug 修复

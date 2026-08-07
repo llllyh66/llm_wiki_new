@@ -1,9 +1,12 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import {
+  applyWikiPageSectionChanges,
   extractRelatedReferences,
+  listWikiPageSections,
   parseWikiPage,
   prepareWikiPageContent,
+  readWikiPageSection,
 } from "../src/wiki-page.js"
 
 function pagePatch(content, related = []) {
@@ -121,4 +124,63 @@ test("explicit patch Related values are mirrored into the body and self-links ar
 
   assert.deepEqual(parsed.related, ["entities/ueinitiateddetach"])
   assert.match(prepared, /## Related\n\n- \[\[entities\/ueinitiateddetach\]\]/)
+})
+
+test("incremental section changes ignore fenced headings and preserve page frontmatter", () => {
+  const content = `---
+type: "concept"
+title: "Business Entity"
+created: "2026-08-07"
+updated: "2026-08-07"
+tags: []
+related: []
+sources: ["source-1"]
+covers: ["page-1"]
+summary: "Entity"
+---
+
+# Business Entity
+
+## Details
+
+Original details.
+
+\`\`\`markdown
+## Details
+This is an example, not a section.
+\`\`\`
+
+## History
+
+Original history.
+`
+  assert.deepEqual(listWikiPageSections(content).map((section) => section.heading), ["Details", "History"])
+  assert.equal(readWikiPageSection(content, "details").content.includes("Original details."), true)
+
+  const changed = applyWikiPageSectionChanges(content, [
+    { operation: "replace_section", heading: "Details", content: "Updated details." },
+    { operation: "append_to_section", heading: "History", content: "A new event." },
+    { operation: "upsert_section", heading: "Operations", level: 3, content: "Operational guidance." },
+  ])
+  assert.match(changed.content, /^---\ntype: "concept"/)
+  assert.match(changed.content, /## Details\n\nUpdated details\./)
+  assert.doesNotMatch(changed.content, /Original details\./)
+  assert.match(changed.content, /## History[\s\S]*Original history\.[\s\S]*A new event\./)
+  assert.match(changed.content, /### Operations\n\nOperational guidance\./)
+})
+
+test("incremental section removal rejects missing and duplicate headings", () => {
+  const removed = applyWikiPageSectionChanges("# Page\n\n## Remove Me\n\nOld.\n\n## Keep Me\n\nKeep.\n", [
+    { operation: "remove_section", heading: "Remove Me" },
+  ])
+  assert.doesNotMatch(removed.content, /Remove Me|Old\./)
+  assert.match(removed.content, /## Keep Me\n\nKeep\./)
+  assert.throws(
+    () => applyWikiPageSectionChanges("# Page\n", [{ operation: "replace_section", heading: "Missing", content: "New." }]),
+    (error) => error.code === "WIKI_SECTION_NOT_FOUND",
+  )
+  assert.throws(
+    () => applyWikiPageSectionChanges("# Page\n\n## Same\n\nOne.\n\n## Same\n\nTwo.\n", [{ operation: "replace_section", heading: "Same", content: "New." }]),
+    (error) => error.code === "WIKI_SECTION_AMBIGUOUS",
+  )
 })
