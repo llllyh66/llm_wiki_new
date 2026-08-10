@@ -46,6 +46,34 @@ test("materialized source extension controls parsing instead of display_name", a
   assert.equal(markdownDocument.mediaType, "text/markdown")
 })
 
+test("byte-identical files with different real media types keep separate parser results", async (t) => {
+  const fixture = await formatFixture()
+  t.after(() => rm(fixture.root, { recursive: true, force: true }))
+  const content = "<h1>Shared bytes</h1><script>alert(1)</script><p>Safe body</p>"
+  const markdown = path.join(fixture.incoming, "shared.md")
+  const html = path.join(fixture.incoming, "shared.html")
+  await Promise.all([writeFile(markdown, content), writeFile(html, content)])
+
+  const markdownImport = await fixture.core.importFiles({ files: [{ path: markdown }] })
+  const htmlImport = await fixture.core.importFiles({ files: [{ path: html }] })
+  const repeatedHtmlImport = await fixture.core.importFiles({ files: [{ path: html }] })
+  const markdownSource = markdownImport.sources[0]
+  const htmlSource = htmlImport.sources[0]
+
+  assert.equal(markdownSource.content_hash, htmlSource.content_hash)
+  assert.notEqual(markdownSource.source_id, htmlSource.source_id)
+  assert.equal(htmlImport.accepted.length, 1)
+  assert.equal(repeatedHtmlImport.duplicates.length, 1)
+  assert.equal(repeatedHtmlImport.sources[0].source_id, htmlSource.source_id)
+
+  const markdownDocument = await documentForManagedPath(fixture.workspace, markdownSource.managed_path)
+  const htmlDocument = await documentForManagedPath(fixture.workspace, htmlSource.managed_path)
+  assert.equal(markdownDocument.mediaType, "text/markdown")
+  assert.equal(htmlDocument.mediaType, "text/html")
+  assert.equal(JSON.stringify(markdownDocument).includes("alert(1)"), true)
+  assert.equal(JSON.stringify(htmlDocument).includes("alert(1)"), false)
+})
+
 test("DOCX tables retain headers, rows, and merge metadata without executing active content", async (t) => {
   const fixture = await formatFixture()
   t.after(() => rm(fixture.root, { recursive: true, force: true }))
@@ -224,6 +252,33 @@ test("long block chunks retain piece-level source locators", async (t) => {
   }
 })
 
+test("parser and task batching never split a supplementary Unicode character", async (t) => {
+  const fixture = await formatFixture()
+  t.after(() => rm(fixture.root, { recursive: true, force: true }))
+
+  const parserSource = `${"a".repeat(299)}😀${"b".repeat(900)}`
+  const parserPath = path.join(fixture.incoming, "unicode-parser.md")
+  await writeFile(parserPath, parserSource)
+  const parsed = await parseManagedSource(parserPath, "source-unicode-parser", "text/markdown", { maxChunkChars: 500 })
+  assert.equal(parsed.chunks.map((chunk) => chunk.text).join(""), parserSource)
+  assert.equal(parsed.chunks.every((chunk) => !hasUnpairedSurrogate(chunk.text)), true)
+
+  const tinyPath = path.join(fixture.incoming, "unicode-tiny.md")
+  await writeFile(tinyPath, "😀a")
+  const tiny = await parseManagedSource(tinyPath, "source-unicode-tiny", "text/markdown", { maxChunkChars: 1 })
+  assert.equal(tiny.chunks.map((chunk) => chunk.text).join(""), "😀a")
+  assert.equal(tiny.chunks.every((chunk) => !hasUnpairedSurrogate(chunk.text)), true)
+
+  const taskSource = `${"x".repeat(1_799)}😀${"y".repeat(3_500)}`
+  const taskPath = path.join(fixture.incoming, "unicode-task.md")
+  await writeFile(taskPath, taskSource)
+  const imported = await fixture.core.importFiles({ files: [{ path: taskPath }] })
+  const batches = JSON.parse(await readFile(path.join(fixture.workspace, ".llm-wiki", "tasks", imported.task_id, "batches.json"), "utf8"))
+  const taskChunks = batches.flatMap((batch) => batch.chunks)
+  assert.equal(taskChunks.every((chunk) => !hasUnpairedSurrogate(chunk.text)), true)
+  assert.equal(taskChunks.map((chunk) => chunk.text).join(""), taskSource)
+})
+
 test("PDF text is normalized page by page with traceable page numbers", async (t) => {
   const fixture = await formatFixture()
   t.after(() => rm(fixture.root, { recursive: true, force: true }))
@@ -241,6 +296,22 @@ async function managedDocument(workspace, hash) {
 
 async function managedChunks(workspace, hash) {
   return JSON.parse(await readFile(path.join(workspace, ".llm-wiki", "sources", "objects", hash, "extracted", "chunks.json"), "utf8"))
+}
+
+async function documentForManagedPath(workspace, managedPath) {
+  return JSON.parse(await readFile(path.join(workspace, path.dirname(managedPath), "extracted", "document.json"), "utf8"))
+}
+
+function hasUnpairedSurrogate(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code >= 0xD800 && code <= 0xDBFF) {
+      const next = value.charCodeAt(index + 1)
+      if (!(next >= 0xDC00 && next <= 0xDFFF)) return true
+      index += 1
+    } else if (code >= 0xDC00 && code <= 0xDFFF) return true
+  }
+  return false
 }
 
 function spreadsheetAnalysis(taskId, batchId, sourceRef) {

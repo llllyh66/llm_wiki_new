@@ -3,7 +3,7 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 import JSZip from "jszip"
 import { fail } from "./errors.js"
-import { sha256 } from "./utils.js"
+import { safeTextCut, sha256 } from "./utils.js"
 import { xlsxToMarkdown } from "./xlsx.js"
 
 export const SUPPORTED_SOURCE_TYPES = Object.freeze({
@@ -450,8 +450,8 @@ function splitTextWithOffsets(text, maxChars) {
   while (text.length - cursor > maxChars) {
     const window = text.slice(cursor, cursor + maxChars + 1)
     const candidates = [window.lastIndexOf("\n\n"), window.lastIndexOf("\n"), window.lastIndexOf("。"), window.lastIndexOf(". "), window.lastIndexOf(" ")]
-    const cut = Math.max(...candidates, Math.floor(maxChars * 0.6))
-    const rawEnd = cursor + cut
+    const cut = Math.max(...candidates, Math.max(1, Math.floor(maxChars * 0.6)))
+    const rawEnd = safeTextCut(text, cursor + cut, cursor)
     const rawPiece = text.slice(cursor, rawEnd)
     const piece = rawPiece.trim()
     if (piece) {

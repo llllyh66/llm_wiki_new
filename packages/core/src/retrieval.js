@@ -1,7 +1,8 @@
 import { readFile, readdir } from "node:fs/promises"
 import path from "node:path"
 import { embedQueryAndDocuments, warmEmbeddingCache } from "./embedding.js"
-import { listFilesRecursive, pathExists, readJson, relativePosix, sha256, tokenize } from "./utils.js"
+import { listFilesRecursive, pathExists, readJson, relativePosix, safeTextCut, sha256, tokenize } from "./utils.js"
+import { extractWikiLinks } from "./wiki-page.js"
 
 const DEFAULT_RRF_K = 60
 const VECTOR_DIMENSIONS = 256
@@ -285,8 +286,8 @@ function scoreWiki(documents, queryTerms, seeds) {
   }
   documents.forEach((document, sourceIndex) => {
     if (document.kind !== "wiki-page") return
-    for (const match of document.content.matchAll(/\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g)) {
-      const normalized = normalizeWikiTarget(match[1])
+    for (const link of extractWikiLinks(document.content)) {
+      const normalized = normalizeWikiTarget(link)
       const targetIndexes = pageLookup.get(normalized) ?? pageLookup.get(path.posix.basename(normalized)) ?? []
       for (const targetIndex of targetIndexes) {
         connect(sourceIndex, targetIndex)
@@ -431,7 +432,7 @@ function splitSections(content, maxChars) {
   let rest = String(content)
   while (rest.length > maxChars) {
     const window = rest.slice(0, maxChars + 1)
-    const cut = Math.max(window.lastIndexOf("\n## "), window.lastIndexOf("\n\n"), window.lastIndexOf("\n"), Math.floor(maxChars * 0.6))
+    const cut = safeTextCut(rest, Math.max(window.lastIndexOf("\n## "), window.lastIndexOf("\n\n"), window.lastIndexOf("\n"), Math.floor(maxChars * 0.6)))
     sections.push(rest.slice(0, cut).trim())
     rest = rest.slice(cut).trimStart()
   }

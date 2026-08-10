@@ -39,15 +39,20 @@
   classification. The domain contract supplements, rather than replaces,
   SourceRef grounding.
 
-Minimal shape:
+Current candidate excerpt (copy the complete server scaffold; this is not a
+standalone envelope):
 
 ```json
 {
-  "sourceRefs": [{ "sourceId": "source-...", "chunkId": "chunk-...", "quote": "short verbatim text", "locator": {} }],
+  "sourceRefMode": "batch-evidence-index",
+  "sourceRefs": [0, 1],
   "entities": [{ "localId": "entity-1", "name": "Example", "sourceRefs": [0] }],
-  "reviewItems": [{ "content": "A sourced issue requiring review", "sourceRefs": [0] }]
+  "reviewItems": [{ "content": "A sourced issue requiring review", "sourceRefs": [1] }]
 }
 ```
+
+Only a legacy server without `evidence_catalog` uses complete SourceRef objects
+in the top-level catalog.
 
 ## Page planning
 

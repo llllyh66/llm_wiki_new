@@ -33,7 +33,7 @@ Use this shape on every entity and concept:
     "confidence": 0.91,
     "domain": { "key": "Customer_Domain", "name": "客户域", "file": "Customer_Domain/Customer_Domain_domain.json" },
     "abe": { "key": "customer_management", "name": "客户管理", "file": "Customer_Domain/customer_management.json" },
-    "be": { "key": "customer_management#/businessEntities/2", "name": "个人客户", "pointer": "/businessEntities/2" }
+    "be": { "key": "individual_customer", "name": "个人客户", "pointer": "/businessEntities/2" }
   }
 }
 ```

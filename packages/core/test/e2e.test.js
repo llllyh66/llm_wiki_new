@@ -359,6 +359,25 @@ test("Wiki title and bidirectional link neighbors participate in RRF", async (t)
   assert.equal(retrieval.hits.some((hit) => hit.path === "wiki/topics/hidden-neighbor.md"), true)
 })
 
+test("Wiki retrieval graph ignores links inside Markdown code examples", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const topics = path.join(f.workspace, "wiki", "topics")
+  await mkdir(topics, { recursive: true })
+  await writeFile(path.join(topics, "alpha.md"), "# AlphaCodeExample\n\n```markdown\n[[topics/hidden-neighbor]]\n```\n")
+  await writeFile(path.join(topics, "hidden-neighbor.md"), "# Hidden Neighbor\n\nUnrelated background knowledge.\n")
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  const retrieval = await f.core.retrieveContext({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    queries: ["AlphaCodeExample"],
+    channels: ["bm25", "wiki"],
+  })
+  assert.equal(retrieval.hits.some((hit) => hit.path === "wiki/topics/alpha.md"), true)
+  assert.equal(retrieval.hits.some((hit) => hit.path === "wiki/topics/hidden-neighbor.md"), false)
+})
+
 test("page planning resolves safe cross-batch local IDs into bidirectional Related scaffolds", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))

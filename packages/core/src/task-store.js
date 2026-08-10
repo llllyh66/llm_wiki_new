@@ -1,7 +1,7 @@
 import { rm, stat } from "node:fs/promises"
 import path from "node:path"
 import { fail } from "./errors.js"
-import { ensureDir, newId, nowIso, pathExists, readJson, sha256, stableStringify, writeJsonAtomic } from "./utils.js"
+import { ensureDir, newId, nowIso, pathExists, readJson, safeTextCut, sha256, stableStringify, writeJsonAtomic } from "./utils.js"
 import { writeProgressiveSchemaSnapshot } from "./schema-bundle.js"
 
 export const ACTIVE_TASK_STATUSES = ["importing", "parsing", "prepared", "extracting", "planning", "committing", "finalizing", "failed"]
@@ -340,11 +340,12 @@ function splitChunkText(text, maxChars) {
     const window = text.slice(cursor, cursor + maxChars + 1)
     const cut = Math.max(window.lastIndexOf("\n"), window.lastIndexOf("。"), window.lastIndexOf(". "), window.lastIndexOf(" "), Math.floor(maxChars * 0.6))
     let start = cursor
-    let end = cursor + cut
+    const rawEnd = safeTextCut(text, cursor + cut, cursor)
+    let end = rawEnd
     while (start < end && /\s/u.test(text[start])) start += 1
     while (end > start && /\s/u.test(text[end - 1])) end -= 1
     if (start < end) pieces.push({ text: text.slice(start, end), start, end })
-    cursor += cut
+    cursor = rawEnd
     while (cursor < text.length && /\s/u.test(text[cursor])) cursor += 1
   }
   let start = cursor

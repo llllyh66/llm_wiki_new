@@ -156,7 +156,7 @@ async function main() {
   const lock = await acquireStartLock(lockFile)
   if (!lock) {
     if (await waitForHealth(port, workspaceRoot)) return
-    throw new Error(`Timed out waiting for another Claude session to start the llm-wiki MCP daemon on port ${port}.`)
+    throw new Error(`Timed out waiting for another client session to start the llm-wiki MCP daemon on port ${port}.`)
   }
 
   try {

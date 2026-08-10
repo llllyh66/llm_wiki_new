@@ -15,6 +15,24 @@ export const nowIso = () => new Date().toISOString()
 export const newId = (prefix) => `${prefix}-${randomUUID()}`
 export const sha256 = (value) => createHash("sha256").update(value).digest("hex")
 
+// String offsets in the parser and batching contracts are UTF-16 offsets.
+// Keep a chosen boundary from landing between the two code units of one
+// supplementary Unicode character (emoji, historic scripts, etc.).
+export function safeTextCut(text, cut, minimum = 0) {
+  const value = String(text ?? "")
+  const bounded = Math.min(Math.max(Math.trunc(Number(cut) || 0), 0), value.length)
+  if (bounded > 0
+    && bounded < value.length
+    && value.charCodeAt(bounded - 1) >= 0xD800
+    && value.charCodeAt(bounded - 1) <= 0xDBFF
+    && value.charCodeAt(bounded) >= 0xDC00
+    && value.charCodeAt(bounded) <= 0xDFFF) {
+    const backward = bounded - 1
+    return backward > minimum ? backward : Math.min(value.length, bounded + 1)
+  }
+  return bounded
+}
+
 export async function sha256File(filePath) {
   const handle = await open(filePath, "r")
   const hash = createHash("sha256")

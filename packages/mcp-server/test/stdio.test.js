@@ -109,6 +109,50 @@ test("supervised HTTP MCP keeps idle sessions alive and accepts a new session af
   assert.match(stderr, /"event":"worker-retry"/)
 })
 
+test("HTTP MCP bounds concurrent sessions and releases capacity after close", async (t) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-http-capacity-"))
+  const workerPath = fileURLToPath(new URL("../dist/http-worker.js", import.meta.url))
+  const port = await reservePort()
+  const worker = spawn(process.execPath, [workerPath, "--workspace", workspace, "--port", String(port)], {
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      LLM_WIKI_MCP_MAX_SESSIONS: "1",
+      LLM_WIKI_MCP_KEEPALIVE_MS: "1000",
+      LLM_WIKI_MCP_KEEPALIVE_TIMEOUT_MS: "250",
+      LLM_WIKI_MCP_MAX_KEEPALIVE_FAILURES: "1",
+    },
+  })
+  t.after(async () => {
+    if (worker.exitCode === null) worker.kill("SIGTERM")
+    await Promise.race([
+      new Promise((resolve) => worker.once("exit", resolve)),
+      new Promise((resolve) => setTimeout(resolve, 3_000)),
+    ])
+    await rm(workspace, { recursive: true, force: true })
+  })
+  const health = await waitForHealth(port)
+  assert.equal(health.maxSessions, 1)
+
+  const firstTransport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`))
+  const firstClient = new Client({ name: "llm-wiki-http-capacity-first", version: "1.0.0" })
+  await firstClient.connect(firstTransport)
+  assert.equal((await waitForHealth(port, (value) => value.sessions === 1)).sessions, 1)
+
+  const rejectedTransport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`))
+  const rejectedClient = new Client({ name: "llm-wiki-http-capacity-rejected", version: "1.0.0" })
+  await assert.rejects(rejectedClient.connect(rejectedTransport))
+  await rejectedTransport.close().catch(() => {})
+
+  await firstClient.close()
+  await waitForHealth(port, (value) => value.sessions === 0)
+  const replacementTransport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`))
+  const replacementClient = new Client({ name: "llm-wiki-http-capacity-replacement", version: "1.0.0" })
+  await replacementClient.connect(replacementTransport)
+  assert.equal((await replacementClient.listTools()).tools.length, 17)
+  await replacementClient.close()
+})
+
 async function reservePort() {
   const server = net.createServer()
   await new Promise((resolve, reject) => {

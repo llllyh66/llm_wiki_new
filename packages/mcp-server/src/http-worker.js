@@ -17,6 +17,8 @@ const DEFAULT_PORT = 31_982
 const DEFAULT_HTTP_KEEPALIVE_MS = 10_000
 const DEFAULT_PROTOCOL_KEEPALIVE_MS = 60_000
 const DEFAULT_KEEPALIVE_TIMEOUT_MS = 15_000
+const DEFAULT_MAX_SESSIONS = 128
+const DEFAULT_MAX_KEEPALIVE_FAILURES = 3
 
 let runtimeLogStream = null
 let runtimeDegraded = false
@@ -91,9 +93,12 @@ async function main() {
   const core = await LlmWikiCore.open(workspaceRoot)
   const router = new HeadlessToolRouter(core)
   const sessions = new Map()
+  let pendingSessions = 0
   const httpKeepaliveMs = readInteger("LLM_WIKI_MCP_HTTP_KEEPALIVE_MS", DEFAULT_HTTP_KEEPALIVE_MS, { minimum: 1_000, maximum: 60_000 })
   const protocolKeepaliveMs = readInteger("LLM_WIKI_MCP_KEEPALIVE_MS", DEFAULT_PROTOCOL_KEEPALIVE_MS, { minimum: 1_000, maximum: 30 * 60_000 })
   const keepaliveTimeoutMs = readInteger("LLM_WIKI_MCP_KEEPALIVE_TIMEOUT_MS", DEFAULT_KEEPALIVE_TIMEOUT_MS, { minimum: 250, maximum: 60_000 })
+  const maxSessions = readInteger("LLM_WIKI_MCP_MAX_SESSIONS", DEFAULT_MAX_SESSIONS, { minimum: 1, maximum: 1_024 })
+  const maxKeepaliveFailures = readInteger("LLM_WIKI_MCP_MAX_KEEPALIVE_FAILURES", DEFAULT_MAX_KEEPALIVE_FAILURES, { minimum: 1, maximum: 20 })
   const app = createMcpExpressApp({ host })
   app.disable("x-powered-by")
 
@@ -118,12 +123,13 @@ async function main() {
       keepAliveMs: httpKeepaliveMs,
       onsessioninitialized: (initializedSessionId) => {
         sessionId = initializedSessionId
+        record.sessionId = initializedSessionId
         sessions.set(initializedSessionId, record)
         log("session-ready", { sessionId: initializedSessionId, sessions: sessions.size })
       },
       onsessionclosed: (closedSessionId) => cleanupSession(closedSessionId, "client-delete"),
     })
-    const record = { transport, server: protocolServer, keepalive: null, keepaliveBusy: false }
+    const record = { transport, server: protocolServer, sessionId: null, initializationPending: false, keepalive: null, keepaliveBusy: false, keepaliveFailures: 0 }
     transport.onerror = (error) => log("transport-error", { sessionId, message: error instanceof Error ? error.message : String(error) })
     transport.onclose = () => {
       if (sessionId && sessions.has(sessionId)) void cleanupSession(sessionId, "transport-close")
@@ -139,14 +145,22 @@ async function main() {
         EmptyResultSchema,
         { timeout: keepaliveTimeoutMs, maxTotalTimeout: keepaliveTimeoutMs },
       ))
-        .then(() => log("keepalive", { transport: "http", sessionId, status: "ok", durationMs: Date.now() - startedAt }))
-        .catch((error) => log("keepalive", {
-          transport: "http",
-          sessionId,
-          status: "failed",
-          durationMs: Date.now() - startedAt,
-          message: error instanceof Error ? error.message : String(error),
-        }))
+        .then(() => {
+          record.keepaliveFailures = 0
+          log("keepalive", { transport: "http", sessionId, status: "ok", durationMs: Date.now() - startedAt })
+        })
+        .catch(async (error) => {
+          record.keepaliveFailures += 1
+          log("keepalive", {
+            transport: "http",
+            sessionId,
+            status: "failed",
+            consecutiveFailures: record.keepaliveFailures,
+            durationMs: Date.now() - startedAt,
+            message: error instanceof Error ? error.message : String(error),
+          })
+          if (record.keepaliveFailures >= maxKeepaliveFailures) await cleanupSession(sessionId, "keepalive-failed")
+        })
         .finally(() => { record.keepaliveBusy = false })
     }, protocolKeepaliveMs)
     return record
@@ -155,7 +169,25 @@ async function main() {
   const resolveSession = async (req, res) => {
     const sessionId = req.headers["mcp-session-id"]
     if (typeof sessionId === "string" && sessions.has(sessionId)) return sessions.get(sessionId)
-    if (!sessionId && isInitializeRequest(req.body)) return createSession()
+    if (!sessionId && isInitializeRequest(req.body)) {
+      if (sessions.size + pendingSessions >= maxSessions) {
+        res.set("retry-after", "1").status(503).json({
+          jsonrpc: "2.0",
+          error: { code: -32_000, message: "MCP session capacity reached; retry after another session closes." },
+          id: req.body?.id ?? null,
+        })
+        return null
+      }
+      pendingSessions += 1
+      try {
+        const session = await createSession()
+        session.initializationPending = true
+        return session
+      } catch (error) {
+        pendingSessions -= 1
+        throw error
+      }
+    }
     res.status(sessionId ? 404 : 400).json({
       jsonrpc: "2.0",
       error: { code: -32_000, message: sessionId ? "MCP session not found; reconnect and initialize a new session." : "Missing MCP session ID." },
@@ -174,13 +206,23 @@ async function main() {
     supervisorPid: Number(process.env.LLM_WIKI_MCP_SUPERVISOR_PID) || null,
     supervisorBuild: process.env.LLM_WIKI_MCP_SUPERVISOR_BUILD || null,
     sessions: sessions.size,
+    pendingSessions,
+    maxSessions,
     degraded: runtimeDegraded,
     build: buildInfo,
   }))
   app.post("/mcp", async (req, res) => {
     const session = await resolveSession(req, res)
     if (!session) return
-    await session.transport.handleRequest(req, res, req.body)
+    try {
+      await session.transport.handleRequest(req, res, req.body)
+    } finally {
+      if (session.initializationPending) {
+        session.initializationPending = false
+        pendingSessions = Math.max(0, pendingSessions - 1)
+        if (!session.sessionId) await session.server.close().catch(() => {})
+      }
+    }
   })
   app.get("/mcp", async (req, res) => {
     const sessionId = req.headers["mcp-session-id"]
@@ -210,6 +252,8 @@ async function main() {
     httpKeepaliveMs,
     protocolKeepaliveMs,
     keepaliveTimeoutMs,
+    maxSessions,
+    maxKeepaliveFailures,
     build: buildInfo,
     runtimeLogPath,
   })

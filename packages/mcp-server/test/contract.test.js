@@ -12,7 +12,6 @@ const textResult = (result) => JSON.parse(result.content[0].text)
 
 test("CAC project integration mirrors Claude with only client-name substitutions", async () => {
   const files = [
-    "README.md",
     "settings.json",
     "agents/llm-wiki-extractor.md",
     "agents/llm-wiki-page-drafter.md",
@@ -30,28 +29,55 @@ test("CAC project integration mirrors Claude with only client-name substitutions
   }
 })
 
-test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool allowlist", async () => {
+test("CAC documentation does not assume every compatible host installs a cac executable", async () => {
+  const readme = await readFile(new URL("../../../.cac/README.md", import.meta.url), "utf8")
+  assert.doesNotMatch(readme, /^cac mcp list$/m)
+  assert.match(readme, /actual launcher command/i)
+})
+
+test("Claude project agents inherit llm-wiki MCP without a restrictive tool allowlist", async () => {
   const extractor = await readFile(new URL("../../../.claude/agents/llm-wiki-extractor.md", import.meta.url), "utf8")
   const writer = await readFile(new URL("../../../.claude/agents/llm-wiki-writer.md", import.meta.url), "utf8")
   const drafter = await readFile(new URL("../../../.claude/agents/llm-wiki-page-drafter.md", import.meta.url), "utf8")
   const settings = JSON.parse(await readFile(new URL("../../../.claude/settings.json", import.meta.url), "utf8"))
   const skill = await readFile(new URL("../../../.agents/skills/llm-wiki-builder/SKILL.md", import.meta.url), "utf8")
+  const analysisRules = await readFile(new URL("../../../.agents/skills/llm-wiki-builder/references/analysis-rules.md", import.meta.url), "utf8")
+  const domainSchema = await readFile(new URL("../../../.agents/skills/llm-wiki-builder/references/domain-schema.md", import.meta.url), "utf8")
 
-  for (const agent of [extractor, writer]) {
+  for (const agent of [extractor, writer, drafter]) {
     assert.doesNotMatch(agent, /^tools:/m)
     assert.match(agent, /^disallowedTools:/m)
     assert.match(agent, /^mcpServers:\n  - llm-wiki$/m)
     assert.match(agent, /^permissionMode: dontAsk$/m)
-    assert.match(agent, /ToolSearch/)
   }
-  assert.match(drafter, /^tools: \[\]$/m)
+  assert.match(extractor, /ToolSearch/)
+  assert.match(writer, /ToolSearch/)
+  assert.doesNotMatch(writer, /^skills:/m)
+  assert.match(extractor, /^disallowedTools:.*llm_wiki_delete_knowledge_base.*llm_wiki_lint$/m)
+  assert.match(writer, /^disallowedTools:.*llm_wiki_delete_knowledge_base.*llm_wiki_lint$/m)
   assert.match(drafter, /^disallowedTools:.*ToolSearch$/m)
+  assert.match(drafter, /^disallowedTools:.*llm_wiki_update_pages/m)
   assert.match(drafter, /^mcpServers:\n  - llm-wiki$/m)
   assert.match(drafter, /llm_wiki_stage_page_drafts/)
   assert.match(drafter, /never returns page bodies/i)
   assert.match(drafter, /^permissionMode: dontAsk$/m)
   assert.match(drafter, /one bounded shard/)
   assert.match(drafter, /no duplicate paths/)
+  assert.deepEqual(agentMcpTools(extractor), [
+    "llm_wiki_commit_analysis",
+    "llm_wiki_get_batch",
+    "llm_wiki_get_domain_schema",
+    "llm_wiki_retrieve_context",
+  ])
+  assert.deepEqual(agentMcpTools(drafter), [
+    "llm_wiki_get_page_plan_context",
+    "llm_wiki_stage_page_drafts",
+  ])
+  assert.deepEqual(agentMcpTools(writer), [
+    "llm_wiki_commit_pages",
+    "llm_wiki_get_page_plan_context",
+    "llm_wiki_get_staged_page_drafts",
+  ])
   assert.equal(settings.enableAllProjectMcpServers, true)
   const sessionStartHook = settings.hooks.SessionStart[0].hooks[0]
   assert.equal(sessionStartHook.command, "node")
@@ -98,16 +124,22 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(extractor, /cite `evidence_index` values directly/)
   assert.match(extractor, /including `batch_count: 1`/)
   assert.match(skill, /at most two `commit_analysis` attempts for each batch/)
+  assert.match(skill, /both permitted validation attempts is the exception/)
+  assert.match(extractor, /second validation rejection.*`restart_required: false`/s)
+  assert.match(skill, /leave the\s+scaffold's prefilled numeric top-level `sourceRefs` catalog unchanged/)
+  assert.match(analysisRules, /"sourceRefMode": "batch-evidence-index"/)
+  assert.doesNotMatch(domainSchema, /customer_management#\/businessEntities/)
   assert.match(writer, /Normal mode: staged receipts only/)
   assert.match(writer, /never launches or asks to\s+launch a Drafter/)
   assert.match(writer, /waiting_for_drafter_receipts/)
-  assert.match(writer, /After one accepted staged wave, stop/)
+  assert.match(writer, /After one accepted staged wave, inspect only its returned action/)
+  assert.match(writer, /execute it once in this same invocation and then stop/)
   assert.match(writer, /action_owner: "coordinator"/)
   assert.match(writer, /300–1,200 characters/)
   assert.match(writer, /stable server-side Wiki committer/)
   assert.match(writer, /main coordinator owns the\s+projection manifest/)
   assert.match(skill, /incremental projection leases at most eight batches/)
-  assert.match(skill, /coordinator projection loop uses only\s+`llm_wiki_get_page_plan_context`/)
+  assert.match(skill, /resumes an existing projection with an exact coordinator-owned\s+`view: "draft-shard"` action/)
   assert.match(skill, /must never call\s+`llm_wiki_get_staged_page_drafts` or `llm_wiki_commit_pages`/)
   assert.match(writer, /`patches: \[\]` is the required staged-commit form/)
   assert.match(skill, /`llm_wiki_apply_projection`\s+is only a compatibility redirect/)
@@ -116,13 +148,17 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(writer, /explicit-serial-writer-fallback-only/)
   assert.match(writer, /Never import or extract sources, launch Agents, coordinate Drafters/)
   assert.match(skill, /at most four concurrent/)
-  assert.match(skill, /background subagents cannot reliably spawn nested subagents/)
+  assert.match(skill, /background subagents cannot reliably spawn nested subagents/i)
   assert.match(skill, /path is indivisible.*requirement sharing\s+`patch_scaffold\.path`/s)
   assert.match(skill, /parallel draft generation must\s+never become parallel commits/)
-  assert.match(skill, /must launch project Agent\s+`llm-wiki-page-drafter`/)
+  assert.match(skill, /Launch one project Agent\s+`llm-wiki-page-drafter` for every returned action/)
+  assert.match(skill, /one-shard\s+manifest where `parallel_drafting.enabled` is false/)
+  assert.match(skill, /Maintain one active-Writer flag/)
+  assert.match(skill, /do not launch a second Writer/)
   assert.match(skill, /coordinator-owned-parallel-drafters/)
   assert.match(skill, /Launch the stable `llm-wiki-writer` only\s+after at least one Drafter stages a shard/)
   assert.match(skill, /A Writer launched without hash-bound receipts must return\s+`waiting_for_drafter_receipts`/)
+  assert.match(skill, /exact Writer-owned empty\s+`projection_complete: true` acknowledgement/)
   assert.match(skill, /Do not pass a manifest or\s+`draft-shard` action to that Writer/)
   assert.doesNotMatch(skill, /inspect `writer_next_action`/)
   assert.match(skill, /Never generate an oversized patch set and split it afterward/)
@@ -132,6 +168,14 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(skill, /Do not call `llm_wiki_get_batch` or perform semantic extraction in the main/)
   assert.match(skill, /only after a worker creation was attempted and failed/)
 })
+
+function agentMcpTools(agent) {
+  const deniedLine = agent.match(/^disallowedTools:\s*(.+)$/m)?.[1] ?? ""
+  const denied = new Set(deniedLine.split(/,\s*/))
+  return TOOL_DEFINITIONS.map((tool) => tool.name)
+    .filter((name) => !denied.has(`mcp__llm-wiki__${name}`))
+    .sort()
+}
 
 test("MCP publishes the complete Agent-first tool contract without desktop tools", () => {
   const names = TOOL_DEFINITIONS.map((tool) => tool.name)

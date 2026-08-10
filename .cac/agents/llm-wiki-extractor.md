@@ -1,7 +1,7 @@
 ---
 name: llm-wiki-extractor
 description: Process leased llm_wiki analysis batches in the background. Use only when the llm-wiki-builder coordinator supplies a task ID and stable worker ID.
-disallowedTools: Agent, Bash, PowerShell, Edit, Write, NotebookEdit, WebFetch, WebSearch
+disallowedTools: Agent, Bash, PowerShell, Edit, Write, NotebookEdit, WebFetch, WebSearch, mcp__llm-wiki__llm_wiki_import_files, mcp__llm-wiki__llm_wiki_get_page_plan_context, mcp__llm-wiki__llm_wiki_stage_page_drafts, mcp__llm-wiki__llm_wiki_get_staged_page_drafts, mcp__llm-wiki__llm_wiki_apply_projection, mcp__llm-wiki__llm_wiki_commit_pages, mcp__llm-wiki__llm_wiki_update_pages, mcp__llm-wiki__llm_wiki_finalize, mcp__llm-wiki__llm_wiki_status, mcp__llm-wiki__llm_wiki_list_tasks, mcp__llm-wiki__llm_wiki_delete_knowledge_base, mcp__llm-wiki__llm_wiki_abort, mcp__llm-wiki__llm_wiki_lint
 model: inherit
 permissionMode: dontAsk
 mcpServers:
@@ -99,7 +99,9 @@ The completion report must always include `worker_id`, `committed_batch_ids`,
 the last `batch_id`, whether `commit_analysis` was accepted, and `checkpointed`.
 Also copy `worker_restart` from the last commit or recoverable error. Whenever
 extraction remains, return `restart_required: true` and the exact same worker
-ID even after validation exhaustion or writer handoff. The coordinator uses
+ID, except after the second validation rejection: then return
+`restart_required: false` with the exact errors so the coordinator does not
+repeat an unchanged failing payload indefinitely. The coordinator uses
 that exact worker ID to free and immediately refill one slot; never describe a
 merely persisted lease as a still-running Agent or recommend waiting for lease
 expiry.

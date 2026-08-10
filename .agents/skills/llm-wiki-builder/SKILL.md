@@ -127,7 +127,7 @@ always use it and return control to the user while the worker runs.
    `llm-wiki-extractor` explicitly for every initial and replacement worker.
    Never launch these slots as `general-purpose`, a dynamically composed
    "Worker N", or an Agent Team teammate: those invocations do not apply
-   `.claude/agents/llm-wiki-extractor.md` and therefore may not receive its
+   project `llm-wiki-extractor` definition and therefore may not receive its
    `mcpServers` declaration. Assign stable IDs `extractor-1` through
    `extractor-N`, and keep the main Agent as a responsive coordinator. Give
    each worker only the task ID, its worker ID, this Skill path, and the
@@ -220,9 +220,11 @@ always use it and return control to the user while the worker runs.
       code block; preserve the exact `taskId` and `batchId`; include every
       required top-level array; and give every entity, concept, claim, relation,
       contradiction, candidate page, and review item at least one grounded
-      SourceRef. Put complete SourceRef objects in the top-level catalog and
-      preferably use checked zero-based catalog indexes in nested `sourceRefs`;
-      the Core resolves them to complete objects before persistence. For every
+      evidence index. In current `batch-evidence-index` mode, leave the
+      scaffold's prefilled numeric top-level `sourceRefs` catalog unchanged and
+      use checked `evidence_catalog.evidence_index` values in nested
+      `sourceRefs`. Only on a legacy server without `evidence_catalog` should
+      the top-level catalog contain complete SourceRef objects. For every
       claim, relation, contradiction, and review item, cite a short verbatim
       quote that contains its identifying terms. Never use one document-title
       reference as evidence for an entire table; split references by row or
@@ -248,8 +250,8 @@ always use it and return control to the user while the worker runs.
       entities and concepts first, and do not duplicate the same facts into
       claims or candidate pages unless they add distinct, reusable knowledge.
       Entity and concept page requirements are derived automatically.
-   6. Call `llm_wiki_commit_analysis` with its `worker_id` and a unique
-      idempotency key. Core rejects invalid Schema classifications before
+   6. Call `llm_wiki_commit_analysis` with its `worker_id` and an idempotency
+      key deterministic for that exact task, batch, and payload. Core rejects invalid Schema classifications before
       persistence; correct the payload rather than dropping candidates.
       If the accepted result has `wiki_projection.ready: true`, stop this
       extractor immediately and return `writer_required: true`, the supplied
@@ -311,13 +313,17 @@ always use it and return control to the user while the worker runs.
    the current extraction cap has room, immediately relaunch
    `llm-wiki-extractor` with that same worker ID and its exact leased batch or
    next-batch action, add it back to `running_worker_ids`, and only then refresh
-   status. This zero-delay refill applies after a normal quantum, validation
-   exhaustion, an interrupted lease, and a writer-required handoff; never wait
+   status. This zero-delay refill applies after a normal quantum, an interrupted
+   lease, and a writer-required handoff; never wait
    for lease expiry or another extractor to finish. If page drafting has reduced
    the extraction cap, assign the freed slot to the pending Drafter instead of
    exceeding the four-Agent budget. When no restart signal is available, call
    `llm_wiki_status` immediately and reconcile from persisted state. Reconcile that freed slot
-   independently of every other still-running worker. Use the
+   independently of every other still-running worker. A worker that has used
+   both permitted validation attempts is the exception: do not automatically
+   relaunch the same unchanged failing lease. Preserve the lease, return the
+   exact validation errors, and wait for a coordinator-directed correction
+   before starting another invocation. Use the
    status result's current `parallel_extraction.recommended_workers` and
    `worker_batch_quantum`, not a stale recommendation saved when an older task
    was imported:
@@ -369,7 +375,10 @@ always use it and return control to the user while the worker runs.
    When `ready: true` and `in_progress: false`, run the bounded projection
    orchestration loop in the main coordinator with stable writer ID
    `wiki-writer-1`, starting from the exact coordinator-owned `next_action`
-   returned by status or `commit_analysis`. The coordinator performs only fast manifest coordination,
+   returned by status or `commit_analysis`. A `view: "manifest"` action starts
+   or refreshes manifest coordination; a resumed `view: "draft-shard"` action
+   must be delegated unchanged to the named Drafter. Do not coerce one action
+   into the other. The coordinator performs only fast manifest coordination,
    background-Agent lifecycle management, and compact receipt validation. It
    may call `llm_wiki_get_page_plan_context` with `view: "manifest"` to obtain
    bounded drafter actions, but it must never call
@@ -378,7 +387,7 @@ always use it and return control to the user while the worker runs.
    Agent never receives generated PagePatch content. Semantic
    drafting is delegated in step 8 so the main Agent remains responsive while
    drafts run. This placement is intentional:
-   Claude background subagents cannot reliably spawn nested subagents, so a
+   Background subagents cannot reliably spawn nested subagents, so a
    background `llm-wiki-writer` cannot be the parent of parallel drafters.
    Never run two projection coordinators or MCP committers for one task. When
    the returned `parallel_drafting.execution_mode` is
@@ -387,7 +396,9 @@ always use it and return control to the user while the worker runs.
    project `llm-wiki-writer` as the sole committer only after Drafter receipts
    arrive. Never launch the Writer merely because a projection is ready or a
    manifest exists. A Writer launched without hash-bound receipts must return
-   `waiting_for_drafter_receipts` and must not fetch a manifest or shard. When
+   `waiting_for_drafter_receipts` and must not fetch a manifest or shard,
+   unless it receives the exact Writer-owned empty
+   `projection_complete: true` acknowledgement after the last committed shard. When
    the host concretely fails to launch `llm-wiki-page-drafter`, the coordinator
    may explicitly launch the stable Writer in
    `explicit-serial-writer-fallback-only` mode for one exact shard. That Writer
@@ -400,9 +411,12 @@ always use it and return control to the user while the worker runs.
    processes each projection independently and commits semantic pages before
    continuing; if extraction finishes with unprojected batches, drain those
    projections before opening the final full reconciliation.
-8. The coordinator projection loop uses only
-   `llm_wiki_get_page_plan_context` with `view: "manifest"` for every
-   projection. The stable `llm-wiki-writer` is the only caller of
+8. The coordinator starts each new projection with
+   `llm_wiki_get_page_plan_context` and `view: "manifest"`. When status or a
+   commit resumes an existing projection with an exact coordinator-owned
+   `view: "draft-shard"` action, delegate that action directly to one
+   `llm-wiki-page-drafter`; use the next returned manifest action to refresh
+   the bounded wave. The stable `llm-wiki-writer` is the only caller of
    `llm_wiki_get_staged_page_drafts` and `llm_wiki_commit_pages`.
    `llm_wiki_apply_projection`
    is only a compatibility redirect to the same page-plan action and never
@@ -433,26 +447,31 @@ always use it and return control to the user while the worker runs.
       `patch_scaffold.path` must stay in the same shard. Page planning never requires the multi-megabyte domain
       Schema, so do not fetch or reconstruct it.
    2. Use only the exact bounded `draft_manifest.draft_actions` returned by
-      Core; do not invent shard IDs. The coordinator must launch project Agent
-      `llm-wiki-page-drafter` in waves of at most four concurrent children
-      Do not traverse every manifest shard before drafting; start the first
-      bounded wave as soon as its shard actions are available.
-      whenever `parallel_drafting.enabled` is true. Pass each child only its
+      Core; do not invent shard IDs. Launch one project Agent
+      `llm-wiki-page-drafter` for every returned action, including a one-shard
+      manifest where `parallel_drafting.enabled` is false; that flag controls
+      whether several Drafters may run concurrently, not whether delegation is
+      required. When it is true, launch waves of at most four concurrent
+      children. Do not traverse every manifest shard before drafting; start the
+      first bounded wave as soon as its shard actions are available. Pass each child only its
       exact task, Writer, projection, and shard action. The child fetches its
       own bounded `view: "draft-shard"` context, follows only that shard's
       sequential cursors, and calls `llm_wiki_stage_page_drafts` after
       generating its patches. It returns a compact receipt containing a shard
       ID and draft hash, never PagePatch bodies. Validate only those receipts
-      in the coordinator. On every successful receipt notification,
-      immediately launch the stable `llm-wiki-writer` with the exact task,
-      projection, Writer, and exact hash-bound staged receipts. Do not pass a manifest or
+      in the coordinator. Maintain one active-Writer flag for the task and a
+      queue of validated receipts. When a receipt arrives and no Writer is
+      active, launch the stable `llm-wiki-writer` with that receipt or one
+      bounded queued receipt wave. If the Writer is already active, queue the
+      receipt and do not launch a second Writer; after it returns, process the
+      next queued wave before requesting more manifest work. Pass the exact task,
+      projection, Writer, and hash-bound staged receipts. Do not pass a manifest or
       `draft-shard` action to that Writer. The Writer calls
       `llm_wiki_get_staged_page_drafts` and commits with
       `staged_draft_receipts` and `patches: []`; page bodies remain in the
       task-scoped temporary staging area. After one accepted staged wave the
       Writer returns; the coordinator follows the returned coordinator-owned
-      manifest action and launches the next Drafter wave. If fewer than two
-      disjoint shards are available, launch one Drafter. Use the serial Writer
+      manifest action and launches the next Drafter wave. Use the serial Writer
       fallback only after a concrete Drafter creation failure; never
       fetch PagePatch bodies into the coordinator just because the wave has one shard.
       The coordinator must not interpret a receipt as permission to commit and
@@ -465,14 +484,16 @@ always use it and return control to the user while the worker runs.
       coordinator.
       Respect the four-Agent pipeline budget: normally two extractors plus two
       drafters while extraction overlaps, then up to four drafters afterward.
-   3. For `incremental` mode, update only pages affected by the projection's
+   3. Require each Drafter (or the serial-fallback Writer) in `incremental` mode
+      to update only pages affected by the projection's
       batch IDs. Reuse canonical paths, merge with existing grounded content,
       and avoid speculative or duplicate pages. Follow `writer_guidance`: keep
       an incremental page to a concise grounded draft (normally 300–1,200 body
       characters), add only facts introduced by the leased batches, and omit
       generic filler. Rich cross-batch synthesis belongs in final mode, not in
-      every repeated incremental update. For `final` mode, inspect all batch
-      analyses, reconcile cross-batch duplicates and contradictions, and
+      every repeated incremental update. For `final` mode, reconcile all
+      batch-derived analyses and evidence supplied in the assigned shard,
+      including cross-batch duplicates and contradictions, and
       explicitly review every existing page marked `provisional: true`.
       In both modes, treat the current shard's `page_requirements` as the minimum
       materialization contract, not as optional suggestions. It includes
@@ -483,7 +504,8 @@ always use it and return control to the user while the worker runs.
       patch's `covers`. Use `related_requirement_ids` plus evidence-backed body
       links to author useful Related navigation. Never invent an empty stub
       merely to satisfy coverage.
-   4. Generate PagePatch objects under the returned schema. Use the exact
+   4. Each Drafter (or serial-fallback Writer) generates PagePatch objects under
+      the returned schema. Use the exact
       `file_hash` as `expectedFileHash` for `replace` or `merge`.
       Every `page_requirement` now contains a server-generated
       `patch_scaffold`. Copy that object, add `content`, and keep its path,
@@ -519,10 +541,12 @@ always use it and return control to the user while the worker runs.
       coordinator context. Only the stable Writer may invoke
       `llm_wiki_commit_pages`, and it must use `staged_draft_receipts` with
       `patches: []`; parallel draft generation must never become parallel commits.
-   5. Obey `page_commit_limits` before drafting. A wave must contain no more
+   5. The Drafter and Writer must obey `page_commit_limits` before drafting or
+      committing. A wave must contain no more
       than the returned recommended count and can never exceed the hard 50
       patches or the content-character ceiling. Pass task ID, writer ID,
-      projection ID, current Wiki revision, and a unique idempotency key. Set
+      projection ID, current Wiki revision, and an idempotency key deterministic
+      for that exact commit payload. Set
       `projection_complete: false` for every staged shard/wave commit. Each
       accepted serial-fallback Writer call must copy the returned
       `draft_shard_ids`; staged receipt commits instead copy
@@ -533,7 +557,9 @@ always use it and return control to the user while the worker runs.
       `next_action` to the next missing shard and never regenerate or resubmit
       an accepted wave. When the server says no shard remains, send the
       returned empty `patches: []`, `projection_complete: true`
-      acknowledgement. This final coverage audit completes the projection.
+      acknowledgement. The currently active Writer executes this explicit
+      Writer-owned empty acknowledgement before it stops; it does not require a
+      new receipt or a second concurrent Writer. This final coverage audit completes the projection.
       For a server-side manifest, a non-final wave must contain a complete
       PagePatch set for every assigned path, or use hash-bound `staged_draft_receipts`;
       `projection_complete: false` with `draft_shard_ids` and `patches: []` is
@@ -560,7 +586,9 @@ always use it and return control to the user while the worker runs.
       When it is coordinator-owned and requests a manifest, the coordinator
       immediately starts the next manifest/Drafter wave with the same writer
       ID; do not call status or wait for the 30-second debounce. Launch the
-      Writer again only after new receipts exist. Stop after the reported
+      Writer again only after new receipts exist; the sole exception is the
+      exact Writer-owned empty final acknowledgement, which the current Writer
+      executes before returning. Stop after the reported
       coordinator projection quantum (currently six), when no backlog is ready,
       after a final projection, or on a recoverable error. The coordinator
       never substitutes itself as committer.

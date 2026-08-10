@@ -83,14 +83,18 @@ restarts the MCP worker with exponential backoff after a crash. Claude Code
 2.1.121 or later then supplies native HTTP reconnect with exponential backoff.
 This setup is portable across devices: each clone starts its own localhost
 daemon and stores its PID and logs only under that clone's `.llm-wiki/`.
-`.claude/skills/llm-wiki-builder` links to the canonical shared Skill, while
+`.claude/skills/llm-wiki-builder` is a discoverable entrypoint that points to
+the canonical shared Skill, while
 `.claude/settings.json` pre-approves all `llm-wiki` tools for the main and
 background agents and uses `dontAsk` for unattended extraction. Approve project
 trust on first use, then restart Claude Code after changing these files.
 
-CAC users receive the same project integration under `.cac/`: settings, all
-three Agents, and the `llm-wiki-builder` Skill mirror `.claude/` with only the
-client name, directory, and `CAC_PROJECT_DIR` placeholder substituted. Both
+Claude-compatible CAC hosts receive the same project integration under `.cac/`:
+settings, all three Agents, and the `llm-wiki-builder` Skill mirror `.claude/`
+with only the client name, directory, and `CAC_PROJECT_DIR` placeholder
+substituted. A CAC host must explicitly support these project settings, hooks,
+and placeholders; the root `.mcp.json` connection itself does not imply that
+its CLI command is named `cac`. Both
 clients share the root `.mcp.json`, the loopback daemon, and the canonical
 `.agents/skills/llm-wiki-builder/` workflow. The files are checked in directly
 rather than symlinked for Windows, GitHub archive, and multi-device portability.
@@ -219,7 +223,8 @@ The Claude Code startup hook uses `CLAUDE_PROJECT_DIR` rather than a mutable
 shell working directory and keeps this bounded 17-tool server loaded for the
 session. Ten-second HTTP keep-alive frames, one-minute protocol pings, a
 bounded SSE replay window, a supervised worker, Claude's native HTTP reconnect,
-and bounded transient-tool retries protect long-running sessions. MCP
+bounded transient-tool retries, a 128-session cap, and cleanup after three
+consecutive protocol-ping failures protect long-running sessions. MCP
 input/output budgets and paginated page-plan context prevent a single oversized
 request or response from closing the transport. Set `LLM_WIKI_MCP_HTTP_PORT`
 before starting Claude when the default localhost port `31982` conflicts with

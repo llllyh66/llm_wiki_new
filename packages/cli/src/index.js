@@ -4,15 +4,11 @@ import { readdir } from "node:fs/promises"
 import path from "node:path"
 
 const argv = process.argv.slice(2)
-const workspaceFlag = argv.indexOf("--workspace")
-const workspace = workspaceFlag >= 0 ? argv[workspaceFlag + 1] : process.cwd()
-if (workspaceFlag >= 0) argv.splice(workspaceFlag, 2)
-const domainSchemaFlag = argv.indexOf("--domain-schema")
-const domainSchemaPath = domainSchemaFlag >= 0 ? argv[domainSchemaFlag + 1] : undefined
-if (domainSchemaFlag >= 0) argv.splice(domainSchemaFlag, 2)
-const command = argv.shift()
 
 try {
+  const workspace = takeOption(argv, "--workspace") ?? process.cwd()
+  const domainSchemaPath = takeOption(argv, "--domain-schema")
+  const command = argv.shift()
   const core = await LlmWikiCore.open(workspace)
   let result
   if (command === "init") result = await core.init()
@@ -46,7 +42,7 @@ try {
 }
 
 async function collectSupportedFiles(root) {
-  const supported = new Set([".md", ".markdown", ".txt", ".html", ".htm", ".docx", ".pdf"])
+  const supported = new Set([".md", ".markdown", ".txt", ".html", ".htm", ".docx", ".xlsx", ".pdf"])
   const files = []
   async function walk(current) {
     const entries = await readdir(current, { withFileTypes: true })
@@ -60,4 +56,15 @@ async function collectSupportedFiles(root) {
   }
   await walk(root)
   return files
+}
+
+function takeOption(args, name) {
+  const indexes = args.flatMap((value, index) => value === name ? [index] : [])
+  if (indexes.length > 1) throw new Error(`${name} may only be specified once.`)
+  if (indexes.length === 0) return undefined
+  const index = indexes[0]
+  const value = args[index + 1]
+  if (!value || value.startsWith("--")) throw new Error(`${name} requires a value.`)
+  args.splice(index, 2)
+  return value
 }

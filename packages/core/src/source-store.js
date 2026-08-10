@@ -107,11 +107,24 @@ async function importOne(workspace, input, displayName) {
   }
 
   const contentHash = hash.digest("hex")
-  const sourceId = `source-${contentHash.slice(0, 24)}`
-  const objectDir = path.join(workspace.paths.sourceObjects, contentHash)
-  const manifestPath = path.join(workspace.paths.sourceManifests, `${sourceId}.json`)
-  const duplicate = await pathExists(manifestPath)
-  let manifest = duplicate ? await readJson(manifestPath) : undefined
+  let storageHash = contentHash
+  let sourceId = `source-${storageHash.slice(0, 24)}`
+  let manifestPath = path.join(workspace.paths.sourceManifests, `${sourceId}.json`)
+  let existingManifest = await pathExists(manifestPath) ? await readJson(manifestPath) : undefined
+  // Parser output is a function of both bytes and media type. Preserve the
+  // historical content-only ID for the first imported representation, while
+  // separating a later byte-identical file whose real extension selects a
+  // different parser. Otherwise import order can make HTML sanitization and
+  // extracted structure reuse the wrong parser result.
+  if (existingManifest && existingManifest.mediaType !== mediaType) {
+    storageHash = sha256(`${contentHash}\0${mediaType}`)
+    sourceId = `source-${storageHash.slice(0, 24)}`
+    manifestPath = path.join(workspace.paths.sourceManifests, `${sourceId}.json`)
+    existingManifest = await pathExists(manifestPath) ? await readJson(manifestPath) : undefined
+  }
+  const objectDir = path.join(workspace.paths.sourceObjects, storageHash)
+  const duplicate = Boolean(existingManifest)
+  let manifest = existingManifest
   if (!duplicate) {
     try {
       await ensureDir(objectDir)

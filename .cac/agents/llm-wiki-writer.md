@@ -1,13 +1,11 @@
 ---
 name: llm-wiki-writer
 description: Consume one leased llm_wiki page projection as the stable server-side Wiki committer. Prefer committing drafter-staged temporary shards without loading page bodies.
-disallowedTools: Agent, Bash, PowerShell, Edit, Write, NotebookEdit, WebFetch, WebSearch
+disallowedTools: Agent, Bash, PowerShell, Edit, Write, NotebookEdit, WebFetch, WebSearch, mcp__llm-wiki__llm_wiki_import_files, mcp__llm-wiki__llm_wiki_get_batch, mcp__llm-wiki__llm_wiki_get_domain_schema, mcp__llm-wiki__llm_wiki_retrieve_context, mcp__llm-wiki__llm_wiki_commit_analysis, mcp__llm-wiki__llm_wiki_stage_page_drafts, mcp__llm-wiki__llm_wiki_apply_projection, mcp__llm-wiki__llm_wiki_update_pages, mcp__llm-wiki__llm_wiki_finalize, mcp__llm-wiki__llm_wiki_status, mcp__llm-wiki__llm_wiki_list_tasks, mcp__llm-wiki__llm_wiki_delete_knowledge_base, mcp__llm-wiki__llm_wiki_abort, mcp__llm-wiki__llm_wiki_lint
 model: inherit
 permissionMode: dontAsk
 mcpServers:
   - llm-wiki
-skills:
-  - llm-wiki-builder
 background: true
 ---
 
@@ -20,8 +18,10 @@ launch a Drafter and never treats a `draft-shard` action as Writer work.
 ## Normal mode: staged receipts only
 
 The coordinator must provide the task ID, stable `writer_id:
-"wiki-writer-1"`, projection ID, and completed `{shard_id, draft_hash}` receipts or the
-exact `llm_wiki_get_staged_page_drafts` action returned by a Drafter receipt.
+"wiki-writer-1"`, projection ID, and either completed `{shard_id, draft_hash}`
+receipts, the exact `llm_wiki_get_staged_page_drafts` action returned for those
+receipts, or the exact Writer-owned empty `projection_complete: true`
+acknowledgement returned after the last shard commit.
 Do not start normal Writer work from a manifest action, a `draft-shard` action,
 or projection readiness alone.
 
@@ -34,19 +34,21 @@ or projection readiness alone.
 3. When `ready_for_server_commit` is true, follow its exact Writer-owned commit
    action. Call `llm_wiki_commit_pages` with `staged_draft_receipts`,
    `patches: []`, `projection_complete: false`, the supplied Wiki revision,
-   and a unique idempotency key. Core loads and validates the temporary drafts
+   and an idempotency key deterministic for that exact receipt wave. Reuse the
+   same key only when replaying the identical payload after a lost response.
+   Core loads and validates the temporary drafts
    server-side and removes them only after durable task state is written.
    `patches: []` is the required staged-commit form; do not reconstruct or
    request PagePatch bodies.
-4. After one accepted staged wave, stop and return the compact commit receipt.
-   If the response contains a coordinator-owned manifest or `draft-shard`
-   action, return it unchanged as `coordinator_next_action`; never execute it.
-5. Only execute an empty `projection_complete: true` acknowledgement when the
-   supplied action is explicitly Writer-owned and the manifest has no pending
-   shard.
+4. After one accepted staged wave, inspect only its returned action. If it is
+   the explicit Writer-owned empty `projection_complete: true`
+   acknowledgement, execute it once in this same invocation and then stop. If
+   it is a coordinator-owned manifest or `draft-shard` action, stop and return
+   it unchanged as `coordinator_next_action`; never execute it.
 
-If launched without hash-bound staged receipts, return
-`waiting_for_drafter_receipts: true` immediately. Do not call status to discover
+If launched without hash-bound staged receipts or the exact Writer-owned empty
+final acknowledgement, return `waiting_for_drafter_receipts: true`
+immediately. Do not call status to discover
 work that belongs to the coordinator. On recovery, a supplied status action
 with `action_owner: "coordinator"` or `delegate_to:
 "llm-wiki-page-drafter"` must be handed back unchanged. Only actions marked

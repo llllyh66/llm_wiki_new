@@ -1,14 +1,17 @@
-# CAC Code integration
+# CAC-compatible integration
 
-The project root `.mcp.json` connects CAC Code to the Headless `llm-wiki`
+This directory targets CAC clients that implement Claude Code-compatible
+project settings, hooks, agents, skills, and the `CAC_PROJECT_DIR` placeholder.
+The project root `.mcp.json` connects such a client to the Headless `llm-wiki`
 Streamable HTTP MCP server on loopback. A `SessionStart` command hook resolves
 the executable and workspace from `CAC_PROJECT_DIR` using CAC's
 cross-platform exec form, then idempotently starts
 a detached project-local supervisor. The supervisor restarts a crashed worker
-with exponential backoff; CAC Code 2.1.121+ automatically reconnects HTTP
-MCP sessions. The small 17-tool server remains `alwaysLoad`, so changing the
+with exponential backoff. When the client supports HTTP MCP reconnect and
+`anthropic/alwaysLoad`, the small 17-tool server remains available across
+worker restarts, so changing the
 shell working directory or deferred tool discovery cannot detach the workflow.
-CAC Code asks for project-server and hook trust the first time it reads the
+The client may ask for project-server and hook trust the first time it reads the
 checked-in configuration.
 
 On native Windows, both detached Node processes use hidden-window spawning, so
@@ -34,7 +37,7 @@ Verify from the repository root:
 ```bash
 npm ci
 npm run build
-cac mcp list
+# Use your CAC client's MCP status page or actual launcher command.
 test -f .cac/skills/llm-wiki-builder/SKILL.md
 ```
 
@@ -44,7 +47,7 @@ Expected MCP status:
 llm-wiki: http://127.0.0.1:31982/mcp (HTTP) - Connected
 ```
 
-Start CAC Code from the repository root, approve the project MCP server if
+Open the repository root in the CAC client, approve the project MCP server if
 prompted, and confirm `/mcp` reports `Connected` with 17 tools. Attach or
 reference documents, then ask:
 
@@ -80,13 +83,14 @@ Every initial and replacement slot must use the exact project Agent type
 `llm-wiki-extractor`; a generic "Worker N", `general-purpose` Agent, or Team
 teammate does not apply that file's `mcpServers` field. The MCP server and all
 17 tools are marked always-load, with ToolSearch as a deferred-discovery
-fallback. CAC Code 2.1.121 or later is recommended because that release adds
-the documented `alwaysLoad` and HTTP reconnect behavior; fully restart CAC
-Code after updating. Each device starts its own daemon. If port 31982 is already
-in use on one device, set `LLM_WIKI_MCP_HTTP_PORT` before starting CAC; the
+fallback. Confirm your CAC client documents `alwaysLoad`, HTTP reconnect, the
+project hook schema, and `CAC_PROJECT_DIR`; these capabilities cannot be
+inferred from the `.cac` directory name alone. Fully restart the client after
+updating. Each device starts its own daemon. If port 31982 is already in use on
+one device, set `LLM_WIKI_MCP_HTTP_PORT` before starting the client; the
 same variable is expanded by both `.mcp.json` and the startup hook.
 After `npm run build`, the next `SessionStart` compares `dist/build-info.json`
-with `/health` and replaces an older daemon before CAC reconnects.
+with `/health` and replaces an older daemon before the client reconnects.
 
 The server enforces a total four-Agent pipeline budget (normally two
 extractors plus two page drafters while extraction overlaps), and its router
@@ -145,7 +149,7 @@ changing the agent name cannot repair an MCP server that was not inherited by
 subagents. A Team initialization warning is not an MCP probe result. When the
 host confirms workers were launched, the coordinator tracks those workers and
 does not duplicate their work locally.
-After pulling this configuration change, fully restart CAC Code so existing
+After pulling this configuration change, fully restart the CAC client so existing
 subagent definitions are not reused from the prior session.
 
 You may also explicitly invoke the workflow with `/llm-wiki-builder`.

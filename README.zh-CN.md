@@ -148,14 +148,16 @@ Claude Code。
 
 ## CAC 配置
 
-项目同时提供实体目录 `.cac/`，其 `settings.json`、三个 Agent 和
+项目同时为支持 Claude Code 兼容项目配置的 CAC 客户端提供实体目录 `.cac/`，其 `settings.json`、三个 Agent 和
 `llm-wiki-builder` Skill 与 `.claude/` 一一对应，仅将 Claude 标识、路径和
 `CLAUDE_PROJECT_DIR` 替换为 CAC、`.cac` 和 `CAC_PROJECT_DIR`。两套配置共享
 根目录 `.mcp.json`、同一个 localhost HTTP MCP daemon 和规范工作流
 `.agents/skills/llm-wiki-builder/`。实体文件而非符号链接可确保 GitHub ZIP、
 Windows 和多设备克隆均能直接发现配置。
 
-在每台设备完成 `npm ci` 和 `npm run build` 后，从项目根目录启动 CAC，首次
+CAC 客户端必须明确支持这些项目级 settings、hook 和 `CAC_PROJECT_DIR` 占位符；
+仅能读取根目录 `.mcp.json` 并不代表其命令行程序一定名为 `cac`。在每台设备完成
+`npm ci` 和 `npm run build` 后，从项目根目录打开 CAC 客户端，首次
 使用时批准项目 MCP 和 hook。若此前已经打开该项目，请完全退出并重新启动 CAC，
 再在 MCP 页面确认 `llm-wiki` 为 `Connected` 且包含 17 个工具。
 
@@ -442,7 +444,7 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
 
 ### MCP 已连接，但工具无法调用
 
-1. 在 Claude Code 中运行 `/mcp`，确认已批准且工具数为 16。
+1. 在 Claude Code 中运行 `/mcp`，确认已批准且工具数为 17。
 2. 运行 `npm run build`，然后重启 Claude Code。
 3. 确保是从项目根目录启动。
 4. 显式测试：
@@ -453,10 +455,10 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
    ```
 
 如果主 Agent 可以调用，但后台 Agent 报告“只有 Read 工具”，说明当前会话仍
-加载了旧的子代理定义。确认两个 `.claude/agents/llm-wiki-*.md` 都包含
+加载了旧的子代理定义。确认三个 `.claude/agents/llm-wiki-*.md` 都包含
 `mcpServers: - llm-wiki`（YAML 分行形式）且没有 `tools:` 字段，然后完全退出
-Claude Code 并从项目根目录重新启动。新版会先做子代理能力探测；探测失败只
-回退一次到主 Agent，不会继续启动 `general-purpose` worker。
+Claude Code 并从项目根目录重新启动。新版由协调器先直接调用 status 验证连接，
+再启动具名项目 Agent；不会创建探测 Agent，也不会改用 `general-purpose` worker。
 
 ### Agent 提示“MCP 工具在跨 turn 时不可靠”
 
@@ -497,7 +499,8 @@ MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 若是在长时间没有工具调用、后台 Agent 仍在工作时断开，先查看
 `.llm-wiki/logs/mcp-daemon.log` 中的 `worker-exit`、`worker-retry` 和新
 `worker-start`，再查看 `.llm-wiki/logs/mcp-runtime.jsonl`。HTTP 每 10 秒
-发送 keep-alive frame，每 1 分钟发送标准 ping；心跳失败只记录日志。
+发送 keep-alive frame，每 1 分钟发送标准 ping；连续 3 次 ping 失败会清理失效
+会话，让重连客户端建立新会话，同时服务器最多保留 128 个并发会话。
 worker 退出后 supervisor 会自动拉起新 PID，Claude 会对 HTTP MCP 自动重连。
 默认端口 `31982` 冲突时，在该设备启动 Claude 前设置
 `LLM_WIKI_MCP_HTTP_PORT`。
