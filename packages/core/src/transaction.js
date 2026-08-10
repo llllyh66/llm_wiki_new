@@ -230,23 +230,37 @@ export async function cleanupTransactionArtifacts(workspace) {
       if (artifactBytes === 0) continue
       const terminalAt = Date.parse(journal.committedAt ?? journal.rolledBackAt ?? journal.createdAt ?? 0)
       const eligibleAt = Date.parse(journal.cleanupEligibleAt ?? new Date(terminalAt + retentionDays * 86_400_000).toISOString())
-      candidates.push({ journalPath, journal, backupRoot, stagingRoot, artifactBytes, eligibleAt })
+      candidates.push({ journalPath, journal, backupRoot, stagingRoot, artifactBytes, eligibleAt, terminalAt })
     }
     let retainedBytes = candidates.reduce((sum, candidate) => sum + candidate.artifactBytes, 0)
-    const removable = candidates
+    const expired = candidates
       .filter((candidate) => Number.isFinite(candidate.eligibleAt) && candidate.eligibleAt <= now)
       .sort((left, right) => left.eligibleAt - right.eligibleAt)
     const removed = []
-    for (const candidate of removable) {
+    const removeCandidate = async (candidate, reason) => {
       await removeArtifactDirectory(candidate.backupRoot)
       await removeArtifactDirectory(candidate.stagingRoot)
       retainedBytes -= candidate.artifactBytes
-      removed.push(candidate)
+      removed.push({ ...candidate, reason })
       await writeJsonAtomic(candidate.journalPath, {
         ...candidate.journal,
         artifactsCleanedAt: nowIso(),
         artifactsCleanedBytes: candidate.artifactBytes,
+        artifactsCleanupReason: reason,
       })
+    }
+    for (const candidate of expired) await removeCandidate(candidate, "retention_expired")
+    const expiredSet = new Set(expired.map((candidate) => candidate.journalPath))
+    const budgetCandidates = candidates
+      .filter((candidate) => !expiredSet.has(candidate.journalPath))
+      .sort((left, right) => {
+        const leftTime = Number.isFinite(left.terminalAt) ? left.terminalAt : 0
+        const rightTime = Number.isFinite(right.terminalAt) ? right.terminalAt : 0
+        return leftTime - rightTime
+      })
+    for (const candidate of budgetCandidates) {
+      if (retainedBytes <= maxBackupBytes) break
+      await removeCandidate(candidate, "backup_budget_exceeded")
     }
     return {
       skipped: false,
@@ -254,6 +268,7 @@ export async function cleanupTransactionArtifacts(workspace) {
       removedBytes: removed.reduce((sum, candidate) => sum + candidate.artifactBytes, 0),
       retainedBytes,
       overBudget: retainedBytes > maxBackupBytes,
+      budgetEvictedTransactions: removed.filter((candidate) => candidate.reason === "backup_budget_exceeded").length,
     }
   } finally {
     await release?.().catch(() => {})

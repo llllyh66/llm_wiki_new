@@ -133,7 +133,9 @@ export async function loadProgressiveSchemaSnapshot(record) {
   if (totalBytes !== manifest.total_bytes || totalBytes > MAX_SCHEMA_BUNDLE_BYTES) {
     fail("INVALID_DOMAIN_SCHEMA", "Task Schema snapshot total byte count is invalid.")
   }
-  const domainFolders = new Set(files.map((file) => file.relativePath.split("/")[0]).filter((value) => value !== PROGRESSIVE_SCHEMA_ROOT_FILE && value.includes("/")))
+  const domainFolders = new Set(files
+    .filter((file) => file.relativePath.includes("/"))
+    .map((file) => file.relativePath.split("/")[0]))
   for (const folder of domainFolders) {
     if (!files.some((file) => file.relativePath === `${folder}/${folder}_domain.json`)) {
       fail("INVALID_DOMAIN_SCHEMA", `Task Schema snapshot domain folder ${folder} is missing ${folder}_domain.json.`)
@@ -169,14 +171,17 @@ export function progressiveSchemaDisclosure(bundle, input = {}) {
   const level = String(input.level ?? "domains").trim().toLowerCase()
   if (!["domains", "domain", "abe"].includes(level)) fail("INVALID_INPUT", "level must be domains, domain, or abe.")
   let relativePath = PROGRESSIVE_SCHEMA_ROOT_FILE
+  let selectedDomainFolder = null
   if (level === "domain") {
     const folder = safePathPart(input.domain_folder, "domain_folder")
+    selectedDomainFolder = folder
     relativePath = `${folder}/${folder}_domain.json`
   }
   if (level === "abe") {
     const folder = safePathPart(input.domain_folder, "domain_folder")
     const file = safePathPart(input.abe_file, "abe_file")
     if (!file.toLowerCase().endsWith(".json") || file.toLowerCase().endsWith("_domain.json")) fail("INVALID_INPUT", "abe_file must name a non-domain JSON file.")
+    selectedDomainFolder = folder
     relativePath = `${folder}/${file}`
   }
   const disclosed = progressiveSchemaFile(bundle, relativePath)
@@ -193,6 +198,7 @@ export function progressiveSchemaDisclosure(bundle, input = {}) {
       .map((file) => file.relativePath.slice(folder.length + 1))
       .sort()
   }
+  const bePointerHints = level === "abe" ? jsonPointerHints(disclosed.content) : []
   return {
     level,
     relative_path: disclosed.relativePath,
@@ -202,6 +208,33 @@ export function progressiveSchemaDisclosure(bundle, input = {}) {
     navigation,
     snapshot_hash: bundle.manifest.snapshot_hash,
     full_file_exposed: true,
+    ...(level === "abe" ? {
+      classification_scaffold: {
+        status: "classified",
+        snapshotHash: bundle.manifest.snapshot_hash,
+        domain: {
+          key: selectedDomainFolder,
+          file: `${selectedDomainFolder}/${selectedDomainFolder}_domain.json`,
+        },
+        abe: {
+          key: path.posix.basename(disclosed.relativePath, ".json"),
+          file: disclosed.relativePath,
+        },
+        be: {
+          key: "<copy the selected BE key or id>",
+          name: "<copy the selected BE name>",
+          pointer: "<copy an exact pointer from be_pointer_hints>",
+        },
+      },
+      json_pointer_contract: {
+        canonical_syntax: "/objectField/arrayIndex",
+        uri_fragment_syntax_accepted: "#/objectField/arrayIndex",
+        array_indexes_are_numeric: true,
+        copy_pointer_from_be_pointer_hints: true,
+      },
+      be_pointer_hints: bePointerHints,
+      be_pointer_hints_truncated: bePointerHints.length >= 200,
+    } : {}),
     next_action: level === "domains"
       ? { tool: "llm_wiki_get_domain_schema", arguments: { task_id: input.task_id, level: "domain", domain_folder: "<selected-domain-folder>" } }
       : level === "domain"
@@ -213,6 +246,7 @@ export function progressiveSchemaDisclosure(bundle, input = {}) {
 export function applyProgressiveSchema(analysis, bundle) {
   if (!bundle) return { analysis, report: null }
   const errors = []
+  const classificationHints = []
   const checkCandidate = (candidate, collection, index) => {
     const classification = candidate?.schemaClassification ?? candidate?.schema_classification
     if (!classification || typeof classification !== "object") {
@@ -225,7 +259,10 @@ export function applyProgressiveSchema(analysis, bundle) {
     }
     const status = String(classification.status ?? "classified").trim().toLowerCase()
     if (!["classified", "unresolved"].includes(status)) errors.push(`${collection}[${index}].schemaClassification.status must be classified or unresolved`)
-    if (status === "unresolved") return { ...candidate, schemaClassification: { ...classification, status, snapshotHash: bundle.manifest.snapshot_hash } }
+    if (status === "unresolved") {
+      const resolvedReference = resolveProgressiveClassificationReference(bundle, classification)
+      return { ...candidate, schemaClassification: { ...(resolvedReference ?? classification), status, snapshotHash: bundle.manifest.snapshot_hash } }
+    }
     const domain = classification.domain
     const abe = classification.abe
     const be = classification.be
@@ -233,32 +270,55 @@ export function applyProgressiveSchema(analysis, bundle) {
       errors.push(`${collection}[${index}].schemaClassification must include domain, abe, and be`)
       return candidate
     }
-    const domainFolder = String(domain.key ?? domain.folder ?? "").trim()
-    const abeFile = String(abe.file ?? abe.key ?? "").trim()
-    const bePointer = String(be.pointer ?? be.jsonPointer ?? "").trim()
-    const validDomainFolder = Boolean(domainFolder) && ![".", ".."].includes(domainFolder)
-      && !domainFolder.includes("/") && !domainFolder.includes("\\") && !domainFolder.includes("\0")
-    const domainFile = validDomainFolder ? progressiveSchemaFile(bundle, `${domainFolder}/${domainFolder}_domain.json`) : null
-    let abeRelative = ""
-    if (abeFile.includes("/")) {
-      try { abeRelative = safeRelativePath(abeFile) } catch { errors.push(`${collection}[${index}].schemaClassification.abe.file is not a safe relative path`) }
-    } else if (abeFile) {
-      abeRelative = `${domainFolder}/${abeFile.endsWith(".json") ? abeFile : `${abeFile}.json`}`
+    const requestedDomainFolder = String(domain.key ?? domain.folder ?? "").trim()
+    const domainFolder = resolveDomainFolder(bundle, requestedDomainFolder)
+    const domainFile = domainFolder ? progressiveSchemaFile(bundle, `${domainFolder}/${domainFolder}_domain.json`) : null
+    const requestedAbeFile = String(abe.file ?? "").trim()
+    const requestedAbeKey = String(abe.key ?? "").trim()
+    const abeDataFile = domainFolder ? resolveAbeFile(bundle, domainFolder, requestedAbeFile, requestedAbeKey) : null
+    if (!domainFile) errors.push(`${collection}[${index}].schemaClassification.domain.key is not a known domain folder`)
+    else if (!abeDataFile) errors.push(`${collection}[${index}].schemaClassification.abe.file is not a known ABE JSON file`)
+
+    const rawBePointer = String(be.pointer ?? be.jsonPointer ?? "").trim()
+    let bePointer = rawBePointer ? normalizeJsonPointer(rawBePointer) : null
+    let resolvedBe = abeDataFile && bePointer !== null ? resolveJsonPointer(abeDataFile.content, bePointer) : undefined
+    if (resolvedBe === undefined && abeDataFile) {
+      const identitySelector = firstNonEmpty(be.key, be.id, be.name, pointerIdentitySelector(bePointer ?? rawBePointer))
+      const matches = findJsonIdentityNodes(abeDataFile.content, identitySelector, 2)
+      if (matches.length === 1) {
+        bePointer = matches[0].pointer
+        resolvedBe = matches[0].value
+      }
     }
-    const abeSchemaFile = abeRelative && validDomainFolder ? progressiveSchemaFile(bundle, abeRelative) : null
-    const abeDataFile = abeSchemaFile && !abeSchemaFile.relativePath.endsWith("_domain.json") ? abeSchemaFile : null
-    if (!validDomainFolder || !domainFile) errors.push(`${collection}[${index}].schemaClassification.domain.key is not a known domain folder`)
-    if (!abeDataFile) errors.push(`${collection}[${index}].schemaClassification.abe.file is not a known ABE JSON file`)
-    if (!bePointer || !abeDataFile || resolveJsonPointer(abeDataFile.content, bePointer) === undefined) errors.push(`${collection}[${index}].schemaClassification.be.pointer does not resolve in the selected ABE JSON`)
-    const abeKey = path.posix.basename(abeFile).replace(/\.json$/i, "")
+    if (abeDataFile && resolvedBe === undefined) {
+      errors.push(`${collection}[${index}].schemaClassification.be.pointer does not resolve in the selected ABE JSON`)
+    }
+    if (!domainFile || !abeDataFile || resolvedBe === undefined) {
+      classificationHints.push({
+        field: `${collection}[${index}].schemaClassification`,
+        requested_domain_key: requestedDomainFolder,
+        resolved_domain_key: domainFolder,
+        available_domain_folders: progressiveDomainFolders(bundle),
+        requested_abe_file: requestedAbeFile || requestedAbeKey,
+        selected_abe_file: abeDataFile?.relativePath ?? null,
+        available_abe_files: domainFolder ? progressiveAbeFiles(bundle, domainFolder).map((file) => file.relativePath) : [],
+        requested_be_pointer: rawBePointer,
+        canonical_be_pointer: resolvedBe === undefined ? null : bePointer,
+        be_pointer_hints: abeDataFile ? jsonPointerHints(abeDataFile.content).slice(0, 50) : [],
+      })
+    }
+    const abeKey = path.posix.basename(abeDataFile?.relativePath ?? requestedAbeFile ?? requestedAbeKey).replace(/\.json$/i, "")
+    const resolvedIdentity = schemaNodeIdentity(resolvedBe)
+    const normalizedBeKey = firstNonEmpty(resolvedIdentity.key, be.key, be.id, `${abeKey}#${bePointer ?? rawBePointer}`).slice(0, 200)
+    const normalizedBeName = firstNonEmpty(resolvedIdentity.name, be.name, normalizedBeKey).slice(0, 500)
     const normalized = {
       ...candidate,
       schemaClassification: {
         ...classification,
         status: "classified",
-        domain: { ...domain, key: domainFolder, file: domainFile?.relativePath ?? `${domainFolder}/${domainFolder}_domain.json` },
-        abe: { ...abe, key: abeKey, file: abeDataFile?.relativePath ?? abeFile },
-        be: { ...be, pointer: bePointer, key: String(be.key ?? `${abeKey}#${bePointer}`).trim() },
+        domain: { ...domain, key: domainFolder || requestedDomainFolder, file: domainFile?.relativePath ?? `${requestedDomainFolder}/${requestedDomainFolder}_domain.json` },
+        abe: { ...abe, key: abeKey, file: abeDataFile?.relativePath ?? requestedAbeFile ?? requestedAbeKey },
+        be: { ...be, pointer: bePointer ?? rawBePointer, key: normalizedBeKey, name: normalizedBeName },
         snapshotHash: bundle.manifest.snapshot_hash,
       },
     }
@@ -266,10 +326,47 @@ export function applyProgressiveSchema(analysis, bundle) {
   }
   const entities = (analysis.entities ?? []).map((candidate, index) => checkCandidate(candidate, "entities", index))
   const concepts = (analysis.concepts ?? []).map((candidate, index) => checkCandidate(candidate, "concepts", index))
-  if (errors.length > 0) fail("INVALID_DOMAIN_ANALYSIS", "Analysis does not conform to the progressive Schema classification contract.", { details: { validation_errors: errors.slice(0, 100), validation_error_count: errors.length, schema_mode: PROGRESSIVE_SCHEMA_MODE } })
+  if (errors.length > 0) fail("INVALID_DOMAIN_ANALYSIS", "Analysis does not conform to the progressive Schema classification contract.", { details: { validation_errors: errors.slice(0, 100), validation_error_count: errors.length, schema_mode: PROGRESSIVE_SCHEMA_MODE, classification_hints: classificationHints.slice(0, 20) } })
   return {
     analysis: { ...analysis, entities, concepts },
     report: { schema_mode: PROGRESSIVE_SCHEMA_MODE, snapshot_hash: bundle.manifest.snapshot_hash, validation_error_count: 0, classified_entities: entities.filter((item) => item.schemaClassification?.status === "classified").length, classified_concepts: concepts.filter((item) => item.schemaClassification?.status === "classified").length },
+  }
+}
+
+export function resolveProgressiveClassificationReference(bundle, classification) {
+  if (!bundle || !classification || typeof classification !== "object") return null
+  const domain = classification.domain ?? {}
+  const abe = classification.abe ?? {}
+  const be = classification.be ?? {}
+  const requestedDomainFolder = String(domain.key ?? domain.folder ?? "").trim()
+  const domainFolder = resolveDomainFolder(bundle, requestedDomainFolder)
+  const domainFile = domainFolder ? progressiveSchemaFile(bundle, `${domainFolder}/${domainFolder}_domain.json`) : null
+  if (!domainFile) return null
+  const requestedAbeFile = String(abe.file ?? "").trim()
+  const requestedAbeKey = String(abe.key ?? "").trim()
+  const abeDataFile = resolveAbeFile(bundle, domainFolder, requestedAbeFile, requestedAbeKey)
+  if (!abeDataFile) return null
+  const rawBePointer = String(be.pointer ?? be.jsonPointer ?? "").trim()
+  let bePointer = rawBePointer ? normalizeJsonPointer(rawBePointer) : null
+  let resolvedBe = bePointer !== null ? resolveJsonPointer(abeDataFile.content, bePointer) : undefined
+  if (resolvedBe === undefined) {
+    const selector = firstNonEmpty(be.key, be.id, be.name, pointerIdentitySelector(bePointer ?? rawBePointer))
+    const matches = findJsonIdentityNodes(abeDataFile.content, selector, 2)
+    if (matches.length !== 1) return null
+    bePointer = matches[0].pointer
+    resolvedBe = matches[0].value
+  }
+  const abeKey = path.posix.basename(abeDataFile.relativePath, ".json")
+  const resolvedIdentity = schemaNodeIdentity(resolvedBe)
+  const beKey = firstNonEmpty(resolvedIdentity.key, be.key, be.id, `${abeKey}#${bePointer}`).slice(0, 200)
+  const beName = firstNonEmpty(resolvedIdentity.name, be.name, beKey).slice(0, 500)
+  if (!beKey || !beName) return null
+  return {
+    ...classification,
+    domain: { ...domain, key: domainFolder, file: domainFile.relativePath },
+    abe: { ...abe, key: abeKey, file: abeDataFile.relativePath },
+    be: { ...be, key: beKey, name: beName, pointer: bePointer },
+    snapshotHash: bundle.manifest.snapshot_hash,
   }
 }
 
@@ -289,7 +386,7 @@ function makeProgressiveSchema(manifest, files) {
 
 function resolveJsonPointer(value, pointer) {
   if (pointer === "") return value
-  if (!pointer.startsWith("/")) return undefined
+  if (typeof pointer !== "string" || !pointer.startsWith("/")) return undefined
   let current = value
   for (const rawPart of pointer.slice(1).split("/")) {
     const part = rawPart.replace(/~1/g, "/").replace(/~0/g, "~")
@@ -297,6 +394,143 @@ function resolveJsonPointer(value, pointer) {
     current = current[part]
   }
   return current
+}
+
+function normalizeJsonPointer(value) {
+  let pointer = String(value ?? "").trim()
+  if (pointer.startsWith("#")) {
+    try {
+      pointer = decodeURIComponent(pointer.slice(1))
+    } catch {
+      return null
+    }
+  }
+  if (pointer === "") return ""
+  return pointer.startsWith("/") ? pointer : null
+}
+
+function progressiveDomainFolders(bundle) {
+  return [...new Set(bundle.files
+    .map((file) => file.relativePath.split("/")[0])
+    .filter((folder) => folder !== PROGRESSIVE_SCHEMA_ROOT_FILE && bundle.files.some((file) => file.relativePath === `${folder}/${folder}_domain.json`)))]
+}
+
+function resolveDomainFolder(bundle, selector) {
+  const folders = progressiveDomainFolders(bundle)
+  if (folders.includes(selector)) return selector
+  const normalized = canonicalSelector(selector)
+  const matches = folders.filter((folder) => canonicalSelector(folder) === normalized)
+  return matches.length === 1 ? matches[0] : null
+}
+
+function progressiveAbeFiles(bundle, domainFolder) {
+  return bundle.files.filter((file) => file.relativePath.startsWith(`${domainFolder}/`)
+    && file.relativePath !== `${domainFolder}/${domainFolder}_domain.json`)
+}
+
+function resolveAbeFile(bundle, domainFolder, requestedFile, requestedKey) {
+  const files = progressiveAbeFiles(bundle, domainFolder)
+  const selectors = [requestedFile, requestedKey].map((value) => String(value ?? "").trim()).filter(Boolean)
+  for (const selector of selectors) {
+    const normalizedPath = selector.replace(/\\/g, "/")
+    const exactRelative = normalizedPath.includes("/") ? normalizedPath : `${domainFolder}/${normalizedPath.endsWith(".json") ? normalizedPath : `${normalizedPath}.json`}`
+    const exact = files.find((file) => file.relativePath === exactRelative)
+    if (exact) return exact
+  }
+  for (const selector of selectors) {
+    const normalized = canonicalSelector(path.posix.basename(selector).replace(/\.json$/i, ""))
+    const matches = files.filter((file) => canonicalSelector(path.posix.basename(file.relativePath, ".json")) === normalized)
+    if (matches.length === 1) return matches[0]
+  }
+  return null
+}
+
+function jsonPointerHints(value, limit = 200) {
+  const hints = []
+  const visit = (current, pointer, parentIsArray = false, depth = 0) => {
+    if (hints.length >= limit || depth > 40 || current === null || typeof current !== "object") return
+    const identity = schemaNodeIdentity(current)
+    if (pointer && (parentIsArray || identity.key || identity.name)) {
+      hints.push({ pointer, ...(identity.key ? { key: identity.key } : {}), ...(identity.name ? { name: identity.name } : {}) })
+      if (hints.length >= limit) return
+    }
+    if (Array.isArray(current)) {
+      current.forEach((item, index) => visit(item, `${pointer}/${index}`, true, depth + 1))
+      return
+    }
+    for (const [key, item] of Object.entries(current)) {
+      visit(item, `${pointer}/${escapeJsonPointerPart(key)}`, false, depth + 1)
+      if (hints.length >= limit) return
+    }
+  }
+  visit(value, "")
+  return hints
+}
+
+function findJsonIdentityNodes(value, selector, limit = 2) {
+  const normalizedSelector = canonicalSelector(selector)
+  if (!normalizedSelector) return []
+  const matches = []
+  const visit = (current, pointer, depth = 0) => {
+    if (matches.length >= limit || depth > 40 || current === null || typeof current !== "object") return
+    if (!Array.isArray(current)) {
+      const identityValues = schemaNodeIdentityValues(current)
+      if (identityValues.some((candidate) => canonicalSelector(candidate) === normalizedSelector)) {
+        matches.push({ pointer, value: current })
+        if (matches.length >= limit) return
+      }
+      for (const [key, item] of Object.entries(current)) visit(item, `${pointer}/${escapeJsonPointerPart(key)}`, depth + 1)
+      return
+    }
+    current.forEach((item, index) => visit(item, `${pointer}/${index}`, depth + 1))
+  }
+  visit(value, "")
+  return matches
+}
+
+function schemaNodeIdentity(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { key: "", name: "" }
+  const entries = Object.entries(value)
+  const pick = (fieldNames) => {
+    for (const [field, candidate] of entries) {
+      if (!fieldNames.has(canonicalSelector(field)) || !["string", "number"].includes(typeof candidate)) continue
+      const normalized = String(candidate).trim()
+      if (normalized) return normalized.slice(0, 500)
+    }
+    return ""
+  }
+  return {
+    key: pick(new Set(["id", "key", "code", "identifier", "beid", "businessentityid"])),
+    name: pick(new Set(["name", "title", "label", "displayname"])),
+  }
+}
+
+function schemaNodeIdentityValues(value) {
+  const identity = schemaNodeIdentity(value)
+  return [identity.key, identity.name].filter(Boolean)
+}
+
+function pointerIdentitySelector(pointer) {
+  const normalized = String(pointer ?? "").replace(/^#/, "")
+  const last = normalized.split("/").filter(Boolean).pop() ?? ""
+  if (/^[0-9]+$/.test(last)) return ""
+  return last.replace(/~1/g, "/").replace(/~0/g, "~")
+}
+
+function escapeJsonPointerPart(value) {
+  return String(value).replace(/~/g, "~0").replace(/\//g, "~1")
+}
+
+function canonicalSelector(value) {
+  return String(value ?? "").normalize("NFKC").trim().toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "")
+}
+
+function firstNonEmpty(...values) {
+  for (const value of values) {
+    const normalized = String(value ?? "").trim()
+    if (normalized) return normalized
+  }
+  return ""
 }
 
 function safePathPart(value, field) {

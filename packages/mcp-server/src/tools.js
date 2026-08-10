@@ -29,6 +29,7 @@ const ATOMIC_PAGE_REJECTION_CODES = new Set([
   "PAGE_DRAFT_SHARD_NOT_READY",
   "STAGED_DRAFT_NOT_FOUND",
   "STAGED_DRAFT_EXISTS",
+  "STAGED_DRAFT_HASH_MISMATCH",
   "PAGE_DRAFT_STAGING_UNAVAILABLE",
   "DUPLICATE_PAGE_COVERAGE",
   "FILE_HASH_CONFLICT",
@@ -136,6 +137,15 @@ function errorResult(error, context = {}) {
     ...(Array.isArray(normalized.details?.validation_errors)
       ? { validation_errors: normalized.details.validation_errors }
       : analysisRetry ? { validation_errors: [normalized.message] } : {}),
+    ...(analysisRetry ? {
+      worker_restart: {
+        required: true,
+        strategy: "restart-same-worker-id-immediately",
+        worker_id: context.args?.worker_id,
+        batch_id: context.args?.batch_id,
+        delay_ms: 0,
+      },
+    } : {}),
     ...(atomicPageRejection ? {
       atomic_commit_applied: false,
       page_commit_recovery: {
@@ -190,7 +200,7 @@ function recoveryAction(tool, args, error) {
   }
   if (error.code === "MCP_BUSY") return { tool: "llm_wiki_list_tasks", arguments: {} }
   if (tool === "llm_wiki_commit_analysis" && RECOVERABLE_ANALYSIS_CODES.has(error.code)) {
-    return { tool, arguments: { task_id: args?.task_id, batch_id: args?.batch_id } }
+    return { tool, arguments: { task_id: args?.task_id, batch_id: args?.batch_id, worker_id: args?.worker_id } }
   }
   if (tool === "llm_wiki_commit_analysis" && error.code === "BATCH_LEASE_REQUIRED") {
     return {

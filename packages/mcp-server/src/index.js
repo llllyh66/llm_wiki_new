@@ -6,7 +6,7 @@ import { createWriteStream } from "node:fs"
 import { mkdir, readFile } from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { LlmWikiCore } from "../../core/src/index.js"
+import { LlmWikiCore } from "@llm-wiki/core"
 import { HeadlessToolRouter } from "./tools.js"
 
 const STDIO_MAX_BUFFER_BYTES = 32 * 1024 * 1024
@@ -132,7 +132,7 @@ async function main() {
   const buildInfo = await loadBuildInfo()
   log("startup", { workspace: workspaceRoot, build: buildInfo, runtimeLogPath })
   const router = new HeadlessToolRouter(core)
-  const server = new Server({ name: "llm-wiki", version: "1.0.4" }, { capabilities: { tools: {} } })
+  const server = new Server({ name: "llm-wiki", version: "1.0.5" }, { capabilities: { tools: {} } })
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: router.listTools() }))
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const startedAt = Date.now()

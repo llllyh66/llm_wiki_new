@@ -1,5 +1,9 @@
 const taskId = { type: "string", description: "Task ID in the current workspace." }
 const closedObject = (properties, required = []) => ({ type: "object", properties, required, additionalProperties: false })
+const stagedDraftReceipt = closedObject({
+  shard_id: { type: "string", pattern: "^draft-[0-9]{4,}$" },
+  draft_hash: { type: "string", pattern: "^[0-9a-f]{64}$" },
+}, ["shard_id", "draft_hash"])
 const wikiSectionChange = closedObject({
   operation: { enum: ["upsert_section", "replace_section", "append_to_section", "remove_section"], description: "Apply one deterministic Markdown section edit. Core-owned Related and Domain Classification sections cannot be edited directly." },
   heading: { type: "string", minLength: 1, maxLength: 300, description: "Exact Markdown heading text without leading # characters." },
@@ -44,7 +48,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_domain_schema",
-    description: "Progressively disclose a validated Schema directory. Call level=domains to read all_domains.json, level=domain to read the selected Domain's *_domain.json, and level=abe to read the complete selected ABE JSON. JSON field names are unrestricted and the returned file is never truncated.",
+    description: "Progressively disclose a validated Schema directory. Call level=domains to read all_domains.json, level=domain to read the selected Domain's *_domain.json, and level=abe to read the complete selected ABE JSON plus a canonical classification_scaffold and bounded be_pointer_hints. JSON field names are unrestricted and the returned file is never truncated.",
     inputSchema: closedObject({
       task_id: taskId,
       level: { enum: ["domains", "domain", "abe"], description: "Disclosure level. domains reads all_domains.json; domain reads a Domain index; abe reads one complete ABE JSON." },
@@ -71,7 +75,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_page_plan_context",
-    description: "Coordinator-owned projection tool. For parallel drafting, the main coordinator calls view=manifest, then delegates each returned draft-shard action to one llm-wiki-page-drafter (up to four). Each Drafter fetches its own bounded context and stages a receipt. In normal mode the stable Writer never calls manifest or draft-shard and is launched only after receipt IDs exist; it is the sole committer and uses staged_draft_shard_ids with patches:[]. Serial Writer drafting is an explicit fallback only after Drafter creation fails. Legacy view=plan remains for compatibility.",
+    description: "Coordinator-owned projection tool. For parallel drafting, the main coordinator calls view=manifest, then delegates each returned draft-shard action to one llm-wiki-page-drafter (up to four). Each Drafter fetches its own bounded context and stages a hash-bound receipt. In normal mode the stable Writer never calls manifest or draft-shard and is launched only after receipts exist; it is the sole committer and uses staged_draft_receipts with patches:[]. Serial Writer drafting is an explicit fallback only after Drafter creation fails. Legacy view=plan remains for compatibility.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
@@ -106,24 +110,25 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_staged_page_drafts",
-    description: "Writer-owned metadata call. The stable Writer calls this only with completed staged receipt IDs supplied by the coordinator. It never returns page bodies. If receipts are missing, the Writer stops so the coordinator can relaunch those Drafters; the Writer must not fetch their shard context.",
+    description: "Writer-owned metadata call. The stable Writer calls this only with completed, hash-bound staged receipts supplied by the coordinator. It never returns page bodies. Missing or changed receipts fail closed so the coordinator can relaunch the matching Drafter; the Writer must not discover or fetch shard context.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
       projection_id: { type: "string", minLength: 1, maxLength: 100 },
-      shard_ids: { type: "array", maxItems: 8, uniqueItems: true, items: { type: "string", pattern: "^draft-[0-9]{4,}$" } },
-    }, ["task_id", "writer_id", "projection_id"]),
+      draft_receipts: { type: "array", minItems: 1, maxItems: 8, items: stagedDraftReceipt },
+    }, ["task_id", "writer_id", "projection_id", "draft_receipts"]),
   },
   {
     name: "llm_wiki_commit_pages",
-    description: "Writer-owned atomic commit. In normal mode the stable Writer is launched only after Drafter receipts exist and commits staged_draft_shard_ids with patches:[]; it never launches Drafters or fetches manifest/draft-shard context. Hard maximum: 50 patches. After one staged wave it returns any coordinator-owned next action instead of executing it. Direct PagePatch commits are reserved for the explicitly requested serial Writer fallback. Finish with projection_complete=true after every manifest shard is covered.",
+    description: "Writer-owned atomic commit. In normal mode the stable Writer is launched only after Drafter receipts exist and commits hash-bound staged_draft_receipts with patches:[]; it never launches Drafters or fetches manifest/draft-shard context. Hard maximum: 50 patches. After one staged wave it returns any coordinator-owned next action instead of executing it. Direct PagePatch commits are reserved for the explicitly requested serial Writer fallback. Finish with projection_complete=true after every manifest shard is covered.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
       projection_id: { type: "string", minLength: 1, maxLength: 100 },
       projection_complete: { type: "boolean", description: "Set false when more bounded patch commits remain for this projection. Omit or true on the final commit, including an empty acknowledgement." },
       draft_shard_ids: { type: "array", minItems: 1, maxItems: 8, uniqueItems: true, items: { type: "string", pattern: "^draft-[0-9]{4,}$" }, description: "For projection_complete=false manifest waves, copy the shard IDs from the returned commit action." },
-      staged_draft_shard_ids: { type: "array", minItems: 1, maxItems: 8, uniqueItems: true, items: { type: "string", pattern: "^draft-[0-9]{4,}$" }, description: "Optional server-side temporary draft shards produced by llm_wiki_stage_page_drafts. Use this instead of page bodies; Core loads and validates the staged patches atomically." },
+      staged_draft_shard_ids: { type: "array", minItems: 1, maxItems: 8, uniqueItems: true, items: { type: "string", pattern: "^draft-[0-9]{4,}$" }, description: "Deprecated bare-ID compatibility form. Current Writers use staged_draft_receipts so the accepted draft hash is verified." },
+      staged_draft_receipts: { type: "array", minItems: 1, maxItems: 8, items: stagedDraftReceipt, description: "Hash-bound server-side draft receipts returned by llm_wiki_get_staged_page_drafts. Current staged commits use this instead of bare shard IDs." },
       based_on_wiki_revision: { type: "string", pattern: "^[0-9a-f]{64}$" },
       patches: { type: "array", minItems: 0, maxItems: 50, items: { type: "object" } },
       idempotency_key: { type: "string", minLength: 8, maxLength: 200 },

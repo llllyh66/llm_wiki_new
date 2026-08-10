@@ -7,7 +7,7 @@ import test from "node:test"
 import { taskPaths, withIdempotency } from "../src/task-store.js"
 import { sha256, stableStringify, writeJsonAtomic, readJson, nowIso } from "../src/utils.js"
 import { ensureWorkspace } from "../src/workspace.js"
-import { recoverPendingPageTransactions } from "../src/transaction.js"
+import { cleanupTransactionArtifacts, recoverPendingPageTransactions } from "../src/transaction.js"
 
 async function idempotencyFixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-recovery-"))
@@ -136,4 +136,32 @@ test("startup transaction recovery completes a durable staged page and links its
   assert.deepEqual(await readJson(path.join(taskRoot, "commits.json")), [transactionId])
   assert.equal(task.commitRevision, 1)
   assert.equal(task.wikiRevision, journal.wikiRevision)
+})
+
+test("terminal transaction backups are evicted immediately when the byte budget is exceeded", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-journal-budget-"))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const workspace = await ensureWorkspace(root)
+  workspace.config.journal = { retentionDays: 30, maxBackupBytes: 1_024 }
+  for (let index = 0; index < 2; index += 1) {
+    const transactionId = `txn-${randomUUID()}`
+    const transactionRoot = path.join(workspace.paths.journal, transactionId)
+    const backup = path.join(transactionRoot, "backup", "wiki", "topics", `page-${index}.md`)
+    await mkdir(path.dirname(backup), { recursive: true })
+    await writeFile(backup, "x".repeat(900))
+    await writeJsonAtomic(path.join(transactionRoot, "transaction.json"), {
+      schemaVersion: 2,
+      state: "committed",
+      transactionId,
+      committedAt: new Date(Date.now() - (2 - index) * 1_000).toISOString(),
+      cleanupEligibleAt: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+      targets: [],
+      patches: [],
+    })
+  }
+
+  const cleaned = await cleanupTransactionArtifacts(workspace)
+  assert.equal(cleaned.overBudget, false)
+  assert.equal(cleaned.retainedBytes <= 1_024, true)
+  assert.equal(cleaned.budgetEvictedTransactions, 1)
 })

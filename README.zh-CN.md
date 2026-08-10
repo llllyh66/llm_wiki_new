@@ -142,8 +142,8 @@ llm-wiki: node packages/mcp-server/dist/index.js --workspace . - Connected
 Claude Code。
 
 多批次任务默认按 `parallel_extraction.recommended_workers` 启动后台抽取
-Agent，当前最多 4 个；大型 Schema 也不再降为 2 个，因为每个 worker 只获取服务端选中的
-相关类型。每个 Agent 使用固定 `worker_id` 租约不同批次，Core
+Agent，当前最多 4 个；`get_batch` 不内联大型 Schema，worker 会按三级 disclosure
+显式读取所选 Domain、ABE 和完整 ABE JSON。每个 Agent 使用固定 `worker_id` 租约不同批次，Core
 串行保护同一任务的状态提交，因此不会抢同一批次或覆盖其他 Agent 的结果。
 主 Agent 只负责轻量的 page-plan 编排、启动后台 Agent 和校验 receipt；它不生成页面，也不调用
 `llm_wiki_get_staged_page_drafts` 或 `llm_wiki_commit_pages`。后台抽取 Agent 与 page drafter
@@ -151,14 +151,15 @@ Agent，当前最多 4 个；大型 Schema 也不再降为 2 个，因为每个 
 每个增量 projection 最多租约 8 个 batch，一次协调器编排最多连续处理 6 个
 projection。协调器投影 loop 只读取 compact manifest；Core 按
 `patch_scaffold.path` 分成互斥 shard，最多使用 4 个仅具备 page-plan/staging MCP 权限的 page drafter
-并行生成语义正文并暂存；协调器收到 receipt 后才启动唯一稳定 Writer，使用
-`staged_draft_shard_ids + patches=[]` 在服务端校验并提交。小计划也由一个 drafter
+并行生成语义正文并暂存；协调器收到 `{shard_id, draft_hash}` receipt 后才启动唯一稳定 Writer，使用
+`staged_draft_receipts + patches=[]` 在服务端校验并提交。小计划也由一个 drafter
 处理。正常流程中的 Writer 不读取 manifest/draft-shard，也不启动 drafter；只有
 协调器在 drafter 创建明确失败后才能显式启用 Writer 串行 fallback。Core 只负责
 校验 SourceRef、页面结构、哈希和事务，不自动替代 Agent 写作。
 任一 `commit_analysis` 使投影就绪时，该 extractor 会立即返回
 `writer_required: true`，而不是继续领取 batch；主 Agent 随即启动
-协调器投影编排，收到 drafter receipt 后才启动稳定 Writer，再按需补充 extractor。抽取与写入重叠时使用总计 4 个后台
+协调器投影编排，并在 overlap 上限允许时同步以同一 worker ID 零延迟补位；收到
+drafter receipt 后才启动稳定 Writer。抽取与写入重叠时使用总计 4 个后台
 Agent 的预算，通常保留 2 个 extractor 和 2 个 page drafter；投影提交后恢复完整
 extractor 数量。`status.next_action` 也会在投影就绪时
 优先指向 `llm_wiki_get_page_plan_context`，因此不需要等用户追问才生成页面。
@@ -183,7 +184,9 @@ ToolSearch 发现工具，而不是直接判定 MCP 不可用。
 的开销，同时不依赖长时间跨 turn 存活的子 Agent。后续 turn 先调用 `llm_wiki_status`，
 `worker_recovery.leases` 会返回已持久化的 worker 和 batch 租约。使用相同
 `worker_id` 启动新子 Agent，即可通过新 MCP 客户端继续同一 batch。
-因此旧后台 Agent 消失不等于 MCP 断开，也不会丢失进度。
+只要仍有待抽取 batch，协调器会零延迟补位同一个 worker ID；即使该 invocation
+因验证重试耗尽而返回，也不会等待 lease 超时。因此旧后台 Agent 消失不等于 MCP
+断开，也不会丢失进度。
 
 `worker_recovery.leases` 表示持久化的 batch 预留，不表示 SubAgent 进程仍在运行。
 主 Agent 会另外维护 `running_worker_ids`。任何 extractor 发出完成通知后，
@@ -267,7 +270,9 @@ schemas/customer/
 JSON 内部字段名和嵌套结构不做业务限制，只要是合法 JSON。抽取 Worker 会按
 `all_domains.json → <domain>/<domain>_domain.json → <domain>/<abe>.json`
 逐级读取；最后一个 ABE JSON 会完整暴露给模型，由模型选择 BE，并在实体或概念上
-提交 `schemaClassification` 和 JSON Pointer。Core 只校验快照、文件链和 Pointer，
+返回可直接复制的 `classification_scaffold` 和 `be_pointer_hints`。模型提交
+`schemaClassification` 和 JSON Pointer；Core 接受 `/...` 与 `#/...`，规范化唯一的
+Domain/ABE/BE 引用，并从 Pointer 指向的 Schema 节点补齐 BE key/name。
 Schema JSON 的业务字段和嵌套结构不受限制。分类有歧义时保留候选并标记
 `unresolved`，不会静默丢失知识。
 

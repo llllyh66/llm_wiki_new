@@ -1,12 +1,18 @@
 # 更新日志
 
-## Unreleased
+## [V1.0.5] - 2026-08-10
 
 - Remove the fixed-object Domain Schema protocol, inline Schema input,
   automatic batch selection, search/catalog/types pagination, destructive
   drop-invalid commits, and fixed-object Wiki metadata.
 - Require `progressive-directory-v2` directories and Domain → ABE → BE
   disclosure for every configured Domain Schema.
+- Return canonical classification scaffolds and BE pointer hints, accept both
+  JSON Pointer and URI-fragment syntax, and derive non-empty Wiki BE metadata
+  from the selected Schema node.
+- Refill completed extractor invocations immediately with the same worker ID
+  while extraction remains; recoverable validation stops no longer wait for a
+  lease timeout.
 
 ## [V1.0.4] - 2026-08-10
 
@@ -81,7 +87,7 @@
 ### Writer 职责与 Related 一致性修复
 
 - 消除 Skill 中“协调器 Writer loop 直接提交”与“稳定 Writer 是唯一提交者”的冲突：主 Agent 只获取 compact manifest、启动 drafter、校验 receipt 并唤醒 Writer；只有 `llm-wiki-writer` 调用 `llm_wiki_get_staged_page_drafts` 和 `llm_wiki_commit_pages`。
-- 明确 `staged_draft_shard_ids + patches=[]` 是服务端暂存提交的正确形式，禁止 Writer 误报“必须由主 Agent 提供实际 PagePatch”。
+- 明确 hash-bound `staged_draft_receipts + patches=[]` 是当前服务端暂存提交形式；裸 `staged_draft_shard_ids` 仅保留兼容，禁止 Writer 误报“必须由主 Agent 提供实际 PagePatch”。
 - Related 解析同时支持 canonical `[[...]]`、指向 Wiki 页面的 Markdown 链接，以及 Related 章节中的旧式 `wiki/...md` 路径；写盘时统一同步 frontmatter 与正文 canonical wikilink。
 - Finalize、lint 和知识库概览使用同一套 Related 解析，避免页面正文有链接但 frontmatter 仍为 `related: []`。
 - 跨 batch relation 优先使用同 batch localId，并仅在全局 localId 唯一或页面名称唯一时安全补全关联，避免漏链和误链。
@@ -150,7 +156,7 @@
 - shard 成功写入后立即保存 `draft_shard_ids`，Writer 重启或上下文压缩后从第一个未完成 shard 继续。
 - final projection 必须完成全部 shard 后才能确认，不会因旧页面已有 coverage 而跳过语义重写。
 - 大型页面计划只返回分片上下文，避免一次性生成 50+ 页面后重新生成前半部分。
-- drafter 生成的 PagePatch 现在只写入任务级临时 staging；主协调器和 Writer 只传递 receipt/hash，Writer 通过 `staged_draft_shard_ids` 在服务端原子提交。
+- drafter 生成的 PagePatch 现在只写入任务级临时 staging；主协调器和 Writer 只传递 `{shard_id, draft_hash}` receipt，Writer 通过 `staged_draft_receipts` 在服务端校验 hash 并原子提交。
 - draft-shard 响应强制限制在约 40K 字符，并对既有大页面发送确定性的头尾摘要；完整页面正文保留在服务端，避免上下文压缩或超限。
 - 保留 `view=plan` 作为旧版 page-plan cursor 流程的兼容入口。
 

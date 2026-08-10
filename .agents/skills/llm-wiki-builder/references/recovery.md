@@ -107,9 +107,9 @@ durable and are not part of this retry.
 If a multipart projection invocation stops, inspect `wiki_projection` in
 status. While `in_progress` remains true, keep the same projection and Writer
 ID. The coordinator resumes the returned manifest/Drafter action; it does not
-launch the Writer until staged receipt IDs exist. If a Drafter stopped before
+launch the Writer until hash-bound staged receipts exist. If a Drafter stopped before
 staging, relaunch only that Drafter with the exact shard action. If the Writer
-stopped during a receipt commit, replay the same receipt IDs and idempotency
+stopped during a receipt commit, replay the same `{shard_id, draft_hash}` receipts and idempotency
 key. Paths written by an incomplete projection remain provisional and excluded
 from retrieval. After upgrading from an older server, resume that same
 projection from cursor zero;

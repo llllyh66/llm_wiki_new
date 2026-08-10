@@ -12,13 +12,13 @@ test("progressive directory Schema snapshots files and discloses Domain, ABE, th
   const workspace = path.join(root, "workspace")
   const schema = path.join(root, "schema")
   const incoming = path.join(root, "incoming")
-  await mkdir(path.join(schema, "customer"), { recursive: true })
+  await mkdir(path.join(schema, "Customer_Domain"), { recursive: true })
   await mkdir(workspace, { recursive: true })
   await mkdir(incoming, { recursive: true })
-  await writeFile(path.join(schema, "all_domains.json"), JSON.stringify({ domains: [{ key: "customer", name: "客户域" }] }))
-  await writeFile(path.join(schema, "customer", "customer_domain.json"), JSON.stringify({ items: [{ key: "customer_management", name: "客户管理" }] }))
-  const abe = { businessEntities: [{ id: "individual_customer", name: "个人客户", properties: { arbitrary: ["JSON", 1, true] } }] }
-  await writeFile(path.join(schema, "customer", "customer_management.json"), JSON.stringify(abe))
+  await writeFile(path.join(schema, "all_domains.json"), JSON.stringify({ domains: [{ key: "Customer_Domain", name: "客户域" }] }))
+  await writeFile(path.join(schema, "Customer_Domain", "Customer_Domain_domain.json"), JSON.stringify({ items: [{ key: "customer_management", name: "客户管理" }] }))
+  const abe = { bes: [{ id: "individual_customer", name: "个人客户", properties: { arbitrary: ["JSON", 1, true] } }] }
+  await writeFile(path.join(schema, "Customer_Domain", "customer_management.json"), JSON.stringify(abe))
   const source = path.join(incoming, "record.md")
   await writeFile(source, "# 客户\n\n张三是个人客户。\n")
   const core = await LlmWikiCore.open(workspace)
@@ -31,13 +31,17 @@ test("progressive directory Schema snapshots files and discloses Domain, ABE, th
   assert.equal(manifest.mode, PROGRESSIVE_SCHEMA_MODE)
 
   const domains = await core.getDomainSchema({ task_id: imported.task_id, level: "domains" })
-  assert.deepEqual(domains.navigation.available_domain_folders, ["customer"])
-  assert.deepEqual(domains.content, { domains: [{ key: "customer", name: "客户域" }] })
-  const domain = await core.getDomainSchema({ task_id: imported.task_id, level: "domain", domain_folder: "customer" })
+  assert.deepEqual(domains.navigation.available_domain_folders, ["Customer_Domain"])
+  assert.deepEqual(domains.content, { domains: [{ key: "Customer_Domain", name: "客户域" }] })
+  const domain = await core.getDomainSchema({ task_id: imported.task_id, level: "domain", domain_folder: "Customer_Domain" })
   assert.deepEqual(domain.navigation.available_abe_files, ["customer_management.json"])
-  const disclosedAbe = await core.getDomainSchema({ task_id: imported.task_id, level: "abe", domain_folder: "customer", abe_file: "customer_management.json" })
+  const disclosedAbe = await core.getDomainSchema({ task_id: imported.task_id, level: "abe", domain_folder: "Customer_Domain", abe_file: "customer_management.json" })
   assert.deepEqual(disclosedAbe.content, abe)
   assert.equal(disclosedAbe.full_file_exposed, true)
+  assert.equal(disclosedAbe.classification_scaffold.domain.key, "Customer_Domain")
+  assert.equal(disclosedAbe.classification_scaffold.abe.file, "Customer_Domain/customer_management.json")
+  assert.deepEqual(disclosedAbe.be_pointer_hints[0], { pointer: "/bes/0", key: "individual_customer", name: "个人客户" })
+  assert.equal(disclosedAbe.json_pointer_contract.uri_fragment_syntax_accepted, "#/objectField/arrayIndex")
 
   const batch = await core.getBatch({ task_id: imported.task_id, worker_id: "progressive-test-worker" })
   assert.equal(batch.workspace_context.domain_schema.mode, PROGRESSIVE_SCHEMA_MODE)
@@ -46,6 +50,31 @@ test("progressive directory Schema snapshots files and discloses Domain, ABE, th
   assert.equal(batch.workspace_context.domain_schema_pagination, undefined)
   assert.equal(batch.extraction_hot_path.schema_call_required, true)
   const chunk = batch.chunks[0]
+  await assert.rejects(
+    () => core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      worker_id: batch.worker_id,
+      idempotency_key: "progressive-invalid-pointer-v1",
+      analysis: {
+        ...batch.analysis_scaffold,
+        entities: [{
+          localId: "invalid-customer",
+          name: "张三",
+          sourceRefs: [0],
+          schemaClassification: {
+            status: "classified",
+            domain: { key: "Customer_Domain" },
+            abe: { file: "customer_management.json" },
+            be: { key: "not_in_schema", pointer: "/bes/999" },
+          },
+        }],
+      },
+    }),
+    (error) => error?.code === "INVALID_DOMAIN_ANALYSIS"
+      && error.details?.classification_hints?.[0]?.selected_abe_file === "Customer_Domain/customer_management.json"
+      && error.details.classification_hints[0].be_pointer_hints[0].pointer === "/bes/0",
+  )
   const committed = await core.commitAnalysis({
     task_id: imported.task_id,
     batch_id: batch.batch_id,
@@ -61,15 +90,31 @@ test("progressive directory Schema snapshots files and discloses Domain, ABE, th
         schemaClassification: {
           status: "classified",
           confidence: 0.9,
-          domain: { key: "customer", name: "客户域" },
-          abe: { key: "customer_management", name: "客户管理", file: "customer_management.json" },
-          be: { key: "individual_customer", name: "个人客户", pointer: "/businessEntities/0" },
+          domain: { key: "customer_domain", name: "客户域" },
+          abe: { key: "customermanagement", name: "客户管理", file: "missing-old-name.json" },
+          be: { key: "individual_customer", pointer: "#/bes/individual_customer" },
         },
       }],
+      unresolvedQuestions: [{ reason: "等待后续批次核对别名。" }],
     },
   })
   assert.equal(committed.accepted, true)
   assert.equal(committed.domain_validation.schema_mode, PROGRESSIVE_SCHEMA_MODE)
+  assert.equal(committed.normalized_unresolved_questions, 1)
+  const persistedAnalysisPath = path.join(workspace, ".llm-wiki", "tasks", imported.task_id, "analysis", `${batch.batch_id}.json`)
+  const persistedAnalysis = JSON.parse(await readFile(persistedAnalysisPath, "utf8"))
+  assert.equal(persistedAnalysis.unresolvedQuestions[0], "等待后续批次核对别名。")
+  assert.deepEqual(persistedAnalysis.entities[0].schemaClassification.domain.key, "Customer_Domain")
+  assert.equal(persistedAnalysis.entities[0].schemaClassification.abe.file, "Customer_Domain/customer_management.json")
+  assert.deepEqual(persistedAnalysis.entities[0].schemaClassification.be, {
+    key: "individual_customer",
+    pointer: "/bes/0",
+    name: "个人客户",
+  })
+  const legacyAnalysis = structuredClone(persistedAnalysis)
+  legacyAnalysis.entities[0].schemaClassification.status = "unresolved"
+  legacyAnalysis.entities[0].schemaClassification.be = { pointer: "/bes/0" }
+  await writeFile(persistedAnalysisPath, JSON.stringify(legacyAnalysis))
 
   const page = prepareWikiPageContent({
     path: "wiki/entities/zhang-san.md",
@@ -95,6 +140,44 @@ test("progressive directory Schema snapshots files and discloses Domain, ABE, th
   assert.match(page, /schema_layout: "progressive-directory-v2"/u)
   assert.match(page, /schema_classification_kinds: \["entity"\]/u)
   assert.doesNotMatch(page, /domain_type_(?:kinds|ids|names)/u)
+
+  const manifestView = await core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    view: "manifest",
+    cursor: 0,
+    max_chars: 40_000,
+  })
+  const shardView = await core.getPagePlanContext(manifestView.draft_manifest.draft_actions[0].arguments)
+  assert.equal(shardView.page_requirements[0].domain_classifications[0].be.key, "individual_customer")
+  const staged = await core.stagePageDrafts({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: manifestView.projection.projection_id,
+    shard_id: shardView.shard.shard_id,
+    patches: shardView.page_requirements.map((requirement) => ({
+      ...requirement.patch_scaffold,
+      content: `# ${requirement.title}\n\n客户实体。`,
+      summary: "客户实体。",
+    })),
+    idempotency_key: "progressive-stage-with-be-v1",
+  })
+  const stagedStatus = await core.getStagedPageDrafts(staged.next_action.arguments)
+  const committedPages = await core.commitPages({
+    ...stagedStatus.next_action.arguments,
+    idempotency_key: "progressive-commit-with-be-v1",
+  })
+  const completedProjection = await core.commitPages({
+    ...committedPages.next_action.arguments,
+    idempotency_key: "progressive-final-ack-with-be-v1",
+  })
+  assert.equal(completedProjection.projection_complete, true)
+  const wikiPage = await readFile(path.join(workspace, shardView.page_requirements[0].patch_scaffold.path), "utf8")
+  assert.match(wikiPage, /schema_be_keys: \["individual_customer"\]/u)
+  assert.match(wikiPage, /schema_be_names: \["个人客户"\]/u)
+  assert.match(wikiPage, /schema_classification_status: "unresolved"/u)
+  assert.doesNotMatch(wikiPage, /schema_be_(?:keys|names): \[\]/u)
+  assert.match(wikiPage, /BE：个人客户/u)
 })
 
 test("progressive disclosure accepts an ABE larger than the old 80 KiB guard and keeps it whole", async (t) => {

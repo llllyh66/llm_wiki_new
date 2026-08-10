@@ -52,9 +52,13 @@ reads the complete `all_domains.json`, then the selected Domain's
 `*_domain.json`, then the complete selected ABE JSON before choosing a BE.
 `llm_wiki_get_domain_schema` accepts `level=domains`, `level=domain` with
 `domain_folder`, and `level=abe` with `domain_folder` plus `abe_file`.
-Entities and concepts carry `schemaClassification` with a JSON Pointer into the
-selected ABE file. Core verifies the immutable snapshot, file chain, hashes and
-Pointer, while semantic classification remains the model's responsibility.
+The ABE response includes a canonical `classification_scaffold` and bounded
+`be_pointer_hints`; workers copy those values instead of reconstructing file
+names or guessing pointers. Entities and concepts carry `schemaClassification`
+with a JSON Pointer into the selected ABE file. Core accepts `/...` and `#/...`,
+canonicalizes unique Domain/ABE/BE references, derives BE key/name from the
+pointed Schema node, and verifies the immutable snapshot, file chain and hashes.
+Semantic classification remains the model's responsibility.
 Ambiguous candidates are retained with `status: "unresolved"`. Wiki pages show
 the resulting Domain → ABE → BE path and index its keys and names. A disclosed
 JSON file is read and returned verbatim (up to the 5 MiB per-file safety
@@ -118,7 +122,7 @@ canonical paths. Each accepted shard is a durable checkpoint identified by
 `draft_shard_ids`; after a restart or context compaction, the coordinator
 resumes from the first unfinished shard instead of regenerating earlier pages.
 It launches path-disjoint Drafters, then launches the stable Writer only with
-completed staged receipt IDs. The Writer never launches Drafters and never
+completed hash-bound staged receipts. The Writer never launches Drafters and never
 fetches manifest or shard context in normal mode. The
 legacy full page-plan cursor mode remains available for compatibility.
 Incremental pages use concise grounded drafts. When extraction finishes, Core
@@ -133,6 +137,8 @@ startup and Skill-loading time while preserving recovery. On a later turn,
 `llm_wiki_status` exposes
 `worker_recovery.leases`; relaunching a short-lived extractor with the same
 `worker_id` resumes the same batch using a fresh MCP client connection. The
+coordinator refills that same worker slot with zero delay whenever extraction
+remains; validation exhaustion never waits for lease expiry. The
 workflow therefore does not depend on background Agent or MCP-client lifetime
 across turns, and it does not infer a disconnect when a successful status call
 shows the current connection is usable.
@@ -177,8 +183,10 @@ for custom prose workflows, but is no longer on the default ingestion path.
 - `llm_wiki_get_domain_schema`
 - `llm_wiki_retrieve_context`
 - `llm_wiki_commit_analysis`
-- `llm_wiki_apply_projection` (fast default Writer path)
 - `llm_wiki_get_page_plan_context`
+- `llm_wiki_apply_projection` (compatibility redirect)
+- `llm_wiki_stage_page_drafts`
+- `llm_wiki_get_staged_page_drafts`
 - `llm_wiki_commit_pages`
 - `llm_wiki_update_pages`
 - `llm_wiki_finalize`
@@ -278,7 +286,7 @@ whitespace differences are repaired before validation. Later page-plan cursors
 reuse the persisted snapshot instead of rebuilding analyses and rereading every
 Wiki page. Tools which do not consume a Wiki revision also skip the full Wiki
 hash. The coordinator resumes its current manifest/Drafter action without an
-extra status probe; a newly launched Writer receives only staged receipt IDs.
+extra status probe; a newly launched Writer receives only hash-bound staged receipts.
 
 ## Managed workspace
 

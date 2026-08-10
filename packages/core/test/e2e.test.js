@@ -910,8 +910,17 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
     recommended_drafters: 2,
   })
   assert.equal(ready.parallel_extraction.recommended_workers, 2)
+  assert.equal(ready.parallel_extraction.restart_on_worker_completion, true)
+  assert.equal(ready.parallel_extraction.restart_delay_ms, 0)
   assert.equal(projectionSignal.next_action.tool, "llm_wiki_get_page_plan_context")
   assert.equal(projectionSignal.worker_next_action.tool, "llm_wiki_get_batch")
+  assert.deepEqual(projectionSignal.worker_restart, {
+    required: true,
+    strategy: "restart-same-worker-id-immediately",
+    worker_id: projectionSignal.worker_next_action.arguments.worker_id,
+    delay_ms: 0,
+    action: projectionSignal.worker_next_action,
+  })
 
   const incrementalPlan = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1" })
   assert.equal(incrementalPlan.waiting, undefined)
@@ -1868,36 +1877,57 @@ test("page drafters stage receipt-only shards and the Writer commits them server
   assert.equal(staged.patches, undefined)
   assert.equal(staged.next_action.action_owner, "writer")
   assert.equal(staged.next_action.delegate_to, "llm-wiki-writer")
-  const stagedStatus = await f.core.getStagedPageDrafts({
-    task_id: imported.task_id,
-    writer_id: "wiki-writer-1",
-    projection_id: manifest.projection.projection_id,
-    shard_ids: [shard.shard.shard_id],
-  })
+  assert.deepEqual(staged.next_action.arguments.draft_receipts, [{ shard_id: shard.shard.shard_id, draft_hash: staged.draft_hash }])
+  await assert.rejects(
+    () => f.core.getStagedPageDrafts({
+      task_id: imported.task_id,
+      writer_id: "wiki-writer-1",
+      projection_id: manifest.projection.projection_id,
+    }),
+    (error) => error instanceof LlmWikiError && error.code === "INVALID_INPUT",
+  )
+  await assert.rejects(
+    () => f.core.getStagedPageDrafts({
+      ...staged.next_action.arguments,
+      draft_receipts: [{ shard_id: shard.shard.shard_id, draft_hash: "0".repeat(64) }],
+    }),
+    (error) => error instanceof LlmWikiError && error.code === "STAGED_DRAFT_HASH_MISMATCH",
+  )
+  const changedPatches = patches.map((patch) => ({ ...patch, content: `${patch.content}\nChanged after receipt.\n` }))
+  await assert.rejects(
+    () => f.core.stagePageDrafts({
+      task_id: imported.task_id,
+      writer_id: "wiki-writer-1",
+      projection_id: manifest.projection.projection_id,
+      shard_id: shard.shard.shard_id,
+      patches: changedPatches,
+      idempotency_key: "stage-page-draft-v2",
+    }),
+    (error) => error instanceof LlmWikiError && error.code === "STAGED_DRAFT_EXISTS",
+  )
+  const stagedStatus = await f.core.getStagedPageDrafts(staged.next_action.arguments)
   assert.equal(stagedStatus.ready_for_server_commit, true)
   assert.equal(stagedStatus.staged[0].draft_hash, staged.draft_hash)
   assert.equal(stagedStatus.next_action.action_owner, "writer")
+  await assert.rejects(
+    () => f.core.commitPages({
+      ...stagedStatus.next_action.arguments,
+      staged_draft_receipts: [{ shard_id: shard.shard.shard_id, draft_hash: "0".repeat(64) }],
+      idempotency_key: "commit-staged-page-draft-wrong-hash",
+    }),
+    (error) => error instanceof LlmWikiError && error.code === "STAGED_DRAFT_HASH_MISMATCH",
+  )
   const committed = await f.core.commitPages({
-    task_id: imported.task_id,
-    writer_id: "wiki-writer-1",
-    projection_id: manifest.projection.projection_id,
-    staged_draft_shard_ids: [shard.shard.shard_id],
-    based_on_wiki_revision: manifest.based_on_wiki_revision,
-    projection_complete: false,
-    patches: [],
+    ...stagedStatus.next_action.arguments,
     idempotency_key: "commit-staged-page-draft-v1",
   })
   assert.equal(committed.accepted, true)
   assert.deepEqual(committed.committed_staged_draft_shard_ids, [shard.shard.shard_id])
+  assert.deepEqual(committed.committed_staged_draft_receipts, [{ shard_id: shard.shard.shard_id, draft_hash: staged.draft_hash }])
   assert.equal(committed.main_agent_payload, "receipt-only")
   assert.equal(committed.next_action.action_owner, committed.projection.pending_draft_shards > 0 ? "coordinator" : "writer")
   assert.equal(committed.writer_next_action, null)
-  const after = await f.core.getStagedPageDrafts({
-    task_id: imported.task_id,
-    writer_id: "wiki-writer-1",
-    projection_id: manifest.projection.projection_id,
-    shard_ids: [shard.shard.shard_id],
-  })
+  const after = await f.core.getStagedPageDrafts(staged.next_action.arguments)
   assert.deepEqual(after.missing_shard_ids, [shard.shard.shard_id])
 })
 

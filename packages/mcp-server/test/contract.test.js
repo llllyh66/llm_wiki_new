@@ -55,9 +55,14 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(skill, /same\s+`worker_id`/)
   assert.match(skill, /Never claim that MCP is "unreliable across\s+turns"/)
   assert.match(skill, /running_worker_ids/)
+  assert.match(skill, /immediately relaunch\s+`llm-wiki-extractor` with that same worker ID/)
+  assert.match(skill, /never wait\s+for lease expiry/)
   assert.match(skill, /Never say "both leases active, waiting\s+for the other Agent"/)
   assert.match(skill, /level\s+`"domains"`/)
   assert.match(skill, /progressive-directory-v2/)
+  assert.match(skill, /classification_scaffold/)
+  assert.match(skill, /be_pointer_hints/)
+  assert.match(extractor, /plain string, never an object/)
   assert.match(skill, /Skip\s+`llm_wiki_retrieve_context` by default/)
   assert.match(skill, /do not call `llm_wiki_status` inside this\s+worker/)
   assert.match(skill, /Start by copying `analysis_scaffold`/)
@@ -90,7 +95,7 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(skill, /must launch project Agent\s+`llm-wiki-page-drafter`/)
   assert.match(skill, /coordinator-owned-parallel-drafters/)
   assert.match(skill, /Launch the stable `llm-wiki-writer` only\s+after at least one Drafter stages a shard/)
-  assert.match(skill, /A Writer launched without receipt IDs must return\s+`waiting_for_drafter_receipts`/)
+  assert.match(skill, /A Writer launched without hash-bound receipts must return\s+`waiting_for_drafter_receipts`/)
   assert.match(skill, /Do not pass a manifest or\s+`draft-shard` action to that Writer/)
   assert.doesNotMatch(skill, /inspect `writer_next_action`/)
   assert.match(skill, /Never generate an oversized patch set and split it afterward/)
@@ -148,8 +153,12 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
   const pageCommit = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_commit_pages")
   assert.equal(pageCommit.inputSchema.properties.patches.maxItems, 50)
   assert.equal(pageCommit.inputSchema.properties.staged_draft_shard_ids.maxItems, 8)
+  assert.equal(pageCommit.inputSchema.properties.staged_draft_receipts.maxItems, 8)
   assert.match(pageCommit.description, /Hard maximum: 50 patches/)
-  assert.match(pageCommit.description, /staged_draft_shard_ids/)
+  assert.match(pageCommit.description, /staged_draft_receipts/)
+  const stagedDrafts = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_get_staged_page_drafts")
+  assert.equal(stagedDrafts.inputSchema.required.includes("draft_receipts"), true)
+  assert.equal(stagedDrafts.inputSchema.properties.draft_receipts.minItems, 1)
   const pageUpdate = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_update_pages")
   assert.deepEqual(pageUpdate.inputSchema.properties.action.enum, ["inspect", "apply"])
   assert.equal(pageUpdate.inputSchema.properties.updates.maxItems, 20)
@@ -216,6 +225,7 @@ test("commit_analysis validation failures are recoverable business results, not 
     const response = await router.callMcp("llm_wiki_commit_analysis", {
       task_id: "task-example",
       batch_id: "batch-0001",
+      worker_id: "extractor-4",
       analysis: {},
       idempotency_key: "contract-retry-v1",
     })
@@ -224,6 +234,14 @@ test("commit_analysis validation failures are recoverable business results, not 
     assert.equal(response.structuredContent.error.code, code)
     assert.deepEqual(response.structuredContent.validation_errors, ["fix this field"])
     assert.equal(response.structuredContent.next_action.tool, "llm_wiki_commit_analysis")
+    assert.equal(response.structuredContent.next_action.arguments.worker_id, "extractor-4")
+    assert.deepEqual(response.structuredContent.worker_restart, {
+      required: true,
+      strategy: "restart-same-worker-id-immediately",
+      worker_id: "extractor-4",
+      batch_id: "batch-0001",
+      delay_ms: 0,
+    })
   }
 })
 

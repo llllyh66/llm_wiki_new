@@ -21,7 +21,7 @@ const PAGE_PATCH_FIELDS = new Set(["patchId", "path", "operation", "expectedFile
 
 export function normalizeAnalysisEnvelope(analysis, options = {}) {
   if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) {
-    return { analysis, resolvedSourceRefIndexes: 0 }
+    return { analysis, resolvedSourceRefIndexes: 0, normalizedUnresolvedQuestions: 0 }
   }
   if (analysis.sourceRefMode === "batch-evidence-index") {
     return normalizeBatchEvidenceEnvelope(analysis, options.evidenceCatalog)
@@ -29,7 +29,8 @@ export function normalizeAnalysisEnvelope(analysis, options = {}) {
   const catalog = Array.isArray(analysis.sourceRefs) ? analysis.sourceRefs : []
   const errors = []
   let resolvedSourceRefIndexes = 0
-  const normalized = { ...analysis }
+  const unresolved = normalizeUnresolvedQuestions(analysis.unresolvedQuestions)
+  const normalized = { ...analysis, ...(unresolved.value ? { unresolvedQuestions: unresolved.value } : {}) }
   for (const collection of GROUNDED_ANALYSIS_COLLECTIONS) {
     if (!Array.isArray(analysis[collection])) continue
     normalized[collection] = analysis[collection].map((item, itemIndex) => {
@@ -56,7 +57,7 @@ export function normalizeAnalysisEnvelope(analysis, options = {}) {
       details: { validation_errors: errors.slice(0, MAX_ANALYSIS_VALIDATION_ERRORS), validation_error_count: errors.length },
     })
   }
-  return { analysis: normalized, resolvedSourceRefIndexes }
+  return { analysis: normalized, resolvedSourceRefIndexes, normalizedUnresolvedQuestions: unresolved.normalized }
 }
 
 function normalizeBatchEvidenceEnvelope(analysis, evidenceCatalog) {
@@ -93,7 +94,8 @@ function normalizeBatchEvidenceEnvelope(analysis, evidenceCatalog) {
       }
     })
   }
-  const normalized = { ...analysis }
+  const unresolved = normalizeUnresolvedQuestions(analysis.unresolvedQuestions)
+  const normalized = { ...analysis, ...(unresolved.value ? { unresolvedQuestions: unresolved.value } : {}) }
   delete normalized.sourceRefMode
   for (const collection of GROUNDED_ANALYSIS_COLLECTIONS) {
     if (!Array.isArray(analysis[collection])) continue
@@ -118,7 +120,22 @@ function normalizeBatchEvidenceEnvelope(analysis, evidenceCatalog) {
       details: { validation_errors: errors.slice(0, MAX_ANALYSIS_VALIDATION_ERRORS), validation_error_count: errors.length },
     })
   }
-  return { analysis: normalized, resolvedSourceRefIndexes }
+  return { analysis: normalized, resolvedSourceRefIndexes, normalizedUnresolvedQuestions: unresolved.normalized }
+}
+
+function normalizeUnresolvedQuestions(value) {
+  if (!Array.isArray(value)) return { value, normalized: 0 }
+  let normalized = 0
+  const result = value.map((item) => {
+    if (typeof item === "string" || !item || typeof item !== "object" || Array.isArray(item)) return item
+    for (const field of ["question", "reason", "content", "message", "text"]) {
+      if (typeof item[field] !== "string" || !item[field].trim()) continue
+      normalized += 1
+      return item[field].trim()
+    }
+    return item
+  })
+  return { value: result, normalized }
 }
 
 export function validateAnalysisShape(analysis, taskId, batchId) {

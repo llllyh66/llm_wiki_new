@@ -1,4 +1,4 @@
-import { cp, mkdir, rm, writeFile } from "node:fs/promises"
+import { chmod, cp, mkdir, rm, writeFile } from "node:fs/promises"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 
@@ -7,6 +7,7 @@ const execFileAsync = promisify(execFile)
 await rm(new URL("../dist", import.meta.url), { recursive: true, force: true })
 await mkdir(new URL("../dist", import.meta.url), { recursive: true })
 await cp(new URL("../src", import.meta.url), new URL("../dist", import.meta.url), { recursive: true })
+await chmod(new URL("../dist/index.js", import.meta.url), 0o755)
 
 let gitCommit = "unknown"
 try {
@@ -18,6 +19,6 @@ try {
 }
 await writeFile(
   new URL("../dist/build-info.json", import.meta.url),
-  `${JSON.stringify({ schemaVersion: 1, packageVersion: "1.0.4", gitCommit, builtAt: new Date().toISOString() }, null, 2)}\n`,
+  `${JSON.stringify({ schemaVersion: 1, packageVersion: "1.0.5", gitCommit, builtAt: new Date().toISOString() }, null, 2)}\n`,
   "utf8",
 )

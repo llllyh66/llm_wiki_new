@@ -84,7 +84,7 @@ export const analysisSchema = Object.freeze({
         properties: { type: "object", description: "Source-grounded structured properties when useful." },
         schemaClassification: {
           type: "object",
-          description: "Progressive directory Schema classification. Domain, ABE, and BE are selected by the Agent after reading the three disclosure levels; input JSON field names are unrestricted.",
+          description: "Progressive directory Schema classification. Copy Domain/ABE from the level=abe classification_scaffold and select BE from be_pointer_hints; input JSON field names are unrestricted.",
           properties: {
             status: { enum: ["classified", "unresolved"] },
             confidence: { type: "number", minimum: 0, maximum: 1 },

@@ -43,7 +43,9 @@ entity or concept.
 The only supported mode is `progressive-directory-v2`. Follow the three-level
 contract in `references/domain-schema.md`: read `all_domains.json`, each
 selected Domain's `*_domain.json`, and the complete selected ABE JSON before
-choosing a BE. Put `schemaClassification` on every entity and concept, include
+choosing a BE. Copy the ABE response's `classification_scaffold` and select an
+exact pointer from `be_pointer_hints`; never reconstruct folder/file names or
+guess pointer variants. Put `schemaClassification` on every entity and concept, include
 a JSON Pointer into the selected ABE JSON, and retain unresolved candidates
 with `status: "unresolved"` instead of inventing or dropping them.
 
@@ -190,8 +192,10 @@ always use it and return control to the user while the worker runs.
       When `workspace_context.domain_schema` is non-null, call
       `llm_wiki_get_domain_schema` with level `"domains"`, then level
       `"domain"` for each selected Domain, and level `"abe"` for each selected
-      ABE. Read every returned JSON file completely and select a BE with a JSON
-      Pointer. Do not search or paginate the Schema, read the original Schema
+      ABE. Read every returned JSON file completely, copy the returned
+      `classification_scaffold`, and select a BE using an exact
+      `be_pointer_hints` entry. Canonical `/field/0` and URI fragment
+      `#/field/0` are accepted; array indexes are numeric. Do not search or paginate the Schema, read the original Schema
       directory, or infer omitted classifications from memory.
    3. Follow `extraction_context_policy`: retrieval is not required for normal
       extraction because the leased batch is complete evidence and the final
@@ -207,7 +211,9 @@ always use it and return control to the user while the worker runs.
    4. Analyze the chunks under the supplied AnalysisEnvelope schema. When a
       Domain Schema is present, put a progressive `schemaClassification` on
       every entity and concept. Use `status: "unresolved"` and explain genuine
-      ambiguity instead of inventing a Domain, ABE, or BE. Relations remain
+      ambiguity as a plain string item in `unresolvedQuestions` instead of
+      inventing a Domain, ABE, or BE. Never put objects in
+      `unresolvedQuestions`. Relations remain
       source-grounded AnalysisEnvelope candidates.
    5. Before calling `llm_wiki_commit_analysis`, preflight the payload: pass
       `analysis` as a JSON object, never a serialized JSON string or Markdown
@@ -251,8 +257,9 @@ always use it and return control to the user while the worker runs.
       another batch first; this completion notification is what starts the
       Wiki projection promptly. The coordinator starts manifest/Drafter
       orchestration first and starts the one Writer only after a staged receipt
-      exists. It may then replace this extractor when `worker_next_action` is
-      non-null.
+      exists. When `worker_restart.required` is true, it simultaneously refills
+      this extractor's same-ID slot without waiting for projection completion,
+      subject to the current two-extractor overlap cap.
       Otherwise record `checkpointed: true`, append the committed batch ID to
       the worker report, and inspect `worker_next_action`. If the bounded
       quantum has remaining capacity and `worker_next_action.tool` is
@@ -299,8 +306,18 @@ always use it and return control to the user while the worker runs.
       not poll in a tight loop.
 6. Keep the coordinator responsive while extraction runs. After every worker
    completion notification, first remove that exact stable worker ID from
-   `running_worker_ids`, then call `llm_wiki_status`. Reconcile that freed slot
-   immediately and independently of every other still-running worker. Use the
+   `running_worker_ids`. Inspect its `worker_restart`, `worker_next_action`, and
+   `restart_required` report before calling status. When extraction remains and
+   the current extraction cap has room, immediately relaunch
+   `llm-wiki-extractor` with that same worker ID and its exact leased batch or
+   next-batch action, add it back to `running_worker_ids`, and only then refresh
+   status. This zero-delay refill applies after a normal quantum, validation
+   exhaustion, an interrupted lease, and a writer-required handoff; never wait
+   for lease expiry or another extractor to finish. If page drafting has reduced
+   the extraction cap, assign the freed slot to the pending Drafter instead of
+   exceeding the four-Agent budget. When no restart signal is available, call
+   `llm_wiki_status` immediately and reconcile from persisted state. Reconcile that freed slot
+   independently of every other still-running worker. Use the
    status result's current `parallel_extraction.recommended_workers` and
    `worker_batch_quantum`, not a stale recommendation saved when an older task
    was imported:
@@ -369,7 +386,7 @@ always use it and return control to the user while the worker runs.
    the available `llm-wiki-page-drafter` children and never draft locally. Use
    project `llm-wiki-writer` as the sole committer only after Drafter receipts
    arrive. Never launch the Writer merely because a projection is ready or a
-   manifest exists. A Writer launched without receipt IDs must return
+   manifest exists. A Writer launched without hash-bound receipts must return
    `waiting_for_drafter_receipts` and must not fetch a manifest or shard. When
    the host concretely fails to launch `llm-wiki-page-drafter`, the coordinator
    may explicitly launch the stable Writer in
@@ -390,9 +407,9 @@ always use it and return control to the user while the worker runs.
    `llm_wiki_apply_projection`
    is only a compatibility redirect to the same page-plan action and never
    writes pages automatically. Call the exact
-   action supplied by status or `commit_analysis`, with stable Writer ID
-   `wiki-writer-1` and `max_projections` set to
-   `wiki_projection.writer_projection_quantum` (currently six). The Core
+   action supplied by status or `commit_analysis` with stable Writer ID
+   `wiki-writer-1`; do not add the compatibility-only `max_projections`
+   argument to `llm_wiki_get_page_plan_context`. The Core
    returns bounded context for the Agent to author semantic pages. The Core
    validates evidence, page shape, hashes, and atomic transactions; it never
    invents semantic facts. Return the
@@ -428,10 +445,10 @@ always use it and return control to the user while the worker runs.
       ID and draft hash, never PagePatch bodies. Validate only those receipts
       in the coordinator. On every successful receipt notification,
       immediately launch the stable `llm-wiki-writer` with the exact task,
-      projection, Writer, and staged shard IDs. Do not pass a manifest or
+      projection, Writer, and exact hash-bound staged receipts. Do not pass a manifest or
       `draft-shard` action to that Writer. The Writer calls
       `llm_wiki_get_staged_page_drafts` and commits with
-      `staged_draft_shard_ids` and `patches: []`; page bodies remain in the
+      `staged_draft_receipts` and `patches: []`; page bodies remain in the
       task-scoped temporary staging area. After one accepted staged wave the
       Writer returns; the coordinator follows the returned coordinator-owned
       manifest action and launches the next Drafter wave. If fewer than two
@@ -496,9 +513,11 @@ always use it and return control to the user while the worker runs.
       Finalize.
       The staging call performs the deterministic path, requirement, scaffold,
       SourceRef, Related, and context-completeness checks. A receipt without a
-      server draft hash is not success. Never copy staged patch bodies into the
+      server draft hash is not success. Treat `{shard_id, draft_hash}` as one
+      immutable receipt; never pass a bare shard ID or accept a changed hash.
+      Never copy staged patch bodies into the
       coordinator context. Only the stable Writer may invoke
-      `llm_wiki_commit_pages`, and it must use `staged_draft_shard_ids` with
+      `llm_wiki_commit_pages`, and it must use `staged_draft_receipts` with
       `patches: []`; parallel draft generation must never become parallel commits.
    5. Obey `page_commit_limits` before drafting. A wave must contain no more
       than the returned recommended count and can never exceed the hard 50
@@ -516,7 +535,7 @@ always use it and return control to the user while the worker runs.
       returned empty `patches: []`, `projection_complete: true`
       acknowledgement. This final coverage audit completes the projection.
       For a server-side manifest, a non-final wave must contain a complete
-      PagePatch set for every assigned path, or use `staged_draft_shard_ids`;
+      PagePatch set for every assigned path, or use hash-bound `staged_draft_receipts`;
       `projection_complete: false` with `draft_shard_ids` and `patches: []` is
       invalid and must never be treated as an accepted shard commit.
       `INCOMPLETE_PAGE_COVERAGE` is a normal recoverable result: author the

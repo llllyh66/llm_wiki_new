@@ -8,7 +8,7 @@ import {
   loadTaskDomainSchema,
   resolveDomainSchema,
 } from "./domain-schema.js"
-import { PROGRESSIVE_SCHEMA_MODE } from "./schema-bundle.js"
+import { PROGRESSIVE_SCHEMA_MODE, resolveProgressiveClassificationReference } from "./schema-bundle.js"
 import { lintWiki } from "./lint.js"
 import { batchEvidenceCatalog, compactEvidenceCatalog } from "./evidence.js"
 import { buildRetrievalIndexes, retrieveContext } from "./retrieval.js"
@@ -409,6 +409,9 @@ export class LlmWikiCore {
         worker_batch_quantum: workerBatchQuantum,
         recommended_batch_chars: task.options.maxBatchChars,
         checkpoint_each_batch: true,
+        restart_on_worker_completion: true,
+        restart_delay_ms: 0,
+        restart_strategy: "same-worker-id",
         ...(task.domainSchema?.size_bytes ? { domain_schema_bytes: task.domainSchema.size_bytes } : {}),
         lease_minutes: BATCH_LEASE_MS / 60_000,
       },
@@ -550,7 +553,7 @@ export class LlmWikiCore {
         domain_schema: schemaContext.value,
         domain_schema_disclosure: schemaContext.disclosure,
         domain_extraction_instructions: domainSchema
-          ? "Use progressive Schema disclosure. First call llm_wiki_get_domain_schema with level=domains to read all_domains.json. Group candidates by selected domain, then call level=domain for each domain. For each selected ABE, call level=abe and read the complete returned JSON. Select one BE per entity or concept using a JSON Pointer into that complete ABE JSON. Put the result in schemaClassification with domain, abe, be, pointer, confidence, and status. The input JSON shape is unrestricted. Keep sourceRefs for document evidence separate from schema references. If classification is ambiguous, preserve the candidate with status=unresolved and explain the ambiguity in unresolvedQuestions."
+          ? "Use progressive Schema disclosure. First call llm_wiki_get_domain_schema with level=domains to read all_domains.json. Group candidates by selected domain, then call level=domain for each domain. For each selected ABE, call level=abe and read the complete returned JSON. Copy its classification_scaffold and choose a BE from be_pointer_hints; do not reconstruct folder/file names or guess pointer variants. Put the result in schemaClassification with domain, abe, be, pointer, confidence, and status. The input JSON shape is unrestricted. Keep sourceRefs for document evidence separate from schema references. If classification is ambiguous, preserve the candidate with status=unresolved and add a plain string to unresolvedQuestions."
           : null,
       },
       analysis_contract: {
@@ -605,6 +608,7 @@ export class LlmWikiCore {
         evidence: "Do not retype quotes or read the source file. The server generated every evidence_catalog quote as an exact contiguous batch substring.",
         relation_grounding: "Put the directly supported relationship statement in relation.content and cite the evidence entry containing it.",
         review_items: "Use {content, sourceRefs} objects only when a batch quote directly supports the concern; otherwise use unresolvedQuestions.",
+        unresolved_questions: "Use plain strings only. Common legacy {question|reason|content|message|text} objects are normalized, but current workers must emit strings.",
       },
       extraction_context_policy: {
         retrieval_required: false,
@@ -739,10 +743,18 @@ export class LlmWikiCore {
         validation_errors: [],
         normalized_source_ref_indexes: normalized.resolvedSourceRefIndexes,
         normalized_source_ref_quotes: normalizedSourceRefQuotes,
+        normalized_unresolved_questions: normalized.normalizedUnresolvedQuestions,
         domain_validation: domainApplied.report,
         wiki_projection: wikiProjection,
         next_action: projectionNextAction ?? extractionNextAction,
         worker_next_action: extractionNextAction,
+        worker_restart: {
+          required: remaining > 0,
+          strategy: "restart-same-worker-id-immediately",
+          worker_id: workerId,
+          delay_ms: 0,
+          action: extractionNextAction,
+        },
       }
       // Persist the replay payload before leaving the side-effecting
       // operation. If the process dies before the idempotency shard is
@@ -1062,7 +1074,7 @@ export class LlmWikiCore {
         returned_shard_count: availableShards.length,
         shards: availableShards,
         complete_manifest_persisted_server_side: true,
-        workflow: "The coordinator launches one page drafter per returned draft_action. Each drafter fetches and stages exactly one shard, then returns a receipt. Only after a staged receipt exists does the coordinator launch the stable Writer, which commits receipt IDs without fetching draft-shard context. After every shard is covered, the Writer sends one empty projection_complete=true acknowledgement.",
+        workflow: "The coordinator launches one page drafter per returned draft_action. Each drafter fetches and stages exactly one shard, then returns a hash-bound receipt. Only after a staged receipt exists does the coordinator launch the stable Writer, which commits {shard_id,draft_hash} receipts without fetching draft-shard context. After every shard is covered, the Writer sends one empty projection_complete=true acknowledgement.",
         draft_actions: availableShards.map((shard) => ({
           tool: "llm_wiki_get_page_plan_context",
           action_owner: "coordinator",
@@ -1480,13 +1492,12 @@ export class LlmWikiCore {
       },
       async ({ persistResponse }) => {
         const previous = await readJson(draftPath, null)
-        if (previous?.draft_hash && previous.draft_hash !== draftHash
-          && projection.committedDraftShardIds?.includes(shardId)) {
-          fail("STAGED_DRAFT_EXISTS", "This shard was already committed and cannot be replaced in the completed wave.", {
+        if (previous?.draft_hash && previous.draft_hash !== draftHash) {
+          fail("STAGED_DRAFT_EXISTS", "This shard already has a different accepted draft and cannot be replaced after its receipt was issued.", {
             retryable: true,
             taskId: record.task.taskId,
             details: { shard_id: shardId, existing_draft_hash: previous.draft_hash, submitted_draft_hash: draftHash },
-            suggestedAction: "Stage the corrected PagePatch under the next uncommitted shard; accepted shards are durable.",
+            suggestedAction: "Use the existing hash-bound receipt, or restart the projection before staging corrected semantic content.",
           })
         }
         const stagedAt = previous?.staged_at ?? nowIso()
@@ -1523,7 +1534,7 @@ export class LlmWikiCore {
               task_id: record.task.taskId,
               writer_id: projection.writerId,
               projection_id: projection.projectionId,
-              shard_ids: [shardId],
+              draft_receipts: [{ shard_id: shardId, draft_hash: draftHash }],
             },
           },
         }
@@ -1551,10 +1562,14 @@ export class LlmWikiCore {
     }
     const snapshot = await this.#pagePlanSnapshot(record, projection.projectionId)
     const manifest = snapshot?.draftManifest ?? []
-    const requested = Array.isArray(input?.shard_ids) && input.shard_ids.length > 0
-      ? uniqueStrings(input.shard_ids.map(normalizeDraftShardId))
-      : manifest.slice(0, 4).map((shard) => shard.shard_id)
-    if (requested.length > 8) fail("INVALID_INPUT", "shard_ids must contain at most 8 entries.")
+    const requestedReceipts = normalizeStagedDraftReceipts(input?.draft_receipts, "draft_receipts")
+    if (requestedReceipts.length === 0) {
+      fail("INVALID_INPUT", "draft_receipts must contain 1 to 8 hash-bound staged draft receipts.", {
+        retryable: true,
+        taskId: record.task.taskId,
+      })
+    }
+    const requested = requestedReceipts.map((receipt) => receipt.shard_id)
     const known = new Set(manifest.map((shard) => shard.shard_id))
     const unknown = requested.filter((shardId) => !known.has(shardId))
     if (unknown.length > 0) {
@@ -1571,6 +1586,15 @@ export class LlmWikiCore {
       if (!draft || draft.projection_id !== projection.projectionId || draft.writer_id !== projection.writerId || draft.shard_id !== shardId) {
         missing.push(shardId)
         continue
+      }
+      const expectedHash = requestedReceipts.find((receipt) => receipt.shard_id === shardId)?.draft_hash
+      if (draft.draft_hash !== expectedHash) {
+        fail("STAGED_DRAFT_HASH_MISMATCH", `The staged draft changed after its receipt was issued: ${shardId}.`, {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: { shard_id: shardId, expected_draft_hash: expectedHash, actual_draft_hash: draft.draft_hash, atomic_commit_applied: false },
+          suggestedAction: "Do not commit this shard. Return control to the coordinator and relaunch the matching Drafter in a new projection.",
+        })
       }
       staged.push({
         shard_id: shardId,
@@ -1599,7 +1623,7 @@ export class LlmWikiCore {
               task_id: record.task.taskId,
               writer_id: projection.writerId,
               projection_id: projection.projectionId,
-              staged_draft_shard_ids: staged.map((item) => item.shard_id),
+              staged_draft_receipts: staged.map((item) => ({ shard_id: item.shard_id, draft_hash: item.draft_hash })),
               based_on_wiki_revision: projection.wikiRevision ?? snapshot.basedOnWikiRevision,
               projection_complete: false,
               patches: [],
@@ -2031,7 +2055,17 @@ export class LlmWikiCore {
     const workspace = await this.workspace({ skipWikiRevision: true })
     const record = await loadTask(workspace.paths, input?.task_id)
     const projectionCommit = input?.projection_id !== undefined || input?.writer_id !== undefined
-    const stagedDraftShardIds = uniqueStrings((Array.isArray(input?.staged_draft_shard_ids) ? input.staged_draft_shard_ids : []).map(normalizeDraftShardId))
+    const stagedDraftReceipts = normalizeStagedDraftReceipts(input?.staged_draft_receipts, "staged_draft_receipts")
+    const legacyStagedDraftShardIds = uniqueStrings((Array.isArray(input?.staged_draft_shard_ids) ? input.staged_draft_shard_ids : []).map(normalizeDraftShardId))
+    const receiptShardIds = stagedDraftReceipts.map((receipt) => receipt.shard_id)
+    if (receiptShardIds.length > 0 && legacyStagedDraftShardIds.length > 0
+      && stableStringify(receiptShardIds) !== stableStringify(legacyStagedDraftShardIds)) {
+      fail("INVALID_INPUT", "staged_draft_receipts and staged_draft_shard_ids must identify the same shards when both are supplied.", {
+        retryable: true,
+        taskId: record.task.taskId,
+      })
+    }
+    const stagedDraftShardIds = receiptShardIds.length > 0 ? receiptShardIds : legacyStagedDraftShardIds
     const submittedPatches = Array.isArray(input?.patches) ? [...input.patches] : []
     const projectionComplete = input?.projection_complete !== false
     await this.#repairProjectionState(workspace, record, { force: projectionComplete })
@@ -2045,20 +2079,20 @@ export class LlmWikiCore {
       ? uniqueStrings(input.draft_shard_ids.map(normalizeDraftShardId))
       : []
     if (stagedDraftShardIds.length > 0 && submittedPatches.length > 0) {
-      fail("INVALID_INPUT", "Provide either patches or staged_draft_shard_ids, not both.", {
+      fail("INVALID_INPUT", "Provide either patches or staged draft receipts, not both.", {
         retryable: true,
         taskId: record.task.taskId,
       })
     }
     if (!Array.isArray(input?.patches) && stagedDraftShardIds.length === 0) {
-      fail("INVALID_PAGE_PATCH", "patches must be an array unless staged_draft_shard_ids are supplied.")
+      fail("INVALID_PAGE_PATCH", "patches must be an array unless staged draft receipts are supplied.")
     }
     if (submittedPatches.length === 0 && stagedDraftShardIds.length === 0 && !projectionCommit) {
       fail("INVALID_PAGE_PATCH", "patches must not be empty outside a leased page projection.")
     }
     const commitProjection = projectionCommit ? requirePageProjectionLease(record.task, input) : null
     if (stagedDraftShardIds.length > 0 && (!commitProjection || commitProjection.pagePlanTraversal?.serverSideManifest !== true)) {
-      fail("PAGE_DRAFT_STAGING_UNAVAILABLE", "staged_draft_shard_ids require an active server-side manifest projection.", {
+      fail("PAGE_DRAFT_STAGING_UNAVAILABLE", "Staged draft receipts require an active server-side manifest projection.", {
         retryable: true,
         taskId: record.task.taskId,
       })
@@ -2108,6 +2142,15 @@ export class LlmWikiCore {
             taskId: record.task.taskId,
             details: { shard_id: shardId, atomic_commit_applied: false },
             suggestedAction: "Ask the drafter to stage the shard again before invoking the Writer commit.",
+          })
+        }
+        const expectedHash = stagedDraftReceipts.find((receipt) => receipt.shard_id === shardId)?.draft_hash
+        if (expectedHash && staged.draft_hash !== expectedHash) {
+          fail("STAGED_DRAFT_HASH_MISMATCH", `The staged draft no longer matches its accepted receipt: ${shardId}.`, {
+            retryable: true,
+            taskId: record.task.taskId,
+            details: { shard_id: shardId, expected_draft_hash: expectedHash, actual_draft_hash: staged.draft_hash, atomic_commit_applied: false },
+            suggestedAction: "Do not commit this shard. Return control to the coordinator and relaunch the matching Drafter in a new projection.",
           })
         }
         submittedPatches.push(...staged.patches)
@@ -2303,6 +2346,7 @@ export class LlmWikiCore {
       projectionComplete,
       draftShardIds: submittedManifestShardIds,
       stagedDraftShardIds,
+      stagedDraftReceipts,
     }, async ({ persistResponse }) => {
       let projection = commitProjection
       if (!projectionCommit) {
@@ -2442,6 +2486,7 @@ export class LlmWikiCore {
         normalized_page_source_ref_quotes: normalizedPageSourceRefQuotes,
         ...(stagedDraftShardIds.length > 0 ? {
           committed_staged_draft_shard_ids: stagedDraftShardIds,
+          ...(stagedDraftReceipts.length > 0 ? { committed_staged_draft_receipts: stagedDraftReceipts } : {}),
           main_agent_payload: "receipt-only",
         } : {}),
         written_pages: journal.patches.map((patch) => ({ path: patch.path, file_hash: patch.fileHash })),
@@ -3094,8 +3139,8 @@ function normalizeWorkerId(value) {
 function recommendedWorkerCount(batchCount) {
   if (batchCount <= 0) return 0
   if (batchCount === 1) return 1
-  // Large Schemas are selected server-side per batch, so their full byte size
-  // no longer needs to reduce semantic worker parallelism.
+  // get_batch returns only progressive-disclosure metadata, so a large Schema
+  // is never duplicated wholesale across extraction worker responses.
   return Math.min(4, batchCount)
 }
 
@@ -3619,75 +3664,93 @@ async function buildGenerationArtifacts(workspace, { generationId, taskId, pageS
 }
 
 async function recoverPendingFinalizations(workspace) {
+  let release
+  try {
+    release = await acquireProcessFileLock(
+      path.join(workspace.paths.locks, "write.lock"),
+      { kind: "finalization-recovery" },
+      { waitMs: 5_000 },
+    )
+  } catch (error) {
+    if (error?.code === "FILE_LOCK_BUSY") {
+      fail("WORKSPACE_LOCKED", "A Wiki write is active while Finalize recovery is starting.", { retryable: true })
+    }
+    throw error
+  }
   let entries = []
   try {
     entries = await readdir(workspace.paths.tasks, { withFileTypes: true })
   } catch {
+    await release?.().catch(() => {})
     return
   }
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !entry.name.startsWith("task-")) continue
-    const taskRoot = path.join(workspace.paths.tasks, entry.name)
-    const finalizationPath = path.join(taskRoot, "finalization.json")
-    const finalization = await readJson(finalizationPath, null)
-    if (!finalization || finalization.state === "task_completed" || finalization.state === "failed") continue
-    const taskPath = path.join(taskRoot, "task.json")
-    const resultPath = path.join(taskRoot, "result.json")
-    const task = await readJson(taskPath, null)
-    if (!task) continue
-    const generationId = finalization.generationId
-    const generationRoot = typeof generationId === "string" && /^generation-[0-9a-f-]+$/i.test(generationId)
-      ? path.join(workspace.paths.generations, generationId)
-      : null
-    const manifestPath = generationRoot ? path.join(generationRoot, "manifest.json") : null
-    const manifestExists = Boolean(manifestPath && await pathExists(manifestPath))
-    const manifestSha256 = manifestExists ? await sha256File(manifestPath) : null
-    if (finalization.state === "ready_to_publish" && manifestSha256 === finalization.manifestSha256) {
-      await writeJsonAtomic(workspace.paths.currentGeneration, {
-        schemaVersion: 1,
-        generation_id: generationId,
-        task_id: task.taskId,
-        wiki_revision: finalization.wikiRevision,
-        manifest_sha256: manifestSha256,
-        published_at: nowIso(),
-      })
-      await writeJsonAtomic(finalizationPath, { ...finalization, state: "published", publishedAt: nowIso() })
-      finalization.state = "published"
-    }
-    if (finalization.state === "published") {
-      const pointer = await readJson(workspace.paths.currentGeneration, null)
-      const pointerValid = pointer?.generation_id === generationId
-        && pointer?.task_id === task.taskId
-        && pointer?.manifest_sha256 === finalization.manifestSha256
-        && manifestSha256 === finalization.manifestSha256
-      if (!pointerValid || !finalization.result) {
-        await writeJsonAtomic(finalizationPath, {
-          ...finalization,
-          state: "recovery_required",
-          recoveryReason: "published generation pointer or manifest is missing",
-          recoveryAt: nowIso(),
+  try {
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !entry.name.startsWith("task-")) continue
+      const taskRoot = path.join(workspace.paths.tasks, entry.name)
+      const finalizationPath = path.join(taskRoot, "finalization.json")
+      const finalization = await readJson(finalizationPath, null)
+      if (!finalization || finalization.state === "task_completed" || finalization.state === "failed") continue
+      const taskPath = path.join(taskRoot, "task.json")
+      const resultPath = path.join(taskRoot, "result.json")
+      const task = await readJson(taskPath, null)
+      if (!task) continue
+      const generationId = finalization.generationId
+      const generationRoot = typeof generationId === "string" && /^generation-[0-9a-f-]+$/i.test(generationId)
+        ? path.join(workspace.paths.generations, generationId)
+        : null
+      const manifestPath = generationRoot ? path.join(generationRoot, "manifest.json") : null
+      const manifestExists = Boolean(manifestPath && await pathExists(manifestPath))
+      const manifestSha256 = manifestExists ? await sha256File(manifestPath) : null
+      if (finalization.state === "ready_to_publish" && manifestSha256 === finalization.manifestSha256) {
+        await writeJsonAtomic(workspace.paths.currentGeneration, {
+          schemaVersion: 1,
+          generation_id: generationId,
+          task_id: task.taskId,
+          wiki_revision: finalization.wikiRevision,
+          manifest_sha256: manifestSha256,
+          published_at: nowIso(),
         })
-        continue
+        await writeJsonAtomic(finalizationPath, { ...finalization, state: "published", publishedAt: nowIso() })
+        finalization.state = "published"
       }
-      task.status = "completed"
-      task.completedAt = task.completedAt ?? nowIso()
-      task.wikiRevision = finalization.wikiRevision
-      task.generationId = generationId
-      task.generationManifestSha256 = finalization.manifestSha256
-      task.updatedAt = nowIso()
-      await writeJsonAtomic(taskPath, task)
-      await writeJsonAtomic(resultPath, finalization.result)
-      await writeJsonAtomic(finalizationPath, { ...finalization, state: "task_completed", completedAt: nowIso() })
-      continue
-    }
-    if (["prepared", "pages_published", "indexes_ready", "recovery_required"].includes(finalization.state)) {
-      if (task.status !== "completed") {
-        task.status = "failed"
-        task.lastError = new LlmWikiError("FINALIZE_RECOVERY_REQUIRED", "Finalize was interrupted before generation publication; rerun Finalize to rebuild the generation.", { retryable: true, taskId: task.taskId }).toJSON()
+      if (finalization.state === "published") {
+        const pointer = await readJson(workspace.paths.currentGeneration, null)
+        const pointerValid = pointer?.generation_id === generationId
+          && pointer?.task_id === task.taskId
+          && pointer?.manifest_sha256 === finalization.manifestSha256
+          && manifestSha256 === finalization.manifestSha256
+        if (!pointerValid || !finalization.result) {
+          await writeJsonAtomic(finalizationPath, {
+            ...finalization,
+            state: "recovery_required",
+            recoveryReason: "published generation pointer or manifest is missing",
+            recoveryAt: nowIso(),
+          })
+          continue
+        }
+        task.status = "completed"
+        task.completedAt = task.completedAt ?? nowIso()
+        task.wikiRevision = finalization.wikiRevision
+        task.generationId = generationId
+        task.generationManifestSha256 = finalization.manifestSha256
         task.updatedAt = nowIso()
         await writeJsonAtomic(taskPath, task)
+        await writeJsonAtomic(resultPath, finalization.result)
+        await writeJsonAtomic(finalizationPath, { ...finalization, state: "task_completed", completedAt: nowIso() })
+        continue
+      }
+      if (["prepared", "pages_published", "indexes_ready", "recovery_required"].includes(finalization.state)) {
+        if (task.status !== "completed") {
+          task.status = "failed"
+          task.lastError = new LlmWikiError("FINALIZE_RECOVERY_REQUIRED", "Finalize was interrupted before generation publication; rerun Finalize to rebuild the generation.", { retryable: true, taskId: task.taskId }).toJSON()
+          task.updatedAt = nowIso()
+          await writeJsonAtomic(taskPath, task)
+        }
       }
     }
+  } finally {
+    await release?.().catch(() => {})
   }
 }
 
@@ -3844,15 +3907,16 @@ function candidateTitle(candidate) {
 
 function domainClassificationsForCandidate(candidate, collection, domainSchema, domainSchemaMetadata) {
   if (!domainSchema || !candidate || typeof candidate !== "object") return []
-  const classification = candidate.schemaClassification ?? candidate.schema_classification
-  if (!classification || typeof classification !== "object") return []
+  const submittedClassification = candidate.schemaClassification ?? candidate.schema_classification
+  if (!submittedClassification || typeof submittedClassification !== "object") return []
+  const classification = resolveProgressiveClassificationReference(domainSchema, submittedClassification) ?? submittedClassification
   const domain = classification.domain ?? {}
   const abe = classification.abe ?? {}
   const be = classification.be ?? {}
   const status = String(classification.status ?? "unresolved").trim().toLowerCase()
   const deepest = status === "classified" ? be : (Object.keys(abe).length > 0 ? abe : domain)
-  const typeId = String(deepest.key ?? deepest.id ?? deepest.name ?? "unresolved").trim()
-  const typeName = String(deepest.name ?? deepest.key ?? "待分类").trim()
+  const typeId = firstNonBlank(deepest.key, deepest.id, deepest.name, status === "classified" ? be.pointer : null, "unresolved")
+  const typeName = firstNonBlank(deepest.name, deepest.key, deepest.id, status === "classified" ? be.pointer : null, "待分类")
   if (!typeId || !typeName) return []
   return [{
     kind: collection === "concepts" ? "concept" : "entity",
@@ -3868,6 +3932,14 @@ function domainClassificationsForCandidate(candidate, collection, domainSchema, 
     ...(Number.isFinite(Number(classification.confidence)) ? { confidence: Math.max(0, Math.min(1, Number(classification.confidence))) } : {}),
     ...(status !== "classified" ? { resolved: false } : {}),
   }]
+}
+
+function firstNonBlank(...values) {
+  for (const value of values) {
+    const normalized = String(value ?? "").trim()
+    if (normalized) return normalized
+  }
+  return ""
 }
 
 function uniqueDomainClassifications(values) {
@@ -4257,6 +4329,31 @@ function normalizeDraftShardId(value) {
   return value
 }
 
+function normalizeStagedDraftReceipts(value, fieldName) {
+  if (value === undefined) return []
+  if (!Array.isArray(value) || value.length === 0 || value.length > 8) {
+    fail("INVALID_INPUT", `${fieldName} must contain 1 to 8 hash-bound staged draft receipts.`)
+  }
+  const seen = new Set()
+  return value.map((receipt, index) => {
+    if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) {
+      fail("INVALID_INPUT", `${fieldName}[${index}] must be an object.`)
+    }
+    const keys = Object.keys(receipt)
+    if (keys.some((key) => !["shard_id", "draft_hash"].includes(key))) {
+      fail("INVALID_INPUT", `${fieldName}[${index}] contains unsupported fields.`)
+    }
+    const shardId = normalizeDraftShardId(receipt.shard_id)
+    const draftHash = typeof receipt.draft_hash === "string" ? receipt.draft_hash : ""
+    if (!/^[0-9a-f]{64}$/.test(draftHash)) {
+      fail("INVALID_INPUT", `${fieldName}[${index}].draft_hash must be a lowercase SHA-256 hash.`)
+    }
+    if (seen.has(shardId)) fail("INVALID_INPUT", `${fieldName} contains duplicate shard_id ${shardId}.`)
+    seen.add(shardId)
+    return { shard_id: shardId, draft_hash: draftHash }
+  })
+}
+
 function pageDraftPath(paths, projectionId, shardId) {
   const key = sha256(`${String(projectionId)}\n${String(shardId)}`)
   return path.join(paths.pageDrafts, `${key}.json`)
@@ -4310,6 +4407,9 @@ function statusResponse(task) {
       worker_batch_quantum: recommendedWorkerBatchQuantum(remainingBatches, recommendedWorkers),
       recommended_batch_chars: Math.min(Number(task.options?.maxBatchChars) || 6_000, 9_000),
       checkpoint_each_batch: true,
+      restart_on_worker_completion: remainingBatches > 0,
+      restart_delay_ms: 0,
+      restart_strategy: "same-worker-id",
     },
     worker_recovery: {
       resumable: true,
@@ -4317,7 +4417,7 @@ function statusResponse(task) {
       leases: workerLeases,
       process_liveness_known: false,
       leases_are_live_agents: false,
-      note: "A lease is a persisted batch reservation, not proof that a SubAgent process is running. After a worker completion notification, if that worker_id still has a lease, restart the same worker_id immediately; do not wait for other workers.",
+      note: "A lease is a persisted batch reservation, not proof that a SubAgent process is running. On every worker completion notification, free that slot and restart the same worker_id immediately when extraction remains; resume its lease first and otherwise lease the next batch. Do not wait for another worker or lease expiry.",
     },
     updated_at: task.updatedAt,
     ...(task.generationId ? { generation_id: task.generationId, generation_manifest_sha256: task.generationManifestSha256 } : {}),

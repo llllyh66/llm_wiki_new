@@ -1,6 +1,6 @@
 {
   "name": "@llm-wiki/cli",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "type": "module",
   "bin": {
     "llm-wiki": "src/index.js"
@@ -9,7 +9,7 @@
     "src"
   ],
   "dependencies": {
-    "@llm-wiki/core": "1.0.4"
+    "@llm-wiki/core": "1.0.5"
   },
   "scripts": {
     "build": "node --check src/index.js",

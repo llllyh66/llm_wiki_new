@@ -58,15 +58,15 @@ allowlist. The agent runs in `dontAsk` mode. After four new batches or a
 30-second debounce, the main coordinator fetches a compact page manifest and
 launches path-disjoint `llm-wiki-page-drafter` agents. Each Drafter reads one
 bounded shard and stages it server-side. Only after a receipt exists does the
-coordinator launch `llm-wiki-writer`, which commits receipt IDs without reading
+coordinator launch `llm-wiki-writer`, which commits hash-bound receipts without reading
 page bodies. Incremental pages remain provisional and excluded from retrieval
 until final all-batch reconciliation. The main Agent remains responsive for
 questions: retrieval defaults to BM25 + embedding while the task is building,
 then adds the Wiki channel automatically after Finalize.
 Incremental pages are concise grounded drafts. Completed extraction drains any
-remaining incremental backlog before final mode; when explicit page coverage
-is complete and unique with no contradictions, Core recommends an empty final
-stabilization commit instead of regenerating the entire Wiki.
+remaining incremental backlog before final mode. Final mode always performs
+semantic reconciliation over the persisted shard manifest, even when coverage
+is already complete and unique.
 
 Every initial and replacement slot must use the exact project Agent type
 `llm-wiki-extractor`; a generic "Worker N", `general-purpose` Agent, or Team
@@ -82,17 +82,21 @@ long runs, inspect `.llm-wiki/logs/mcp-runtime.jsonl` after a real transport
 error; it records build, memory, request, heartbeat, and shutdown events.
 
 The extraction hot path does not invoke retrieval for every batch. `get_batch`
-automatically includes bounded domain-Schema definitions matched from canonical
-labels in the source text, and the worker analyzes the complete leased evidence
-directly. Schema search and BM25/embedding retrieval are reserved for genuine
-classification or cross-batch ambiguity. User questions still use the normal
-multi-route retrieval defaults.
+returns only the immutable progressive Domain Schema snapshot identity and
+disclosure instructions. The worker explicitly reads `domains`, each selected
+Domain, and each selected complete ABE JSON before choosing a BE. It copies the
+ABE response's `classification_scaffold` and `be_pointer_hints`; Core
+canonicalizes the reference and derives non-empty BE metadata from the selected
+Schema node. BM25/embedding
+retrieval is reserved for genuine cross-batch ambiguity. User questions still
+use the normal multi-route retrieval defaults.
 
 An extractor stops and reports `writer_required: true` as soon as its accepted
 commit makes a projection ready. The coordinator starts manifest/Drafter
-orchestration before replacing that extractor; it does not start
+orchestration and immediately refills the same extractor ID in parallel when
+`worker_restart.required` is true and the overlap cap has room; it does not start
 `wiki-writer-1` until a Drafter receipt exists. The default
-`llm_wiki_apply_projection` call returns a compact server-side draft manifest;
+`llm_wiki_get_page_plan_context` manifest call returns a compact server-side draft manifest;
 it never renders or writes pages automatically. Each coordinator-launched
 Drafter fetches one at-most-six-path shard and stages a receipt. The Writer
 commits one ready receipt wave, returns any coordinator-owned next action, and

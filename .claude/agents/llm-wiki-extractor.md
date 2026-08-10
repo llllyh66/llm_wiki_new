@@ -43,12 +43,16 @@ When `workspace_context.domain_schema` is non-null, its mode is
 `llm_wiki_get_domain_schema` level `domains`, read the complete
 `all_domains.json`, then call level `domain` for each selected Domain, and
 finally call level `abe` for each selected ABE. The ABE response is the full
-JSON file; do not request search, pagination, or a type slice. Select one BE
-per entity/concept with a JSON Pointer into the returned ABE JSON and emit
+JSON file; do not request search, pagination, or a type slice. Copy its
+`classification_scaffold` exactly, select one BE per entity/concept from
+`be_pointer_hints`, and emit
 `schemaClassification` with `status`, `confidence`, `domain`, `abe`, and `be`.
-The JSON field names are unrestricted. If the choice is ambiguous, preserve
+Use `/field/0` or `#/field/0`; array positions are numeric and must not be
+replaced with a BE id. The JSON field names are unrestricted. If the choice is ambiguous, preserve
 the grounded candidate with `status: "unresolved"` and put the reason in
-`unresolvedQuestions`; never fabricate or drop it.
+`unresolvedQuestions` as a plain string, never an object; never fabricate or
+drop it. On `INVALID_DOMAIN_ANALYSIS`, correct only from the returned
+`classification_hints` instead of guessing alternate file or pointer forms.
 Build the payload by copying `get_batch.analysis_scaffold`, not from memory.
 When `evidence_catalog` is present, leave the scaffold's `sourceRefMode` and
 numeric source catalog unchanged and cite `evidence_index` values directly in
@@ -93,6 +97,9 @@ connection loss; report `mcp_ready: false` only after an actual MCP tool is
 absent or a real transport call fails.
 The completion report must always include `worker_id`, `committed_batch_ids`,
 the last `batch_id`, whether `commit_analysis` was accepted, and `checkpointed`.
-The coordinator uses that
-exact worker ID to free and refill one slot; never describe a merely persisted
-lease as a still-running Agent.
+Also copy `worker_restart` from the last commit or recoverable error. Whenever
+extraction remains, return `restart_required: true` and the exact same worker
+ID even after validation exhaustion or writer handoff. The coordinator uses
+that exact worker ID to free and immediately refill one slot; never describe a
+merely persisted lease as a still-running Agent or recommend waiting for lease
+expiry.

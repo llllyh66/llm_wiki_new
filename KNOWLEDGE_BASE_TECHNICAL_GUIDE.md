@@ -50,7 +50,10 @@ Agent 调用 `llm_wiki_import_files`：
 `all_domains.json`，每个 Domain
 目录包含 `<domain>_domain.json` 和多个 ABE JSON。JSON 内部字段不做固定约束；Agent
 按 Domain → ABE → BE 逐级读取，最后一个 ABE 文件完整暴露给 Agent，并在实体/概念上
-提交 `schemaClassification` 与 JSON Pointer。Core 只验证目录链、快照哈希和 Pointer。
+提交 `schemaClassification` 与 JSON Pointer。ABE 响应同时返回 canonical
+`classification_scaffold` 与 `be_pointer_hints`，避免 Agent 猜测目录名、文件名或数组
+位置。Core 接受 `/...` 与 `#/...`，规范化唯一引用，并从 Pointer 指向的节点补齐
+BE key/name 后再持久化。
 单文件安全上限为 5 MiB，整个快照默认上限为 20 MiB；低于上限的 ABE JSON 始终原样暴露，不做截断或字段重写。
 
 ### 2.2a 页面领域分类投影
@@ -84,7 +87,7 @@ Core 将同样的信息写入正文的“领域分类”章节。分类路径来
 - 对超大单行或旧 batch 尝试安全重分区；
 - 保留原始 batch ID、worker 租约和恢复信息。
 
-每个 extractor 使用稳定的 `worker_id`。Agent 进程退出后，可以使用同一个 worker ID 继续原租约，不依赖原来的子 Agent 或 MCP 客户端仍然存活。
+每个 extractor 使用稳定的 `worker_id`。Agent invocation 一结束，只要仍有抽取工作且未超过当前 pipeline 并发上限，协调器会零延迟以同一 worker ID 补位：有租约则立即续做原 batch，否则领取下一 batch；验证失败也不等待租约过期。
 
 ### 2.3 Schema-first 分析
 
@@ -96,7 +99,7 @@ Agent 根据 batch 和 Schema 生成 `AnalysisEnvelope`，然后调用 `llm_wiki
 2. 解析 `sourceRefs` 索引；
 3. 校验 sourceRef 是否指向真实 chunk；
 4. 校验 quote、locator 和证据质量；
-5. 校验实体和概念的 Domain → ABE → BE 文件链与 JSON Pointer；
+5. 规范化并校验实体和概念的 Domain → ABE → BE 文件链与 JSON Pointer，从目标 Schema 节点补齐 BE key/name；
 6. 校验 reviewItems、claims、relations 等集合结构；
 7. 通过后将分析结果写入 Analysis Store，并标记 batch 完成。
 
@@ -114,7 +117,7 @@ Schema 分类不合法时，Core 在持久化前返回可修正错误，不会�
 
 主协调器的投影编排 loop 只请求服务端持久化的 compact manifest、启动 page drafter 并校验 receipt；它不调用 `llm_wiki_get_staged_page_drafts` 或 `llm_wiki_commit_pages`。manifest 在生成正文之前明确返回“单次最多 50 个 patch”的硬限制，并按精确的 `patch_scaffold.path` 预先分成最多 6 个路径的 shard；同一路径的全部 requirement 始终留在一个 shard。稳定 Writer 是唯一提交者，每次通过服务端暂存处理一个 bounded wave，不再把整个 page plan 和几百个 patch 放入模型上下文。已接受的 shard 是恢复检查点，即使 context compaction 或 Writer 重启，也会从第一个未覆盖 shard 继续，不重做前 50 页。
 
-页面 drafter 不把 PagePatch 正文返回给主协调器：它通过 `llm_wiki_stage_page_drafts` 将一个路径互斥的 shard 写入任务级临时 staging，只返回 `draft_hash`、数量和字符数等 receipt。主协调器收到 receipt 后只负责启动或恢复稳定 Writer。稳定 Writer 通过 `llm_wiki_get_staged_page_drafts` 获取元数据，再用 `llm_wiki_commit_pages(staged_draft_shard_ids, patches=[])` 让 Core 在服务端读取、校验并原子提交；该形式不需要调用方携带实际 PagePatch。提交成功并完成任务状态持久化后，Core 才删除暂存文件。
+页面 drafter 不把 PagePatch 正文返回给主协调器：它通过 `llm_wiki_stage_page_drafts` 将一个路径互斥的 shard 写入任务级临时 staging，只返回 `{shard_id, draft_hash}`、数量和字符数等 receipt。主协调器收到 hash-bound receipt 后只负责启动或恢复稳定 Writer。稳定 Writer 通过 `llm_wiki_get_staged_page_drafts(draft_receipts)` 获取元数据，再用 `llm_wiki_commit_pages(staged_draft_receipts, patches=[])` 让 Core 校验 receipt hash、读取暂存正文并原子提交；该形式不需要调用方携带实际 PagePatch。提交成功并完成任务状态持久化后，Core 才删除暂存文件。
 
 draft-shard 的服务端响应硬上限约为 40K 字符；对既有超大页面只提供确定性的头尾摘要并保留 hash，完整正文不离开服务端。这样即使调用方误传 200K 的旧 `max_chars`，也不会把大页面或整批 patch 带入主 Agent 上下文。
 
@@ -126,12 +129,12 @@ draft-shard 的服务端响应硬上限约为 40K 字符；对既有超大页面
 
 1. `llm_wiki_get_page_plan_context(view="manifest")` 在服务端冻结完整计划，只返回紧凑分片清单和提交限制；
 2. 每个 page drafter 按自己的 `draft_action` 读取一个 `view="draft-shard"`，仅在分片内综合相关 batch 的实体、声明、关系、冲突和现有页面，然后调用 `llm_wiki_stage_page_drafts`；
-3. Writer 用 `llm_wiki_get_staged_page_drafts` 检查 receipt，并让 Core 通过 `staged_draft_shard_ids` 统一、原子提交；页面正文不经过主 Agent；
+3. Writer 用 `llm_wiki_get_staged_page_drafts(draft_receipts)` 检查 `{shard_id, draft_hash}` receipt，并让 Core 通过 `staged_draft_receipts` 统一、原子提交；页面正文不经过主 Agent；
 4. 原始 chunk 只放在简洁的来源证据区；
-5. 每个小 wave 以 `projection_complete=false` 原子提交，并回传服务端给出的 `committed_staged_draft_shard_ids`；这些持久化 ID 证明 final Writer 确实处理了该 shard，不会因旧页已有 coverage 而跳过语义重写。成功后立即丢弃该分片上下文；所有 shard 处理后用空 patch 和 `projection_complete=true` 完成最终覆盖审计；
+5. 每个小 wave 以 `projection_complete=false` 原子提交，并回传服务端给出的 `committed_staged_draft_receipts`；这些持久化的 ID + hash 证明 final Writer 确实处理了该 shard，不会因旧页已有 coverage 而跳过语义重写。成功后立即丢弃该分片上下文；所有 shard 处理后用空 patch 和 `projection_complete=true` 完成最终覆盖审计；
 6. 最终 projection 完成后，由 Finalize 更新 `index.md` 和 `overview.md` 等全局汇总页。
 
-如果 Drafter 在 shard cursor 处中断，协调器使用同一 projection ID、shard ID 和准确 cursor 重启该 Drafter；如果 Writer 在 receipt 提交处中断，则重放相同 receipt ID 与幂等键。上下文压缩后直接按状态返回的未覆盖 shard 恢复，无需重放已接受页面。`llm_wiki_apply_projection` 只是兼容入口，会返回同一 compact manifest，不会自动渲染页面。
+如果 Drafter 在 shard cursor 处中断，协调器使用同一 projection ID、shard ID 和准确 cursor 重启该 Drafter；如果 Writer 在 receipt 提交处中断，则重放相同 `{shard_id, draft_hash}` receipt 与幂等键。上下文压缩后直接按状态返回的未覆盖 shard 恢复，无需重放已接受页面。`llm_wiki_apply_projection` 只是兼容入口，会返回同一 compact manifest，不会自动渲染页面。
 
 ### 2.6 Related 关系生成
 
@@ -180,7 +183,7 @@ Embedding 配置位于 `.llm-wiki/config.json` 的 `retrieval.embedding`，包�
 | `llm_wiki_apply_projection` | 兼容入口：获取 compact manifest，不自动写页面 |
 | `llm_wiki_stage_page_drafts` | 将单个 drafter 的完整 shard 暂存在服务端，只返回 receipt |
 | `llm_wiki_get_staged_page_drafts` | 读取暂存 shard 的元数据，不返回页面正文 |
-| `llm_wiki_commit_pages` | 原子提交页面 patch，或通过 `staged_draft_shard_ids` 提交服务端暂存 shard |
+| `llm_wiki_commit_pages` | 原子提交页面 patch，或通过 hash-bound `staged_draft_receipts` 提交服务端暂存 shard |
 | `llm_wiki_finalize` | 生成索引、来源页并完成任务 |
 | `llm_wiki_status` | 查看任务、租约、并行建议和下一步动作 |
 | `llm_wiki_list_tasks` | 列出当前 workspace 的任务 |
@@ -286,7 +289,7 @@ npm run build
 2. 按返回的 `next_action` 继续；
 3. worker 消失时使用原 worker_id 重新启动；
 4. 主协调器先取 manifest，并把每个 draft-shard action 交给一个 page drafter；
-   Writer 只接收已暂存的 receipt ID。若 drafter 创建明确失败，才显式让 Writer
+   Writer 只接收已暂存的 `{shard_id, draft_hash}` receipt。若 drafter 创建明确失败，才显式让 Writer
    以 `explicit-serial-writer-fallback-only` 模式读取一个 shard；
 5. 原子提交失败时修复整个被拒绝 patch 集合后，用新的 idempotency key 重试；
 6. 代码更新后重新 `npm run build` 并重启 Claude MCP，避免继续使用旧 dist。
