@@ -170,12 +170,12 @@ function pageCommitRetryScope(code) {
 
 function pageCommitRetryInstruction(code) {
   if (["WIKI_PAGE_NOT_FOUND", "WIKI_SECTION_NOT_FOUND", "WIKI_SECTION_AMBIGUOUS", "INVALID_WIKI_UPDATE"].includes(code)) return "Inspect every target page again, correct the section operations, and resubmit the entire rejected update set with a new idempotency key."
-  if (code === "PAGE_PLAN_INCOMPLETE") return "Request view=manifest, then generate and commit one bounded draft shard at a time."
-  if (code === "PAGE_DRAFT_SHARDS_INCOMPLETE") return "Process the returned next draft shard; accepted earlier shards are durable and must not be regenerated."
-  if (code === "PAGE_DRAFT_SHARD_NOT_READY") return "Retrieve every cursor for the returned draft shard before committing it; accepted earlier shards remain durable."
-  if (code === "STAGED_DRAFT_NOT_FOUND") return "Restage the reported shard with a new idempotency key, then retry the same server-side commit without loading page bodies."
+  if (code === "PAGE_PLAN_INCOMPLETE") return "Return control to the coordinator. It requests view=manifest, launches a Drafter for one bounded shard, and starts the Writer only after a receipt exists."
+  if (code === "PAGE_DRAFT_SHARDS_INCOMPLETE") return "Return the next shard to the coordinator, which launches its Drafter; accepted earlier shards are durable and must not be regenerated."
+  if (code === "PAGE_DRAFT_SHARD_NOT_READY") return "The coordinator must relaunch the shard's Drafter to retrieve every cursor and stage a receipt before restarting the Writer."
+  if (code === "STAGED_DRAFT_NOT_FOUND") return "Return control to the coordinator so it can relaunch the reported Drafter; retry the Writer only after a replacement receipt exists."
   if (code === "STAGED_DRAFT_EXISTS") return "Do not resubmit an accepted shard; continue with the next uncommitted manifest shard."
-  if (code === "PAGE_DRAFT_STAGING_UNAVAILABLE") return "Resume the active manifest projection and stage the shard before retrying the Writer commit."
+  if (code === "PAGE_DRAFT_STAGING_UNAVAILABLE") return "Return control to the coordinator so it can resume the active manifest and stage the shard before restarting the Writer."
   if (code === "INCOMPLETE_PAGE_COVERAGE") return "Add the reported missing coverage to the rejected set and resubmit it; no patch from the rejected call was stored."
   if (code === "DUPLICATE_PAGE_COVERAGE") return "Keep every requirement ID on one canonical path, repair all reported duplicate owners, and resubmit the whole rejected set."
   if (["FILE_HASH_CONFLICT", "PROVISIONAL_PAGE_CONFLICT"].includes(code)) return "Rebase the conflicting target, then resubmit the whole rejected atomic patch set; do not retry only one patch."
@@ -219,6 +219,8 @@ function recoveryAction(tool, args, error) {
   if (tool === "llm_wiki_commit_pages" && error.code === "PAGE_PLAN_INCOMPLETE") {
     return {
       tool: "llm_wiki_get_page_plan_context",
+      action_owner: "coordinator",
+      delegate_to: "llm-wiki-page-drafter",
       arguments: {
         task_id: args?.task_id,
         writer_id: args?.writer_id,
@@ -232,6 +234,8 @@ function recoveryAction(tool, args, error) {
   if (tool === "llm_wiki_commit_pages" && ["FILE_HASH_CONFLICT", "PROVISIONAL_PAGE_CONFLICT"].includes(error.code)) {
     return {
       tool: "llm_wiki_get_page_plan_context",
+      action_owner: "coordinator",
+      delegate_to: "llm-wiki-page-drafter",
       arguments: {
         task_id: args?.task_id,
         writer_id: args?.writer_id,
@@ -245,6 +249,8 @@ function recoveryAction(tool, args, error) {
   if (tool === "llm_wiki_commit_pages" && ["INCOMPLETE_PAGE_COVERAGE", "PAGE_DRAFT_SHARDS_INCOMPLETE", "PAGE_DRAFT_SHARD_NOT_READY"].includes(error.code) && error.details?.next_draft_shard?.shard_id) {
     return {
       tool: "llm_wiki_get_page_plan_context",
+      action_owner: "coordinator",
+      delegate_to: "llm-wiki-page-drafter",
       arguments: {
         task_id: args?.task_id,
         writer_id: args?.writer_id,
@@ -256,9 +262,26 @@ function recoveryAction(tool, args, error) {
       },
     }
   }
-  if (tool === "llm_wiki_commit_pages" && ["INVALID_PAGE_PATCH", "INVALID_PAGE_PATH", "INVALID_SOURCE_REF", "INCOMPLETE_PAGE_COVERAGE", "DUPLICATE_PAGE_COVERAGE", "PAGE_COMMIT_TOO_LARGE", "STAGED_DRAFT_NOT_FOUND", "PAGE_DRAFT_STAGING_UNAVAILABLE"].includes(error.code)) {
+  if (tool === "llm_wiki_commit_pages" && ["STAGED_DRAFT_NOT_FOUND", "PAGE_DRAFT_STAGING_UNAVAILABLE"].includes(error.code)) {
+    return {
+      tool: "llm_wiki_get_page_plan_context",
+      action_owner: "coordinator",
+      delegate_to: "llm-wiki-page-drafter",
+      arguments: {
+        task_id: args?.task_id,
+        writer_id: args?.writer_id,
+        projection_id: args?.projection_id,
+        view: "manifest",
+        cursor: 0,
+        max_chars: 40_000,
+      },
+    }
+  }
+  if (tool === "llm_wiki_commit_pages" && ["INVALID_PAGE_PATCH", "INVALID_PAGE_PATH", "INVALID_SOURCE_REF", "INCOMPLETE_PAGE_COVERAGE", "DUPLICATE_PAGE_COVERAGE", "PAGE_COMMIT_TOO_LARGE"].includes(error.code)) {
     return {
       tool,
+      action_owner: "writer",
+      delegate_to: "llm-wiki-writer",
       arguments: {
         task_id: args?.task_id,
         writer_id: args?.writer_id,
@@ -272,6 +295,7 @@ function recoveryAction(tool, args, error) {
   if (tool === "llm_wiki_get_page_plan_context" && ["PAGE_PLAN_CURSOR_MISMATCH", "PAGE_PLAN_SNAPSHOT_MISSING", "PAGE_DRAFT_SHARD_NOT_FOUND"].includes(error.code)) {
     return {
       tool,
+      action_owner: "coordinator",
       arguments: {
         task_id: args?.task_id,
         writer_id: args?.writer_id,

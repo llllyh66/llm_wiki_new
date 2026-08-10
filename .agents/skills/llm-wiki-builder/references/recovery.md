@@ -104,19 +104,24 @@ Restore `sourceRefs`, `covers`, path, operation, and hash from the affected
 Core, so do not copy or retype quotes. Patches from an earlier `accepted: true` partial commit remain
 durable and are not part of this retry.
 
-If a multipart projection worker stops, inspect `wiki_projection` in status.
-While `in_progress` remains true, do not compete for its lease. After expiry,
-the same stable writer ID can acquire a replacement projection. Paths written
-by an incomplete projection remain provisional and excluded from retrieval.
-After upgrading from an older server, resume that same writer from cursor zero;
+If a multipart projection invocation stops, inspect `wiki_projection` in
+status. While `in_progress` remains true, keep the same projection and Writer
+ID. The coordinator resumes the returned manifest/Drafter action; it does not
+launch the Writer until staged receipt IDs exist. If a Drafter stopped before
+staging, relaunch only that Drafter with the exact shard action. If the Writer
+stopped during a receipt commit, replay the same receipt IDs and idempotency
+key. Paths written by an incomplete projection remain provisional and excluded
+from retrieval. After upgrading from an older server, resume that same
+projection from cursor zero;
 Core automatically shrinks an oversized legacy incremental lease to eight
 batches and reports `projection.safely_repartitioned: true`. Remaining batches
 stay queued and are not discarded.
-If the Writer returns normally after reaching its projection quantum and
-status still reports `ready: true`, immediately launch another bounded
-`wiki-writer-1` invocation. The current quantum is six projections and each
-lease is capped at eight batches, so one invocation can drain up to 48 queued
-batches. A ready backlog of at least four batches bypasses the normal debounce.
+After each Writer receipt wave returns, follow its coordinator-owned next
+action, launch the next Drafter wave, and launch the Writer again only after new
+receipts exist. The coordinator quantum is six projections and each lease is
+capped at eight batches, so one orchestration invocation can drain up to 48
+queued batches. A ready backlog of at least four batches bypasses the normal
+debounce.
 
 ## Failed Finalize
 

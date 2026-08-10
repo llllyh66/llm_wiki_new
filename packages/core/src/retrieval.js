@@ -417,7 +417,7 @@ function analysisContent(analysis) {
   const lines = [analysis.batchSummary, ...(analysis.unresolvedQuestions ?? [])]
   for (const collection of ["entities", "concepts", "claims", "relations", "contradictions", "reviewItems"]) {
     for (const item of analysis[collection] ?? []) {
-      lines.push([item.name, item.title, item.text, item.content, item.subject, item.predicate, item.object, item.entityTypeId, item.relationTypeId]
+      lines.push([item.name, item.title, item.text, item.content, item.subject, item.predicate, item.object]
         .filter((value) => typeof value === "string" && value.trim()).join(" "))
       if (item.properties && typeof item.properties === "object") lines.push(JSON.stringify(item.properties))
       if (item.schemaClassification && typeof item.schemaClassification === "object") lines.push(JSON.stringify(item.schemaClassification))

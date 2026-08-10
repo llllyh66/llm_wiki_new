@@ -17,7 +17,7 @@ try {
   let result
   if (command === "init") result = await core.init()
   else if (command === "import") {
-    if (argv.length === 0) throw new Error("Usage: llm-wiki import <file...> [--domain-schema FILE]")
+    if (argv.length === 0) throw new Error("Usage: llm-wiki import <file...> [--domain-schema DIRECTORY]")
     result = await core.importFiles({ files: argv.map((file) => ({ path: file })), options: { domain_schema_path: domainSchemaPath } })
   } else if (command === "status") {
     result = argv[0] ? await core.status({ task_id: argv[0] }) : await core.listTasks()
@@ -35,7 +35,7 @@ try {
     result = await core.importFiles({ files: files.map((file) => ({ path: file })), options: { domain_schema_path: domainSchemaPath } })
   }
   else {
-    process.stderr.write("Usage: llm-wiki <init|import|status|lint|abort|delete|migrate-legacy> [arguments] [--workspace DIR] [--domain-schema FILE]\n")
+    process.stderr.write("Usage: llm-wiki <init|import|status|lint|abort|delete|migrate-legacy> [arguments] [--workspace DIR] [--domain-schema DIRECTORY]\n")
     process.exitCode = 2
     process.exit()
   }

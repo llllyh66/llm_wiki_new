@@ -4,7 +4,6 @@ export { analysisSchema, pagePatchSchema } from "./schemas.js"
 export { DEFAULT_LIMITS } from "./workspace.js"
 export {
   applyDomainSchema,
-  progressiveSchemaDisclosure,
+  discloseDomainSchema,
   resolveDomainSchema,
-  validateDomainSchema,
 } from "./domain-schema.js"

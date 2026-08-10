@@ -2,7 +2,7 @@ import { rm, stat } from "node:fs/promises"
 import path from "node:path"
 import { fail } from "./errors.js"
 import { ensureDir, newId, nowIso, pathExists, readJson, sha256, stableStringify, writeJsonAtomic } from "./utils.js"
-import { PROGRESSIVE_SCHEMA_MODE, writeProgressiveSchemaSnapshot } from "./schema-bundle.js"
+import { writeProgressiveSchemaSnapshot } from "./schema-bundle.js"
 
 export const ACTIVE_TASK_STATUSES = ["importing", "parsing", "prepared", "extracting", "planning", "committing", "finalizing", "failed"]
 const MAX_TASK_CHUNK_PAYLOAD_BYTES = 20 * 1024
@@ -114,11 +114,9 @@ export async function createTask(workspace, sources, options = {}) {
       enableGraph: true,
     },
   }
-  if (options.domainSchema?.metadata?.schema_mode === PROGRESSIVE_SCHEMA_MODE) {
+  if (options.domainSchema) {
     await writeProgressiveSchemaSnapshot(paths, options.domainSchema.bundle)
     await writeJsonAtomic(paths.domainSchema, options.domainSchema.bundle.manifest)
-  } else if (options.domainSchema) {
-    await writeJsonAtomic(paths.domainSchema, options.domainSchema.schema)
   }
   await writeJsonAtomic(paths.task, task)
   await writeJsonAtomic(paths.batches, batches)

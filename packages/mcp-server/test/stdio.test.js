@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
@@ -342,13 +342,16 @@ test("built MCP server survives errors and completes the full workflow over one 
 
   // A domain-schema rejection is also a recoverable business result and must
   // not disconnect the same long-lived MCP process.
-  const domainSchema = JSON.parse(await readFile(fileURLToPath(new URL("../../../llm-wiki.domain-schema.json", import.meta.url)), "utf8"))
-  domainSchema.policy.validationFailurePolicy = "reject-batch"
+  const domainSchema = path.join(workspace, "domain-schema")
+  await mkdir(path.join(domainSchema, "customer"), { recursive: true })
+  await writeFile(path.join(domainSchema, "all_domains.json"), JSON.stringify({ domains: [{ key: "customer", name: "客户域" }] }))
+  await writeFile(path.join(domainSchema, "customer", "customer_domain.json"), JSON.stringify({ abes: [{ key: "customer_management", name: "客户管理" }] }))
+  await writeFile(path.join(domainSchema, "customer", "customer_management.json"), JSON.stringify({ businessEntities: [{ id: "individual_customer", name: "个人客户" }] }))
   const domainSource = path.join(workspace, "domain.md")
   await writeFile(domainSource, "# Domain\n\n客户 C-001 名为张三。\n")
   const domainImported = await client.callTool({
     name: "llm_wiki_import_files",
-    arguments: { files: [{ path: domainSource }], options: { domain_schema: domainSchema } },
+    arguments: { files: [{ path: domainSource }], options: { domain_schema_path: domainSchema } },
   })
   const domainTaskId = domainImported.structuredContent.task_id
   const domainBatch = await client.callTool({ name: "llm_wiki_get_batch", arguments: { task_id: domainTaskId } })
@@ -356,15 +359,19 @@ test("built MCP server survives errors and completes the full workflow over one 
   assert.equal(domainBatch.structuredContent.analysis_scaffold.taskId, domainTaskId)
   assert.equal(domainBatch.structuredContent.analysis_scaffold.batchId, domainBatch.structuredContent.batch_id)
   assert.deepEqual(domainBatch.structuredContent.analysis_scaffold.reviewItems, [])
-  const selectedDomainSchema = await client.callTool({
+  assert.equal(domainBatch.structuredContent.workspace_context.domain_schema.mode, "progressive-directory-v2")
+  assert.equal(domainBatch.structuredContent.workspace_context.domain_schema_auto_selection, undefined)
+  const selectedDomains = await client.callTool({
     name: "llm_wiki_get_domain_schema",
-    arguments: { task_id: domainTaskId, mode: "search", queries: ["客户"], max_matches: 3, max_chars: 20_000 },
+    arguments: { task_id: domainTaskId, level: "domains" },
   })
-  assert.equal(selectedDomainSchema.isError, undefined)
-  assert.equal(selectedDomainSchema.structuredContent.selection.mode, "search")
-  assert.equal(selectedDomainSchema.structuredContent.selection.full_schema_scan, false)
-  assert.equal(selectedDomainSchema.structuredContent.selection.matched_entity_type_ids.includes("business_subject"), true)
-  assert.equal(selectedDomainSchema.structuredContent.items.some((item) => item.kind === "entity_type" && item.entity_type.id === "business_subject"), true)
+  assert.equal(selectedDomains.isError, undefined)
+  assert.deepEqual(selectedDomains.structuredContent.content, { domains: [{ key: "customer", name: "客户域" }] })
+  const selectedAbe = await client.callTool({
+    name: "llm_wiki_get_domain_schema",
+    arguments: { task_id: domainTaskId, level: "abe", domain_folder: "customer", abe_file: "customer_management.json" },
+  })
+  assert.deepEqual(selectedAbe.structuredContent.content, { businessEntities: [{ id: "individual_customer", name: "个人客户" }] })
   const domainChunk = domainBatch.structuredContent.chunks[0]
   const domainRef = {
     sourceId: domainChunk.sourceId,
@@ -377,7 +384,7 @@ test("built MCP server survives errors and completes the full workflow over one 
     arguments: {
       task_id: domainTaskId,
       batch_id: domainBatch.structuredContent.batch_id,
-      idempotency_key: "stdio-domain-rejection-v1",
+      idempotency_key: "stdio-domain-rejection-v2",
       analysis: {
         schemaVersion: 1,
         taskId: domainTaskId,

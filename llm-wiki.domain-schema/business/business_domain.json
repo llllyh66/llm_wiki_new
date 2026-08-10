@@ -1,0 +1,13 @@
+{
+  "domain": {
+    "key": "business",
+    "name": "业务域"
+  },
+  "abes": [
+    {
+      "key": "business_management",
+      "name": "业务管理",
+      "file": "business_management.json"
+    }
+  ]
+}

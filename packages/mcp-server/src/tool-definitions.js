@@ -28,14 +28,13 @@ const toolDefinitions = [
         target_language: { type: "string" },
         force_reanalyze: { type: "boolean" },
         max_batch_chars: { type: "number", minimum: 1000, maximum: 24000 },
-        domain_schema_path: { type: "string", description: "Agent-visible path to a domain extraction Schema JSON file (legacy V1) or progressive Schema directory (V2). The validated file or directory is snapshotted into the task." },
-        domain_schema: { type: "object", description: "Inline domain extraction Schema. Use this or domain_schema_path, not both." },
+        domain_schema_path: { type: "string", description: "Agent-visible path to a progressive-directory-v2 Domain Schema directory. The validated directory is snapshotted into the task." },
       }),
     }, ["files"]),
   },
   {
     name: "llm_wiki_get_batch",
-    description: "Lease and return one complete, stable, Agent-readable batch with a server-generated exact evidence catalog, automatic bounded domain-Schema type selection, and a retrieval-optional extraction policy. Candidates cite evidence indexes, avoiding quote transcription and source rereads. Hard transport ceilings repair legacy oversized batches in place.",
+    description: "Lease and return one complete, stable, Agent-readable batch with a server-generated exact evidence catalog, progressive Domain Schema disclosure metadata, and a retrieval-optional extraction policy. Candidates cite evidence indexes, avoiding quote transcription and source rereads. Hard transport ceilings repair oversized batches in place.",
     inputSchema: closedObject({
       task_id: taskId,
       batch_id: { type: ["string", "null"] },
@@ -45,20 +44,12 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_domain_schema",
-    description: "Progressively disclose a validated Schema directory. For progressive-directory-v2 tasks, call level=domains to read all_domains.json, level=domain to read the selected Domain's *_domain.json, and level=abe to read the complete selected ABE JSON. JSON field names are unrestricted and the returned file is never truncated. Legacy mode/page/catalog/search/types arguments remain available only for V1 task recovery.",
+    description: "Progressively disclose a validated Schema directory. Call level=domains to read all_domains.json, level=domain to read the selected Domain's *_domain.json, and level=abe to read the complete selected ABE JSON. JSON field names are unrestricted and the returned file is never truncated.",
     inputSchema: closedObject({
       task_id: taskId,
-      level: { enum: ["domains", "domain", "abe"], description: "V2 disclosure level. domains reads all_domains.json; domain reads a Domain index; abe reads one complete ABE JSON." },
+      level: { enum: ["domains", "domain", "abe"], description: "Disclosure level. domains reads all_domains.json; domain reads a Domain index; abe reads one complete ABE JSON." },
       domain_folder: { type: "string", minLength: 1, maxLength: 200, description: "One selected Domain folder name for level=domain or level=abe." },
       abe_file: { type: "string", minLength: 1, maxLength: 300, description: "One selected ABE JSON filename for level=abe. The full file is exposed." },
-      mode: { enum: ["page", "catalog", "search", "types"], description: "Use search for batch terms, catalog only when search is insufficient, types for exact IDs, or page for backward-compatible full scanning." },
-      queries: { type: "array", minItems: 1, maxItems: 20, items: { type: "string", minLength: 1, maxLength: 2000 } },
-      entity_type_ids: { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 200 } },
-      concept_type_ids: { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 200 } },
-      relation_type_ids: { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 200 } },
-      max_matches: { type: "integer", minimum: 1, maximum: 50 },
-      cursor: { type: ["integer", "null"], minimum: 0 },
-      max_chars: { type: "integer", minimum: 20000, maximum: 100000, description: "Compatibility name for the approximate UTF-8 byte budget of one Schema page." },
     }, ["task_id"]),
   },
   {
@@ -75,12 +66,12 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_commit_analysis",
-    description: "Resolve server-generated evidence indexes, safely canonicalize uniquely matched legacy quotes, enforce Schema-first extraction, and persist one worker's analysis. Invalid domain candidates are rejected before persistence even under drop-invalid unless accept_dropped_candidates is explicitly true.",
-    inputSchema: closedObject({ task_id: taskId, batch_id: { type: "string" }, worker_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" }, analysis: { type: "object" }, accept_dropped_candidates: { type: "boolean", description: "Explicit opt-in to destructive drop-invalid behavior. Omit or false for Schema-first rejection and correction." }, idempotency_key: { type: "string", minLength: 8, maxLength: 200 } }, ["task_id", "batch_id", "analysis", "idempotency_key"]),
+    description: "Resolve server-generated evidence indexes, safely canonicalize uniquely matched quotes, enforce progressive Schema classification, and persist one worker's analysis.",
+    inputSchema: closedObject({ task_id: taskId, batch_id: { type: "string" }, worker_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" }, analysis: { type: "object" }, idempotency_key: { type: "string", minLength: 8, maxLength: 200 } }, ["task_id", "batch_id", "analysis", "idempotency_key"]),
   },
   {
     name: "llm_wiki_get_page_plan_context",
-    description: "Coordinator-owned projection tool. The main coordinator calls view=manifest, then delegates each returned draft-shard action to one llm-wiki-page-drafter (up to four). Each Drafter fetches its own bounded context and stages a receipt. In normal mode the stable Writer never calls manifest or draft-shard and is launched only after receipt IDs exist; it commits staged_draft_shard_ids with patches:[]. Serial Writer drafting is an explicit fallback only after Drafter creation fails. Legacy view=plan remains for compatibility.",
+    description: "Coordinator-owned projection tool. For parallel drafting, the main coordinator calls view=manifest, then delegates each returned draft-shard action to one llm-wiki-page-drafter (up to four). Each Drafter fetches its own bounded context and stages a receipt. In normal mode the stable Writer never calls manifest or draft-shard and is launched only after receipt IDs exist; it is the sole committer and uses staged_draft_shard_ids with patches:[]. Serial Writer drafting is an explicit fallback only after Drafter creation fails. Legacy view=plan remains for compatibility.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },

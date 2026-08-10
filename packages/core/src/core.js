@@ -3,14 +3,12 @@ import path from "node:path"
 import { LlmWikiError, asLlmWikiError, fail } from "./errors.js"
 import {
   applyDomainSchema,
-  compactDomainSchemaSelectionForText,
+  discloseDomainSchema,
   domainSchemaContext,
   loadTaskDomainSchema,
-  paginateDomainSchema,
-  progressiveSchemaDisclosure,
   resolveDomainSchema,
 } from "./domain-schema.js"
-import { isProgressiveSchema, PROGRESSIVE_SCHEMA_MODE } from "./schema-bundle.js"
+import { PROGRESSIVE_SCHEMA_MODE } from "./schema-bundle.js"
 import { lintWiki } from "./lint.js"
 import { batchEvidenceCatalog, compactEvidenceCatalog } from "./evidence.js"
 import { buildRetrievalIndexes, retrieveContext } from "./retrieval.js"
@@ -84,7 +82,6 @@ const DRAFT_SHARD_RESPONSE_MAX_CHARS = 40_000
 const MCP_SIGNAL = Symbol.for("llm-wiki.mcp.signal")
 const CACHE_LIMITS = Object.freeze({
   domainSchema: { maxEntries: 2, maxBytes: 16 * 1024 * 1024 },
-  domainSchemaSelection: { maxEntries: 64, maxBytes: 4 * 1024 * 1024 },
   chunkIndex: { maxEntries: 2, maxBytes: 32 * 1024 * 1024 },
   analyses: { maxEntries: 2, maxBytes: 64 * 1024 * 1024 },
   pagePlan: { maxEntries: 2, maxBytes: 24 * 1024 * 1024 },
@@ -165,7 +162,6 @@ export class LlmWikiCore {
     this.taskLocks = new Map()
     this.workspaceWriteTail = Promise.resolve()
     this.domainSchemaCache = new Map()
-    this.domainSchemaSelectionCache = new Map()
     this.taskChunkIndexCache = new Map()
     this.taskAnalysisCache = new Map()
     this.pagePlanSnapshotCache = new Map()
@@ -222,17 +218,6 @@ export class LlmWikiCore {
     }
     trimCache(this.domainSchemaCache, CACHE_LIMITS.domainSchema)
     return schema
-  }
-
-  #batchDomainSchemaSelection(record, schema, batch) {
-    if (!schema) return null
-    const chunkKey = batch.chunks.map((chunk) => chunk.contentHash ?? chunk.chunkId).join(":")
-    const cacheKey = `${record.task.taskId}:${record.task.domainSchema?.hash ?? "unknown"}:${batch.batchId}:${chunkKey}`
-    if (this.domainSchemaSelectionCache.has(cacheKey)) return this.domainSchemaSelectionCache.get(cacheKey)
-    const selection = automaticBatchDomainSchemaSelection(schema, batch)
-    this.domainSchemaSelectionCache.set(cacheKey, selection)
-    trimCache(this.domainSchemaSelectionCache, CACHE_LIMITS.domainSchemaSelection)
-    return selection
   }
 
   #taskChunkIndex(record) {
@@ -533,21 +518,10 @@ export class LlmWikiCore {
 
   async #buildBatchResponse({ workspace, record, batch, workerId, expiresAt, requestedBatchChars }) {
     const domainSchema = await this.#taskDomainSchema(record)
-    // get_batch is the extraction hot path. Keep its complete MCP response
-    // below the host's tool-output warning threshold; larger Schemas are
-    // represented by identity metadata plus a compact batch-specific slice.
-    const knownSchemaBytes = record.task.domainSchema?.size_bytes
-    const fullSchemaContext = domainSchemaContext(domainSchema, 8 * 1024, knownSchemaBytes)
-    const progressive = isProgressiveSchema(domainSchema)
-    const automaticSchemaSelection = progressive ? null : this.#batchDomainSchemaSelection(record, domainSchema, batch)
-    const schemaContext = progressive
-      ? fullSchemaContext
-      : automaticSchemaSelection?.ready
-        ? {
-            value: domainSchemaContext(domainSchema, 0, knownSchemaBytes).value,
-            pagination: fullSchemaContext.pagination,
-          }
-        : fullSchemaContext
+    // The batch carries only immutable snapshot identity and disclosure
+    // instructions. Domain, ABE, and complete BE-bearing JSON are loaded by
+    // explicit progressive tool calls after the worker sees the source text.
+    const schemaContext = domainSchemaContext(domainSchema)
     const agentChunks = batch.chunks.map(agentChunkWithSourceRefTemplates)
     const evidenceCatalog = batchEvidenceCatalog(agentChunks)
     const response = {
@@ -574,12 +548,9 @@ export class LlmWikiCore {
           note: "The workspace page schema is enforced by Core during Wiki projection and is intentionally omitted from extraction batches.",
         },
         domain_schema: schemaContext.value,
-        domain_schema_pagination: schemaContext.pagination,
-        domain_schema_auto_selection: automaticSchemaSelection,
+        domain_schema_disclosure: schemaContext.disclosure,
         domain_extraction_instructions: domainSchema
-          ? progressive
-            ? "Use progressive Schema disclosure. First call llm_wiki_get_domain_schema with level=domains to read all_domains.json. Group candidates by selected domain, then call level=domain for each domain. For each selected ABE, call level=abe and read the complete returned JSON. Select one BE per entity or concept using a JSON Pointer into that complete ABE JSON. Put the result in schemaClassification with domain, abe, be, pointer, confidence, and status. The input JSON shape is unrestricted; do not expect entityTypes or concepts. Keep sourceRefs for document evidence separate from schema references. If classification is ambiguous, preserve the candidate with status=unresolved and explain the ambiguity in unresolvedQuestions."
-            : `${automaticSchemaSelection?.ready ? "Use domain_schema_auto_selection directly; no Schema tool call is needed for this batch unless classification remains ambiguous. " : schemaContext.pagination ? "The automatic Schema selection was insufficient; use llm_wiki_get_domain_schema mode=search with focused batch terms, never a full scan. " : ""}Extract entities under this domain schema with localId, entityTypeId, properties, and sourceRefs. ${domainSchema.conceptTypes.length > 0 ? "When a concept matches a defined conceptTypes entry, include conceptTypeId; otherwise keep concepts untyped." : "No conceptTypes are defined, so concepts remain general knowledge concepts."} ${domainSchema.relationTypes.length > 0 ? "Relations require localId, relationTypeId, sourceEntityLocalId, targetEntityLocalId, properties, and sourceRefs." : "relationTypes is empty, so relations use the general AnalysisEnvelope format and are not constrained by the domain schema."} Do not infer missing required properties.`
+          ? "Use progressive Schema disclosure. First call llm_wiki_get_domain_schema with level=domains to read all_domains.json. Group candidates by selected domain, then call level=domain for each domain. For each selected ABE, call level=abe and read the complete returned JSON. Select one BE per entity or concept using a JSON Pointer into that complete ABE JSON. Put the result in schemaClassification with domain, abe, be, pointer, confidence, and status. The input JSON shape is unrestricted. Keep sourceRefs for document evidence separate from schema references. If classification is ambiguous, preserve the candidate with status=unresolved and explain the ambiguity in unresolvedQuestions."
           : null,
       },
       analysis_contract: {
@@ -642,17 +613,15 @@ export class LlmWikiCore {
         rationale: "The leased batch is complete evidence; final Wiki reconciliation handles cross-batch canonicalization.",
       },
       extraction_hot_path: {
-        expected_worker_tool_calls: progressive
+        expected_worker_tool_calls: domainSchema
           ? ["llm_wiki_get_batch", "llm_wiki_get_domain_schema", "llm_wiki_commit_analysis"]
           : ["llm_wiki_get_batch", "llm_wiki_commit_analysis"],
         source_file_read_required: false,
         status_call_required: false,
         retrieval_call_required: false,
-        schema_call_required: progressive || (automaticSchemaSelection?.ready !== true && schemaContext.pagination !== null),
+        schema_call_required: Boolean(domainSchema),
         output_policy: domainSchema
-          ? progressive
-            ? "Prefer source-grounded entities and concepts with one schemaClassification each. Omit redundant claims and candidatePages when they repeat the same facts."
-            : "Prefer typed entities and typed relations. Omit redundant concepts, claims, and candidatePages when they repeat the same facts."
+          ? "Prefer source-grounded entities and concepts with one schemaClassification each. Omit redundant claims and candidatePages when they repeat the same facts."
           : "Extract only reusable grounded knowledge; omit redundant restatements.",
       },
       evidence_catalog: compactEvidenceCatalog(evidenceCatalog),
@@ -673,25 +642,12 @@ export class LlmWikiCore {
     const record = await loadTask(workspace.paths, input?.task_id)
     const domainSchema = await this.#taskDomainSchema(record)
     if (!domainSchema) fail("DOMAIN_SCHEMA_NOT_CONFIGURED", "This task does not have a domain Schema.")
-    if (isProgressiveSchema(domainSchema)) {
-      return {
-        task_id: record.task.taskId,
-        ...progressiveSchemaDisclosure(domainSchema, {
-          ...input,
-          task_id: record.task.taskId,
-          level: input?.level ?? "domains",
-        }),
-      }
-    }
     return {
       task_id: record.task.taskId,
-      ...paginateDomainSchema(domainSchema, input?.cursor, input?.max_chars, {
-        mode: input?.mode,
-        queries: input?.queries,
-        entityTypeIds: input?.entity_type_ids,
-        conceptTypeIds: input?.concept_type_ids,
-        relationTypeIds: input?.relation_type_ids,
-        maxMatches: input?.max_matches,
+      ...discloseDomainSchema(domainSchema, {
+        ...input,
+        task_id: record.task.taskId,
+        level: input?.level ?? "domains",
       }),
     }
   }
@@ -724,7 +680,6 @@ export class LlmWikiCore {
       operation: "commit_analysis",
       batchId: batch.batchId,
       analysis: input?.analysis,
-      acceptDroppedCandidates: input?.accept_dropped_candidates === true,
     }
     const exactReplay = await readExactIdempotencyReplay(record.paths, input?.idempotency_key, exactIdempotencyRequest)
     if (exactReplay) return { ...exactReplay, idempotent_replay: true }
@@ -754,19 +709,9 @@ export class LlmWikiCore {
     validateAnalysisShape(normalized.analysis, record.task.taskId, batch.batchId)
     const domainSchema = await this.#taskDomainSchema(record)
     const domainApplied = applyDomainSchema(normalized.analysis, domainSchema)
-    if (domainApplied.report?.validation_error_count > 0
-      && domainApplied.report.policy === "drop-invalid"
-      && input?.accept_dropped_candidates !== true) {
-      fail("INVALID_DOMAIN_ANALYSIS", "Schema-first preflight found invalid domain candidates; correct them before commit. No candidates were persisted or dropped.", {
-        retryable: true,
-        taskId: record.task.taskId,
-        details: { ...domainApplied.report, schema_first_preflight: true, persisted: false },
-        suggestedAction: "Regenerate only Schema-conforming candidates, or explicitly set accept_dropped_candidates=true if intentional loss is acceptable.",
-      })
-    }
     validateSourceRefs(collectSourceRefs(domainApplied.analysis), record.task, record.batches, workspace.config.limits, chunkIndex)
     validateGroundingQuality(domainApplied.analysis)
-    const idempotent = await withIdempotency(record.paths, input?.idempotency_key, { operation: "commit_analysis", batchId: batch.batchId, analysis: normalized.analysis, acceptDroppedCandidates: input?.accept_dropped_candidates === true }, async ({ persistResponse }) => {
+    const idempotent = await withIdempotency(record.paths, input?.idempotency_key, { operation: "commit_analysis", batchId: batch.batchId, analysis: normalized.analysis }, async ({ persistResponse }) => {
       if (record.task.completedBatchIds.includes(batch.batchId)) fail("BATCH_ALREADY_COMPLETED", `Batch is already completed: ${batch.batchId}`)
       assertTaskStatus(record.task, ["prepared", "extracting"])
       await writeJsonAtomic(path.join(record.paths.analysis, `${batch.batchId}.json`), domainApplied.analysis)
@@ -898,11 +843,12 @@ export class LlmWikiCore {
         covers: parsed.covers,
         ...(parsed.domainSchemaId ? { domain_schema_id: parsed.domainSchemaId } : {}),
         ...(parsed.domainSchemaVersion ? { domain_schema_version: parsed.domainSchemaVersion } : {}),
-        ...(parsed.domainTypeIds.length > 0 ? {
-          domain_type_kinds: parsed.domainTypeKinds,
-          domain_type_ids: parsed.domainTypeIds,
-          domain_type_names: parsed.domainTypeNames,
-        } : {}),
+        ...(parsed.schemaLayout ? { schema_layout: parsed.schemaLayout } : {}),
+        ...(parsed.schemaClassificationStatus ? { schema_classification_status: parsed.schemaClassificationStatus } : {}),
+        ...(parsed.schemaClassificationKinds.length > 0 ? { schema_classification_kinds: parsed.schemaClassificationKinds } : {}),
+        ...(parsed.schemaDomainKeys.length > 0 ? { schema_domain_keys: parsed.schemaDomainKeys } : {}),
+        ...(parsed.schemaAbeKeys.length > 0 ? { schema_abe_keys: parsed.schemaAbeKeys } : {}),
+        ...(parsed.schemaBeKeys.length > 0 ? { schema_be_keys: parsed.schemaBeKeys } : {}),
         file_hash: sha256(content),
         provisional: provisionalOwners.has(relative),
         ...(provisionalOwners.has(relative) ? { provisional_task_id: provisionalOwners.get(relative) } : {}),
@@ -1029,7 +975,6 @@ export class LlmWikiCore {
         // Extraction has already enforced the task Schema. Page planning needs
         // only stable identity metadata, never the multi-megabyte definitions.
         domain_schema: pagePlanDomainSchemaMetadata(record.task.domainSchema),
-        domain_schema_pagination: null,
       } : {}),
       based_on_wiki_revision: planRevision,
       current_wiki_revision: revision,
@@ -1159,7 +1104,6 @@ export class LlmWikiCore {
         commit_strategy: "single-writer-durable-waves",
       },
       domain_schema: pagePlanDomainSchemaMetadata(record.task.domainSchema),
-      domain_schema_pagination: null,
       pagination: { cursor: 0, next_cursor: null, returned_items: manifest.length, total_items: manifest.length, truncated: false },
       next_cursor: null,
       next_action: nextShard
@@ -2990,7 +2934,6 @@ export class LlmWikiCore {
       await clear(workspace.paths.importStaging, "import_staging")
       await clear(workspace.paths.journal, "journal")
       this.domainSchemaCache.clear()
-      this.domainSchemaSelectionCache.clear()
       this.taskChunkIndexCache.clear()
       this.taskAnalysisCache.clear()
       this.pagePlanSnapshotCache.clear()
@@ -3176,11 +3119,6 @@ function recommendedWorkerBatchQuantum(batchCount, workerCount) {
   // independently checkpointed commits. Six bounded 9K batches stay within a
   // typical worker context while cutting coordinator relaunch churn in half.
   return Math.min(6, Math.max(1, Math.ceil(batchCount / workerCount)))
-}
-
-function automaticBatchDomainSchemaSelection(domainSchema, batch) {
-  const text = batch.chunks.map((chunk) => chunk.text).join("\n")
-  return compactDomainSchemaSelectionForText(domainSchema, text)
 }
 
 function agentChunkWithSourceRefTemplates(chunk) {
@@ -3906,63 +3844,30 @@ function candidateTitle(candidate) {
 
 function domainClassificationsForCandidate(candidate, collection, domainSchema, domainSchemaMetadata) {
   if (!domainSchema || !candidate || typeof candidate !== "object") return []
-  if (isProgressiveSchema(domainSchema)) {
-    const classification = candidate.schemaClassification ?? candidate.schema_classification
-    if (!classification || typeof classification !== "object") return []
-    const domain = classification.domain ?? {}
-    const abe = classification.abe ?? {}
-    const be = classification.be ?? {}
-    const status = String(classification.status ?? "unresolved").trim().toLowerCase()
-    const deepest = status === "classified" ? be : (Object.keys(abe).length > 0 ? abe : domain)
-    const typeId = String(deepest.key ?? deepest.id ?? deepest.name ?? "unresolved").trim()
-    const typeName = String(deepest.name ?? deepest.key ?? "待分类").trim()
-    if (!typeId || !typeName) return []
-    return [{
-      kind: collection === "concepts" ? "concept" : "entity",
-      type_id: typeId,
-      type_name: typeName,
-      schema_id: domainSchemaMetadata?.schema_id ?? domainSchema.schemaId,
-      schema_version: domainSchemaMetadata?.schema_version ?? domainSchema.schemaVersion,
-      schema_mode: PROGRESSIVE_SCHEMA_MODE,
-      status: status === "classified" ? "classified" : "unresolved",
-      domain: { key: String(domain.key ?? "").trim(), name: String(domain.name ?? domain.key ?? "").trim() },
-      abe: { key: String(abe.key ?? "").trim(), name: String(abe.name ?? abe.key ?? "").trim(), ...(abe.file ? { file: abe.file } : {}) },
-      be: { key: String(be.key ?? "").trim(), name: String(be.name ?? be.key ?? "").trim(), ...(be.pointer ? { pointer: be.pointer } : {}) },
-      ...(Number.isFinite(Number(classification.confidence)) ? { confidence: Math.max(0, Math.min(1, Number(classification.confidence))) } : {}),
-      ...(status !== "classified" ? { resolved: false } : {}),
-    }]
-  }
-  const candidates = []
-  const entityTypeId = candidate.entityTypeId ?? candidate.entity_type_id ?? (collection === "entities" ? candidate.entityType : undefined)
-  if (typeof entityTypeId === "string" && entityTypeId.trim()) {
-    const normalizedId = entityTypeId.normalize("NFKC").trim()
-    const definition = domainSchema.entityTypes.find((item) => item.id === normalizedId)
-      ?? domainSchema.entityTypes.find((item) => [item.id, item.name, ...item.aliases].some((value) => value.normalize("NFKC").toLowerCase() === normalizedId.toLowerCase()))
-    candidates.push({
-      kind: "entity",
-      type_id: definition?.id ?? normalizedId,
-      type_name: definition?.name ?? normalizedId,
-      schema_id: domainSchemaMetadata?.schema_id ?? domainSchema.schemaId,
-      schema_version: domainSchemaMetadata?.schema_version ?? domainSchema.schemaVersion,
-      ...(definition ? {} : { resolved: false }),
-    })
-  }
-  const conceptTypeId = candidate.conceptTypeId ?? candidate.concept_type_id
-  const conceptTypes = Array.isArray(domainSchema.conceptTypes) ? domainSchema.conceptTypes : []
-  if (typeof conceptTypeId === "string" && conceptTypeId.trim()) {
-    const normalizedId = conceptTypeId.normalize("NFKC").trim()
-    const definition = conceptTypes.find((item) => item.id === normalizedId)
-      ?? conceptTypes.find((item) => [item.id, item.name, ...item.aliases].some((value) => value.normalize("NFKC").toLowerCase() === normalizedId.toLowerCase()))
-    candidates.push({
-      kind: "concept",
-      type_id: definition?.id ?? normalizedId,
-      type_name: definition?.name ?? normalizedId,
-      schema_id: domainSchemaMetadata?.schema_id ?? domainSchema.schemaId,
-      schema_version: domainSchemaMetadata?.schema_version ?? domainSchema.schemaVersion,
-      ...(definition ? {} : { resolved: false }),
-    })
-  }
-  return candidates
+  const classification = candidate.schemaClassification ?? candidate.schema_classification
+  if (!classification || typeof classification !== "object") return []
+  const domain = classification.domain ?? {}
+  const abe = classification.abe ?? {}
+  const be = classification.be ?? {}
+  const status = String(classification.status ?? "unresolved").trim().toLowerCase()
+  const deepest = status === "classified" ? be : (Object.keys(abe).length > 0 ? abe : domain)
+  const typeId = String(deepest.key ?? deepest.id ?? deepest.name ?? "unresolved").trim()
+  const typeName = String(deepest.name ?? deepest.key ?? "待分类").trim()
+  if (!typeId || !typeName) return []
+  return [{
+    kind: collection === "concepts" ? "concept" : "entity",
+    type_id: typeId,
+    type_name: typeName,
+    schema_id: domainSchemaMetadata?.schema_id ?? domainSchema.schemaId,
+    schema_version: domainSchemaMetadata?.schema_version ?? domainSchema.schemaVersion,
+    schema_mode: PROGRESSIVE_SCHEMA_MODE,
+    status: status === "classified" ? "classified" : "unresolved",
+    domain: { key: String(domain.key ?? "").trim(), name: String(domain.name ?? domain.key ?? "").trim() },
+    abe: { key: String(abe.key ?? "").trim(), name: String(abe.name ?? abe.key ?? "").trim(), ...(abe.file ? { file: abe.file } : {}) },
+    be: { key: String(be.key ?? "").trim(), name: String(be.name ?? be.key ?? "").trim(), ...(be.pointer ? { pointer: be.pointer } : {}) },
+    ...(Number.isFinite(Number(classification.confidence)) ? { confidence: Math.max(0, Math.min(1, Number(classification.confidence))) } : {}),
+    ...(status !== "classified" ? { resolved: false } : {}),
+  }]
 }
 
 function uniqueDomainClassifications(values) {

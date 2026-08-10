@@ -29,20 +29,12 @@ The Agent automatically imports the attachments, initializes the local
 workspace, extracts knowledge, writes Wiki pages, updates indexes, and reports
 the result.
 
-If `llm-wiki.domain-schema.json` exists at the workspace root, imports also
-snapshot and enforce it as the entity/property/relation extraction contract.
-You can instead pass `options.domain_schema_path` or `options.domain_schema` to
-`llm_wiki_import_files`. Compatible mode resolves names and aliases to stable
-IDs. Extraction is Schema-first: invalid candidates are rejected before
-persistence even when the Schema says `drop-invalid`. Destructive dropping is
-available only through the explicit `accept_dropped_candidates` commit option;
-`reject-batch` always returns a recoverable `INVALID_DOMAIN_ANALYSIS` result.
-`relationTypes` may be an empty array; this disables domain-level relation
-constraints and keeps general relation extraction enabled. `entityTypes` must
-still contain at least one type.
+If `llm-wiki.domain-schema/` exists at the workspace root, imports snapshot and
+enforce it as the progressive Domain Schema. You can instead pass
+`options.domain_schema_path` to `llm_wiki_import_files`. Inline and single-file
+Schemas are not supported.
 
-For new tasks, `options.domain_schema_path` may point to a progressive Schema
-directory instead of a fixed-object JSON file:
+The Schema directory has this layout:
 
 ```text
 schemas/customer/
@@ -69,12 +61,12 @@ JSON file is read and returned verbatim (up to the 5 MiB per-file safety
 ceiling); a complete snapshot is limited to 20 MiB. Oversized files fail import
 rather than being truncated.
 
-Typed Wiki pages are projected from the validated task Schema. Entity and
-optional concept pages receive `domain_schema_id`, `domain_schema_version`,
-`domain_type_ids`, and `domain_type_names` in frontmatter, plus a generated
-Domain Classification section. The Core derives these fields from covered page
-requirements, so a Writer cannot invent or silently omit a type. Existing pages
-can be backfilled by calling `llm_wiki_finalize` with
+Classified Wiki pages are projected from the validated task Schema. Entity and
+concept pages receive the snapshot identity, classification status, Domain,
+ABE, BE, and complete path in frontmatter, plus a generated Domain
+Classification section. Core derives these fields from covered page
+requirements, so a Writer cannot invent or silently omit a classification.
+Existing pages can be backfilled by calling `llm_wiki_finalize` with
 `refresh_page_metadata: true`.
 
 No desktop application, separate HTTP server, project creation, Provider API
@@ -91,7 +83,7 @@ changing these files.
 Every initial and replacement extraction slot explicitly uses the named project
 Agent type `llm-wiki-extractor`. Generic "Worker N", `general-purpose`, and
 Agent Team teammates are not used because they do not apply that Agent file's
-`mcpServers` declaration. Permissions list all 16 MCP tools explicitly, every
+`mcpServers` declaration. Permissions list all 17 MCP tools explicitly, every
 published tool carries `anthropic/alwaysLoad`, and ToolSearch provides a
 deferred-discovery fallback. Claude Code 2.1.121 or later is recommended for
 the documented always-load behavior.
@@ -231,21 +223,18 @@ Agent transport ceilings remain fixed at 3,000 characters per chunk, at most
 9,000 source characters per batch, and 24 KiB of serialized chunk payload even
 when an old workspace requested larger values.
 The full `get_batch` result is also budgeted: the unrelated Wiki page schema is
-omitted, the Analysis schema is represented by a compact contract, and a large
-domain Schema contributes only a compact batch-matched slice. `batch_limits`
+omitted, the Analysis schema is represented by a compact contract, and a
+Domain Schema contributes only snapshot identity plus disclosure instructions. `batch_limits`
 reports chunk-payload bytes and complete-response bytes against a 40 KiB target.
 Oversized structured table fields are compacted so pretty-printed MCP JSON does
 not contain an unreadable 80K single line. An unfinished legacy batch is
 repaired in place while preserving its original batch ID and worker lease.
 One chunk is bounded by the smaller of the chunk and batch limits, so legacy
 repair does not repeatedly rebuild the same batch or invalidate worker leases.
-Domain Schemas up to 5 MiB are accepted. Schemas larger than 8 KiB are
-summarized on the extraction hot path so the complete batch response remains
-bounded. Extractors use server-side
-`llm_wiki_get_domain_schema` search to receive only the complete definitions
-and properties matched to the current batch. Bounded catalog and exact-type
-modes resolve ambiguous classifications without reconstructing the full Schema
-in Agent context; Core validation still enforces the complete task snapshot.
+Each disclosed Schema JSON file may be up to 5 MiB and a complete directory
+snapshot up to 20 MiB. Extractors progressively read the complete Domain index,
+selected Domain file, and selected ABE files without reconstructing the whole
+Schema in Agent context. Core validates against the immutable task snapshot.
 Every batch also includes a ready-to-fill `analysis_scaffold` and a
 server-generated `evidence_catalog`. Workers cite zero-based evidence indexes;
 they no longer transcribe quotes, reread source files, or reconstruct spreadsheet
@@ -288,8 +277,8 @@ SourceRefs are still accepted and uniquely safe Markdown, Unicode-quote, and
 whitespace differences are repaired before validation. Later page-plan cursors
 reuse the persisted snapshot instead of rebuilding analyses and rereading every
 Wiki page. Tools which do not consume a Wiki revision also skip the full Wiki
-hash, and a newly launched Writer follows the coordinator's current action
-without an extra status probe.
+hash. The coordinator resumes its current manifest/Drafter action without an
+extra status probe; a newly launched Writer receives only staged receipt IDs.
 
 ## Managed workspace
 
@@ -307,7 +296,7 @@ wiki/
   locks/
   journal/
 llm-wiki.schema.md
-llm-wiki.domain-schema.json # optional domain extraction contract
+llm-wiki.domain-schema/ # optional progressive Domain Schema directory
 ```
 
 Sources are content-addressed and deduplicated. Task, batch, analysis,

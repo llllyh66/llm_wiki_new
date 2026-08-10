@@ -31,10 +31,9 @@ Core 会同时创建 `.llm-wiki/` 运行状态目录，保存受管理的原文�
 索引、锁和事务日志。
 
 使用领域 Schema 时，实体或概念页面还会显示其领域分类。例如实体页面会在
-frontmatter 中加入 `domain_schema_id`、`domain_schema_version`、
-`domain_type_ids` 和 `domain_type_names`，正文中同步生成“领域分类”章节。
-类型由 Core 根据已校验的分析结果和任务 Schema 快照确定，Writer 不能自行
-修改。一个页面覆盖多个 requirement 时会保留全部合法类型。
+frontmatter 中加入 Schema 快照、分类状态、Domain、ABE、BE 和完整路径，
+正文中同步生成“领域分类”章节。分类由 Core 根据已校验的分析结果
+和任务 Schema 快照确定，Writer 不能自行修改。
 
 页面规划会把每个重要实体、概念和 Agent 提议页转成
 `page_requirements`。Writer 完成投影前必须逐项覆盖，所以不会再因
@@ -131,7 +130,7 @@ llm-wiki: node packages/mcp-server/dist/index.js --workspace . - Connected
 /mcp
 ```
 
-`llm-wiki` 应显示 `Connected` 和 16 个工具。
+`llm-wiki` 应显示 `Connected` 和 17 个工具。
 
 页面规划上下文会自动分页，Skill 会持续读取到 `next_cursor` 为空；大请求和大结果
 也有明确预算，超过限制时会返回可恢复错误，而不是关闭 MCP 连接。
@@ -149,16 +148,17 @@ Agent，当前最多 4 个；大型 Schema 也不再降为 2 个，因为每个 
 主 Agent 只负责轻量的 page-plan 编排、启动后台 Agent 和校验 receipt；它不生成页面，也不调用
 `llm_wiki_get_staged_page_drafts` 或 `llm_wiki_commit_pages`。后台抽取 Agent 与 page drafter
 形成流水线，每新增 4 个 batch 或等待满 30 秒后增量更新受影响页面。
-每个增量 projection 最多租约 8 个 batch，一次 Writer 后台调用最多连续处理 6 个
+每个增量 projection 最多租约 8 个 batch，一次协调器编排最多连续处理 6 个
 projection。协调器投影 loop 只读取 compact manifest；Core 按
 `patch_scaffold.path` 分成互斥 shard，最多使用 4 个仅具备 page-plan/staging MCP 权限的 page drafter
-并行生成语义正文并暂存，再由唯一稳定 Writer 使用
-`staged_draft_shard_ids + patches=[]` 在服务端校验并提交。小计划也由一个 drafter 或稳定 Writer
-串行 fallback 处理，不把提交转移给主 Agent。Core 只负责
+并行生成语义正文并暂存；协调器收到 receipt 后才启动唯一稳定 Writer，使用
+`staged_draft_shard_ids + patches=[]` 在服务端校验并提交。小计划也由一个 drafter
+处理。正常流程中的 Writer 不读取 manifest/draft-shard，也不启动 drafter；只有
+协调器在 drafter 创建明确失败后才能显式启用 Writer 串行 fallback。Core 只负责
 校验 SourceRef、页面结构、哈希和事务，不自动替代 Agent 写作。
 任一 `commit_analysis` 使投影就绪时，该 extractor 会立即返回
 `writer_required: true`，而不是继续领取 batch；主 Agent 随即启动
-协调器投影编排，收到 drafter receipt 后立即启动或恢复稳定 Writer，再按需补充 extractor。抽取与写入重叠时使用总计 4 个后台
+协调器投影编排，收到 drafter receipt 后才启动稳定 Writer，再按需补充 extractor。抽取与写入重叠时使用总计 4 个后台
 Agent 的预算，通常保留 2 个 extractor 和 2 个 page drafter；投影提交后恢复完整
 extractor 数量。`status.next_action` 也会在投影就绪时
 优先指向 `llm_wiki_get_page_plan_context`，因此不需要等用户追问才生成页面。
@@ -172,7 +172,7 @@ extractor 数量。`status.next_action` 也会在投影就绪时
 在协调器中重复抽取。
 首次启动和补位都必须显式使用项目 Agent 类型 `llm-wiki-extractor`，不能改用
 `general-purpose`、动态“Worker N”或 Agent Team teammate，因为它们不会加载该
-Agent 文件的 `mcpServers` 配置。项目同时显式允许 16 个 MCP 工具名，每个工具
+Agent 文件的 `mcpServers` 配置。项目同时显式允许 17 个 MCP 工具名，每个工具
 都发布 `anthropic/alwaysLoad` 元数据；如果宿主仍延迟加载，Worker 会先使用
 ToolSearch 发现工具，而不是直接判定 MCP 不可用。
 `.claude/agents/llm-wiki-writer.md` 使用同样的 MCP 复用方式，且每个任务同时
@@ -249,7 +249,9 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
 
 ### 目录型渐进式披露 Schema（V2）
 
-新任务推荐传入 Schema 文件夹，而不是单个固定字段 JSON：
+这是唯一支持的 Domain Schema 格式。默认读取 workspace 根目录的
+`llm-wiki.domain-schema/`，也可通过 `options.domain_schema_path` 指定其他目录。
+不支持单个 Schema JSON 文件或内联 Schema 对象：
 
 ```text
 schemas/customer/
@@ -266,7 +268,7 @@ JSON 内部字段名和嵌套结构不做业务限制，只要是合法 JSON。�
 `all_domains.json → <domain>/<domain>_domain.json → <domain>/<abe>.json`
 逐级读取；最后一个 ABE JSON 会完整暴露给模型，由模型选择 BE，并在实体或概念上
 提交 `schemaClassification` 和 JSON Pointer。Core 只校验快照、文件链和 Pointer，
-不再假设 `entityTypes`、`conceptTypes` 或 `relationTypes`。分类有歧义时保留候选并标记
+Schema JSON 的业务字段和嵌套结构不受限制。分类有歧义时保留候选并标记
 `unresolved`，不会静默丢失知识。
 
 Wiki 页面会生成 `Domain → ABE → BE` 的“领域分类”区块，并把快照哈希、分类状态、
@@ -283,82 +285,6 @@ Domain/ABE/BE key 和路径写入 frontmatter 与检索索引。
 导入时会把整个目录快照到任务目录中，外部 Schema 后续变化不会影响任务。暴露文件会
 原样读取并返回（单文件安全上限为 5 MiB），整个快照默认不能超过 20 MiB，超限时导入失败而不截断。
 
-### V1 固定对象 Schema 兼容
-
-仓库根目录的 `llm-wiki.domain-schema.json` 是当前默认领域 Schema。
-导入时 Core 会先校验它，再把一份不可变快照保存到当前任务中；
-因此任务进行期间修改原 Schema 不会改变已创建任务的抽取契约。
-Schema 最大可为 5 MiB。抽取热路径上超过 8 KiB 时不会塞进 `get_batch`
-的主响应，Core
-只返回摘要。抽取 Worker 会优先调用 `llm_wiki_get_domain_schema`
-的 `search` 模式，由服务端根据当前 batch 术语选出少量相关类型，并返回这些
-类型的完整属性和关系定义。分类仍有歧义时，再用有界的 `catalog` 摘要和
-`types` 精确查询；不再让 Agent 逐页重建数 MiB Schema。Core 仍使用任务的完整
-Schema 快照校验，因此不会降低约束强度。
-
-`get_batch` 还会返回可直接填充的 `analysis_scaffold` 和服务端生成的
-`evidence_catalog`。后者已经包含逐行或逐段的精确 quote 以及正确的 Excel
-定位信息；Worker 只需在实体和关系中填写 `evidence_index`，不再复制 quote、
-读取原文件或拼写 `sheetName` / `cellRange`。Core 会在提交时解析索引、只保存
-实际使用的完整 SourceRef。旧式完整 SourceRef 仍兼容；弯引号、Markdown 强调
-标记等轻微差异仅在能唯一匹配原文时自动还原为精确 quote。
-
-为了降低每个 batch 的延迟，`get_batch` 会直接用 batch 原文匹配 Schema 中的类型 ID、
-名称、别名和属性名，并内联少量相关类型的完整抽取约束（省略冗长描述）。大多数 batch 不再需要
-额外调用 Schema 工具。抽取热路径也默认不做 BM25/Embedding 检索，因为当前
-batch 已是完整证据，最终 Wiki 投影会统一合并跨 batch 重复。这不会关闭用户查询的
-BM25 + Embedding + Wiki 多路召回；只是不再为每次抽取强制支付该开销。
-
-直接告诉 Claude：
-
-```text
-/llm-wiki-builder 按 ./llm-wiki.domain-schema.json 的领域模型，
-从 ./data/业务记录.xlsx 抽取业务主体、业务对象、业务事件及关系，并生成 Wiki。
-```
-
-Agent 在 `entities` 中提交 `entityTypeId` 和 `properties`，在
-`relations` 中提交 `relationTypeId`、`sourceEntityLocalId` 和
-`targetEntityLocalId`。`compatible` 模式允许 Agent 使用中文名称或别名，
-Core 会将它们规范化为 Schema 中的稳定 ID。
-如果 Schema 提供可选的 `conceptTypes`，概念可以提交 `conceptTypeId`，对应的
-概念页面会使用同一套领域分类字段；未定义 `conceptTypes` 时，概念仍按通用
-概念抽取，不会被拒绝。
-允许使用 `"relationTypes": []`；这表示不启用领域级关系约束，Agent 仍按通用
-AnalysisEnvelope 抽取并保存关系，不检查关系类型、端点类型或关系属性。
-`entityTypes` 仍必须至少包含一个实体类型。只有 `relationTypes` 非空时，Core
-才执行领域关系校验。
-
-抽取采用 Schema-first：Agent 在生成候选时先选择 Schema 类型，再抽取允许的
-属性和有原文证据的必填值，不应先生成不合规候选再依赖 Core 丢弃。即使
-`validationFailurePolicy` 为 `drop-invalid`，默认提交也会在持久化前返回可
-恢复的 `INVALID_DOMAIN_ANALYSIS`，让后台 Agent 修正同一批次，不会静默丢失。
-
-只有用户明确接受数据损失并在提交中设置
-`accept_dropped_candidates: true` 时，`drop-invalid` 才执行：
-
-- 缺少必填属性、属性类型错误或使用未知类型的实体会被丢弃；
-- 指向已丢弃实体或端点类型不合法的关系会被丢弃；
-- 批次仍可成功提交，返回的 `domain_validation` 会列出原因和丢弃数量。
-
-必填值在源文档中缺失时，Agent 不应编造。默认模板使用
-`"validationFailurePolicy": "reject-batch"`；该策略始终以
-可恢复的 `accepted: false` 返回，不会断开 MCP。
-
-为旧知识库补齐领域类型，可以让 Agent 调用：
-
-```text
-对任务 task-xxx 执行 finalize，并设置 refresh_page_metadata=true，
-为已有 Wiki 页面补齐领域 Schema 类型，不重新抽取正文。
-```
-
-该刷新是确定性的、可重复执行的，只更新页面元数据、领域分类章节和检索索引。
-
-也可显式指定其他 Schema：
-
-```bash
-npm run cli -- import ./data/业务记录.xlsx \
-  --domain-schema ./schemas/telecom.json --workspace .
-```
 
 ### 恢复中断任务
 
@@ -389,7 +315,7 @@ Skill 会先调用 `llm_wiki_list_tasks` 和 `llm_wiki_status`，然后按 `next
 - Writer 使用已验证分析、服务端保存的精确 SourceRef 和 `page_requirement + patch_scaffold`
   生成语义页面；大型 Schema 只以元数据形式提供给 Writer。
 - 页面数达到 4 个时按 canonical path 分片，最多 4 个 drafter 并行生成；同一路径
-  不跨 shard，drafter 不调用 MCP，唯一 Writer 统一校验和原子提交。
+  不跨 shard；drafter 通过 MCP 只读取自己的有界上下文并暂存 receipt，唯一 Writer 统一校验和原子提交。
 - provisional 页面在所有未完成任务的检索中都被排除，不会污染用户问答。
 - 超大页面计划可在同一租约下分多次提交，每次最多 50 个 PagePatch。
 - 全部抽取完成后必须进行一次全局去重、矛盾合并和 provisional 复核；
@@ -538,9 +464,9 @@ npm test
 ```
 
 然后完全退出 Claude Code，从该项目根目录重新运行 `claude`，批准项目 MCP，
-并用 `/mcp` 确认 `llm-wiki` 为 `Connected` 且有 16 个工具。最新版包含连续
+并用 `/mcp` 确认 `llm-wiki` 为 `Connected` 且有 17 个工具。最新版包含连续
 `INVALID_ANALYSIS`、错误 SourceRef 和畸形重试后保持同一 STDIO 连接存活的
-回归测试。现在 16 个工具的所有异常都作为普通工具结果返回，不再进入
+回归测试。现在 17 个工具的所有异常都作为普通工具结果返回，不再进入
 MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 `error`、`next_action` 和 `mcp_connection_usable: true`。Agent 应按
 `next_action` 修正或恢复，不需要执行 `/mcp`。
@@ -557,20 +483,23 @@ MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 运行 `llm_wiki_status`。当 `wiki_projection.ready` 为 `true` 时，最新版会让
 `next_action.tool` 直接返回 `llm_wiki_get_page_plan_context`，并带上固定的
 `writer_id: wiki-writer-1`。主协调器读取 compact manifest 后启动 page drafter，
-再将 receipt 交给稳定 Writer 提交语义页面。
+再将 receipt 交给稳定 Writer 提交语义页面；没有 receipt 时不启动 Writer。
 后台 extractor 也会停止并向主 Agent 返回
 `writer_required: true`，从而触发 Writer；不要继续等待更多 batch，也不要启动
 第二个 projection 提交者。主协调器启动的 `llm-wiki-page-drafter` 只生成互斥
 页面草稿，不持有提交权，也不属于第二个 Writer；稳定后台 Writer 始终是唯一提交者，
-无法启动 drafter 时由它执行串行回退，主协调器也不能代替提交。
+无法启动 drafter 时，协调器必须显式标注
+`explicit-serial-writer-fallback-only` 才能让 Writer 执行一个 shard 的串行回退；
+Writer 本身永远不启动 drafter，主协调器也不能代替提交。
 
 页面规划不会内联完整 Schema。即使领域 Schema 接近 5 MiB，
 传统 `llm_wiki_get_page_plan_context` 也只返回 Schema ID、版本、哈希和大小元数据，
 并将页面规划正文按约 40K 字符分页。Writer 应沿 `next_cursor` 读取完所有页面，
 不能以“忽略 Schema”或“忽略截断响应”的方式继续。如果旧任务显示
 `wiki_projection.in_progress: true`，使用相同的 `wiki-writer-1` 恢复该租约。
-传统 Writer 流程已有积压时，每次提交返回的 `writer_next_action` 会直接指向下一个页面规划，
-Writer 在自己的有界 quantum 内直接继续，不需要等待主 Agent 再次询问状态。
+已有积压时，每次 staged commit 返回 `coordinator_next_action`。Writer 在一个
+receipt wave 提交后立即停止；主协调器继续获取 manifest、启动下一批 drafter，
+新 receipt 到达后再启动 Writer，不需要等待用户再次询问状态。
 
 若行为仍与上述不符，说明另一台电脑还在运行旧的构建产物；执行
 `npm run build` 后完全退出并重新启动 Claude Code。

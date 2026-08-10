@@ -23,10 +23,8 @@
   relations, contradictions, and review items must cite quotes containing their
   identifying terms. Split table evidence by row or coherent topic; a single
   SourceRef may ground at most eight candidates.
-- A canonical Schema relation name or ID does not need to appear in the source
-  prose. Put the directly supported statement in `content`; when that statement
-  is contained in the selected server evidence quote, use that evidence index
-  directly and do not replace it merely to find the Schema label in a quote.
+- Put the directly supported relation statement in `content` and cite the
+  evidence index containing that statement.
 - Use conservative confidence values between 0 and 1.
 - Put uncertainty in `unresolvedQuestions` instead of guessing.
 - Keep sourced facts separate from inference.
@@ -36,10 +34,10 @@
   use only cached values supplied by the Core.
 - Detect exact duplicates before proposing semantic aliases or merges.
 - Do not copy large passages from the source.
-- If a domain Schema is active, follow
-  [domain-schema.md](domain-schema.md) for typed entity properties. Follow its
-  typed relation rules only when `relationTypes` is non-empty. The domain
-  contract supplements, rather than replaces, SourceRef grounding.
+- If a Domain Schema is active, follow
+  [domain-schema.md](domain-schema.md) for progressive Domain → ABE → BE
+  classification. The domain contract supplements, rather than replaces,
+  SourceRef grounding.
 
 Minimal shape:
 

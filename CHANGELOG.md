@@ -1,12 +1,20 @@
 # 更新日志
 
+## Unreleased
+
+- Remove the fixed-object Domain Schema protocol, inline Schema input,
+  automatic batch selection, search/catalog/types pagination, destructive
+  drop-invalid commits, and fixed-object Wiki metadata.
+- Require `progressive-directory-v2` directories and Domain → ABE → BE
+  disclosure for every configured Domain Schema.
+
 ## [V1.0.4] - 2026-08-10
 
 - Add progressive directory Schema V2 with immutable snapshots and Domain → ABE → BE disclosure.
 - Expose complete ABE JSON files to extraction Agents while allowing unrestricted JSON field layouts.
 - Persist and render `schemaClassification` paths in Wiki pages, frontmatter, and retrieval content.
-- Keep V1 fixed-object Schema tasks resumable for compatibility.
 - Raise the progressive per-file guard from 80 KiB to 5 MiB so complete ABE JSON files are not rejected before disclosure.
+- Unify every orchestration prompt on the latest role contract: the coordinator launches Drafters, a Drafter stages one shard, and the Writer starts only after receipts exist to commit them. The Writer never launches Drafters or fetches shard context in normal mode.
 
 ## [V1.0.3] - 2026-08-07
 

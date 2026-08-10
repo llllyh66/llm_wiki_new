@@ -3,11 +3,7 @@ import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
-import { fileURLToPath } from "node:url"
 import { LlmWikiCore, LlmWikiError } from "../src/index.js"
-import { matchDomainSchemaTypesForText } from "../src/domain-schema.js"
-
-const domainSchemaPath = fileURLToPath(new URL("../../../llm-wiki.domain-schema.json", import.meta.url))
 
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-core-"))
@@ -59,26 +55,6 @@ function analysisFor(taskId, batch) {
     },
   }
 }
-
-test("domain schema matching respects word boundaries and CJK longest matches", () => {
-  const schema = {
-    entityTypes: [
-      { id: "cat_type", name: "Cat", aliases: ["cat"], properties: [] },
-      { id: "customer_type", name: "Customer", aliases: ["客户"], properties: [] },
-      { id: "customer_info_type", name: "Customer Information", aliases: ["客户信息"], properties: [] },
-    ],
-    conceptTypes: [],
-    relationTypes: [],
-  }
-  const falsePositive = matchDomainSchemaTypesForText(schema, "concatenate values", 12)
-  assert.equal(falsePositive.entityTypeIds.includes("cat_type"), false)
-  const cjk = matchDomainSchemaTypesForText(schema, "客户信息系统需要升级", 12)
-  assert.equal(cjk.entityTypeIds.includes("customer_info_type"), true)
-  assert.equal(cjk.entityTypeIds.includes("customer_type"), false)
-  const mixedCjk = matchDomainSchemaTypesForText(schema, "客户信息系统与客户服务", 12)
-  assert.equal(mixedCjk.entityTypeIds.includes("customer_info_type"), true)
-  assert.equal(mixedCjk.entityTypeIds.includes("customer_type"), true)
-})
 
 async function analyzeAll(core, imported) {
   let lastRef
@@ -296,496 +272,6 @@ test("grounding accepts exact relation content from server evidence without labe
   assert.equal(committed.accepted, true)
 })
 
-test("domain schema is snapshotted, exposed to the Agent, and normalizes or drops typed candidates", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  const domainSource = path.join(f.incoming, "domain-record.md")
-  await writeFile(domainSource, "# 业务记录\n\n客户 C-001（张三）拥有产品 O-100（家庭宽带）。\n")
-  const domainSchema = JSON.parse(await readFile(domainSchemaPath, "utf8"))
-  domainSchema.policy.validationFailurePolicy = "drop-invalid"
-  const imported = await f.core.importFiles({
-    files: [{ path: domainSource }],
-    options: { domain_schema: domainSchema },
-  })
-  assert.equal(imported.domain_schema.schema_id, "your-domain-schema")
-  const batch = await f.core.getBatch({ task_id: imported.task_id })
-  assert.equal(batch.workspace_context.domain_schema.policy.validationFailurePolicy, "drop-invalid")
-  assert.equal(batch.workspace_context.domain_schema.inline, false)
-  assert.equal(batch.workspace_context.domain_schema.entityTypeCount, 3)
-  assert.equal(batch.workspace_context.domain_schema_auto_selection.ready, true)
-  assert.equal(batch.workspace_context.domain_schema_auto_selection.matcher, "cached-multi-pattern")
-  assert.equal(batch.workspace_context.domain_schema_auto_selection.items.some((item) => item.kind === "entity_type" && item.entity_type.id === "business_subject"), true)
-  const chunk = batch.chunks[0]
-  const sourceRef = {
-    sourceId: chunk.sourceId,
-    chunkId: chunk.chunkId,
-    quote: "客户 C-001（张三）拥有产品 O-100（家庭宽带）。",
-    locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
-  }
-  const analysis = {
-    schemaVersion: 1,
-    taskId: imported.task_id,
-    batchId: batch.batch_id,
-    sourceRefs: [sourceRef],
-    entities: [
-      { local_id: "subject-1", name: "张三", entityType: "客户", properties: { "主体编号": "C-001", "主体名称": "张三" }, sourceRefs: [0] },
-      { localId: "object-1", name: "家庭宽带", entityTypeId: "business_object", properties: { object_id: "O-100", object_name: "家庭宽带" }, sourceRefs: [0] },
-      { localId: "event-1", name: "订购事件", entityTypeId: "business_event", properties: { event_id: "E-001" }, sourceRefs: [0] },
-      { localId: "unknown-1", name: "未知", entityTypeId: "unknown_type", properties: {}, sourceRefs: [0] },
-    ],
-    concepts: [],
-    claims: [],
-    relations: [
-      {
-        local_id: "owns-1",
-        name: "拥有",
-        content: "客户 C-001（张三）拥有产品 O-100（家庭宽带）。",
-        relationType: "业务主体拥有业务对象",
-        sourceLocalId: "subject-1",
-        targetLocalId: "object-1",
-        properties: {},
-        sourceRefs: [0],
-      },
-      {
-        localId: "affects-1",
-        name: "影响",
-        content: "客户 C-001（张三）拥有产品 O-100（家庭宽带）。",
-        relationTypeId: "event_affects_object",
-        sourceEntityLocalId: "event-1",
-        targetEntityLocalId: "object-1",
-        properties: {},
-        sourceRefs: [0],
-      },
-    ],
-    contradictions: [],
-    candidatePages: [],
-    reviewItems: [],
-    batchSummary: "客户拥有家庭宽带产品。",
-    unresolvedQuestions: [],
-  }
-  await assert.rejects(
-    () => f.core.commitAnalysis({
-      task_id: imported.task_id,
-      batch_id: batch.batch_id,
-      analysis,
-      idempotency_key: "domain-schema-first-preflight-v1",
-    }),
-    (error) => error instanceof LlmWikiError
-      && error.code === "INVALID_DOMAIN_ANALYSIS"
-      && error.details.schema_first_preflight === true
-      && error.details.persisted === false,
-  )
-  assert.equal((await f.core.status({ task_id: imported.task_id })).completed_batches, 0)
-  const committed = await f.core.commitAnalysis({
-    task_id: imported.task_id,
-    batch_id: batch.batch_id,
-    analysis,
-    accept_dropped_candidates: true,
-    idempotency_key: "domain-schema-drop-invalid-v1",
-  })
-  assert.equal(committed.accepted, true)
-  assert.equal(committed.domain_validation.dropped_entities, 2)
-  assert.equal(committed.domain_validation.dropped_relations, 1)
-  assert.equal(committed.domain_validation.validation_error_count >= 3, true)
-  const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
-  assert.equal(plan.domain_schema.schemaId, "your-domain-schema")
-  assert.deepEqual(plan.analysis_summary.entities.map((item) => item.entityTypeId), ["business_subject", "business_object"])
-  assert.deepEqual(plan.analysis_summary.entities[0].properties, { subject_id: "C-001", subject_name: "张三" })
-  assert.equal(plan.analysis_summary.relations.length, 1)
-  assert.equal(plan.analysis_summary.relations[0].relationTypeId, "subject_owns_object")
-})
-
-test("domain entity types are projected into Wiki frontmatter and body", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  const domainSource = path.join(f.incoming, "typed-page.md")
-  await writeFile(domainSource, "# 业务记录\n\n客户 C-001 的名称为张三。\n")
-  const domainSchema = JSON.parse(await readFile(domainSchemaPath, "utf8"))
-  const imported = await f.core.importFiles({
-    files: [{ path: domainSource }],
-    options: { domain_schema: domainSchema },
-  })
-  const batch = await f.core.getBatch({ task_id: imported.task_id })
-  const chunk = batch.chunks[0]
-  const sourceRef = {
-    sourceId: chunk.sourceId,
-    chunkId: chunk.chunkId,
-    quote: "客户 C-001 的名称为张三。",
-    locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
-  }
-  await f.core.commitAnalysis({
-    task_id: imported.task_id,
-    batch_id: batch.batch_id,
-    analysis: {
-      ...batch.analysis_scaffold,
-      sourceRefs: [sourceRef],
-      entities: [{ localId: "subject-1", name: "张三", entityTypeId: "business_subject", properties: { subject_id: "C-001", subject_name: "张三" }, sourceRefs: [0] }],
-      batchSummary: "客户记录。",
-    },
-    idempotency_key: "domain-page-type-analysis-v1",
-  })
-  const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
-  const requirement = plan.page_requirements.find((item) => item.title === "张三")
-  assert.ok(requirement)
-  assert.deepEqual(requirement.domain_classifications.map((item) => item.type_id), ["business_subject"])
-  assert.deepEqual(requirement.patch_scaffold.domainClassifications.map((item) => item.typeName), ["业务主体"])
-  const committed = await f.core.commitPages({
-    task_id: imported.task_id,
-    based_on_wiki_revision: plan.based_on_wiki_revision,
-    idempotency_key: "domain-page-type-commit-v1",
-    patches: [{
-      ...requirement.patch_scaffold,
-      content: "# 张三\n\n客户主体。\n",
-      summary: "客户主体。",
-      domainClassifications: [{ kind: "entity", typeId: "spoofed_type", typeName: "错误类型" }],
-      rationale: "领域 Schema 将该实体分类为业务主体。",
-    }],
-  })
-  assert.equal(committed.accepted, true)
-  const initialFinalize = await f.core.finalize({ task_id: imported.task_id })
-  const page = await readFile(path.join(f.workspace, "wiki", "entities", "张三.md"), "utf8")
-  assert.match(page, /domain_schema_id: "your-domain-schema"/)
-  assert.match(page, /domain_type_ids: \["business_subject"\]/)
-  assert.match(page, /domain_type_names: \["业务主体"\]/)
-  assert.match(page, /## 领域分类/)
-  assert.match(page, /业务主体（`business_subject`）/)
-  await writeFile(path.join(f.workspace, "wiki", "entities", "张三.md"), `---\ntype: "entity"\ntitle: "张三"\ncreated: "2026-08-07"\nupdated: "2026-08-07"\ntags: []\nrelated: []\nsources: ["${sourceRef.sourceId}"]\ncovers: ["${requirement.requirement_id}"]\nsummary: "旧页面"\n---\n\n# 张三\n\n旧页面。\n`)
-  const refreshed = await f.core.finalize({ task_id: imported.task_id, refresh_page_metadata: true })
-  assert.equal(refreshed.domain_metadata_refresh.updated_pages, 1)
-  assert.match(refreshed.generation_id, /^generation-/)
-  assert.notEqual(refreshed.generation_id, initialFinalize.generation_id)
-  assert.match(await readFile(path.join(f.workspace, "wiki", "entities", "张三.md"), "utf8"), /domain_type_ids: \["business_subject"\]/)
-})
-
-test("optional concept types are normalized and projected into concept pages", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  const domainSource = path.join(f.incoming, "typed-concept.md")
-  await writeFile(domainSource, "# 概念\n\n用户体验属于服务质量。\n")
-  const domainSchema = JSON.parse(await readFile(domainSchemaPath, "utf8"))
-  domainSchema.conceptTypes = [{ id: "service_quality", name: "服务质量", properties: [] }]
-  const imported = await f.core.importFiles({ files: [{ path: domainSource }], options: { domain_schema: domainSchema } })
-  const batch = await f.core.getBatch({ task_id: imported.task_id })
-  const chunk = batch.chunks[0]
-  const sourceRef = {
-    sourceId: chunk.sourceId,
-    chunkId: chunk.chunkId,
-    quote: "用户体验属于服务质量。",
-    locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
-  }
-  await f.core.commitAnalysis({
-    task_id: imported.task_id,
-    batch_id: batch.batch_id,
-    analysis: {
-      ...batch.analysis_scaffold,
-      sourceRefs: [sourceRef],
-      concepts: [{ localId: "concept-1", name: "用户体验", conceptTypeId: "service_quality", sourceRefs: [0] }],
-      batchSummary: "用户体验概念。",
-    },
-    idempotency_key: "domain-concept-type-analysis-v1",
-  })
-  const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
-  const requirement = plan.page_requirements.find((item) => item.title === "用户体验")
-  assert.deepEqual(requirement.domain_classifications.map((item) => item.type_id), ["service_quality"])
-  await f.core.commitPages({
-    task_id: imported.task_id,
-    based_on_wiki_revision: plan.based_on_wiki_revision,
-    idempotency_key: "domain-concept-type-commit-v1",
-    patches: [{ ...requirement.patch_scaffold, content: "# 用户体验\n\n服务质量相关概念。\n", rationale: "Schema concept type." }],
-  })
-  await f.core.finalize({ task_id: imported.task_id })
-  const page = await readFile(path.join(f.workspace, "wiki", "concepts", "用户体验.md"), "utf8")
-  assert.match(page, /domain_type_kinds: \["concept"\]/)
-  assert.match(page, /domain_type_names: \["服务质量"\]/)
-})
-
-test("large domain schemas are summarized in batches and retrieved through bounded pages", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  const entityTypes = Array.from({ length: 120 }, (_, typeIndex) => ({
-    id: `entity_type_${typeIndex}`,
-    name: `实体类型 ${typeIndex}`,
-    description: `领域实体 ${typeIndex} ${"说明".repeat(80)}`,
-    aliases: [`类型别名 ${typeIndex}`, ...(typeIndex === 42 ? ["Business Entity"] : [])],
-    properties: Array.from({ length: 6 }, (_, propertyIndex) => ({
-      id: `property_${propertyIndex}`,
-      name: `属性 ${typeIndex}-${propertyIndex}`,
-      description: `属性定义 ${typeIndex}-${propertyIndex} ${"约束".repeat(60)}`,
-      valueType: "string",
-      required: propertyIndex === 0,
-      unique: propertyIndex === 0,
-    })),
-  }))
-  const schema = {
-    formatVersion: "1.0",
-    schemaId: "large-domain-schema",
-    schemaVersion: "1.0.0",
-    name: "大型领域模型",
-    description: "用于验证大型 Schema 的分页传输。",
-    language: "zh-CN",
-    policy: {
-      extractionMode: "compatible",
-      validationFailurePolicy: "drop-invalid",
-      allowUnknownEntityTypes: false,
-      allowUnknownRelationTypes: false,
-      allowUnknownProperties: false,
-    },
-    entityTypes,
-    relationTypes: [{
-      id: "relates_to",
-      name: "关联",
-      description: "实体之间的关联。",
-      aliases: [],
-      sourceEntityTypeIds: ["entity_type_0"],
-      targetEntityTypeIds: ["entity_type_1"],
-      properties: [],
-    }],
-  }
-  assert.equal(Buffer.byteLength(JSON.stringify(schema)) > 64 * 1024, true)
-  const imported = await f.core.importFiles({ files: [{ path: f.source }], options: { domain_schema: schema } })
-  const batch = await f.core.getBatch({ task_id: imported.task_id })
-  assert.equal(batch.workspace_context.domain_schema.inline, false)
-  assert.equal(batch.workspace_context.domain_schema.entityTypeCount, 120)
-  assert.equal(batch.workspace_context.domain_schema.entityTypes, undefined)
-  assert.deepEqual(batch.workspace_context.domain_schema_pagination, {
-    required: true,
-    cursor: 0,
-    tool: "llm_wiki_get_domain_schema",
-    recommended_mode: "search",
-    recommended_max_matches: 12,
-    fallback_modes: ["catalog", "types"],
-    full_scan_required: false,
-  })
-  assert.equal(batch.workspace_context.domain_schema_auto_selection.ready, true)
-  assert.equal(batch.workspace_context.domain_schema_auto_selection.selection.matched_entity_type_ids.includes("entity_type_42"), true)
-  assert.equal(batch.workspace_context.domain_schema_auto_selection.items.some((item) => item.kind === "entity_type" && item.entity_type.id === "entity_type_42"), true)
-  assert.equal(batch.workspace_context.domain_schema_auto_selection.payload_bytes <= 6 * 1024, true)
-  assert.equal(batch.analysis_schema, undefined)
-  assert.equal(batch.workspace_context.schema, undefined)
-  assert.equal(batch.batch_limits.complete_response_bytes < batch.batch_limits.complete_response_target_bytes, true)
-  assert.equal(Buffer.byteLength(JSON.stringify(batch, null, 2)) < 40 * 1024, true)
-  assert.match(batch.workspace_context.domain_extraction_instructions, /no Schema tool call is needed/)
-  assert.equal(batch.extraction_context_policy.retrieval_required, false)
-  assert.equal(batch.extraction_context_policy.default, "skip_retrieve_context")
-  assert.equal(batch.analysis_scaffold.schemaVersion, 1)
-  assert.equal(batch.analysis_scaffold.taskId, imported.task_id)
-  assert.equal(batch.analysis_scaffold.batchId, batch.batch_id)
-  assert.deepEqual(batch.analysis_scaffold.reviewItems, [])
-
-  const selected = await f.core.getDomainSchema({
-    task_id: imported.task_id,
-    mode: "search",
-    queries: ["实体类型 42"],
-    max_matches: 3,
-    max_chars: 20_000,
-  })
-  assert.equal(selected.selection.mode, "search")
-  assert.equal(selected.selection.full_schema_scan, false)
-  assert.equal(selected.selection.matched_entity_type_ids.includes("entity_type_42"), true)
-  assert.equal(selected.items.some((item) => item.kind === "entity_type" && item.entity_type.id === "entity_type_42"), true)
-  assert.equal(selected.items.filter((item) => item.kind === "entity_type").length <= 3, true)
-
-  const exact = await f.core.getDomainSchema({
-    task_id: imported.task_id,
-    mode: "types",
-    entity_type_ids: ["entity_type_42"],
-    relation_type_ids: ["relates_to"],
-    max_chars: 20_000,
-  })
-  assert.deepEqual(exact.selection.matched_relation_type_ids, ["relates_to"])
-  assert.equal(exact.items.some((item) => item.kind === "entity_property" && item.entity_type_id === "entity_type_42"), true)
-
-  const catalog = await f.core.getDomainSchema({ task_id: imported.task_id, mode: "catalog", max_chars: 20_000 })
-  assert.equal(catalog.selection.mode, "catalog")
-  assert.equal(catalog.items.some((item) => item.kind === "entity_type_summary"), true)
-  assert.equal(catalog.items.some((item) => item.kind === "entity_property"), false)
-
-  const items = []
-  let cursor = 0
-  do {
-    const page = await f.core.getDomainSchema({ task_id: imported.task_id, cursor, max_chars: 20_000 })
-    assert.equal(Buffer.byteLength(JSON.stringify(page)) < 30_000, true)
-    items.push(...page.items)
-    cursor = page.pagination.next_cursor
-  } while (cursor !== null)
-  assert.equal(items.filter((item) => item.kind === "entity_type").length, 120)
-  assert.equal(items.filter((item) => item.kind === "entity_property").length, 720)
-  assert.equal(items.filter((item) => item.kind === "relation_type").length, 1)
-})
-
-test("domain schema allows an empty relationTypes array", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  const schema = {
-    formatVersion: "1.0",
-    schemaId: "entity-only-schema",
-    schemaVersion: "1.0.0",
-    name: "仅实体领域模型",
-    description: "只约束实体抽取，不定义关系类型。",
-    language: "zh-CN",
-    policy: {
-      extractionMode: "strict",
-      validationFailurePolicy: "drop-invalid",
-      allowUnknownEntityTypes: false,
-      allowUnknownRelationTypes: false,
-      allowUnknownProperties: false,
-    },
-    entityTypes: [{
-      id: "business_entity",
-      name: "业务实体",
-      description: "一个业务实体。",
-      aliases: [],
-      properties: [],
-    }],
-    relationTypes: [],
-  }
-  const imported = await f.core.importFiles({ files: [{ path: f.source }], options: { domain_schema: schema } })
-  const batch = await f.core.getBatch({ task_id: imported.task_id })
-  assert.deepEqual(batch.workspace_context.domain_schema.relationTypes, [])
-  assert.equal(batch.workspace_context.domain_schema.entityTypes.length, 1)
-  assert.equal(batch.workspace_context.domain_schema_auto_selection.ready, false)
-  const chunk = batch.chunks[0]
-  const sourceRef = {
-    sourceId: chunk.sourceId,
-    chunkId: chunk.chunkId,
-    quote: "Business Entity is the canonical business object.",
-    locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
-  }
-  const committed = await f.core.commitAnalysis({
-    task_id: imported.task_id,
-    batch_id: batch.batch_id,
-    idempotency_key: "entity-only-domain-analysis",
-    analysis: {
-      schemaVersion: 1,
-      taskId: imported.task_id,
-      batchId: batch.batch_id,
-      sourceRefs: [sourceRef],
-      entities: [{ localId: "entity-1", name: "Business Entity", entityTypeId: "business_entity", properties: {}, sourceRefs: [0] }],
-      concepts: [],
-      claims: [],
-      relations: [{
-        localId: "relation-1",
-        name: "self relation",
-        content: "Business Entity is the canonical business object.",
-        sourceRefs: [0],
-      }],
-      contradictions: [],
-      candidatePages: [],
-      reviewItems: [],
-      batchSummary: "Entity-only extraction.",
-      unresolvedQuestions: [],
-    },
-  })
-  assert.equal(committed.accepted, true)
-  assert.equal(committed.domain_validation.dropped_relations, 0)
-  assert.equal(committed.domain_validation.relation_constraints_applied, false)
-  const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
-  assert.equal(plan.analysis_summary.relations.length, 1)
-  assert.equal(plan.analysis_summary.relations[0].name, "self relation")
-})
-
-test("domain schema accepts bounded multi-megabyte input and rejects payloads over 5 MiB", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  const makeSchema = (propertyCount, descriptionChars) => ({
-    formatVersion: "1.0",
-    schemaId: `sized-schema-${propertyCount}`,
-    schemaVersion: "1.0.0",
-    name: "容量边界模型",
-    description: "验证领域 Schema 总大小限制。",
-    language: "zh-CN",
-    policy: {
-      extractionMode: "strict",
-      validationFailurePolicy: "drop-invalid",
-      allowUnknownEntityTypes: false,
-      allowUnknownRelationTypes: false,
-      allowUnknownProperties: false,
-    },
-    entityTypes: [{
-      id: "large_entity",
-      name: "大型实体",
-      description: "包含大量属性定义。",
-      aliases: [],
-      properties: Array.from({ length: propertyCount }, (_, index) => ({
-        id: `property_${index}`,
-        name: `属性 ${index}`,
-        description: "x".repeat(descriptionChars),
-        valueType: "string",
-        required: false,
-        unique: false,
-      })),
-    }],
-    relationTypes: [{
-      id: "self_relation",
-      name: "自关联",
-      description: "大型实体之间的关联。",
-      aliases: [],
-      sourceEntityTypeIds: ["large_entity"],
-      targetEntityTypeIds: ["large_entity"],
-      properties: [],
-    }],
-  })
-
-  const acceptedSchema = makeSchema(450, 10_000)
-  const acceptedBytes = Buffer.byteLength(JSON.stringify(acceptedSchema))
-  assert.equal(acceptedBytes > 4 * 1024 * 1024, true)
-  assert.equal(acceptedBytes < 5 * 1024 * 1024, true)
-  const imported = await f.core.importFiles({ files: [{ path: f.source }], options: { domain_schema: acceptedSchema } })
-  const batch = await f.core.getBatch({ task_id: imported.task_id })
-  assert.equal(batch.workspace_context.domain_schema.inline, false)
-  assert.equal(batch.workspace_context.domain_schema.totalBytes >= acceptedBytes, true)
-  assert.equal(batch.workspace_context.domain_schema.totalBytes < 5 * 1024 * 1024, true)
-  const chunk = batch.chunks[0]
-  const sourceRef = {
-    sourceId: chunk.sourceId,
-    chunkId: chunk.chunkId,
-    quote: "Business Entity is the canonical business object.",
-    locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset },
-  }
-  await f.core.commitAnalysis({
-    task_id: imported.task_id,
-    batch_id: batch.batch_id,
-    idempotency_key: "large-domain-schema-analysis-v1",
-    analysis: {
-      schemaVersion: 1,
-      taskId: imported.task_id,
-      batchId: batch.batch_id,
-      sourceRefs: [sourceRef],
-      entities: [{ localId: "large-entity-1", name: "Business Entity", entityTypeId: "large_entity", properties: {}, sourceRefs: [0] }],
-      concepts: [], claims: [], relations: [], contradictions: [], candidatePages: [], reviewItems: [],
-      batchSummary: "Large domain Schema page-plan regression.",
-      unresolvedQuestions: [],
-    },
-  })
-  const plan = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 20_000 })
-  assert.equal(plan.domain_schema.schemaId, acceptedSchema.schemaId)
-  assert.equal(plan.domain_schema.sizeBytes >= acceptedBytes, true)
-  assert.equal(plan.domain_schema.included, false)
-  assert.equal(plan.domain_schema.requiredForPagePlanning, false)
-  assert.equal(plan.domain_schema.entityTypes, undefined)
-  assert.equal(plan.domain_schema_pagination, null)
-  assert.equal(Buffer.byteLength(JSON.stringify(plan)) < 40_000, true)
-
-  const oversizedSchema = makeSchema(550, 10_000)
-  assert.equal(Buffer.byteLength(JSON.stringify(oversizedSchema)) > 5 * 1024 * 1024, true)
-  await assert.rejects(
-    () => f.core.importFiles({ files: [{ path: f.source }], options: { domain_schema: oversizedSchema } }),
-    (error) => error instanceof LlmWikiError && error.code === "INVALID_DOMAIN_SCHEMA" && error.message.includes("5242880"),
-  )
-})
-
-test("invalid domain schema is rejected before a task is created", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  await assert.rejects(
-    () => f.core.importFiles({
-      files: [{ path: f.source }],
-      options: { domain_schema: { formatVersion: "1.0", schemaId: "broken" } },
-    }),
-    (error) => error instanceof LlmWikiError && error.code === "INVALID_DOMAIN_SCHEMA",
-  )
-  assert.equal((await f.core.listTasks()).tasks.length, 0)
-})
 
 test("real embedding recall is cached and endpoint failures degrade without failing retrieval", async (t) => {
   const f = await fixture()
@@ -1353,6 +839,8 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
     enabled: true,
     execution_mode: "coordinator-owned-parallel-drafters",
     fallback_mode: "serial-writer-only",
+    writer_launch_policy: "after-staged-drafter-receipt",
+    writer_normal_mode: "staged-receipt-commit-only",
     max_drafters: 4,
     max_paths_per_shard: 6,
     minimum_paths: 4,
@@ -1439,6 +927,9 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(leasedStatus.wiki_projection.page_plan_next_cursor, null)
   assert.deepEqual(leasedStatus.next_action, {
     tool: "llm_wiki_commit_pages",
+    action_owner: "writer",
+    delegate_to: "llm-wiki-writer",
+    execution_mode: "legacy-plan-compatibility",
     arguments: {
       task_id: imported.task_id,
       writer_id: "wiki-writer-1",
@@ -1720,9 +1211,11 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
   assert.equal(committed.wiki_projection.ready, true)
   assert.equal(committed.wiki_projection.unprojected_batches, 4)
   assert.equal(committed.next_action.tool, "llm_wiki_get_page_plan_context")
-  assert.equal(committed.writer_next_action.tool, "llm_wiki_get_page_plan_context")
+  assert.equal(committed.next_action.action_owner, "coordinator")
+  assert.equal(committed.writer_next_action, null)
+  assert.equal(committed.coordinator_next_action.tool, "llm_wiki_get_page_plan_context")
   assert.equal(committed.next_action.arguments.view, "manifest")
-  assert.equal(committed.writer_next_action.arguments.view, "manifest")
+  assert.equal(committed.coordinator_next_action.arguments.view, "manifest")
 
   const second = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 40_000 })
   assert.equal(second.projection.batch_ids.length, 4)
@@ -1801,6 +1294,8 @@ test("compatibility projection redirects to the semantic Writer and final commit
   assert.equal(projectedManifest.parallel_drafting.same_path_requirements_are_indivisible, true)
   assert.equal(projectedManifest.parallel_drafting.execution_mode, "coordinator-owned-parallel-drafters")
   assert.equal(projectedManifest.parallel_drafting.fallback_mode, "serial-writer-only")
+  assert.equal(projectedManifest.parallel_drafting.writer_launch_policy, "after-staged-drafter-receipt")
+  assert.equal(projectedManifest.parallel_drafting.writer_normal_mode, "staged-receipt-commit-only")
   assert.equal(projectedManifest.parallel_drafting.sole_committer, "wiki-writer-1")
   assert.equal(projected.projection.mode, "incremental")
   assert.equal(projected.page_plan_complete, true)
@@ -2349,6 +1844,8 @@ test("page drafters stage receipt-only shards and the Writer commits them server
     max_chars: 40_000,
   })
   const action = manifest.draft_manifest.draft_actions[0]
+  assert.equal(action.action_owner, "coordinator")
+  assert.equal(action.delegate_to, "llm-wiki-page-drafter")
   const shard = await f.core.getPagePlanContext(action.arguments)
   assert.equal(shard.draft_shard_complete, true)
   assert.equal(shard.draft_context_limits.max_response_chars, 40_000)
@@ -2369,6 +1866,8 @@ test("page drafters stage receipt-only shards and the Writer commits them server
   assert.equal(staged.accepted, true)
   assert.equal(staged.main_agent_payload, "receipt-only")
   assert.equal(staged.patches, undefined)
+  assert.equal(staged.next_action.action_owner, "writer")
+  assert.equal(staged.next_action.delegate_to, "llm-wiki-writer")
   const stagedStatus = await f.core.getStagedPageDrafts({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
@@ -2377,6 +1876,7 @@ test("page drafters stage receipt-only shards and the Writer commits them server
   })
   assert.equal(stagedStatus.ready_for_server_commit, true)
   assert.equal(stagedStatus.staged[0].draft_hash, staged.draft_hash)
+  assert.equal(stagedStatus.next_action.action_owner, "writer")
   const committed = await f.core.commitPages({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
@@ -2390,6 +1890,8 @@ test("page drafters stage receipt-only shards and the Writer commits them server
   assert.equal(committed.accepted, true)
   assert.deepEqual(committed.committed_staged_draft_shard_ids, [shard.shard.shard_id])
   assert.equal(committed.main_agent_payload, "receipt-only")
+  assert.equal(committed.next_action.action_owner, committed.projection.pending_draft_shards > 0 ? "coordinator" : "writer")
+  assert.equal(committed.writer_next_action, null)
   const after = await f.core.getStagedPageDrafts({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",

@@ -56,8 +56,8 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(skill, /Never claim that MCP is "unreliable across\s+turns"/)
   assert.match(skill, /running_worker_ids/)
   assert.match(skill, /Never say "both leases active, waiting\s+for the other Agent"/)
-  assert.match(skill, /mode\s+`"search"`/)
-  assert.match(skill, /domain_schema_auto_selection\.ready/)
+  assert.match(skill, /level\s+`"domains"`/)
+  assert.match(skill, /progressive-directory-v2/)
   assert.match(skill, /Skip\s+`llm_wiki_retrieve_context` by default/)
   assert.match(skill, /do not call `llm_wiki_status` inside this\s+worker/)
   assert.match(skill, /Start by copying `analysis_scaffold`/)
@@ -66,28 +66,33 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(extractor, /cite `evidence_index` values directly/)
   assert.match(extractor, /including `batch_count: 1`/)
   assert.match(skill, /at most two `commit_analysis` attempts for each batch/)
-  assert.match(writer, /view: "manifest"/)
-  assert.match(writer, /hard maximum is 50 patches per call/)
-  assert.match(writer, /Do not collect all manifest\s+shards/s)
-  assert.match(writer, /accepted wave is durable/i)
-  assert.match(writer, /currently six/)
-  assert.match(writer, /300–1,200 body characters/)
-  assert.match(writer, /server-side shard manifest/)
+  assert.match(writer, /Normal mode: staged receipts only/)
+  assert.match(writer, /never launches or asks to\s+launch a Drafter/)
+  assert.match(writer, /waiting_for_drafter_receipts/)
+  assert.match(writer, /After one accepted staged wave, stop/)
+  assert.match(writer, /action_owner: "coordinator"/)
+  assert.match(writer, /300–1,200 characters/)
   assert.match(writer, /stable server-side Wiki committer/)
-  assert.match(writer, /main coordinator launches path-disjoint/)
+  assert.match(writer, /main coordinator owns the\s+projection manifest/)
   assert.match(skill, /incremental projection leases at most eight batches/)
   assert.match(skill, /coordinator projection loop uses only\s+`llm_wiki_get_page_plan_context`/)
   assert.match(skill, /must never call\s+`llm_wiki_get_staged_page_drafts` or `llm_wiki_commit_pages`/)
   assert.match(writer, /`patches: \[\]` is the required staged-commit form/)
-  assert.match(writer, /`llm_wiki_apply_projection` for compatibility/)
-  assert.match(writer, /stable Wiki Writer and only committer/)
+  assert.match(skill, /`llm_wiki_apply_projection`\s+is only a compatibility redirect/)
+  assert.match(writer, /stable Wiki committer/)
   assert.match(writer, /^disallowedTools: Agent,/m)
+  assert.match(writer, /explicit-serial-writer-fallback-only/)
+  assert.match(writer, /Never import or extract sources, launch Agents, coordinate Drafters/)
   assert.match(skill, /at most four concurrent/)
   assert.match(skill, /background subagents cannot reliably spawn nested subagents/)
   assert.match(skill, /path is indivisible.*requirement sharing\s+`patch_scaffold\.path`/s)
   assert.match(skill, /parallel draft generation must\s+never become parallel commits/)
   assert.match(skill, /must launch project Agent\s+`llm-wiki-page-drafter`/)
   assert.match(skill, /coordinator-owned-parallel-drafters/)
+  assert.match(skill, /Launch the stable `llm-wiki-writer` only\s+after at least one Drafter stages a shard/)
+  assert.match(skill, /A Writer launched without receipt IDs must return\s+`waiting_for_drafter_receipts`/)
+  assert.match(skill, /Do not pass a manifest or\s+`draft-shard` action to that Writer/)
+  assert.doesNotMatch(skill, /inspect `writer_next_action`/)
   assert.match(skill, /Never generate an oversized patch set and split it afterward/)
   assert.match(skill, /Do not traverse every manifest\s+shard before drafting/)
   assert.match(skill, /Background-agent priority \(mandatory\)/)
@@ -121,6 +126,11 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
   assert.equal(names.includes("llm_wiki_chat"), false)
   assert.equal(new Set(names).size, names.length)
   assert.match(TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_import_files").description, /background-agent-first extraction even when batch_count=1/)
+  const importOptions = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_import_files").inputSchema.properties.options.properties
+  assert.equal(importOptions.domain_schema, undefined)
+  assert.match(importOptions.domain_schema_path.description, /progressive-directory-v2/)
+  const schemaProperties = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_get_domain_schema").inputSchema.properties
+  assert.deepEqual(Object.keys(schemaProperties).sort(), ["abe_file", "domain_folder", "level", "task_id"])
   for (const tool of TOOL_DEFINITIONS) {
     assert.match(tool.name, /^llm_wiki_[a-z_]+$/)
     assert.equal(typeof tool.description, "string")
@@ -261,6 +271,8 @@ test("premature page commits return the exact next page-plan cursor without disc
   assert.equal(response.structuredContent.mcp_connection_usable, true)
   assert.deepEqual(response.structuredContent.next_action, {
     tool: "llm_wiki_get_page_plan_context",
+    action_owner: "coordinator",
+    delegate_to: "llm-wiki-page-drafter",
     arguments: {
       task_id: "task-example",
       writer_id: "wiki-writer-1",
@@ -308,6 +320,8 @@ test("page validation rejection reports atomic whole-subset retry semantics", as
   })
   assert.deepEqual(response.structuredContent.next_action, {
     tool: "llm_wiki_commit_pages",
+    action_owner: "writer",
+    delegate_to: "llm-wiki-writer",
     arguments: {
       task_id: "task-example",
       writer_id: "wiki-writer-1",
@@ -344,6 +358,8 @@ test("unfinished server-side page shards recover without restarting or disconnec
   assert.equal(response.structuredContent.mcp_connection_usable, true)
   assert.deepEqual(response.structuredContent.next_action, {
     tool: "llm_wiki_get_page_plan_context",
+    action_owner: "coordinator",
+    delegate_to: "llm-wiki-page-drafter",
     arguments: {
       task_id: "task-example",
       writer_id: "wiki-writer-1",

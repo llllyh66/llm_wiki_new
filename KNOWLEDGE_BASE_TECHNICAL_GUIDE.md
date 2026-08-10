@@ -38,16 +38,16 @@ Agent 调用 `llm_wiki_import_files`：
 ```json
 {
   "options": {
-    "domain_schema_path": "./domain-schema.json",
+    "domain_schema_path": "./domain-schema",
     "target_language": "zh-CN",
     "max_batch_chars": 9000
   }
 }
 ```
 
-领域 Schema 会被校验并快照到任务中。之后即使外部 Schema 文件改变，本次任务仍使用原快照。
-
-新版本也支持目录型渐进式披露 Schema：根目录包含 `all_domains.json`，每个 Domain
+领域 Schema 目录会被校验并快照到任务中。之后即使外部 Schema 文件改变，
+本次任务仍使用原快照。只支持目录型渐进式披露 Schema：根目录包含
+`all_domains.json`，每个 Domain
 目录包含 `<domain>_domain.json` 和多个 ABE JSON。JSON 内部字段不做固定约束；Agent
 按 Domain → ABE → BE 逐级读取，最后一个 ABE 文件完整暴露给 Agent，并在实体/概念上
 提交 `schemaClassification` 与 JSON Pointer。Core 只验证目录链、快照哈希和 Pointer。
@@ -55,20 +55,19 @@ Agent 调用 `llm_wiki_import_files`：
 
 ### 2.2a 页面领域分类投影
 
-分析结果中的 `entities[].entityTypeId`（以及定义了可选 `conceptTypes` 时的
-`concepts[].conceptTypeId`）会在 page requirement 阶段解析为稳定的领域分类：
+分析结果中实体和概念的 `schemaClassification` 会在 page requirement
+阶段解析为稳定的 Domain → ABE → BE 分类：
 
 ```yaml
-domain_schema_id: "your-domain-schema"
-domain_schema_version: "1.0.0"
-domain_type_kinds: ["entity"]
-domain_type_ids: ["business_subject"]
-domain_type_names: ["业务主体"]
+schema_layout: "progressive-directory-v2"
+schema_classification_status: "classified"
+schema_domain_keys: ["customer"]
+schema_abe_keys: ["customer_management"]
+schema_be_keys: ["individual_customer"]
 ```
 
-Core 将同样的信息写入正文的“领域分类”章节。类型名称和 ID 来自任务 Schema
-快照，不来自 Writer 自由生成的字段；一个页面覆盖多个 requirement 时取合法类型
-的并集。没有 Schema 或没有对应类型的旧页面保持兼容。
+Core 将同样的信息写入正文的“领域分类”章节。分类路径来自任务 Schema
+快照，不来自 Writer 自由生成的字段。
 
 页面重写和 staged PagePatch 提交时，Core 会根据 `covers` 重新计算领域分类，
 避免 Writer 漏填、伪造或在跨 batch 合并时覆盖类型。已完成任务可使用
@@ -81,7 +80,7 @@ Core 将同样的信息写入正文的“领域分类”章节。类型名称和
 
 - 给 batch 加 worker 租约，避免多个 worker 抢同一批次；
 - 返回服务端生成的 exact evidence catalog；
-- 返回按当前 batch 内容筛选的 Schema 类型；
+- 返回 Domain Schema 快照身份和三级披露指令；
 - 对超大单行或旧 batch 尝试安全重分区；
 - 保留原始 batch ID、worker 租约和恢复信息。
 
@@ -97,11 +96,11 @@ Agent 根据 batch 和 Schema 生成 `AnalysisEnvelope`，然后调用 `llm_wiki
 2. 解析 `sourceRefs` 索引；
 3. 校验 sourceRef 是否指向真实 chunk；
 4. 校验 quote、locator 和证据质量；
-5. 校验实体类型、属性和关系类型；
+5. 校验实体和概念的 Domain → ABE → BE 文件链与 JSON Pointer；
 6. 校验 reviewItems、claims、relations 等集合结构；
 7. 通过后将分析结果写入 Analysis Store，并标记 batch 完成。
 
-Schema 的抽取策略是“抽取时约束”，不是先随意抽取后再静默丢弃。默认遇到不符合 Schema 的候选会返回可修正错误；只有显式设置 `accept_dropped_candidates=true` 才允许破坏性 drop-invalid 行为。
+Schema 分类不合法时，Core 在持久化前返回可修正错误，不会静默丢弃候选。
 
 ### 2.4 增量 Wiki 投影
 
@@ -129,10 +128,10 @@ draft-shard 的服务端响应硬上限约为 40K 字符；对既有超大页面
 2. 每个 page drafter 按自己的 `draft_action` 读取一个 `view="draft-shard"`，仅在分片内综合相关 batch 的实体、声明、关系、冲突和现有页面，然后调用 `llm_wiki_stage_page_drafts`；
 3. Writer 用 `llm_wiki_get_staged_page_drafts` 检查 receipt，并让 Core 通过 `staged_draft_shard_ids` 统一、原子提交；页面正文不经过主 Agent；
 4. 原始 chunk 只放在简洁的来源证据区；
-5. 每个小 wave 以 `projection_complete=false` 原子提交，并原样回传服务端给出的 `draft_shard_ids`；这些持久化 ID 证明 final Writer 确实处理了该 shard，不会因旧页已有 coverage 而跳过语义重写。成功后立即丢弃该分片上下文；所有 shard 处理后用空 patch 和 `projection_complete=true` 完成最终覆盖审计；
+5. 每个小 wave 以 `projection_complete=false` 原子提交，并回传服务端给出的 `committed_staged_draft_shard_ids`；这些持久化 ID 证明 final Writer 确实处理了该 shard，不会因旧页已有 coverage 而跳过语义重写。成功后立即丢弃该分片上下文；所有 shard 处理后用空 patch 和 `projection_complete=true` 完成最终覆盖审计；
 6. 最终 projection 完成后，由 Finalize 更新 `index.md` 和 `overview.md` 等全局汇总页。
 
-如果 Writer 在 shard 内的 cursor 处中断，恢复时使用同一 projection ID、shard ID 和准确 cursor；如果上下文已被压缩，直接按状态返回的未覆盖 shard 恢复，无需重放已接受页面。`llm_wiki_apply_projection` 只是兼容入口，会返回同一 compact manifest，不会自动渲染页面。
+如果 Drafter 在 shard cursor 处中断，协调器使用同一 projection ID、shard ID 和准确 cursor 重启该 Drafter；如果 Writer 在 receipt 提交处中断，则重放相同 receipt ID 与幂等键。上下文压缩后直接按状态返回的未覆盖 shard 恢复，无需重放已接受页面。`llm_wiki_apply_projection` 只是兼容入口，会返回同一 compact manifest，不会自动渲染页面。
 
 ### 2.6 Related 关系生成
 
@@ -174,7 +173,7 @@ Embedding 配置位于 `.llm-wiki/config.json` 的 `retrieval.embedding`，包�
 | --- | --- |
 | `llm_wiki_import_files` | 导入文件、解析并创建任务 |
 | `llm_wiki_get_batch` | 获取并租约一个抽取 batch |
-| `llm_wiki_get_domain_schema` | V2 按 Domain → ABE → BE 逐级读取完整 JSON；V1 保留分页、搜索和按类型读取 |
+| `llm_wiki_get_domain_schema` | 按 Domain → ABE → BE 逐级读取完整 JSON |
 | `llm_wiki_retrieve_context` | BM25 + Embedding + Wiki 多路召回 |
 | `llm_wiki_commit_analysis` | 校验并持久化一个 batch 的结构化分析 |
 | `llm_wiki_get_page_plan_context` | 返回服务端 manifest 或有界 draft shard，传统 plan cursor 仅作兼容 |
@@ -266,7 +265,7 @@ npm test
 
 ## 7. Claude 配置和基本用法
 
-项目根目录 `.mcp.json` 注册 MCP Server，`.claude/settings.json` 允许主 Agent、extractor 和 writer 使用 Skill 及 16 个 MCP 工具。
+项目根目录 `.mcp.json` 注册 MCP Server，`.claude/settings.json` 允许主 Agent、extractor、drafter 和 writer 使用 Skill 及 17 个 MCP 工具。
 
 首次配置后：
 
@@ -278,7 +277,7 @@ npm run build
 在 Claude 中确认项目 MCP 为 Connected，然后提出类似请求：
 
 ```text
-把这些文档构建成知识库。使用 ./domain-schema.json 作为领域 Schema，完成抽取、Wiki 页面、索引和最终总结。
+把这些文档构建成知识库。使用 ./domain-schema/ 作为领域 Schema，完成抽取、Wiki 页面、索引和最终总结。
 ```
 
 常用恢复方式：
@@ -286,7 +285,9 @@ npm run build
 1. 先调用 `llm_wiki_status`；
 2. 按返回的 `next_action` 继续；
 3. worker 消失时使用原 worker_id 重新启动；
-4. Writer 先取 manifest，再仅按当前 draft shard 的 cursor 读到 `next_cursor=null`；
+4. 主协调器先取 manifest，并把每个 draft-shard action 交给一个 page drafter；
+   Writer 只接收已暂存的 receipt ID。若 drafter 创建明确失败，才显式让 Writer
+   以 `explicit-serial-writer-fallback-only` 模式读取一个 shard；
 5. 原子提交失败时修复整个被拒绝 patch 集合后，用新的 idempotency key 重试；
 6. 代码更新后重新 `npm run build` 并重启 Claude MCP，避免继续使用旧 dist。
 

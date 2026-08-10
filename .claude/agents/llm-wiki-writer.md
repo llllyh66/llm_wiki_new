@@ -36,6 +36,8 @@ or projection readiness alone.
    `patches: []`, `projection_complete: false`, the supplied Wiki revision,
    and a unique idempotency key. Core loads and validates the temporary drafts
    server-side and removes them only after durable task state is written.
+   `patches: []` is the required staged-commit form; do not reconstruct or
+   request PagePatch bodies.
 4. After one accepted staged wave, stop and return the compact commit receipt.
    If the response contains a coordinator-owned manifest or `draft-shard`
    action, return it unchanged as `coordinator_next_action`; never execute it.

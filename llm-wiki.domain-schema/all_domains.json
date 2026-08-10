@@ -1,0 +1,9 @@
+{
+  "domains": [
+    {
+      "key": "business",
+      "name": "业务域",
+      "description": "业务主体、对象与事件所在的领域。"
+    }
+  ]
+}

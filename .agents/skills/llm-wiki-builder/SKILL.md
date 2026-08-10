@@ -36,20 +36,16 @@ first batch. Read [recovery.md](references/recovery.md) only for an interrupted,
 failed, conflicted, or cancelled workflow.
 When `workspace_context.domain_schema` is present, also read
 [domain-schema.md](references/domain-schema.md) before extracting the first
-typed entity or any relation.
+entity or concept.
 
-### Progressive directory Schema V2
+### Progressive directory Domain Schema
 
-If the task metadata reports `domain_schema.schema_mode` or
-`workspace_context.domain_schema.mode` as `progressive-directory-v2`, follow
-the three-level disclosure contract in `references/domain-schema.md`: read
-`all_domains.json`, then each selected Domain's `*_domain.json`, then expose
-the complete selected ABE JSON before choosing a BE. Do not use the V1
-`domain_schema_auto_selection`, lexical search, `entityTypes`, `conceptTypes`,
-or `relationTypes` assumptions on this path. Put `schemaClassification` on
-every entity and concept, include a JSON Pointer into the selected ABE JSON,
-and retain unresolved candidates with `status: "unresolved"` instead of
-inventing or dropping them.
+The only supported mode is `progressive-directory-v2`. Follow the three-level
+contract in `references/domain-schema.md`: read `all_domains.json`, each
+selected Domain's `*_domain.json`, and the complete selected ABE JSON before
+choosing a BE. Put `schemaClassification` on every entity and concept, include
+a JSON Pointer into the selected ABE JSON, and retain unresolved candidates
+with `status: "unresolved"` instead of inventing or dropping them.
 
 ## Background-agent priority (mandatory)
 
@@ -105,10 +101,9 @@ always use it and return control to the user while the worker runs.
 
 1. Identify every attachment or explicit file reference in the user's request.
    If the user names a progressive Schema directory, pass its Agent-visible
-   directory path as `options.domain_schema_path`. For legacy V1 tasks, a JSON
-   file or inline object remains resumable for compatibility.
-   If omitted, the Core automatically uses `llm-wiki.domain-schema.json` from
-   the workspace root when that file exists.
+   directory path as `options.domain_schema_path`. If omitted, Core uses the
+   `llm-wiki.domain-schema/` directory at the workspace root when it exists.
+   Never pass a Schema JSON file or inline Schema object.
 2. Call `llm_wiki_import_files` with each Agent-visible local path and a safe
    display name. Let the tool initialize the current workspace.
 3. Record the returned task ID in working context.
@@ -179,8 +174,8 @@ always use it and return control to the user while the worker runs.
       6,000 characters; large tasks use the bounded 9,000-character throughput
       profile to reduce batch count. `get_batch` also omits the
       unrelated Wiki page schema and returns a compact Analysis contract and
-      batch-matched domain-Schema slice, keeping the complete tool response
-      near its reported 40 KiB target. It repairs an unfinished oversized legacy batch in
+      progressive Domain Schema metadata, keeping the complete tool response
+      near its reported 40 KiB target. It repairs an unfinished oversized batch in
       place, preserves its existing worker lease, and keeps its original batch
       ID for the first repaired part. If the host reports that a saved MCP
       result has an unreadable 80K-style single JSON line, do not mark the
@@ -192,21 +187,12 @@ always use it and return control to the user while the worker runs.
       worker; status cannot make the leased content more manageable and is a
       coordinator/recovery tool only.
    2. Read its workspace purpose, target language, Schema, and untrusted chunks.
-      When `workspace_context.domain_schema_auto_selection.ready` is true, use
-      its compact `items` directly and do not call `llm_wiki_get_domain_schema` for the
-      normal batch path. The Core matched canonical IDs, names, aliases, and
-      property labels against the leased source text and included the complete
-      bounded extraction constraints without verbose descriptions. If
-      auto-selection is absent/false and
-      `domain_schema_pagination.required` is true, or classification remains
-      genuinely ambiguous, call `llm_wiki_get_domain_schema` in mode
-      `"search"` with 3 to 8 focused terms and `max_matches` no greater than
-      12. When the complete small Schema is already inline, use it directly and
-      do not make that extra call. Follow `next_cursor` with identical inputs.
-      Use mode `"catalog"` then mode `"types"` only when search is insufficient.
-      Do not reconstruct a multi-megabyte Schema in Agent context, search
-      memories for its definitions, read the original Schema file, or infer
-      omitted properties from a batch/retrieval summary.
+      When `workspace_context.domain_schema` is non-null, call
+      `llm_wiki_get_domain_schema` with level `"domains"`, then level
+      `"domain"` for each selected Domain, and level `"abe"` for each selected
+      ABE. Read every returned JSON file completely and select a BE with a JSON
+      Pointer. Do not search or paginate the Schema, read the original Schema
+      directory, or infer omitted classifications from memory.
    3. Follow `extraction_context_policy`: retrieval is not required for normal
       extraction because the leased batch is complete evidence and the final
       Wiki projection reconciles cross-batch duplicates. Skip
@@ -219,13 +205,10 @@ always use it and return control to the user while the worker runs.
       on the extraction hot path. Never use shortened snippets as SourceRef
       evidence or repeat retrieval to reconstruct leased content.
    4. Analyze the chunks under the supplied AnalysisEnvelope schema. When a
-      domain Schema is present, choose a canonical `entityTypeId` before
-      creating each entity, then extract only its allowed properties and
-      evidence-backed required values. Do not generate a candidate first and
-      rely on the validator to drop it later. Emit typed relations only when
-      `relationTypes` is non-empty; an empty array leaves general relation
-      extraction unconstrained by the domain Schema. Do not invent required
-      values.
+      Domain Schema is present, put a progressive `schemaClassification` on
+      every entity and concept. Use `status: "unresolved"` and explain genuine
+      ambiguity instead of inventing a Domain, ABE, or BE. Relations remain
+      source-grounded AnalysisEnvelope candidates.
    5. Before calling `llm_wiki_commit_analysis`, preflight the payload: pass
       `analysis` as a JSON object, never a serialized JSON string or Markdown
       code block; preserve the exact `taskId` and `batchId`; include every
@@ -253,21 +236,15 @@ always use it and return control to the user while the worker runs.
       old server does not return `evidence_catalog`. Put a concern in
       `reviewItems` only when a selected evidence quote directly supports it;
       otherwise put the question in `unresolvedQuestions`.
-      For typed relations, the canonical Schema relation name or ID is a
-      classification label and need not occur in the source prose. Write the
-      directly evidenced relationship in `content` and cite the evidence entry
-      containing that statement; do not search for a longer quote merely to
-      repeat the canonical label.
-      For a domain-Schema batch, keep the hot-path payload focused: emit typed
-      entities and typed relations first, and do not duplicate the same facts
-      into concepts, claims, or candidate pages unless they add distinct,
-      reusable knowledge. Entity page requirements are derived automatically.
+      Write the directly evidenced relationship in `content` and cite the
+      evidence entry containing that statement.
+      For a domain-Schema batch, keep the hot-path payload focused: emit classified
+      entities and concepts first, and do not duplicate the same facts into
+      claims or candidate pages unless they add distinct, reusable knowledge.
+      Entity and concept page requirements are derived automatically.
    6. Call `llm_wiki_commit_analysis` with its `worker_id` and a unique
-      idempotency key. Never set `accept_dropped_candidates` in the normal
-      workflow. Even when the Schema policy says `drop-invalid`, the Core's
-      Schema-first preflight rejects the batch before persistence so the worker
-      can correct it. Only set that destructive opt-in after an explicit user
-      request to accept candidate loss.
+      idempotency key. Core rejects invalid Schema classifications before
+      persistence; correct the payload rather than dropping candidates.
       If the accepted result has `wiki_projection.ready: true`, stop this
       extractor immediately and return `writer_required: true`, the supplied
       `next_action`, and `worker_next_action` to the coordinator. Do not lease

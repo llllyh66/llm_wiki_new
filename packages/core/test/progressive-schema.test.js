@@ -41,13 +41,16 @@ test("progressive directory Schema snapshots files and discloses Domain, ABE, th
 
   const batch = await core.getBatch({ task_id: imported.task_id, worker_id: "progressive-test-worker" })
   assert.equal(batch.workspace_context.domain_schema.mode, PROGRESSIVE_SCHEMA_MODE)
-  assert.equal(batch.workspace_context.domain_schema_pagination.full_file_exposure, true)
+  assert.equal(batch.workspace_context.domain_schema_disclosure.fullFileExposure, true)
+  assert.equal(batch.workspace_context.domain_schema_auto_selection, undefined)
+  assert.equal(batch.workspace_context.domain_schema_pagination, undefined)
+  assert.equal(batch.extraction_hot_path.schema_call_required, true)
   const chunk = batch.chunks[0]
   const committed = await core.commitAnalysis({
     task_id: imported.task_id,
     batch_id: batch.batch_id,
     worker_id: batch.worker_id,
-    idempotency_key: "progressive-analysis-v1",
+    idempotency_key: "progressive-analysis-v2",
     analysis: {
       ...batch.analysis_scaffold,
       sourceRefs: [{ sourceId: chunk.sourceId, chunkId: chunk.chunkId, quote: "张三是个人客户。", locator: { headingPath: chunk.headingPath, startOffset: chunk.startOffset, endOffset: chunk.endOffset } }],
@@ -90,6 +93,8 @@ test("progressive directory Schema snapshots files and discloses Domain, ABE, th
   })
   assert.match(page, /Domain：客户域.*ABE：客户管理.*BE：个人客户/u)
   assert.match(page, /schema_layout: "progressive-directory-v2"/u)
+  assert.match(page, /schema_classification_kinds: \["entity"\]/u)
+  assert.doesNotMatch(page, /domain_type_(?:kinds|ids|names)/u)
 })
 
 test("progressive disclosure accepts an ABE larger than the old 80 KiB guard and keeps it whole", async (t) => {
@@ -122,4 +127,69 @@ test("progressive disclosure accepts an ABE larger than the old 80 KiB guard and
   assert.equal(disclosed.full_file_exposed, true)
   assert.deepEqual(disclosed.content, abe)
   assert.equal(disclosed.bytes > 80 * 1024, true)
+})
+
+test("fixed-object and inline Domain Schemas are rejected; only progressive directories are accepted", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-progressive-only-"))
+  const workspace = path.join(root, "workspace")
+  const incoming = path.join(root, "incoming")
+  await mkdir(workspace, { recursive: true })
+  await mkdir(incoming, { recursive: true })
+  const source = path.join(incoming, "record.md")
+  await writeFile(source, "# Record\n\nOne grounded fact.\n")
+  const fixedSchema = path.join(root, "fixed-schema.json")
+  await writeFile(fixedSchema, JSON.stringify({ formatVersion: "1.0", entityTypes: [] }))
+  const core = await LlmWikiCore.open(workspace)
+  t.after(() => rm(root, { recursive: true, force: true }))
+
+  await assert.rejects(
+    () => core.importFiles({ files: [{ path: source }], options: { domain_schema: { formatVersion: "1.0", entityTypes: [] } } }),
+    (error) => error?.code === "INVALID_DOMAIN_SCHEMA" && /Inline domain Schemas are not supported/u.test(error.message),
+  )
+  await assert.rejects(
+    () => core.importFiles({ files: [{ path: source }], options: { domain_schema_path: fixedSchema } }),
+    (error) => error?.code === "INVALID_DOMAIN_SCHEMA" && /must point to a regular progressive-directory-v2/u.test(error.message),
+  )
+})
+
+test("progressive disclosure rejects removed fixed-object query arguments", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-progressive-arguments-"))
+  const workspace = path.join(root, "workspace")
+  const schema = path.join(root, "schema")
+  const incoming = path.join(root, "incoming")
+  await mkdir(path.join(schema, "customer"), { recursive: true })
+  await mkdir(workspace, { recursive: true })
+  await mkdir(incoming, { recursive: true })
+  await writeFile(path.join(schema, "all_domains.json"), JSON.stringify({ domains: [{ key: "customer" }] }))
+  await writeFile(path.join(schema, "customer", "customer_domain.json"), JSON.stringify({ abes: [{ key: "customer_management" }] }))
+  await writeFile(path.join(schema, "customer", "customer_management.json"), JSON.stringify({ businessEntities: [{ id: "customer" }] }))
+  const source = path.join(incoming, "record.md")
+  await writeFile(source, "# Customer\n\nOne customer.\n")
+  const core = await LlmWikiCore.open(workspace)
+  t.after(() => rm(root, { recursive: true, force: true }))
+
+  const imported = await core.importFiles({ files: [{ path: source }], options: { domain_schema_path: schema } })
+  await assert.rejects(
+    () => core.getDomainSchema({ task_id: imported.task_id, mode: "search", queries: ["customer"] }),
+    (error) => error?.code === "INVALID_INPUT" && /Fixed-object Domain Schema arguments were removed/u.test(error.message),
+  )
+})
+
+test("workspace default Domain Schema is the llm-wiki.domain-schema directory", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-progressive-default-"))
+  const workspace = path.join(root, "workspace")
+  const schema = path.join(workspace, "llm-wiki.domain-schema")
+  const incoming = path.join(root, "incoming")
+  await mkdir(path.join(schema, "business"), { recursive: true })
+  await mkdir(incoming, { recursive: true })
+  await writeFile(path.join(schema, "all_domains.json"), JSON.stringify({ domains: [{ key: "business" }] }))
+  await writeFile(path.join(schema, "business", "business_domain.json"), JSON.stringify({ abes: [{ key: "operations" }] }))
+  await writeFile(path.join(schema, "business", "operations.json"), JSON.stringify({ businessEntities: [{ id: "operation" }] }))
+  const source = path.join(incoming, "record.md")
+  await writeFile(source, "# Operation\n\nOne operation.\n")
+  const core = await LlmWikiCore.open(workspace)
+  t.after(() => rm(root, { recursive: true, force: true }))
+
+  const imported = await core.importFiles({ files: [{ path: source }] })
+  assert.equal(imported.domain_schema.schema_mode, PROGRESSIVE_SCHEMA_MODE)
 })

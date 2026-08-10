@@ -2,12 +2,12 @@
 
 The project root `.mcp.json` starts the Headless `llm-wiki` STDIO MCP server.
 It resolves the executable and workspace from `CLAUDE_PROJECT_DIR` and marks
-the small 16-tool server as `alwaysLoad`, so changing the shell working
+the small 17-tool server as `alwaysLoad`, so changing the shell working
 directory or deferred tool discovery cannot detach the workflow. Claude Code
 asks for project-server trust the first time it reads this file.
 
 `.claude/settings.json` approves the project `llm-wiki` server, every tool from
-that server (both server-wide and all 16 explicit tool names), the builder
+that server (both server-wide and all 17 explicit tool names), the builder
 Skill, the named extractor/writer Agents, ToolSearch, all subagents, and
 read-only repository tools.
 It uses `dontAsk`, so background agents never pause for permission: tools not
@@ -37,7 +37,7 @@ llm-wiki: node packages/mcp-server/dist/index.js --workspace . - Connected
 ```
 
 Start Claude Code from the repository root, approve the project MCP server if
-prompted, and confirm `/mcp` reports `Connected` with 16 tools. Attach or
+prompted, and confirm `/mcp` reports `Connected` with 17 tools. Attach or
 reference documents, then ask:
 
 ```text
@@ -48,20 +48,19 @@ For imports with multiple batches, the coordinator verifies the imported task
 with one direct `llm_wiki_status` call, then starts up to four background
 `llm-wiki-extractor` agents using distinct worker leases. It does not create a
 throwaway probe Agent or manage a Team. Each extractor invocation processes a
-bounded quantum of up to three batches and persists every batch independently;
+bounded quantum of up to six batches and persists every batch independently;
 the coordinator then starts the next bounded invocation in that slot. This
 reduces repeated Agent startup and Skill-loading overhead without depending on
 one long-lived subagent across user turns. Each project agent explicitly reuses the parent
 `llm-wiki` MCP connection and uses a denylist for shell, writes, network, and
 nested agents; it does not use a fragile MCP wildcard as its complete tool
-allowlist. The agent runs in `dontAsk` mode. One
-`llm-wiki-writer` agent calls the deterministic fast projection tool after four
-new batches or a 30-second debounce, while later extraction continues. A fast
-projection consumes up to 32 batches and one Writer invocation drains up to six
-ready projections without per-page Agent drafting, page-plan pagination, an
-intermediate status call, or cooldown. Incremental
-pages remain provisional and excluded from retrieval until the writer completes
-the final all-batch reconciliation. The main Agent remains responsive for
+allowlist. The agent runs in `dontAsk` mode. After four new batches or a
+30-second debounce, the main coordinator fetches a compact page manifest and
+launches path-disjoint `llm-wiki-page-drafter` agents. Each Drafter reads one
+bounded shard and stages it server-side. Only after a receipt exists does the
+coordinator launch `llm-wiki-writer`, which commits receipt IDs without reading
+page bodies. Incremental pages remain provisional and excluded from retrieval
+until final all-batch reconciliation. The main Agent remains responsive for
 questions: retrieval defaults to BM25 + embedding while the task is building,
 then adds the Wiki channel automatically after Finalize.
 Incremental pages are concise grounded drafts. Completed extraction drains any
@@ -72,7 +71,7 @@ stabilization commit instead of regenerating the entire Wiki.
 Every initial and replacement slot must use the exact project Agent type
 `llm-wiki-extractor`; a generic "Worker N", `general-purpose` Agent, or Team
 teammate does not apply that file's `mcpServers` field. The MCP server and all
-16 tools are marked always-load, with ToolSearch as a deferred-discovery
+17 tools are marked always-load, with ToolSearch as a deferred-discovery
 fallback. Claude Code 2.1.121 or later is recommended because that release adds
 the documented `alwaysLoad` behavior; fully restart Claude Code after updating.
 
@@ -90,16 +89,21 @@ classification or cross-batch ambiguity. User questions still use the normal
 multi-route retrieval defaults.
 
 An extractor stops and reports `writer_required: true` as soon as its accepted
-commit makes a projection ready. The coordinator starts `wiki-writer-1` before
-replacing that extractor. The default `llm_wiki_apply_projection` call returns
-a compact server-side draft manifest; it never renders or writes pages
-automatically. The Writer fetches one at-most-six-path shard, drafts it, and
-commits a durable bounded wave before loading the next shard. The manifest
-states the hard 50-patch limit before generation, so an oversized result is
-never generated and then repeated. Full affected page content and hashes
-appear only in their matching shard. This keeps large final reconciliation out
-of model context and lets recovery resume at the first uncovered shard after
-context compaction.
+commit makes a projection ready. The coordinator starts manifest/Drafter
+orchestration before replacing that extractor; it does not start
+`wiki-writer-1` until a Drafter receipt exists. The default
+`llm_wiki_apply_projection` call returns a compact server-side draft manifest;
+it never renders or writes pages automatically. Each coordinator-launched
+Drafter fetches one at-most-six-path shard and stages a receipt. The Writer
+commits one ready receipt wave, returns any coordinator-owned next action, and
+stops. The manifest states the hard 50-patch limit before generation, so an
+oversized result is never generated and then repeated. Full affected page
+content and hashes appear only in their matching shard. The Writer never
+launches Drafters and never fetches manifest/draft-shard context in normal
+mode. Serial Writer drafting is permitted only after a concrete Drafter
+creation failure and an explicit `explicit-serial-writer-fallback-only`
+handoff. This keeps large final reconciliation out of model context and lets
+recovery resume at the first uncovered shard after context compaction.
 
 At the beginning of a later user turn, the coordinator calls
 `llm_wiki_status`. Its `worker_recovery.leases` list contains each persisted

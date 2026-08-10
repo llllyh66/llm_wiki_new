@@ -1,0 +1,23 @@
+{
+  "abe": {
+    "key": "business_management",
+    "name": "业务管理"
+  },
+  "businessEntities": [
+    {
+      "key": "business_subject",
+      "name": "业务主体",
+      "description": "在业务活动中发起、拥有、管理或使用资源的个人、组织或账户。"
+    },
+    {
+      "key": "business_object",
+      "name": "业务对象",
+      "description": "被拥有、管理、订购、使用或处理的产品、资源、资产或实例。"
+    },
+    {
+      "key": "business_event",
+      "name": "业务事件",
+      "description": "订单、申请、交易、变更、支付、故障或其他具有时间和结果的业务活动。"
+    }
+  ]
+}

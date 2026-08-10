@@ -38,15 +38,8 @@ Never choose a different batch size from sibling workers. On
 `BATCH_LEASE_REQUIRED`, follow the returned `get_batch` action with this exact
 worker and batch ID, then retry the unchanged analysis and idempotency key.
 
-For a large domain Schema, use `get_batch.workspace_context.domain_schema_auto_selection`
-directly when `ready: true`; do not make a Schema tool call on that normal path.
-Use `llm_wiki_get_domain_schema` search only when auto-selection is not ready
-and `domain_schema_pagination.required` is true, or classification remains
-ambiguous. If a complete small Schema is already inline, use it directly.
-Never load a paginated full Schema or search memories.
-
-When `workspace_context.domain_schema.mode` is `progressive-directory-v2`, use
-the V2 path instead of the legacy instructions above: call
+When `workspace_context.domain_schema` is non-null, its mode is
+`progressive-directory-v2`. Call
 `llm_wiki_get_domain_schema` level `domains`, read the complete
 `all_domains.json`, then call level `domain` for each selected Domain, and
 finally call level `abe` for each selected ABE. The ABE response is the full
@@ -63,12 +56,11 @@ candidate `sourceRefs`. Do not retype quotes or use Read on the original source;
 the server already produced exact quotes and spreadsheet locators. Use
 `chunk.source_ref_templates` only as a legacy fallback when the evidence
 catalog is absent. Never reconstruct spreadsheet `sheetName` or `cellRange`.
-For a typed relation, place the directly evidenced statement in `content` and
-cite the evidence entry containing it. The canonical Schema relation name or
-ID is only a classification label and does not need to occur in the quote.
-For domain-Schema extraction, do not repeat the same typed facts in concepts,
-claims, and candidate pages unless they add distinct reusable knowledge;
-entity requirements are derived automatically.
+For a relation, place the directly evidenced statement in `content` and cite
+the evidence entry containing it. For Domain Schema extraction, do not repeat
+the same classified facts in claims and candidate pages unless they add
+distinct reusable knowledge; entity and concept requirements are derived
+automatically.
 After `get_batch` succeeds, do not call status. Skip retrieval by default; the
 batch is complete evidence and final projection performs cross-batch
 reconciliation. Only for explicit cross-batch or unresolved alias ambiguity,

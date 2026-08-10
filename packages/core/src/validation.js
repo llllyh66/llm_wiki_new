@@ -536,8 +536,8 @@ export function validatePagePatchShape(patch, limits) {
           fail("INVALID_PAGE_PATCH", `domainClassifications[${index}].${field} is invalid.`)
         }
       }
-      if (classification.schemaMode !== undefined && (typeof classification.schemaMode !== "string" || classification.schemaMode.length > 100)) {
-        fail("INVALID_PAGE_PATCH", `domainClassifications[${index}].schemaMode is invalid.`)
+      if (classification.schemaMode !== "progressive-directory-v2") {
+        fail("INVALID_PAGE_PATCH", `domainClassifications[${index}].schemaMode must be progressive-directory-v2.`)
       }
       if (classification.status !== undefined && !["classified", "unresolved"].includes(classification.status)) {
         fail("INVALID_PAGE_PATCH", `domainClassifications[${index}].status is invalid.`)
