@@ -8,6 +8,9 @@ await rm(new URL("../dist", import.meta.url), { recursive: true, force: true })
 await mkdir(new URL("../dist", import.meta.url), { recursive: true })
 await cp(new URL("../src", import.meta.url), new URL("../dist", import.meta.url), { recursive: true })
 await chmod(new URL("../dist/index.js", import.meta.url), 0o755)
+await chmod(new URL("../dist/http-worker.js", import.meta.url), 0o755)
+await chmod(new URL("../dist/http-supervisor.js", import.meta.url), 0o755)
+await chmod(new URL("../dist/ensure-daemon.js", import.meta.url), 0o755)
 
 let gitCommit = "unknown"
 try {

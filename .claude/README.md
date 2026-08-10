@@ -1,10 +1,14 @@
 # Claude Code integration
 
-The project root `.mcp.json` starts the Headless `llm-wiki` STDIO MCP server.
-It resolves the executable and workspace from `CLAUDE_PROJECT_DIR` and marks
-the small 17-tool server as `alwaysLoad`, so changing the shell working
-directory or deferred tool discovery cannot detach the workflow. Claude Code
-asks for project-server trust the first time it reads this file.
+The project root `.mcp.json` connects Claude Code to the Headless `llm-wiki`
+Streamable HTTP MCP server on loopback. A `SessionStart` command hook resolves
+the executable and workspace from `CLAUDE_PROJECT_DIR`, then idempotently starts
+a detached project-local supervisor. The supervisor restarts a crashed worker
+with exponential backoff; Claude Code 2.1.121+ automatically reconnects HTTP
+MCP sessions. The small 17-tool server remains `alwaysLoad`, so changing the
+shell working directory or deferred tool discovery cannot detach the workflow.
+Claude Code asks for project-server and hook trust the first time it reads the
+checked-in configuration.
 
 `.claude/settings.json` approves the project `llm-wiki` server, every tool from
 that server (both server-wide and all 17 explicit tool names), the builder
@@ -33,7 +37,7 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
 Expected MCP status:
 
 ```text
-llm-wiki: node packages/mcp-server/dist/index.js --workspace . - Connected
+llm-wiki: http://127.0.0.1:31982/mcp (HTTP) - Connected
 ```
 
 Start Claude Code from the repository root, approve the project MCP server if
@@ -73,13 +77,20 @@ Every initial and replacement slot must use the exact project Agent type
 teammate does not apply that file's `mcpServers` field. The MCP server and all
 17 tools are marked always-load, with ToolSearch as a deferred-discovery
 fallback. Claude Code 2.1.121 or later is recommended because that release adds
-the documented `alwaysLoad` behavior; fully restart Claude Code after updating.
+the documented `alwaysLoad` and HTTP reconnect behavior; fully restart Claude
+Code after updating. Each device starts its own daemon. If port 31982 is already
+in use on one device, set `LLM_WIKI_MCP_HTTP_PORT` before starting Claude; the
+same variable is expanded by both `.mcp.json` and the startup hook.
+After `npm run build`, the next `SessionStart` compares `dist/build-info.json`
+with `/health` and replaces an older daemon before Claude reconnects.
 
 The server enforces a total four-Agent pipeline budget (normally two
 extractors plus two page drafters while extraction overlaps), and its router
 returns `MCP_BUSY`/`TASK_BUSY` rather than allowing unbounded tool queues. For
 long runs, inspect `.llm-wiki/logs/mcp-runtime.jsonl` after a real transport
 error; it records build, memory, request, heartbeat, and shutdown events.
+Supervisor lifecycle and crash-restart events are written to
+`.llm-wiki/logs/mcp-daemon.log`.
 
 The extraction hot path does not invoke retrieval for every batch. `get_batch`
 returns only the immutable progressive Domain Schema snapshot identity and

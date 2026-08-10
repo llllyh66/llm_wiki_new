@@ -1,13 +1,141 @@
 import assert from "node:assert/strict"
+import { spawn } from "node:child_process"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
 import { fileURLToPath } from "node:url"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
+import { createProtocolServer } from "../src/protocol-server.js"
 
 const textResult = (result) => JSON.parse(result.content[0].text)
+
+test("protocol handler retries only bounded transient tool results", async () => {
+  let attempts = 0
+  const router = {
+    listTools: () => [{ name: "transient", description: "test", inputSchema: { type: "object" } }],
+    runtimeStats: () => ({}),
+    callMcp: async () => {
+      attempts += 1
+      if (attempts < 3) return mcpResult({
+        ok: false,
+        accepted: false,
+        error: { code: "WORKSPACE_LOCKED", retryable: true, details: { retry_after_ms: 1 } },
+      })
+      return mcpResult({ ok: true, attempts })
+    },
+  }
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+  const server = createProtocolServer(router, { maxRetries: 3, retryBaseMs: 1 })
+  const client = new Client({ name: "bounded-tool-retry-test", version: "1.0.0" })
+  await server.connect(serverTransport)
+  await client.connect(clientTransport)
+  const result = await client.callTool({ name: "transient", arguments: {} })
+  assert.equal(result.structuredContent.attempts, 3)
+  assert.equal(attempts, 3)
+  await client.close()
+  await server.close()
+
+  let validationAttempts = 0
+  const validationRouter = {
+    ...router,
+    callMcp: async () => {
+      validationAttempts += 1
+      return mcpResult({ ok: false, accepted: false, error: { code: "INVALID_INPUT", retryable: true } })
+    },
+  }
+  const [validationClientTransport, validationServerTransport] = InMemoryTransport.createLinkedPair()
+  const validationServer = createProtocolServer(validationRouter, { maxRetries: 3, retryBaseMs: 1 })
+  const validationClient = new Client({ name: "no-business-retry-test", version: "1.0.0" })
+  await validationServer.connect(validationServerTransport)
+  await validationClient.connect(validationClientTransport)
+  await validationClient.callTool({ name: "transient", arguments: {} })
+  assert.equal(validationAttempts, 1)
+  await validationClient.close()
+  await validationServer.close()
+})
+
+function mcpResult(data) {
+  return { content: [{ type: "text", text: JSON.stringify(data) }], structuredContent: data }
+}
+
+test("supervised HTTP MCP keeps idle sessions alive and accepts a new session after worker restart", async (t) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-http-supervisor-"))
+  const supervisorPath = fileURLToPath(new URL("../dist/http-supervisor.js", import.meta.url))
+  const port = await reservePort()
+  const supervisor = spawn(process.execPath, [supervisorPath, "--workspace", workspace, "--port", String(port)], {
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      LLM_WIKI_MCP_HTTP_KEEPALIVE_MS: "1000",
+      LLM_WIKI_MCP_KEEPALIVE_MS: "1000",
+      LLM_WIKI_MCP_KEEPALIVE_TIMEOUT_MS: "500",
+    },
+  })
+  let stderr = ""
+  supervisor.stderr.on("data", (chunk) => { stderr += String(chunk) })
+  t.after(async () => {
+    if (supervisor.exitCode === null) supervisor.kill("SIGTERM")
+    await Promise.race([
+      new Promise((resolve) => supervisor.once("exit", resolve)),
+      new Promise((resolve) => setTimeout(resolve, 3_000)),
+    ])
+    await rm(workspace, { recursive: true, force: true })
+  })
+
+  const initialHealth = await waitForHealth(port)
+  assert.equal(initialHealth.workspace, workspace)
+  const firstTransport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`))
+  const firstClient = new Client({ name: "llm-wiki-http-heartbeat-test", version: "1.0.0" })
+  await firstClient.connect(firstTransport)
+  await new Promise((resolve) => setTimeout(resolve, 2_200))
+  assert.equal((await firstClient.listTools()).tools.length, 17)
+  assert.match(stderr, /"event":"keepalive".*"transport":"http".*"status":"ok"/)
+
+  process.kill(initialHealth.pid, "SIGTERM")
+  const restartedHealth = await waitForHealth(port, (health) => health.pid !== initialHealth.pid)
+  assert.notEqual(restartedHealth.pid, initialHealth.pid)
+
+  const secondTransport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`))
+  const secondClient = new Client({ name: "llm-wiki-http-reconnect-test", version: "1.0.0" })
+  await secondClient.connect(secondTransport)
+  assert.equal((await secondClient.listTools()).tools.length, 17)
+  await secondClient.close()
+  await firstClient.close().catch(() => {})
+  assert.match(stderr, /"event":"worker-retry"/)
+})
+
+async function reservePort() {
+  const server = net.createServer()
+  await new Promise((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", resolve)
+  })
+  const address = server.address()
+  await new Promise((resolve) => server.close(resolve))
+  return address.port
+}
+
+async function waitForHealth(port, predicate = () => true, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/health`)
+      if (response.ok) {
+        const health = await response.json()
+        if (predicate(health)) return health
+      }
+    } catch {
+      // The worker can be between supervised restart attempts.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw new Error(`Timed out waiting for supervised MCP health on port ${port}`)
+}
 
 test("built MCP server remains usable across idle protocol heartbeats", async (t) => {
   const workspace = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-stdio-idle-"))
@@ -18,7 +146,7 @@ test("built MCP server remains usable across idle protocol heartbeats", async (t
     args: [serverPath, "--workspace", workspace],
     stderr: "pipe",
     env: {
-      // Production remains five minutes; the short test interval proves that
+      // Production uses one minute; the short test interval proves that
       // repeated server-initiated ping/pong traffic does not poison STDIO.
       LLM_WIKI_MCP_KEEPALIVE_MS: "1000",
       LLM_WIKI_MCP_KEEPALIVE_TIMEOUT_MS: "500",

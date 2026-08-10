@@ -6,7 +6,7 @@
 Codex 或 OpenCode 使用当前会话模型理解文档；不调用模型的 Core 负责
 原文归档、去重、任务恢复、引用校验、安全写入和检索索引。
 
-用户无需启动桌面应用、HTTP 服务或配置额外的模型 API Key。
+用户无需启动桌面应用、手工管理 HTTP 服务或配置额外的模型 API Key。
 
 ## 可以生成什么
 
@@ -106,9 +106,13 @@ cd /path/to/llm_wiki_new
 claude
 ```
 
-根目录的 `.mcp.json` 会使用 `CLAUDE_PROJECT_DIR` 锁定服务器脚本和工作区路径，
-并让这个 14 工具的服务器在会话期间保持加载。第一次打开项目时，Claude Code
-会请求批准项目 MCP，请确认批准。
+根目录的 `.mcp.json` 会连接项目本地的 Streamable HTTP MCP。
+`.claude/settings.json` 中的 `SessionStart` hook 使用 `CLAUDE_PROJECT_DIR`
+幂等启动 supervisor；worker 崩溃后 supervisor 指数退避重启，Claude Code
+2.1.121 及以上会自动重连 HTTP MCP。服务器共 17 个工具并保持
+`alwaysLoad`。这些配置会随仓库同步：每台设备都在自己的 clone 内启动
+localhost daemon，PID 和日志只写入该 clone 的 `.llm-wiki/`。第一次打开
+项目时，请批准项目 MCP 和 hook。
 
 ### 2. 检查 MCP
 
@@ -121,7 +125,7 @@ claude mcp list
 正常状态应为：
 
 ```text
-llm-wiki: node packages/mcp-server/dist/index.js --workspace . - Connected
+llm-wiki: http://127.0.0.1:31982/mcp (HTTP) - Connected
 ```
 
 进入 Claude Code 后执行：
@@ -468,20 +472,21 @@ npm run build
 npm test
 ```
 
-然后完全退出 Claude Code，从该项目根目录重新运行 `claude`，批准项目 MCP，
-并用 `/mcp` 确认 `llm-wiki` 为 `Connected` 且有 17 个工具。最新版包含连续
-`INVALID_ANALYSIS`、错误 SourceRef 和畸形重试后保持同一 STDIO 连接存活的
-回归测试。现在 17 个工具的所有异常都作为普通工具结果返回，不再进入
+然后完全退出 Claude Code，从该项目根目录重新运行 `claude`，批准项目 MCP 和 hook，
+并用 `/mcp` 确认 `llm-wiki` 为 `Connected` 且有 17 个工具。最新版包含空闲
+心跳、worker 崩溃重启和新 HTTP 会话恢复 17 个工具的回归测试。现在
+17 个工具的所有异常都作为普通工具结果返回，不再进入
 MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 `error`、`next_action` 和 `mcp_connection_usable: true`。Agent 应按
 `next_action` 修正或恢复，不需要执行 `/mcp`。
 
-若是在长时间没有工具调用、后台 Agent 仍在工作时断开，查看 MCP stderr：服务默认每
-5 分钟发送一次带 30 秒预算的标准 ping；心跳失败只记录日志，不会因为一次失败主动
-断开。`stdin-closed`、`stdout-closed` 或 `transport-closed` 表示宿主已经关闭了管道，
-需要让 Claude 重新启动 MCP。调试时可用环境变量
-`LLM_WIKI_MCP_KEEPALIVE_MS` 和 `LLM_WIKI_MCP_KEEPALIVE_TIMEOUT_MS` 缩短心跳周期，
-但生产环境建议保持默认值。
+若是在长时间没有工具调用、后台 Agent 仍在工作时断开，先查看
+`.llm-wiki/logs/mcp-daemon.log` 中的 `worker-exit`、`worker-retry` 和新
+`worker-start`，再查看 `.llm-wiki/logs/mcp-runtime.jsonl`。HTTP 每 10 秒
+发送 keep-alive frame，每 1 分钟发送标准 ping；心跳失败只记录日志。
+worker 退出后 supervisor 会自动拉起新 PID，Claude 会对 HTTP MCP 自动重连。
+默认端口 `31982` 冲突时，在该设备启动 Claude 前设置
+`LLM_WIKI_MCP_HTTP_PORT`。
 
 ### 已完成多个 batch，但没有生成 Wiki 页面
 

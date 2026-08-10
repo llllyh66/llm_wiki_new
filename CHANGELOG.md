@@ -1,5 +1,20 @@
 # 更新日志
 
+## [1.0.5.1] - 2026-08-10
+
+- Migrate the Claude Code project registration from non-reconnecting STDIO to
+  a loopback Streamable HTTP endpoint, while retaining STDIO for Codex and
+  OpenCode compatibility.
+- Add a portable `SessionStart` launcher and project-local supervisor. Every
+  clone/device starts its own daemon; a crashed worker restarts with bounded
+  exponential backoff and Claude Code performs native HTTP reconnection.
+- Send ten-second HTTP/SSE keep-alive frames, keep a bounded SSE replay window,
+  send one-minute protocol pings, and retry only transient `MCP_BUSY`,
+  `TASK_BUSY`, and `WORKSPACE_LOCKED`
+  results up to three times.
+- Add an end-to-end regression that verifies an idle HTTP session, worker PID
+  replacement, and a fresh 17-tool MCP session after restart.
+
 ## [V1.0.5] - 2026-08-10
 
 - Remove the fixed-object Domain Schema protocol, inline Schema input,

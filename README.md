@@ -73,16 +73,20 @@ requirements, so a Writer cannot invent or silently omit a classification.
 Existing pages can be backfilled by calling `llm_wiki_finalize` with
 `refresh_page_metadata: true`.
 
-No desktop application, separate HTTP server, project creation, Provider API
-key, or `raw/sources/` directory is required.
+No desktop application, manually managed service, project creation, Provider
+API key, or `raw/sources/` directory is required.
 
 For Claude Code, run `claude` from the repository root. The checked-in
-`.mcp.json` registers the server, and `.claude/skills/llm-wiki-builder` links to
-the canonical shared Skill. The checked-in `.claude/settings.json` pre-approves
-all `llm-wiki` MCP tools for the main and background agents and uses `dontAsk`
-for unattended extraction. Unrelated shell, write, and network tools remain
-unapproved. Approve project trust on first use, then restart Claude Code after
-changing these files.
+`.mcp.json` registers a loopback Streamable HTTP endpoint. A checked-in
+`SessionStart` hook idempotently starts a project-local supervisor, which
+restarts the MCP worker with exponential backoff after a crash. Claude Code
+2.1.121 or later then supplies native HTTP reconnect with exponential backoff.
+This setup is portable across devices: each clone starts its own localhost
+daemon and stores its PID and logs only under that clone's `.llm-wiki/`.
+`.claude/skills/llm-wiki-builder` links to the canonical shared Skill, while
+`.claude/settings.json` pre-approves all `llm-wiki` tools for the main and
+background agents and uses `dontAsk` for unattended extraction. Approve project
+trust on first use, then restart Claude Code after changing these files.
 
 Every initial and replacement extraction slot explicitly uses the named project
 Agent type `llm-wiki-extractor`. Generic "Worker N", `general-purpose`, and
@@ -163,9 +167,12 @@ frontmatter and body navigation cannot diverge.
 ## Architecture
 
 ```text
-Codex / OpenCode / Claude Code current model
+Codex / OpenCode current model
   -> .agents/skills/llm-wiki-builder/SKILL.md
   -> llm-wiki MCP over STDIO
+Claude Code current model
+  -> .claude/skills/llm-wiki-builder/SKILL.md
+  -> project-local supervised Streamable HTTP MCP
   -> packages/core (no model, UI, Tauri, or HTTP dependency)
   -> wiki/ and .llm-wiki/ in the current workspace
 ```
@@ -201,10 +208,15 @@ not accept an arbitrary workspace or project path. The only external paths it
 opens are files explicitly passed to `llm_wiki_import_files`; after a safe,
 streaming import, all later work uses the managed copy.
 
-The Claude Code registration uses `CLAUDE_PROJECT_DIR` rather than a mutable
+The Claude Code startup hook uses `CLAUDE_PROJECT_DIR` rather than a mutable
 shell working directory and keeps this bounded 17-tool server loaded for the
-session. MCP input/output budgets and paginated page-plan context prevent a
-single oversized request or response from closing the STDIO transport.
+session. Ten-second HTTP keep-alive frames, one-minute protocol pings, a
+bounded SSE replay window, a supervised worker, Claude's native HTTP reconnect,
+and bounded transient-tool retries protect long-running sessions. MCP
+input/output budgets and paginated page-plan context prevent a single oversized
+request or response from closing the transport. Set `LLM_WIKI_MCP_HTTP_PORT`
+before starting Claude when the default localhost port `31982` conflicts with
+another project.
 Every tool exception is returned as a normal result (`ok: false`,
 `accepted: false`, `error`, `next_action`, and `mcp_connection_usable: true`)
 instead of entering MCP's `isError` channel.

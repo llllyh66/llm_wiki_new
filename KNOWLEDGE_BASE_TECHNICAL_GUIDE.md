@@ -6,7 +6,7 @@
 
 ```text
 Claude / Codex / OpenCode
-        │  Skill + MCP STDIO
+        │  Skill + MCP（Claude: Streamable HTTP；Codex/OpenCode: STDIO）
         ▼
 MCP Server（packages/mcp-server）
         │  工具路由、错误封装、传输保护
@@ -193,7 +193,9 @@ Embedding 配置位于 `.llm-wiki/config.json` 的 `retrieval.embedding`，包�
 
 ## 5. MCP 稳定性和错误恢复
 
-MCP Server 是 STDIO 长连接适配器。工具业务错误不会使用 MCP `isError` 通道，而会返回结构化结果，例如：
+MCP Server 同时提供两种适配器：Claude Code 的项目配置使用受监控的
+loopback Streamable HTTP，Codex 和 OpenCode 保留 STDIO。两者共享同一 Core
+和工具路由。工具业务错误不会使用 MCP `isError` 通道，而会返回结构化结果，例如：
 
 ```json
 {
@@ -209,18 +211,25 @@ MCP Server 是 STDIO 长连接适配器。工具业务错误不会使用 MCP `is
 
 - 工具路由统一捕获 Core 异常；
 - MCP handler 最外层兜底；
-- `uncaughtException` 记录日志并优雅关闭当前协议；`unhandledRejection` 只记录并标记运行时 degraded，不会关闭共享 STDIO；
+- HTTP worker 的 `uncaughtException` 会让 worker 退出并由 supervisor 指数退避重启；`unhandledRejection` 只记录并标记 degraded；
 - 输入 12 MB、输出约 450 KiB、STDIO buffer 32 MB 的边界保护；工具元数据额外声明 80–120 KiB 的宿主结果建议；
 - 全局最多 8 个、单任务最多 4 个活动工具调用；超限返回 `MCP_BUSY`/`TASK_BUSY` 和 `retry_after_ms`，宿主取消的排队请求返回 `MCP_REQUEST_CANCELLED`；
 - Schema、analysis、batch、page-plan 和 draft-shard 缓存按条数与字节双重淘汰，避免大型任务通过重复快照耗尽 Node 堆；
 - `.llm-wiki/logs/mcp-runtime.jsonl` 持久化记录 request ID、字节数、活跃调用、内存、构建提交、心跳和退出原因；`dist/build-info.json` 用于确认实际运行构建；
 - 大结果使用分页而不是一次性返回；
-- 每 5 分钟发送一次标准协议 ping，且为 ping 设置独立的 30 秒超时；心跳定时器保持引用，避免 STDIO 空闲时进程被 Node 提前退出；
+- HTTP 每 10 秒发送 SSE keep-alive comment frame，每 1 分钟发送标准协议 ping；STDIO 也每 1 分钟 ping；
+- 项目 `SessionStart` hook 幂等拉起 supervisor，worker 崩溃后最多 5 秒退避重启；Claude Code 对 HTTP 连接原生自动重连；
+- 仅对 `MCP_BUSY`、`TASK_BUSY` 和 `WORKSPACE_LOCKED` 执行最多 3 次有界重试，业务校验错误不自动重放；
 - 监听 STDIO 的 `end`、`close` 和 `error`，对端退出时主动关闭协议并清理定时器，避免留下“进程仍在但 MCP 已死”的僵尸连接；
 - batch、page plan、worker lease 和任务状态持久化，可跨 turn 恢复；
 - 页面提交使用幂等键、revision 和目标文件 hash。
 
-如果仍然显示断开，应检查 MCP stderr 中的 `transport-error`、`protocol-error`、`uncaught-exception`、`unhandled-rejection`、`shutdown-requested` 和 `keepalive` 日志。`keepalive.status=failed` 只表示宿主没有及时回复 ping，不会单独关闭连接；若出现 `stdin-closed`、`stdout-closed` 或 `transport-closed`，说明宿主已经关闭了 STDIO 管道，需要由 Claude 重新启动 MCP 进程。默认心跳为 5 分钟，可临时用 `LLM_WIKI_MCP_KEEPALIVE_MS` 和 `LLM_WIKI_MCP_KEEPALIVE_TIMEOUT_MS` 缩短诊断周期，生产环境不建议设置为低于 1 分钟。
+如果 Claude 仍显示断开，先检查 `.llm-wiki/logs/mcp-daemon.log` 中的
+`worker-exit`、`worker-retry` 和新 `worker-start`，再检查
+`.llm-wiki/logs/mcp-runtime.jsonl` 中的 `transport-error`、`protocol-error`、
+`uncaught-exception`、`unhandled-rejection` 和 `keepalive`。`keepalive.status=failed`
+只是当次 pong 超时，不会单独关闭连接。默认 HTTP keep-alive 为 10 秒，
+协议 ping 为 1 分钟。
 
 ### 5.1 长连接诊断 Runbook
 
@@ -228,15 +237,19 @@ MCP Server 是 STDIO 长连接适配器。工具业务错误不会使用 MCP `is
 
 | 配置 | 默认值 | 允许范围 | 用途 |
 | --- | ---: | ---: | --- |
-| `LLM_WIKI_MCP_KEEPALIVE_MS` | `300000` ms | `1000`–`1800000` ms | 两次协议 ping 的间隔 |
-| `LLM_WIKI_MCP_KEEPALIVE_TIMEOUT_MS` | `30000` ms | `250`–`60000` ms | 单次 ping 等待 pong 的预算 |
+| `LLM_WIKI_MCP_HTTP_PORT` | `31982` | `1024`–`65535` | 当前设备的 loopback 端口；需在启动 Claude 前设置 |
+| `LLM_WIKI_MCP_HTTP_KEEPALIVE_MS` | `10000` ms | `1000`–`60000` ms | HTTP/SSE keep-alive frame 间隔 |
+| `LLM_WIKI_MCP_KEEPALIVE_MS` | `60000` ms | `1000`–`1800000` ms | 两次协议 ping 的间隔 |
+| `LLM_WIKI_MCP_KEEPALIVE_TIMEOUT_MS` | HTTP `15000` ms，STDIO `30000` ms | `250`–`60000` ms | 单次 ping 等待 pong 的预算 |
+| `LLM_WIKI_MCP_MAX_RETRIES` | `3` | `0`–`5` | 可重试瞬时工具错误的最大重试次数 |
+| `LLM_WIKI_MCP_RETRY_BASE_MS` | `250` ms | `50`–`5000` ms | 工具重试的基础退避 |
 
 定位断开时按以下顺序判断：
 
-1. `tool-call` 后仍能看到 `keepalive.status=ok`：MCP Server 和 STDIO 管道仍然存活，问题更可能在宿主 Agent 的 worker 生命周期或跨 turn 调度，不需要重启 MCP。
+1. `tool-call` 后仍能看到 `keepalive.status=ok`：MCP 会话仍然存活，问题更可能在宿主 Agent 的 worker 生命周期或跨 turn 调度，不需要重启 MCP。
 2. 出现 `keepalive.status=failed` 但之后仍能调用工具：这是一次宿主 pong 延迟或丢失，只记录诊断，不会触发断开；继续观察下一次心跳。
-3. 出现 `uncaught-exception` 或 `shutdown-requested`：服务发现致命异常后主动优雅关闭，避免继续返回不可信结果；让 Claude 重新启动 MCP 后再按任务状态恢复。单独的 `unhandled-rejection` 只表示运行时进入 degraded，服务不会主动断开；先继续调用 `llm_wiki_status` 并检查后续工具结果。
-4. 出现 `stdin-closed`、`stdout-closed` 或 `transport-closed`：对端已经关闭了 STDIO 管道，服务端无法阻止外部进程终止；重新启动 MCP 后使用原 `task_id` 和 `worker_id` 恢复，不要重新导入源文件。
+3. 出现 `uncaught-exception`：HTTP worker 会退出，supervisor 写入 `worker-retry` 后拉起新 PID；Claude 在 `/mcp` 中短暂显示 pending 后自动重连。
+4. 只出现 `unhandled-rejection`：运行时进入 degraded 但不主动断开；先继续调用 `llm_wiki_status`。
 
 升级代码后必须重新生成实际运行的 `dist`：
 
@@ -245,9 +258,11 @@ npm run build
 npm test
 ```
 
-然后完全重启 Claude，或执行 `/mcp` 重启项目连接。`.mcp.json` 运行的是
-`packages/mcp-server/dist/index.js`，`dist/` 不提交到 Git；只执行 `git pull` 不会刷新
-正在运行的 MCP 进程。
+然后完全重启 Claude。`SessionStart` hook 会运行
+`packages/mcp-server/dist/ensure-daemon.js`，`dist/` 不提交到 Git；只执行
+`git pull` 不会生成新 dist。重新 build 后，hook 会比对 `/health` 和
+`dist/build-info.json`，自动替换旧 daemon。如果默认端口被占用，在当前设备启动 Claude 前设置
+`LLM_WIKI_MCP_HTTP_PORT`；`.mcp.json` 和 hook 会使用同一变量。
 
 ## 6. 删除知识库
 

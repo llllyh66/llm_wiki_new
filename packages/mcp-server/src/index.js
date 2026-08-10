@@ -1,26 +1,22 @@
 #!/usr/bin/env node
-import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
-import { CallToolRequestSchema, EmptyResultSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js"
+import { EmptyResultSchema } from "@modelcontextprotocol/sdk/types.js"
 import { createWriteStream } from "node:fs"
 import { mkdir, readFile } from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { LlmWikiCore } from "@llm-wiki/core"
+import { createProtocolServer, readInteger } from "./protocol-server.js"
 import { HeadlessToolRouter } from "./tools.js"
 
 const STDIO_MAX_BUFFER_BYTES = 32 * 1024 * 1024
-const DEFAULT_MCP_KEEPALIVE_MS = 5 * 60_000
+const DEFAULT_MCP_KEEPALIVE_MS = 60_000
 const DEFAULT_MCP_KEEPALIVE_TIMEOUT_MS = 30_000
 
-// Keep the production default at five minutes (the documented host-compatibility
-// setting), while allowing the STDIO smoke test and operators to use a shorter
-// interval without editing the bundled server. The lower bound prevents an
-// accidental environment setting from turning the server into a ping loop.
+// One-minute protocol pings keep legacy STDIO hosts active. Claude Code uses
+// the Streamable HTTP entrypoint, which also sends ten-second SSE keep-alives.
 function readMilliseconds(name, fallback, { minimum = 1_000, maximum = 30 * 60_000 } = {}) {
-  const parsed = Number(process.env[name])
-  if (!Number.isFinite(parsed) || parsed <= 0) return fallback
-  return Math.min(maximum, Math.max(minimum, Math.round(parsed)))
+  return readInteger(name, fallback, { minimum, maximum })
 }
 
 const MCP_KEEPALIVE_MS = readMilliseconds("LLM_WIKI_MCP_KEEPALIVE_MS", DEFAULT_MCP_KEEPALIVE_MS)
@@ -132,46 +128,7 @@ async function main() {
   const buildInfo = await loadBuildInfo()
   log("startup", { workspace: workspaceRoot, build: buildInfo, runtimeLogPath })
   const router = new HeadlessToolRouter(core)
-  const server = new Server({ name: "llm-wiki", version: "1.0.5" }, { capabilities: { tools: {} } })
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: router.listTools() }))
-  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-    const startedAt = Date.now()
-    const name = request?.params?.name ?? "<invalid-tool>"
-    const args = request?.params?.arguments ?? {}
-    const requestId = request?.id ?? null
-    const inputBytes = safeByteLength(args)
-    log("tool-call-start", { requestId, name, inputBytes, ...router.runtimeStats(), degraded: runtimeDegraded })
-    try {
-      const result = await router.callMcp(name, args, { signal: extra?.signal, requestId })
-      const structured = result.structuredContent
-      const status = result._meta?.llmWikiStatus === "rejected" || structured?.accepted === false ? "rejected" : "ok"
-      log("tool-call", { requestId, name, status, durationMs: Date.now() - startedAt, outputBytes: safeByteLength(result?.content?.[0]?.text), ...router.runtimeStats() })
-      return result
-    } catch (error) {
-      // This is a last-resort SDK boundary guard. Normally callMcp already
-      // catches and serializes every Core error; returning a protocol-safe
-      // result here prevents one unexpected handler failure from closing MCP.
-      log("tool-handler-error", { requestId, name, durationMs: Date.now() - startedAt, message: error instanceof Error ? error.message : String(error) })
-      return {
-        content: [{ type: "text", text: JSON.stringify({
-          ok: false,
-          accepted: false,
-          rejected: true,
-          error: { code: "MCP_HANDLER_ERROR", message: "Tool handler failed; retry the operation.", retryable: true },
-          next_action: { tool: "llm_wiki_list_tasks", arguments: {} },
-          mcp_connection_usable: true,
-        }) }],
-        structuredContent: {
-          ok: false,
-          accepted: false,
-          rejected: true,
-          error: { code: "MCP_HANDLER_ERROR", message: "Tool handler failed; retry the operation.", retryable: true },
-          next_action: { tool: "llm_wiki_list_tasks", arguments: {} },
-          mcp_connection_usable: true,
-        },
-      }
-    }
-  })
+  const server = createProtocolServer(router, { log, isDegraded: () => runtimeDegraded })
   const transport = new StdioServerTransport(process.stdin, process.stdout, { maxBufferSize: STDIO_MAX_BUFFER_BYTES })
   transport.onerror = (error) => log("transport-error", { message: error instanceof Error ? error.message : String(error) })
   transport.onclose = () => log("transport-closed")
@@ -279,14 +236,6 @@ async function main() {
       runtimeLogStream.end()
       runtimeLogStream = null
     }
-  }
-}
-
-function safeByteLength(value) {
-  try {
-    return Buffer.byteLength(typeof value === "string" ? value : JSON.stringify(value ?? null))
-  } catch {
-    return null
   }
 }
 
