@@ -282,7 +282,6 @@ function makeProgressiveSchema(manifest, files) {
     name: "Progressive directory Schema",
     description: "Unrestricted JSON files disclosed Domain -> ABE -> BE.",
     language: "und",
-    policy: { extractionMode: "progressive", validationFailurePolicy: "reject-batch" },
     manifest,
     files,
   }
