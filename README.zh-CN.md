@@ -280,8 +280,8 @@ Domain/ABE/BE key 和路径写入 frontmatter 与检索索引。
 { "task_id": "task-xxx", "level": "abe", "domain_folder": "customer", "abe_file": "customer_management.json" }
 ```
 
-导入时会把整个目录快照到任务目录中，外部 Schema 后续变化不会影响任务。单个
-暴露文件默认不能超过 80 KiB，整个快照默认不能超过 20 MiB，超限时导入失败而不截断。
+导入时会把整个目录快照到任务目录中，外部 Schema 后续变化不会影响任务。暴露文件会
+原样读取并返回（单文件安全上限为 5 MiB），整个快照默认不能超过 20 MiB，超限时导入失败而不截断。
 
 ### V1 固定对象 Schema 兼容
 

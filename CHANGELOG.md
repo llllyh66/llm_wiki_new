@@ -6,6 +6,7 @@
 - Expose complete ABE JSON files to extraction Agents while allowing unrestricted JSON field layouts.
 - Persist and render `schemaClassification` paths in Wiki pages, frontmatter, and retrieval content.
 - Keep V1 fixed-object Schema tasks resumable for compatibility.
+- Raise the progressive per-file guard from 80 KiB to 5 MiB so complete ABE JSON files are not rejected before disclosure.
 
 ## [V1.0.3] - 2026-08-07
 

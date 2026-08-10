@@ -8,7 +8,13 @@ export const PROGRESSIVE_SCHEMA_VERSION = "2"
 export const PROGRESSIVE_SCHEMA_ROOT_FILE = "all_domains.json"
 export const MAX_SCHEMA_BUNDLE_BYTES = 20 * 1024 * 1024
 export const MAX_SCHEMA_BUNDLE_FILES = 2_000
-export const MAX_SCHEMA_FILE_BYTES = 80 * 1024
+// ABE files are disclosed verbatim.  The old 80 KiB per-file guard made a
+// valid ABE fail during import even though progressive disclosure is designed
+// to keep the large file out of the initial Domain/ABE indexes.  Keep a
+// generous per-file safety ceiling for accidental/binary blobs while allowing
+// a single ABE to use the same 5 MiB budget as a legacy Schema file; the
+// complete directory remains bounded by MAX_SCHEMA_BUNDLE_BYTES.
+export const MAX_SCHEMA_FILE_BYTES = 5 * 1024 * 1024
 
 export function isProgressiveSchema(schema) {
   return schema?.mode === PROGRESSIVE_SCHEMA_MODE

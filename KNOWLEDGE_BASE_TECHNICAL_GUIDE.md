@@ -51,7 +51,7 @@ Agent 调用 `llm_wiki_import_files`：
 目录包含 `<domain>_domain.json` 和多个 ABE JSON。JSON 内部字段不做固定约束；Agent
 按 Domain → ABE → BE 逐级读取，最后一个 ABE 文件完整暴露给 Agent，并在实体/概念上
 提交 `schemaClassification` 与 JSON Pointer。Core 只验证目录链、快照哈希和 Pointer。
-单文件默认上限为 80 KiB，整个快照默认上限为 20 MiB。
+单文件安全上限为 5 MiB，整个快照默认上限为 20 MiB；低于上限的 ABE JSON 始终原样暴露，不做截断或字段重写。
 
 ### 2.2a 页面领域分类投影
 

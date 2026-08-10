@@ -64,9 +64,10 @@ Entities and concepts carry `schemaClassification` with a JSON Pointer into the
 selected ABE file. Core verifies the immutable snapshot, file chain, hashes and
 Pointer, while semantic classification remains the model's responsibility.
 Ambiguous candidates are retained with `status: "unresolved"`. Wiki pages show
-the resulting Domain → ABE → BE path and index its keys and names. A single
-disclosed JSON file is limited to 80 KiB by default and a complete snapshot to
-20 MiB; oversized files fail import rather than being truncated.
+the resulting Domain → ABE → BE path and index its keys and names. A disclosed
+JSON file is read and returned verbatim (up to the 5 MiB per-file safety
+ceiling); a complete snapshot is limited to 20 MiB. Oversized files fail import
+rather than being truncated.
 
 Typed Wiki pages are projected from the validated task Schema. Entity and
 optional concept pages receive `domain_schema_id`, `domain_schema_version`,
