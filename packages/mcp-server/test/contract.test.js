@@ -10,6 +10,26 @@ import { HeadlessToolRouter } from "../src/tools.js"
 
 const textResult = (result) => JSON.parse(result.content[0].text)
 
+test("CAC project integration mirrors Claude with only client-name substitutions", async () => {
+  const files = [
+    "README.md",
+    "settings.json",
+    "agents/llm-wiki-extractor.md",
+    "agents/llm-wiki-page-drafter.md",
+    "agents/llm-wiki-writer.md",
+    "skills/llm-wiki-builder/SKILL.md",
+  ]
+  for (const relativePath of files) {
+    const claude = await readFile(new URL(`../../../.claude/${relativePath}`, import.meta.url), "utf8")
+    const cac = await readFile(new URL(`../../../.cac/${relativePath}`, import.meta.url), "utf8")
+    const expected = claude
+      .replaceAll("CLAUDE_PROJECT_DIR", "CAC_PROJECT_DIR")
+      .replaceAll("Claude", "CAC")
+      .replaceAll("claude", "cac")
+    assert.equal(cac, expected, `.cac/${relativePath} must mirror .claude/${relativePath}`)
+  }
+})
+
 test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool allowlist", async () => {
   const extractor = await readFile(new URL("../../../.claude/agents/llm-wiki-extractor.md", import.meta.url), "utf8")
   const writer = await readFile(new URL("../../../.claude/agents/llm-wiki-writer.md", import.meta.url), "utf8")

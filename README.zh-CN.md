@@ -146,6 +146,19 @@ llm-wiki: http://127.0.0.1:31982/mcp (HTTP) - Connected
 文件写入和外部网络工具会直接拒绝而不是询问。修改配置后需完全退出并重新启动
 Claude Code。
 
+## CAC 配置
+
+项目同时提供实体目录 `.cac/`，其 `settings.json`、三个 Agent 和
+`llm-wiki-builder` Skill 与 `.claude/` 一一对应，仅将 Claude 标识、路径和
+`CLAUDE_PROJECT_DIR` 替换为 CAC、`.cac` 和 `CAC_PROJECT_DIR`。两套配置共享
+根目录 `.mcp.json`、同一个 localhost HTTP MCP daemon 和规范工作流
+`.agents/skills/llm-wiki-builder/`。实体文件而非符号链接可确保 GitHub ZIP、
+Windows 和多设备克隆均能直接发现配置。
+
+在每台设备完成 `npm ci` 和 `npm run build` 后，从项目根目录启动 CAC，首次
+使用时批准项目 MCP 和 hook。若此前已经打开该项目，请完全退出并重新启动 CAC，
+再在 MCP 页面确认 `llm-wiki` 为 `Connected` 且包含 17 个工具。
+
 多批次任务默认按 `parallel_extraction.recommended_workers` 启动后台抽取
 Agent，当前最多 4 个；`get_batch` 不内联大型 Schema，worker 会按三级 disclosure
 显式读取所选 Domain、ABE 和完整 ABE JSON。每个 Agent 使用固定 `worker_id` 租约不同批次，Core

@@ -2,6 +2,11 @@
 
 ## [1.0.5.2] - 2026-08-10
 
+- Add a complete project-level `.cac/` integration that mirrors `.claude/`
+  settings, Agents, and Skill entrypoint with CAC-specific names and
+  `CAC_PROJECT_DIR`, while sharing the same `.mcp.json` HTTP daemon.
+- Add a parity contract test so future Claude integration changes cannot ship
+  without the corresponding CAC configuration update.
 - Run the Claude Code `SessionStart` hook in cross-platform exec form so native
   Windows does not depend on Git Bash or PowerShell command parsing.
 - Hide the detached supervisor and worker consoles on Windows, preventing an

@@ -88,6 +88,13 @@ daemon and stores its PID and logs only under that clone's `.llm-wiki/`.
 background agents and uses `dontAsk` for unattended extraction. Approve project
 trust on first use, then restart Claude Code after changing these files.
 
+CAC users receive the same project integration under `.cac/`: settings, all
+three Agents, and the `llm-wiki-builder` Skill mirror `.claude/` with only the
+client name, directory, and `CAC_PROJECT_DIR` placeholder substituted. Both
+clients share the root `.mcp.json`, the loopback daemon, and the canonical
+`.agents/skills/llm-wiki-builder/` workflow. The files are checked in directly
+rather than symlinked for Windows, GitHub archive, and multi-device portability.
+
 Every initial and replacement extraction slot explicitly uses the named project
 Agent type `llm-wiki-extractor`. Generic "Worker N", `general-purpose`, and
 Agent Team teammates are not used because they do not apply that Agent file's

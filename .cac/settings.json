@@ -1,0 +1,58 @@
+{
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "llm-wiki"
+  ],
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CAC_PROJECT_DIR}/packages/mcp-server/dist/ensure-daemon.js",
+              "--workspace",
+              "${CAC_PROJECT_DIR}"
+            ],
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "allow": [
+      "Agent",
+      "Agent(llm-wiki-extractor)",
+      "Agent(llm-wiki-page-drafter)",
+      "Agent(llm-wiki-writer)",
+      "Skill(llm-wiki-builder)",
+      "ToolSearch",
+      "mcp__llm-wiki",
+      "mcp__llm-wiki__*",
+      "mcp__llm-wiki__llm_wiki_import_files",
+      "mcp__llm-wiki__llm_wiki_get_batch",
+      "mcp__llm-wiki__llm_wiki_get_domain_schema",
+      "mcp__llm-wiki__llm_wiki_retrieve_context",
+      "mcp__llm-wiki__llm_wiki_commit_analysis",
+      "mcp__llm-wiki__llm_wiki_get_page_plan_context",
+      "mcp__llm-wiki__llm_wiki_stage_page_drafts",
+      "mcp__llm-wiki__llm_wiki_get_staged_page_drafts",
+      "mcp__llm-wiki__llm_wiki_apply_projection",
+      "mcp__llm-wiki__llm_wiki_commit_pages",
+      "mcp__llm-wiki__llm_wiki_update_pages",
+      "mcp__llm-wiki__llm_wiki_finalize",
+      "mcp__llm-wiki__llm_wiki_status",
+      "mcp__llm-wiki__llm_wiki_list_tasks",
+      "mcp__llm-wiki__llm_wiki_delete_knowledge_base",
+      "mcp__llm-wiki__llm_wiki_abort",
+      "mcp__llm-wiki__llm_wiki_lint",
+      "Read",
+      "Glob",
+      "Grep"
+    ]
+  }
+}
