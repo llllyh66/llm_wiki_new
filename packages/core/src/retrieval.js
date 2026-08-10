@@ -338,8 +338,13 @@ function scoreEmbeddingVectors(documents, queryVector, vectors) {
 function scoreFeatureHashCandidates(documents, candidates, query) {
   const indexes = new Map(documents.map((document, index) => [document.id, index]))
   const queryVector = embedText(query)
-  return candidates.map((document) => ({ documentIndex: indexes.get(document.id), score: cosine(queryVector, embedText(`${document.title}\n${document.content}`)) }))
-    .filter((item) => item.documentIndex !== undefined && item.score > 0)
+  const longTerms = lexicalTokens(query).filter((term) => term.length >= 8)
+  return candidates.map((document) => {
+    const hasLongTerm = longTerms.length === 0 || longTerms.some((term) => `${document.title}\n${document.content}`.toLowerCase().includes(term))
+    if (!hasLongTerm) return null
+    return { documentIndex: indexes.get(document.id), score: cosine(queryVector, embedText(`${document.title}\n${document.content}`)) }
+  })
+    .filter((item) => item && item.documentIndex !== undefined && item.score > 0)
     .sort((a, b) => b.score - a.score || documents[a.documentIndex].id.localeCompare(documents[b.documentIndex].id))
 }
 
@@ -415,6 +420,7 @@ function analysisContent(analysis) {
       lines.push([item.name, item.title, item.text, item.content, item.subject, item.predicate, item.object, item.entityTypeId, item.relationTypeId]
         .filter((value) => typeof value === "string" && value.trim()).join(" "))
       if (item.properties && typeof item.properties === "object") lines.push(JSON.stringify(item.properties))
+      if (item.schemaClassification && typeof item.schemaClassification === "object") lines.push(JSON.stringify(item.schemaClassification))
     }
   }
   return lines.filter(Boolean).join("\n")

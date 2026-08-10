@@ -84,6 +84,16 @@ export function parseWikiPage(content) {
     domainTypeKinds: arrayValue(fields.domain_type_kinds),
     domainTypeIds: arrayValue(fields.domain_type_ids),
     domainTypeNames: arrayValue(fields.domain_type_names),
+    schemaLayout: scalarValue(fields.schema_layout),
+    schemaSnapshotHash: scalarValue(fields.schema_snapshot_hash),
+    schemaClassificationStatus: scalarValue(fields.schema_classification_status),
+    schemaDomainKeys: arrayValue(fields.schema_domain_keys),
+    schemaDomainNames: arrayValue(fields.schema_domain_names),
+    schemaAbeKeys: arrayValue(fields.schema_abe_keys),
+    schemaAbeNames: arrayValue(fields.schema_abe_names),
+    schemaBeKeys: arrayValue(fields.schema_be_keys),
+    schemaBeNames: arrayValue(fields.schema_be_names),
+    schemaClassificationPaths: arrayValue(fields.schema_classification_paths),
   }
 }
 
@@ -275,6 +285,19 @@ export function prepareWikiPageContent(patch, existingContent = "", date = new D
     standard.domain_type_kinds = domainClassifications.map((item) => item.kind)
     standard.domain_type_ids = domainClassifications.map((item) => item.typeId)
     standard.domain_type_names = domainClassifications.map((item) => item.typeName)
+    const progressive = domainClassifications.filter((item) => item.schemaMode === "progressive-directory-v2")
+    if (progressive.length > 0) {
+      standard.schema_layout = "progressive-directory-v2"
+      standard.schema_snapshot_hash = progressive.find((item) => item.schemaId)?.schemaId ?? ""
+      standard.schema_classification_status = progressive.some((item) => item.status === "unresolved" || item.resolved === false) ? "unresolved" : "classified"
+      standard.schema_domain_keys = progressive.map((item) => item.domain?.key).filter(Boolean)
+      standard.schema_domain_names = progressive.map((item) => item.domain?.name).filter(Boolean)
+      standard.schema_abe_keys = progressive.map((item) => item.abe?.key).filter(Boolean)
+      standard.schema_abe_names = progressive.map((item) => item.abe?.name).filter(Boolean)
+      standard.schema_be_keys = progressive.map((item) => item.be?.key).filter(Boolean)
+      standard.schema_be_names = progressive.map((item) => item.be?.name).filter(Boolean)
+      standard.schema_classification_paths = progressive.map((item) => [item.domain?.key, item.abe?.key, item.be?.key].filter(Boolean).join("/"))
+    }
   }
   const preserved = Object.entries(incoming.fields)
     .filter(([key]) => !Object.hasOwn(standard, key))
@@ -295,6 +318,16 @@ export function prepareWikiPageContent(patch, existingContent = "", date = new D
     ...(standard.domain_type_kinds ? [`domain_type_kinds: ${yamlArray(standard.domain_type_kinds)}`] : []),
     ...(standard.domain_type_ids ? [`domain_type_ids: ${yamlArray(standard.domain_type_ids)}`] : []),
     ...(standard.domain_type_names ? [`domain_type_names: ${yamlArray(standard.domain_type_names)}`] : []),
+    ...(standard.schema_layout ? [`schema_layout: ${yamlScalar(standard.schema_layout)}`] : []),
+    ...(standard.schema_snapshot_hash ? [`schema_snapshot_hash: ${yamlScalar(standard.schema_snapshot_hash)}`] : []),
+    ...(standard.schema_classification_status ? [`schema_classification_status: ${yamlScalar(standard.schema_classification_status)}`] : []),
+    ...(standard.schema_domain_keys ? [`schema_domain_keys: ${yamlArray(standard.schema_domain_keys)}`] : []),
+    ...(standard.schema_domain_names ? [`schema_domain_names: ${yamlArray(standard.schema_domain_names)}`] : []),
+    ...(standard.schema_abe_keys ? [`schema_abe_keys: ${yamlArray(standard.schema_abe_keys)}`] : []),
+    ...(standard.schema_abe_names ? [`schema_abe_names: ${yamlArray(standard.schema_abe_names)}`] : []),
+    ...(standard.schema_be_keys ? [`schema_be_keys: ${yamlArray(standard.schema_be_keys)}`] : []),
+    ...(standard.schema_be_names ? [`schema_be_names: ${yamlArray(standard.schema_be_names)}`] : []),
+    ...(standard.schema_classification_paths ? [`schema_classification_paths: ${yamlArray(standard.schema_classification_paths)}`] : []),
     ...preserved,
     "---",
     "",
@@ -304,6 +337,22 @@ export function prepareWikiPageContent(patch, existingContent = "", date = new D
 }
 
 function domainClassificationsFromPage(page) {
+  if (page.schemaLayout === "progressive-directory-v2") {
+    const count = Math.max(page.schemaBeKeys.length, page.schemaAbeKeys.length, page.schemaDomainKeys.length, 1)
+    return uniqueDomainClassifications(Array.from({ length: count }, (_, index) => ({
+      kind: page.domainTypeKinds[index] || "entity",
+      typeId: page.schemaBeKeys[index] || page.schemaAbeKeys[index] || page.schemaDomainKeys[index] || "unresolved",
+      typeName: page.schemaBeNames[index] || page.schemaAbeNames[index] || page.schemaDomainNames[index] || "待分类",
+      schemaId: page.schemaSnapshotHash || page.domainSchemaId,
+      schemaVersion: page.domainSchemaVersion || "2",
+      schemaMode: "progressive-directory-v2",
+      status: page.schemaClassificationStatus || "classified",
+      domain: { key: page.schemaDomainKeys[index] || "", name: page.schemaDomainNames[index] || "" },
+      abe: { key: page.schemaAbeKeys[index] || "", name: page.schemaAbeNames[index] || "" },
+      be: { key: page.schemaBeKeys[index] || "", name: page.schemaBeNames[index] || "" },
+      ...(page.schemaClassificationStatus === "unresolved" ? { resolved: false } : {}),
+    })))
+  }
   const ids = page.domainTypeIds ?? []
   const names = page.domainTypeNames ?? []
   const kinds = page.domainTypeKinds ?? []
@@ -324,6 +373,12 @@ function normalizeDomainClassifications(values) {
     typeName: String(item?.typeName ?? item?.type_name ?? item?.typeId ?? item?.type_id ?? "").trim(),
     schemaId: String(item?.schemaId ?? item?.schema_id ?? "").trim(),
     schemaVersion: String(item?.schemaVersion ?? item?.schema_version ?? "").trim(),
+    ...(item?.schemaMode ? { schemaMode: String(item.schemaMode).trim() } : {}),
+    ...(item?.status ? { status: String(item.status).trim() } : {}),
+    ...(item?.confidence !== undefined ? { confidence: Number(item.confidence) } : {}),
+    ...(item?.domain ? { domain: item.domain } : {}),
+    ...(item?.abe ? { abe: item.abe } : {}),
+    ...(item?.be ? { be: item.be } : {}),
     ...(item?.resolved === false ? { resolved: false } : {}),
   })).filter((item) => item.typeId && item.typeName))
 }
@@ -346,10 +401,19 @@ function withDomainClassificationSection(body, classifications) {
   if (classifications.length === 0) return normalizedBody
   const language = classifications.some((item) => /[\u3400-\u9fff]/u.test(item.typeName)) ? "zh" : "en"
   const heading = language === "zh" ? "## 领域分类" : "## Domain Classification"
-  const lines = classifications.map((item) => {
+  const progressive = classifications.some((item) => item.schemaMode === "progressive-directory-v2")
+  const lines = progressive
+    ? classifications.map((item) => {
+      const unresolved = item.status === "unresolved" || item.resolved === false ? "（待分类）" : ""
+      const domain = item.domain?.name || item.domain?.key || "未知 Domain"
+      const abe = item.abe?.name || item.abe?.key || "待分类 ABE"
+      const be = item.be?.name || item.be?.key || "待分类 BE"
+      return `- Domain：${domain}（\`${item.domain?.key || "?"}\`） → ABE：${abe}（\`${item.abe?.key || "?"}\`） → BE：${be}（\`${item.be?.key || "?"}\`）${unresolved}`
+    })
+    : classifications.map((item) => {
     const unresolved = item.resolved === false ? "（未解析）" : ""
     return `- ${item.typeName}（\`${item.typeId}\`）${unresolved}`
-  })
+    })
   const section = `${heading}\n\n${lines.join("\n")}`
   if (!match || match.index === undefined) return `${normalizedBody}\n\n${section}`.trim()
   const afterHeading = match.index + match[0].length

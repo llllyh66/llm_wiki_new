@@ -28,7 +28,7 @@ const toolDefinitions = [
         target_language: { type: "string" },
         force_reanalyze: { type: "boolean" },
         max_batch_chars: { type: "number", minimum: 1000, maximum: 24000 },
-        domain_schema_path: { type: "string", description: "Agent-visible path to a domain extraction Schema JSON file. The validated Schema is snapshotted into the task." },
+        domain_schema_path: { type: "string", description: "Agent-visible path to a domain extraction Schema JSON file (legacy V1) or progressive Schema directory (V2). The validated file or directory is snapshotted into the task." },
         domain_schema: { type: "object", description: "Inline domain extraction Schema. Use this or domain_schema_path, not both." },
       }),
     }, ["files"]),
@@ -45,9 +45,12 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_domain_schema",
-    description: "Return a bounded catalog, server-side lexical selection, exact type selection, or legacy full page from the validated domain Schema. Prefer search mode for large Schemas, then request exact matched type IDs; Core validation still enforces the complete snapshot.",
+    description: "Progressively disclose a validated Schema directory. For progressive-directory-v2 tasks, call level=domains to read all_domains.json, level=domain to read the selected Domain's *_domain.json, and level=abe to read the complete selected ABE JSON. JSON field names are unrestricted and the returned file is never truncated. Legacy mode/page/catalog/search/types arguments remain available only for V1 task recovery.",
     inputSchema: closedObject({
       task_id: taskId,
+      level: { enum: ["domains", "domain", "abe"], description: "V2 disclosure level. domains reads all_domains.json; domain reads a Domain index; abe reads one complete ABE JSON." },
+      domain_folder: { type: "string", minLength: 1, maxLength: 200, description: "One selected Domain folder name for level=domain or level=abe." },
+      abe_file: { type: "string", minLength: 1, maxLength: 300, description: "One selected ABE JSON filename for level=abe. The full file is exposed." },
       mode: { enum: ["page", "catalog", "search", "types"], description: "Use search for batch terms, catalog only when search is insufficient, types for exact IDs, or page for backward-compatible full scanning." },
       queries: { type: "array", minItems: 1, maxItems: 20, items: { type: "string", minLength: 1, maxLength: 2000 } },
       entity_type_ids: { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 200 } },

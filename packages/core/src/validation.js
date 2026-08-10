@@ -536,6 +536,20 @@ export function validatePagePatchShape(patch, limits) {
           fail("INVALID_PAGE_PATCH", `domainClassifications[${index}].${field} is invalid.`)
         }
       }
+      if (classification.schemaMode !== undefined && (typeof classification.schemaMode !== "string" || classification.schemaMode.length > 100)) {
+        fail("INVALID_PAGE_PATCH", `domainClassifications[${index}].schemaMode is invalid.`)
+      }
+      if (classification.status !== undefined && !["classified", "unresolved"].includes(classification.status)) {
+        fail("INVALID_PAGE_PATCH", `domainClassifications[${index}].status is invalid.`)
+      }
+      if (classification.confidence !== undefined && (typeof classification.confidence !== "number" || classification.confidence < 0 || classification.confidence > 1)) {
+        fail("INVALID_PAGE_PATCH", `domainClassifications[${index}].confidence is invalid.`)
+      }
+      for (const field of ["domain", "abe", "be"]) {
+        if (classification[field] !== undefined && (!classification[field] || typeof classification[field] !== "object" || Array.isArray(classification[field]))) {
+          fail("INVALID_PAGE_PATCH", `domainClassifications[${index}].${field} must be an object.`)
+        }
+      }
       if (classification.typeId.length > 200 || classification.typeName.length > 500) {
         fail("INVALID_PAGE_PATCH", `domainClassifications[${index}] exceeds its length limit.`)
       }
@@ -575,6 +589,12 @@ export function normalizePagePatchDomainClassifications(patch, requirements) {
         typeName: classification.type_name,
         schemaId: classification.schema_id,
         schemaVersion: classification.schema_version,
+        ...(classification.schema_mode ? { schemaMode: classification.schema_mode } : {}),
+        ...(classification.status ? { status: classification.status } : {}),
+        ...(classification.confidence !== undefined ? { confidence: classification.confidence } : {}),
+        ...(classification.domain ? { domain: classification.domain } : {}),
+        ...(classification.abe ? { abe: classification.abe } : {}),
+        ...(classification.be ? { be: classification.be } : {}),
         ...(classification.resolved === false ? { resolved: false } : {}),
       })
     }

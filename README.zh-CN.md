@@ -247,6 +247,44 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
 
 ## 按领域 Schema 抽取
 
+### 目录型渐进式披露 Schema（V2）
+
+新任务推荐传入 Schema 文件夹，而不是单个固定字段 JSON：
+
+```text
+schemas/customer/
+├── all_domains.json
+├── customer/
+│   ├── customer_domain.json
+│   └── customer_management.json
+└── product/
+    ├── product_domain.json
+    └── product_design.json
+```
+
+JSON 内部字段名和嵌套结构不做业务限制，只要是合法 JSON。抽取 Worker 会按
+`all_domains.json → <domain>/<domain>_domain.json → <domain>/<abe>.json`
+逐级读取；最后一个 ABE JSON 会完整暴露给模型，由模型选择 BE，并在实体或概念上
+提交 `schemaClassification` 和 JSON Pointer。Core 只校验快照、文件链和 Pointer，
+不再假设 `entityTypes`、`conceptTypes` 或 `relationTypes`。分类有歧义时保留候选并标记
+`unresolved`，不会静默丢失知识。
+
+Wiki 页面会生成 `Domain → ABE → BE` 的“领域分类”区块，并把快照哈希、分类状态、
+Domain/ABE/BE key 和路径写入 frontmatter 与检索索引。
+
+`llm_wiki_get_domain_schema` 的 V2 调用方式为：
+
+```json
+{ "task_id": "task-xxx", "level": "domains" }
+{ "task_id": "task-xxx", "level": "domain", "domain_folder": "customer" }
+{ "task_id": "task-xxx", "level": "abe", "domain_folder": "customer", "abe_file": "customer_management.json" }
+```
+
+导入时会把整个目录快照到任务目录中，外部 Schema 后续变化不会影响任务。单个
+暴露文件默认不能超过 80 KiB，整个快照默认不能超过 20 MiB，超限时导入失败而不截断。
+
+### V1 固定对象 Schema 兼容
+
 仓库根目录的 `llm-wiki.domain-schema.json` 是当前默认领域 Schema。
 导入时 Core 会先校验它，再把一份不可变快照保存到当前任务中；
 因此任务进行期间修改原 Schema 不会改变已创建任务的抽取契约。

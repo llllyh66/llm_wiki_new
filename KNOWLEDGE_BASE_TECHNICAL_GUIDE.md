@@ -47,6 +47,12 @@ Agent 调用 `llm_wiki_import_files`：
 
 领域 Schema 会被校验并快照到任务中。之后即使外部 Schema 文件改变，本次任务仍使用原快照。
 
+新版本也支持目录型渐进式披露 Schema：根目录包含 `all_domains.json`，每个 Domain
+目录包含 `<domain>_domain.json` 和多个 ABE JSON。JSON 内部字段不做固定约束；Agent
+按 Domain → ABE → BE 逐级读取，最后一个 ABE 文件完整暴露给 Agent，并在实体/概念上
+提交 `schemaClassification` 与 JSON Pointer。Core 只验证目录链、快照哈希和 Pointer。
+单文件默认上限为 80 KiB，整个快照默认上限为 20 MiB。
+
 ### 2.2a 页面领域分类投影
 
 分析结果中的 `entities[].entityTypeId`（以及定义了可选 `conceptTypes` 时的
@@ -168,7 +174,7 @@ Embedding 配置位于 `.llm-wiki/config.json` 的 `retrieval.embedding`，包�
 | --- | --- |
 | `llm_wiki_import_files` | 导入文件、解析并创建任务 |
 | `llm_wiki_get_batch` | 获取并租约一个抽取 batch |
-| `llm_wiki_get_domain_schema` | 分页、搜索或按类型读取领域 Schema |
+| `llm_wiki_get_domain_schema` | V2 按 Domain → ABE → BE 逐级读取完整 JSON；V1 保留分页、搜索和按类型读取 |
 | `llm_wiki_retrieve_context` | BM25 + Embedding + Wiki 多路召回 |
 | `llm_wiki_commit_analysis` | 校验并持久化一个 batch 的结构化分析 |
 | `llm_wiki_get_page_plan_context` | 返回服务端 manifest 或有界 draft shard，传统 plan cursor 仅作兼容 |

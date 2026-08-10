@@ -2,6 +2,15 @@ import { lstat, readFile } from "node:fs/promises"
 import path from "node:path"
 import { fail } from "./errors.js"
 import { pathExists, readJson, sha256, stableStringify } from "./utils.js"
+import {
+  PROGRESSIVE_SCHEMA_MODE,
+  applyProgressiveSchema,
+  isProgressiveSchema,
+  loadProgressiveSchemaSnapshot,
+  progressiveSchemaDisclosure,
+  progressiveSchemaMetadata,
+  resolveProgressiveSchemaDirectory,
+} from "./schema-bundle.js"
 
 const MAX_DOMAIN_SCHEMA_BYTES = 5 * 1024 * 1024
 const VALUE_TYPES = new Set(["string", "number", "integer", "boolean", "date", "datetime", "json"])
@@ -27,7 +36,11 @@ export async function resolveDomainSchema(workspace, options = {}) {
   } catch {
     fail("INVALID_DOMAIN_SCHEMA", "The configured domain schema file is not readable.")
   }
-  if (!info.isFile() || info.isSymbolicLink()) fail("INVALID_DOMAIN_SCHEMA", "The domain schema must be a regular JSON file, not a symbolic link.")
+  if (info.isDirectory()) {
+    const bundle = await resolveProgressiveSchemaDirectory(schemaPath)
+    return { schema: bundle, metadata: progressiveSchemaMetadata(bundle), bundle }
+  }
+  if (!info.isFile() || info.isSymbolicLink()) fail("INVALID_DOMAIN_SCHEMA", "The domain schema must be a regular JSON file or progressive Schema directory, not a symbolic link.")
   if (info.size > MAX_DOMAIN_SCHEMA_BYTES) fail("INVALID_DOMAIN_SCHEMA", `The domain schema exceeds ${MAX_DOMAIN_SCHEMA_BYTES} bytes.`)
   let parsed
   try {
@@ -40,6 +53,9 @@ export async function resolveDomainSchema(workspace, options = {}) {
 
 export async function loadTaskDomainSchema(record) {
   if (!record.task.domainSchema) return null
+  if (record.task.domainSchema.schema_mode === PROGRESSIVE_SCHEMA_MODE || record.task.domainSchema.mode === PROGRESSIVE_SCHEMA_MODE) {
+    return loadProgressiveSchemaSnapshot(record)
+  }
   const schema = await readJson(record.paths.domainSchema)
   // Tasks created before V1.0.1 do not have the optional conceptTypes array.
   // Normalize that missing field at the read boundary so all downstream
@@ -47,8 +63,30 @@ export async function loadTaskDomainSchema(record) {
   return { ...schema, conceptTypes: Array.isArray(schema?.conceptTypes) ? schema.conceptTypes : [] }
 }
 
+export { progressiveSchemaDisclosure }
+
 export function domainSchemaContext(schema, inlineBytes = INLINE_DOMAIN_SCHEMA_BYTES, knownBytes) {
   if (!schema) return { value: null, pagination: null }
+  if (isProgressiveSchema(schema)) {
+    return {
+      value: {
+        mode: PROGRESSIVE_SCHEMA_MODE,
+        schemaId: schema.schemaId,
+        schemaVersion: schema.schemaVersion,
+        rootFile: schema.manifest.root_file,
+        fileCount: schema.manifest.file_count,
+        totalBytes: schema.manifest.total_bytes,
+        disclosureTool: "llm_wiki_get_domain_schema",
+      },
+      pagination: {
+        required: true,
+        mode: "progressive-levels",
+        tool: "llm_wiki_get_domain_schema",
+        first_level: "domains",
+        full_file_exposure: true,
+      },
+    }
+  }
   const bytes = Number.isInteger(knownBytes) && knownBytes >= 0
     ? knownBytes
     : Buffer.byteLength(JSON.stringify(schema))
@@ -342,6 +380,9 @@ function hasSchemaTermMatch(text, term) {
 }
 
 export function paginateDomainSchema(schema, requestedCursor, requestedMaxChars, selection = {}) {
+  if (isProgressiveSchema(schema)) {
+    return progressiveSchemaDisclosure(schema, selection)
+  }
   if (!schema) return { enabled: false, items: [], pagination: { cursor: 0, next_cursor: null, total_items: 0 } }
   const cursor = requestedCursor === undefined || requestedCursor === null ? 0 : Number(requestedCursor)
   if (!Number.isInteger(cursor) || cursor < 0) fail("INVALID_INPUT", "cursor must be a non-negative integer.")
@@ -437,6 +478,7 @@ export function validateDomainSchema(input) {
 
 export function applyDomainSchema(analysis, schema) {
   if (!schema) return { analysis, report: null }
+  if (isProgressiveSchema(schema)) return applyProgressiveSchema(analysis, schema)
   const mode = schema.policy.extractionMode
   const runtime = domainSchemaRuntime(schema)
   const entityLookup = runtime.entityLookup

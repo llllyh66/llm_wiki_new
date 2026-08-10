@@ -41,6 +41,33 @@ available only through the explicit `accept_dropped_candidates` commit option;
 constraints and keeps general relation extraction enabled. `entityTypes` must
 still contain at least one type.
 
+For new tasks, `options.domain_schema_path` may point to a progressive Schema
+directory instead of a fixed-object JSON file:
+
+```text
+schemas/customer/
+├── all_domains.json
+├── customer/
+│   ├── customer_domain.json
+│   └── customer_management.json
+└── product/
+    ├── product_domain.json
+    └── product_design.json
+```
+
+The JSON contents are intentionally unrestricted beyond valid JSON. The Agent
+reads the complete `all_domains.json`, then the selected Domain's
+`*_domain.json`, then the complete selected ABE JSON before choosing a BE.
+`llm_wiki_get_domain_schema` accepts `level=domains`, `level=domain` with
+`domain_folder`, and `level=abe` with `domain_folder` plus `abe_file`.
+Entities and concepts carry `schemaClassification` with a JSON Pointer into the
+selected ABE file. Core verifies the immutable snapshot, file chain, hashes and
+Pointer, while semantic classification remains the model's responsibility.
+Ambiguous candidates are retained with `status: "unresolved"`. Wiki pages show
+the resulting Domain → ABE → BE path and index its keys and names. A single
+disclosed JSON file is limited to 80 KiB by default and a complete snapshot to
+20 MiB; oversized files fail import rather than being truncated.
+
 Typed Wiki pages are projected from the validated task Schema. Entity and
 optional concept pages receive `domain_schema_id`, `domain_schema_version`,
 `domain_type_ids`, and `domain_type_names` in frontmatter, plus a generated

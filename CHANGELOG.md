@@ -1,5 +1,12 @@
 # 更新日志
 
+## [V1.0.4] - 2026-08-10
+
+- Add progressive directory Schema V2 with immutable snapshots and Domain → ABE → BE disclosure.
+- Expose complete ABE JSON files to extraction Agents while allowing unrestricted JSON field layouts.
+- Persist and render `schemaClassification` paths in Wiki pages, frontmatter, and retrieval content.
+- Keep V1 fixed-object Schema tasks resumable for compatibility.
+
 ## [V1.0.3] - 2026-08-07
 
 ### 增量 Wiki 更新

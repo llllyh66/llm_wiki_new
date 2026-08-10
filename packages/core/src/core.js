@@ -7,8 +7,10 @@ import {
   domainSchemaContext,
   loadTaskDomainSchema,
   paginateDomainSchema,
+  progressiveSchemaDisclosure,
   resolveDomainSchema,
 } from "./domain-schema.js"
+import { isProgressiveSchema, PROGRESSIVE_SCHEMA_MODE } from "./schema-bundle.js"
 import { lintWiki } from "./lint.js"
 import { batchEvidenceCatalog, compactEvidenceCatalog } from "./evidence.js"
 import { buildRetrievalIndexes, retrieveContext } from "./retrieval.js"
@@ -534,13 +536,16 @@ export class LlmWikiCore {
     // represented by identity metadata plus a compact batch-specific slice.
     const knownSchemaBytes = record.task.domainSchema?.size_bytes
     const fullSchemaContext = domainSchemaContext(domainSchema, 8 * 1024, knownSchemaBytes)
-    const automaticSchemaSelection = this.#batchDomainSchemaSelection(record, domainSchema, batch)
-    const schemaContext = automaticSchemaSelection?.ready
-      ? {
-          value: domainSchemaContext(domainSchema, 0, knownSchemaBytes).value,
-          pagination: fullSchemaContext.pagination,
-        }
-      : fullSchemaContext
+    const progressive = isProgressiveSchema(domainSchema)
+    const automaticSchemaSelection = progressive ? null : this.#batchDomainSchemaSelection(record, domainSchema, batch)
+    const schemaContext = progressive
+      ? fullSchemaContext
+      : automaticSchemaSelection?.ready
+        ? {
+            value: domainSchemaContext(domainSchema, 0, knownSchemaBytes).value,
+            pagination: fullSchemaContext.pagination,
+          }
+        : fullSchemaContext
     const agentChunks = batch.chunks.map(agentChunkWithSourceRefTemplates)
     const evidenceCatalog = batchEvidenceCatalog(agentChunks)
     const response = {
@@ -570,7 +575,9 @@ export class LlmWikiCore {
         domain_schema_pagination: schemaContext.pagination,
         domain_schema_auto_selection: automaticSchemaSelection,
         domain_extraction_instructions: domainSchema
-          ? `${automaticSchemaSelection?.ready ? "Use domain_schema_auto_selection directly; no Schema tool call is needed for this batch unless classification remains ambiguous. " : schemaContext.pagination ? "The automatic Schema selection was insufficient; use llm_wiki_get_domain_schema mode=search with focused batch terms, never a full scan. " : ""}Extract entities under this domain schema with localId, entityTypeId, properties, and sourceRefs. ${domainSchema.conceptTypes.length > 0 ? "When a concept matches a defined conceptTypes entry, include conceptTypeId; otherwise keep concepts untyped." : "No conceptTypes are defined, so concepts remain general knowledge concepts."} ${domainSchema.relationTypes.length > 0 ? "Relations require localId, relationTypeId, sourceEntityLocalId, targetEntityLocalId, properties, and sourceRefs." : "relationTypes is empty, so relations use the general AnalysisEnvelope format and are not constrained by the domain schema."} Do not infer missing required properties.`
+          ? progressive
+            ? "Use progressive Schema disclosure. First call llm_wiki_get_domain_schema with level=domains to read all_domains.json. Group candidates by selected domain, then call level=domain for each domain. For each selected ABE, call level=abe and read the complete returned JSON. Select one BE per entity or concept using a JSON Pointer into that complete ABE JSON. Put the result in schemaClassification with domain, abe, be, pointer, confidence, and status. The input JSON shape is unrestricted; do not expect entityTypes or concepts. Keep sourceRefs for document evidence separate from schema references. If classification is ambiguous, preserve the candidate with status=unresolved and explain the ambiguity in unresolvedQuestions."
+            : `${automaticSchemaSelection?.ready ? "Use domain_schema_auto_selection directly; no Schema tool call is needed for this batch unless classification remains ambiguous. " : schemaContext.pagination ? "The automatic Schema selection was insufficient; use llm_wiki_get_domain_schema mode=search with focused batch terms, never a full scan. " : ""}Extract entities under this domain schema with localId, entityTypeId, properties, and sourceRefs. ${domainSchema.conceptTypes.length > 0 ? "When a concept matches a defined conceptTypes entry, include conceptTypeId; otherwise keep concepts untyped." : "No conceptTypes are defined, so concepts remain general knowledge concepts."} ${domainSchema.relationTypes.length > 0 ? "Relations require localId, relationTypeId, sourceEntityLocalId, targetEntityLocalId, properties, and sourceRefs." : "relationTypes is empty, so relations use the general AnalysisEnvelope format and are not constrained by the domain schema."} Do not infer missing required properties.`
           : null,
       },
       analysis_contract: {
@@ -633,13 +640,17 @@ export class LlmWikiCore {
         rationale: "The leased batch is complete evidence; final Wiki reconciliation handles cross-batch canonicalization.",
       },
       extraction_hot_path: {
-        expected_worker_tool_calls: ["llm_wiki_get_batch", "llm_wiki_commit_analysis"],
+        expected_worker_tool_calls: progressive
+          ? ["llm_wiki_get_batch", "llm_wiki_get_domain_schema", "llm_wiki_commit_analysis"]
+          : ["llm_wiki_get_batch", "llm_wiki_commit_analysis"],
         source_file_read_required: false,
         status_call_required: false,
         retrieval_call_required: false,
-        schema_call_required: automaticSchemaSelection?.ready !== true && schemaContext.pagination !== null,
+        schema_call_required: progressive || (automaticSchemaSelection?.ready !== true && schemaContext.pagination !== null),
         output_policy: domainSchema
-          ? "Prefer typed entities and typed relations. Omit redundant concepts, claims, and candidatePages when they repeat the same facts."
+          ? progressive
+            ? "Prefer source-grounded entities and concepts with one schemaClassification each. Omit redundant claims and candidatePages when they repeat the same facts."
+            : "Prefer typed entities and typed relations. Omit redundant concepts, claims, and candidatePages when they repeat the same facts."
           : "Extract only reusable grounded knowledge; omit redundant restatements.",
       },
       evidence_catalog: compactEvidenceCatalog(evidenceCatalog),
@@ -660,6 +671,16 @@ export class LlmWikiCore {
     const record = await loadTask(workspace.paths, input?.task_id)
     const domainSchema = await this.#taskDomainSchema(record)
     if (!domainSchema) fail("DOMAIN_SCHEMA_NOT_CONFIGURED", "This task does not have a domain Schema.")
+    if (isProgressiveSchema(domainSchema)) {
+      return {
+        task_id: record.task.taskId,
+        ...progressiveSchemaDisclosure(domainSchema, {
+          ...input,
+          task_id: record.task.taskId,
+          level: input?.level ?? "domains",
+        }),
+      }
+    }
     return {
       task_id: record.task.taskId,
       ...paginateDomainSchema(domainSchema, input?.cursor, input?.max_chars, {
@@ -2799,6 +2820,12 @@ export class LlmWikiCore {
           typeName: classification.type_name,
           schemaId: classification.schema_id,
           schemaVersion: classification.schema_version,
+          ...(classification.schema_mode ? { schemaMode: classification.schema_mode } : {}),
+          ...(classification.status ? { status: classification.status } : {}),
+          ...(classification.confidence !== undefined ? { confidence: classification.confidence } : {}),
+          ...(classification.domain ? { domain: classification.domain } : {}),
+          ...(classification.abe ? { abe: classification.abe } : {}),
+          ...(classification.be ? { be: classification.be } : {}),
           ...(classification.resolved === false ? { resolved: false } : {}),
         })),
       }
@@ -3823,6 +3850,12 @@ function pageRequirementsWithPatchScaffolds(requirements, existingPages) {
             typeName: classification.type_name,
             schemaId: classification.schema_id,
             schemaVersion: classification.schema_version,
+            ...(classification.schema_mode ? { schemaMode: classification.schema_mode } : {}),
+            ...(classification.domain ? { domain: classification.domain } : {}),
+            ...(classification.abe ? { abe: classification.abe } : {}),
+            ...(classification.be ? { be: classification.be } : {}),
+            ...(classification.status ? { status: classification.status } : {}),
+            ...(classification.confidence !== undefined ? { confidence: classification.confidence } : {}),
             ...(classification.resolved === false ? { resolved: false } : {}),
           })),
         } : {}),
@@ -3839,6 +3872,32 @@ function candidateTitle(candidate) {
 
 function domainClassificationsForCandidate(candidate, collection, domainSchema, domainSchemaMetadata) {
   if (!domainSchema || !candidate || typeof candidate !== "object") return []
+  if (isProgressiveSchema(domainSchema)) {
+    const classification = candidate.schemaClassification ?? candidate.schema_classification
+    if (!classification || typeof classification !== "object") return []
+    const domain = classification.domain ?? {}
+    const abe = classification.abe ?? {}
+    const be = classification.be ?? {}
+    const status = String(classification.status ?? "unresolved").trim().toLowerCase()
+    const deepest = status === "classified" ? be : (Object.keys(abe).length > 0 ? abe : domain)
+    const typeId = String(deepest.key ?? deepest.id ?? deepest.name ?? "unresolved").trim()
+    const typeName = String(deepest.name ?? deepest.key ?? "待分类").trim()
+    if (!typeId || !typeName) return []
+    return [{
+      kind: collection === "concepts" ? "concept" : "entity",
+      type_id: typeId,
+      type_name: typeName,
+      schema_id: domainSchemaMetadata?.schema_id ?? domainSchema.schemaId,
+      schema_version: domainSchemaMetadata?.schema_version ?? domainSchema.schemaVersion,
+      schema_mode: PROGRESSIVE_SCHEMA_MODE,
+      status: status === "classified" ? "classified" : "unresolved",
+      domain: { key: String(domain.key ?? "").trim(), name: String(domain.name ?? domain.key ?? "").trim() },
+      abe: { key: String(abe.key ?? "").trim(), name: String(abe.name ?? abe.key ?? "").trim(), ...(abe.file ? { file: abe.file } : {}) },
+      be: { key: String(be.key ?? "").trim(), name: String(be.name ?? be.key ?? "").trim(), ...(be.pointer ? { pointer: be.pointer } : {}) },
+      ...(Number.isFinite(Number(classification.confidence)) ? { confidence: Math.max(0, Math.min(1, Number(classification.confidence))) } : {}),
+      ...(status !== "classified" ? { resolved: false } : {}),
+    }]
+  }
   const candidates = []
   const entityTypeId = candidate.entityTypeId ?? candidate.entity_type_id ?? (collection === "entities" ? candidate.entityType : undefined)
   if (typeof entityTypeId === "string" && entityTypeId.trim()) {
@@ -4267,6 +4326,7 @@ function pageDraftPath(paths, projectionId, shardId) {
 function pagePlanDomainSchemaMetadata(metadata) {
   if (!metadata) return null
   return {
+    ...(metadata.schema_mode ? { schemaMode: metadata.schema_mode } : {}),
     schemaId: metadata.schema_id,
     schemaVersion: metadata.schema_version,
     hash: metadata.hash,

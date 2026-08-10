@@ -44,6 +44,18 @@ Use `llm_wiki_get_domain_schema` search only when auto-selection is not ready
 and `domain_schema_pagination.required` is true, or classification remains
 ambiguous. If a complete small Schema is already inline, use it directly.
 Never load a paginated full Schema or search memories.
+
+When `workspace_context.domain_schema.mode` is `progressive-directory-v2`, use
+the V2 path instead of the legacy instructions above: call
+`llm_wiki_get_domain_schema` level `domains`, read the complete
+`all_domains.json`, then call level `domain` for each selected Domain, and
+finally call level `abe` for each selected ABE. The ABE response is the full
+JSON file; do not request search, pagination, or a type slice. Select one BE
+per entity/concept with a JSON Pointer into the returned ABE JSON and emit
+`schemaClassification` with `status`, `confidence`, `domain`, `abe`, and `be`.
+The JSON field names are unrestricted. If the choice is ambiguous, preserve
+the grounded candidate with `status: "unresolved"` and put the reason in
+`unresolvedQuestions`; never fabricate or drop it.
 Build the payload by copying `get_batch.analysis_scaffold`, not from memory.
 When `evidence_catalog` is present, leave the scaffold's `sourceRefMode` and
 numeric source catalog unchanged and cite `evidence_index` values directly in

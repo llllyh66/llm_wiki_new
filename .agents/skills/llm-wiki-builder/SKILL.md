@@ -38,6 +38,19 @@ When `workspace_context.domain_schema` is present, also read
 [domain-schema.md](references/domain-schema.md) before extracting the first
 typed entity or any relation.
 
+### Progressive directory Schema V2
+
+If the task metadata reports `domain_schema.schema_mode` or
+`workspace_context.domain_schema.mode` as `progressive-directory-v2`, follow
+the three-level disclosure contract in `references/domain-schema.md`: read
+`all_domains.json`, then each selected Domain's `*_domain.json`, then expose
+the complete selected ABE JSON before choosing a BE. Do not use the V1
+`domain_schema_auto_selection`, lexical search, `entityTypes`, `conceptTypes`,
+or `relationTypes` assumptions on this path. Put `schemaClassification` on
+every entity and concept, include a JSON Pointer into the selected ABE JSON,
+and retain unresolved candidates with `status: "unresolved"` instead of
+inventing or dropping them.
+
 ## Background-agent priority (mandatory)
 
 ### MCP health proof (mandatory after compaction or a worker notification)
@@ -90,8 +103,9 @@ always use it and return control to the user while the worker runs.
 ## Workflow
 
 1. Identify every attachment or explicit file reference in the user's request.
-   If the user names a domain Schema JSON, pass its Agent-visible path as
-   `options.domain_schema_path` (or pass the object as `options.domain_schema`).
+   If the user names a progressive Schema directory, pass its Agent-visible
+   directory path as `options.domain_schema_path`. For legacy V1 tasks, a JSON
+   file or inline object remains resumable for compatibility.
    If omitted, the Core automatically uses `llm-wiki.domain-schema.json` from
    the workspace root when that file exists.
 2. Call `llm_wiki_import_files` with each Agent-visible local path and a safe

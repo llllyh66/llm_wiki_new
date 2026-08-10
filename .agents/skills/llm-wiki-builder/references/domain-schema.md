@@ -1,5 +1,56 @@
 # Domain Schema extraction contract
 
+## Progressive directory Schema V2
+
+When `workspace_context.domain_schema.mode` is `progressive-directory-v2`, the
+Schema is a task-owned immutable directory snapshot. The JSON files are valid
+JSON but their internal field names and nesting are intentionally unrestricted.
+Do not expect `entityTypes`, `conceptTypes`, `relationTypes`, or any other fixed
+input shape.
+
+For every non-empty batch, classify entities and concepts progressively:
+
+1. Call `llm_wiki_get_domain_schema` with `level: "domains"` and read the
+   complete `all_domains.json` returned in `content`.
+2. Group candidates by the selected Domain folder and call the same tool with
+   `level: "domain"` and that `domain_folder`. Read the complete
+   `<domain>/<domain>_domain.json` returned in `content`.
+3. For each selected ABE call the tool with `level: "abe"`, the Domain folder,
+   and the ABE filename. The returned ABE JSON is complete; never request a
+   search result, cursor, or abbreviated type list.
+4. Select one BE per entity or concept from the complete ABE JSON. Include a
+   JSON Pointer into that ABE document so Core can verify the selection.
+
+Use this output shape on each entity and concept:
+
+```json
+{
+  "schemaClassification": {
+    "status": "classified",
+    "confidence": 0.91,
+    "domain": { "key": "customer", "name": "客户域" },
+    "abe": { "key": "customer_management", "name": "客户管理", "file": "customer_management.json" },
+    "be": { "key": "customer_management#/businessEntities/2", "name": "个人客户", "pointer": "/businessEntities/2" }
+  }
+}
+```
+
+`sourceRefs` prove facts in the imported documents. They are separate from the
+Schema file and JSON Pointer used to prove the classification choice.
+
+If Domain, ABE, or BE selection remains ambiguous, preserve the source-grounded
+candidate with `status: "unresolved"`, include the deepest confirmed level and
+the reason in `unresolvedQuestions`, and never invent a BE. Core validates the
+directory chain, snapshot/file hashes, and JSON Pointer; it does not validate
+business field names inside arbitrary JSON.
+
+Page requirements and Wiki pages inherit the classification path. The Core-owned
+page section renders `Domain → ABE → BE` and marks unresolved paths as pending.
+
+The remainder of this file documents the V1 fixed-object Schema contract for
+existing tasks that are being resumed. Do not apply its entityTypes/property or
+relationTypes rules to a V2 progressive directory task.
+
 Use this contract only when `llm_wiki_get_batch` returns a non-null
 `workspace_context.domain_schema`. The task owns a validated snapshot, so do
 not reload or reinterpret a later version of the source Schema file mid-task.

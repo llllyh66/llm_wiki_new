@@ -1,6 +1,6 @@
 {
   "name": "@llm-wiki/mcp-server",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -14,7 +14,7 @@
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
-    "@llm-wiki/core": "1.0.3",
+    "@llm-wiki/core": "1.0.4",
     "@modelcontextprotocol/sdk": "^1.30.0"
   },
   "engines": {
