@@ -167,8 +167,13 @@ async function main() {
       const child = spawn(process.execPath, [supervisorPath, "--workspace", workspaceRoot, "--port", String(port)], {
         cwd: workspaceRoot,
         detached: true,
+        windowsHide: true,
         env: { ...process.env, LLM_WIKI_MCP_HTTP_PORT: String(port) },
         stdio: ["ignore", logHandle.fd, logHandle.fd],
+      })
+      await new Promise((resolve, reject) => {
+        child.once("spawn", resolve)
+        child.once("error", reject)
       })
       child.unref()
     } finally {

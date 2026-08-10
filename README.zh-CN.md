@@ -108,7 +108,8 @@ claude
 
 根目录的 `.mcp.json` 会连接项目本地的 Streamable HTTP MCP。
 `.claude/settings.json` 中的 `SessionStart` hook 使用 `CLAUDE_PROJECT_DIR`
-幂等启动 supervisor；worker 崩溃后 supervisor 指数退避重启，Claude Code
+和无 shell 的跨平台 `command + args` 形式幂等启动 supervisor；Windows 下
+后台 Node 进程会隐藏控制台窗口。worker 崩溃后 supervisor 指数退避重启，Claude Code
 2.1.121 及以上会自动重连 HTTP MCP。服务器共 17 个工具并保持
 `alwaysLoad`。这些配置会随仓库同步：每台设备都在自己的 clone 内启动
 localhost daemon，PID 和日志只写入该 clone 的 `.llm-wiki/`。第一次打开

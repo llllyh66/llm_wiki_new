@@ -1,5 +1,15 @@
 # 更新日志
 
+## [1.0.5.2] - 2026-08-10
+
+- Run the Claude Code `SessionStart` hook in cross-platform exec form so native
+  Windows does not depend on Git Bash or PowerShell command parsing.
+- Hide the detached supervisor and worker consoles on Windows, preventing an
+  empty `node.exe` window from remaining open during Claude sessions.
+- Wait for the supervisor process to spawn before polling MCP health, so startup
+  failures are reported deterministically instead of appearing as a silent
+  connection failure.
+
 ## [1.0.5.1] - 2026-08-10
 
 - Migrate the Claude Code project registration from non-reconnecting STDIO to

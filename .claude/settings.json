@@ -10,7 +10,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PROJECT_DIR:-.}/packages/mcp-server/dist/ensure-daemon.js\" --workspace \"${CLAUDE_PROJECT_DIR:-.}\" --port \"${LLM_WIKI_MCP_HTTP_PORT:-31982}\"",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/packages/mcp-server/dist/ensure-daemon.js",
+              "--workspace",
+              "${CLAUDE_PROJECT_DIR}"
+            ],
             "timeout": 15
           }
         ]

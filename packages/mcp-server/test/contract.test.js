@@ -33,6 +33,13 @@ test("Claude project agents inherit llm-wiki MCP without a wildcard-only tool al
   assert.match(drafter, /one bounded shard/)
   assert.match(drafter, /no duplicate paths/)
   assert.equal(settings.enableAllProjectMcpServers, true)
+  const sessionStartHook = settings.hooks.SessionStart[0].hooks[0]
+  assert.equal(sessionStartHook.command, "node")
+  assert.deepEqual(sessionStartHook.args, [
+    "${CLAUDE_PROJECT_DIR}/packages/mcp-server/dist/ensure-daemon.js",
+    "--workspace",
+    "${CLAUDE_PROJECT_DIR}",
+  ])
   assert.equal(settings.permissions.allow.includes("Agent(llm-wiki-extractor)"), true)
   assert.equal(settings.permissions.allow.includes("Agent(llm-wiki-page-drafter)"), true)
   assert.equal(settings.permissions.allow.includes("Agent(llm-wiki-writer)"), true)

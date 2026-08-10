@@ -54,6 +54,7 @@ async function main() {
       let becameReady = false
       worker = spawn(process.execPath, [workerPath, "--workspace", workspaceRoot, "--port", String(port)], {
         cwd: workspaceRoot,
+        windowsHide: true,
         env: {
           ...process.env,
           LLM_WIKI_MCP_SUPERVISOR_PID: String(process.pid),

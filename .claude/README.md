@@ -2,13 +2,17 @@
 
 The project root `.mcp.json` connects Claude Code to the Headless `llm-wiki`
 Streamable HTTP MCP server on loopback. A `SessionStart` command hook resolves
-the executable and workspace from `CLAUDE_PROJECT_DIR`, then idempotently starts
+the executable and workspace from `CLAUDE_PROJECT_DIR` using Claude's
+cross-platform exec form, then idempotently starts
 a detached project-local supervisor. The supervisor restarts a crashed worker
 with exponential backoff; Claude Code 2.1.121+ automatically reconnects HTTP
 MCP sessions. The small 17-tool server remains `alwaysLoad`, so changing the
 shell working directory or deferred tool discovery cannot detach the workflow.
 Claude Code asks for project-server and hook trust the first time it reads the
 checked-in configuration.
+
+On native Windows, both detached Node processes use hidden-window spawning, so
+the daemon does not leave an empty `node.exe` console window open.
 
 `.claude/settings.json` approves the project `llm-wiki` server, every tool from
 that server (both server-wide and all 17 explicit tool names), the builder
