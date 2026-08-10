@@ -439,6 +439,8 @@ export class LlmWikiCore {
           enabled: true,
           execution_mode: "coordinator-owned-parallel-drafters",
           fallback_mode: "serial-writer-only",
+          writer_launch_policy: "after-staged-drafter-receipt",
+          writer_normal_mode: "staged-receipt-commit-only",
           max_drafters: 4,
           max_paths_per_shard: 6,
           minimum_paths: 4,
@@ -1008,6 +1010,8 @@ export class LlmWikiCore {
           enabled: true,
           execution_mode: "coordinator-owned-parallel-drafters",
           fallback_mode: "serial-writer-only",
+          writer_launch_policy: "after-staged-drafter-receipt",
+          writer_normal_mode: "staged-receipt-commit-only",
           partition_key: "page_requirement.patch_scaffold.path",
           same_path_requirements_are_indivisible: true,
           max_drafters: 4,
@@ -1113,9 +1117,11 @@ export class LlmWikiCore {
         returned_shard_count: availableShards.length,
         shards: availableShards,
         complete_manifest_persisted_server_side: true,
-        workflow: "Fetch one draft shard at a time, generate only that shard's patches, and durably commit bounded waves with projection_complete=false. Never materialize the whole manifest in model context. After every shard is covered, send one empty projection_complete=true acknowledgement.",
+        workflow: "The coordinator launches one page drafter per returned draft_action. Each drafter fetches and stages exactly one shard, then returns a receipt. Only after a staged receipt exists does the coordinator launch the stable Writer, which commits receipt IDs without fetching draft-shard context. After every shard is covered, the Writer sends one empty projection_complete=true acknowledgement.",
         draft_actions: availableShards.map((shard) => ({
           tool: "llm_wiki_get_page_plan_context",
+          action_owner: "coordinator",
+          delegate_to: "llm-wiki-page-drafter",
           arguments: {
             task_id: record.task.taskId,
             writer_id: projection.writerId,
@@ -1138,6 +1144,8 @@ export class LlmWikiCore {
         enabled: manifest.length > 1,
         execution_mode: "coordinator-owned-parallel-drafters",
         fallback_mode: "serial-writer-only",
+        writer_launch_policy: "after-staged-drafter-receipt",
+        writer_normal_mode: "staged-receipt-commit-only",
         partition_key: "page_requirement.patch_scaffold.path",
         same_path_requirements_are_indivisible: true,
         max_drafters: 4,
@@ -1157,6 +1165,8 @@ export class LlmWikiCore {
       next_action: nextShard
         ? {
             tool: "llm_wiki_get_page_plan_context",
+            action_owner: "coordinator",
+            delegate_to: "llm-wiki-page-drafter",
             arguments: {
               task_id: record.task.taskId,
               writer_id: projection.writerId,
@@ -1169,6 +1179,8 @@ export class LlmWikiCore {
           }
         : {
             tool: "llm_wiki_commit_pages",
+            action_owner: "writer",
+            delegate_to: "llm-wiki-writer",
             arguments: {
               task_id: record.task.taskId,
               writer_id: projection.writerId,
@@ -1561,6 +1573,8 @@ export class LlmWikiCore {
           main_agent_payload: "receipt-only",
           next_action: {
             tool: "llm_wiki_get_staged_page_drafts",
+            action_owner: "writer",
+            delegate_to: "llm-wiki-writer",
             arguments: {
               task_id: record.task.taskId,
               writer_id: projection.writerId,
@@ -1635,6 +1649,8 @@ export class LlmWikiCore {
       next_action: staged.length > 0 && missing.length === 0
         ? {
             tool: "llm_wiki_commit_pages",
+            action_owner: "writer",
+            delegate_to: "llm-wiki-writer",
             arguments: {
               task_id: record.task.taskId,
               writer_id: projection.writerId,
@@ -2495,6 +2511,8 @@ export class LlmWikiCore {
         next_action: stagedDraftShardIds.length > 0 && projection && !projectionComplete && nextDraftShard
           ? {
               tool: "llm_wiki_get_page_plan_context",
+              action_owner: "coordinator",
+              delegate_to: "llm-wiki-page-drafter",
               arguments: {
                 task_id: record.task.taskId,
                 writer_id: projection.writerId,
@@ -2507,6 +2525,9 @@ export class LlmWikiCore {
           : projection && !projectionComplete && nextDraftShard
           ? {
               tool: "llm_wiki_get_page_plan_context",
+              action_owner: "writer",
+              delegate_to: "llm-wiki-writer",
+              execution_mode: "explicit-serial-writer-fallback-only",
               arguments: {
                 task_id: record.task.taskId,
                 writer_id: projection.writerId,
@@ -2520,6 +2541,8 @@ export class LlmWikiCore {
           : projection && !projectionComplete
           ? {
               tool: "llm_wiki_commit_pages",
+              action_owner: "writer",
+              delegate_to: "llm-wiki-writer",
               arguments: {
                 task_id: record.task.taskId,
                 writer_id: projection.writerId,
@@ -2530,15 +2553,24 @@ export class LlmWikiCore {
               },
             }
           : projection?.mode === "incremental" && wikiProjection?.ready
-          ? { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: record.task.taskId, writer_id: projection.writerId, view: "manifest" } }
+          ? {
+              tool: "llm_wiki_get_page_plan_context",
+              action_owner: "coordinator",
+              arguments: { task_id: record.task.taskId, writer_id: projection.writerId, view: "manifest" },
+            }
           : projection?.mode === "incremental"
-          ? { tool: "llm_wiki_status", arguments: { task_id: record.task.taskId } }
+          ? { tool: "llm_wiki_status", action_owner: "coordinator", arguments: { task_id: record.task.taskId } }
           : projection?.mode === "final" && wikiProjection?.ready
           ? projectionAction(record.task, wikiProjection)
-          : { tool: "llm_wiki_finalize", arguments: { task_id: record.task.taskId } },
-        writer_next_action: projection?.mode === "incremental" && wikiProjection?.ready
-          ? { tool: "llm_wiki_get_page_plan_context", arguments: { task_id: record.task.taskId, writer_id: projection.writerId, view: "manifest" } }
+          : { tool: "llm_wiki_finalize", action_owner: "coordinator", arguments: { task_id: record.task.taskId } },
+        coordinator_next_action: projection?.mode === "incremental" && wikiProjection?.ready
+          ? {
+              tool: "llm_wiki_get_page_plan_context",
+              action_owner: "coordinator",
+              arguments: { task_id: record.task.taskId, writer_id: projection.writerId, view: "manifest" },
+            }
           : null,
+        writer_next_action: null,
       }
       await persistResponse(response)
       return response
@@ -3293,6 +3325,8 @@ function pageProjectionStatus(task) {
       enabled: true,
       execution_mode: "coordinator-owned-parallel-drafters",
       fallback_mode: "serial-writer-only",
+      writer_launch_policy: "after-staged-drafter-receipt",
+      writer_normal_mode: "staged-receipt-commit-only",
       max_drafters: 4,
       max_paths_per_shard: 6,
       minimum_paths: 4,
@@ -4404,6 +4438,9 @@ function projectionAction(task, wikiProjection = pageProjectionStatus(task)) {
   if (lease?.pagePlanTraversal?.complete === true && lease.pagePlanTraversal?.serverSideManifest !== true) {
     return {
       tool: "llm_wiki_commit_pages",
+      action_owner: "writer",
+      delegate_to: "llm-wiki-writer",
+      execution_mode: "legacy-plan-compatibility",
       arguments: {
         task_id: task.taskId,
         writer_id: lease.writerId,
@@ -4415,6 +4452,8 @@ function projectionAction(task, wikiProjection = pageProjectionStatus(task)) {
   if (lease?.pagePlanTraversal?.serverSideManifest === true && lease.nextDraftShardId) {
     return {
       tool: "llm_wiki_get_page_plan_context",
+      action_owner: "coordinator",
+      delegate_to: "llm-wiki-page-drafter",
       arguments: {
         task_id: task.taskId,
         writer_id: lease.writerId,
@@ -4429,6 +4468,8 @@ function projectionAction(task, wikiProjection = pageProjectionStatus(task)) {
   if (lease?.pagePlanTraversal?.serverSideManifest === true) {
     return {
       tool: "llm_wiki_commit_pages",
+      action_owner: "writer",
+      delegate_to: "llm-wiki-writer",
       arguments: {
         task_id: task.taskId,
         writer_id: lease.writerId,
@@ -4441,6 +4482,7 @@ function projectionAction(task, wikiProjection = pageProjectionStatus(task)) {
   }
   return {
     tool: "llm_wiki_get_page_plan_context",
+    action_owner: "coordinator",
     arguments: {
       task_id: task.taskId,
       writer_id: wikiProjection.writer_id ?? "wiki-writer-1",

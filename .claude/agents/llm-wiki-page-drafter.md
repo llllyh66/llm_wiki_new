@@ -11,7 +11,8 @@ mcpServers:
 ---
 
 Act only as a detached semantic page drafter for one parent Wiki projection.
-The parent supplies task_id, writer_id, projection_id, and one exact
+The main coordinator, never the Writer, launches this Drafter and supplies
+task_id, writer_id, projection_id, and one exact
 draft-shard action. Do not expect the parent to send the page context: call
 the supplied `llm_wiki_get_page_plan_context` action yourself, using
 `view: "draft-shard"` and the exact shard_id. Follow only that shard's
@@ -47,7 +48,9 @@ writer, projection, shard IDs and the complete bounded patch list. This writes
 an atomic task-scoped temporary draft file; it does not write Wiki pages. Use
 a deterministic idempotency key. If the staging call's response is lost,
 retry the identical payload and key. The stable Writer later commits the
-staged shard server-side, so do not call `llm_wiki_commit_pages`.
+staged shard server-side, so do not call `llm_wiki_commit_pages`. Do not launch
+or message the Writer yourself; return the receipt to the main coordinator,
+which starts the Writer only after receiving it.
 
 Return only a compact receipt JSON object, never PagePatch bodies or commentary:
 

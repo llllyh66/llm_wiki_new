@@ -80,7 +80,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_page_plan_context",
-    description: "Lease a stable semantic Wiki projection. Prefer view=manifest: it returns hard commit limits and small server-side draft shards without putting the full plan in model context. When parallel drafting is enabled, the coordinator launches one llm-wiki-page-drafter per disjoint shard (up to four); each drafter fetches its own bounded context and stages a temporary PagePatch receipt. The stable Writer is the sole committer and uses staged_draft_shard_ids with patches:[]; serial page drafting is fallback only. Legacy view=plan cursor traversal remains available for compatibility.",
+    description: "Coordinator-owned projection tool. The main coordinator calls view=manifest, then delegates each returned draft-shard action to one llm-wiki-page-drafter (up to four). Each Drafter fetches its own bounded context and stages a receipt. In normal mode the stable Writer never calls manifest or draft-shard and is launched only after receipt IDs exist; it commits staged_draft_shard_ids with patches:[]. Serial Writer drafting is an explicit fallback only after Drafter creation fails. Legacy view=plan remains for compatibility.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
@@ -93,7 +93,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_apply_projection",
-    description: "Compatibility entrypoint that acquires or resumes a projection and returns its compact server-side draft manifest. It never writes pages automatically.",
+    description: "Coordinator-only compatibility entrypoint that acquires or resumes a projection and returns its compact server-side draft manifest. It never writes pages and its returned shard actions belong to coordinator-launched Drafters, not the Writer.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
@@ -103,7 +103,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_stage_page_drafts",
-    description: "Persist one fully retrieved, path-disjoint semantic PagePatch shard in task-scoped temporary staging without writing Wiki pages. Page drafters use this receipt-only handoff; the stable Writer later commits the staged shard server-side.",
+    description: "Persist one fully retrieved, path-disjoint semantic PagePatch shard in task-scoped temporary staging without writing Wiki pages. A coordinator-launched Drafter uses this receipt-only handoff and returns the receipt to the coordinator; only then is the stable Writer launched to commit it server-side.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
@@ -115,7 +115,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_staged_page_drafts",
-    description: "Return metadata-only receipts for staged PagePatch shards. The stable Writer calls this with receipt IDs supplied by the coordinator; it never returns page bodies and the coordinator must not substitute itself as committer.",
+    description: "Writer-owned metadata call. The stable Writer calls this only with completed staged receipt IDs supplied by the coordinator. It never returns page bodies. If receipts are missing, the Writer stops so the coordinator can relaunch those Drafters; the Writer must not fetch their shard context.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
@@ -125,7 +125,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_commit_pages",
-    description: "Atomically commit one bounded semantic Wiki wave. The stable Writer is the only Agent that calls this tool. Hard maximum: 50 patches and the returned page_commit_limits may recommend a smaller wave. Use staged_draft_shard_ids with patches:[] to commit drafter-created temporary shards server-side; actual PagePatch bodies are neither required nor returned to the coordinator. Partition paths before drafting, commit accepted waves with projection_complete=false, and never regenerate accepted waves. Finish with projection_complete=true after every manifest shard is covered.",
+    description: "Writer-owned atomic commit. In normal mode the stable Writer is launched only after Drafter receipts exist and commits staged_draft_shard_ids with patches:[]; it never launches Drafters or fetches manifest/draft-shard context. Hard maximum: 50 patches. After one staged wave it returns any coordinator-owned next action instead of executing it. Direct PagePatch commits are reserved for the explicitly requested serial Writer fallback. Finish with projection_complete=true after every manifest shard is covered.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },

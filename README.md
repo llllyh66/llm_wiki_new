@@ -105,7 +105,8 @@ its inherited MCP capability. Team lifecycle warnings are never treated as MCP
 success or failure, and successfully launched workers are not duplicated by
 coordinator extraction. When a commit makes a Wiki projection
 ready, that extractor returns immediately with `writer_required: true` so the
-coordinator starts `wiki-writer-1` before leasing more work. Page-plan responses
+coordinator starts manifest/Drafter orchestration before leasing more work.
+The Writer starts only after a Drafter stages a receipt. Page-plan responses
 never include the full extraction Schema and default to roughly 40K-character
 pages, even when the task Schema is several MiB. The main Agent remains
 available for questions and coordinates page generation without authoring or
@@ -115,15 +116,18 @@ background Wiki Writer; only that Writer calls the staged-draft and page-commit
 tools. After four new batches, or after a 30-second debounce, the pipeline
 incrementally updates affected pages while extractors continue. Each projection
 is capped at eight batches;
-one Writer invocation drains up to six ready projections (48 batches) immediately when a
-backlog exists. Incremental plans include full content only for affected pages
+one coordinator orchestration invocation drains up to six ready projections
+(48 batches) when a backlog exists. Incremental plans include full content only for affected pages
 and compact catalog metadata for unrelated pages. A final all-batch reconciliation stabilizes
 the pages before Finalize.
-The Writer first requests a server-side page manifest. The manifest declares
+The coordinator requests each server-side page manifest. The manifest declares
 the hard 50-patch commit limit and returns bounded draft shards of at most six
 canonical paths. Each accepted shard is a durable checkpoint identified by
-`draft_shard_ids`; after a restart or context compaction, the Writer resumes
-from the first unfinished shard instead of regenerating earlier pages. The
+`draft_shard_ids`; after a restart or context compaction, the coordinator
+resumes from the first unfinished shard instead of regenerating earlier pages.
+It launches path-disjoint Drafters, then launches the stable Writer only with
+completed staged receipt IDs. The Writer never launches Drafters and never
+fetches manifest or shard context in normal mode. The
 legacy full page-plan cursor mode remains available for compatibility.
 Incremental pages use concise grounded drafts. When extraction finishes, Core
 first drains any remaining bounded projections instead of creating one giant
