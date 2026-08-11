@@ -439,6 +439,10 @@ test("built MCP server survives errors and completes the full workflow over one 
   })
   const finalPlan = shardCall.structuredContent
   assert.equal(finalPlan.draft_shard_complete, true)
+  assert.equal(finalPlan.context_retrieval_complete, true)
+  assert.equal(finalPlan.commit_ready, false)
+  assert.equal(finalPlan.next_action.tool, "llm_wiki_stage_page_drafts")
+  assert.equal(finalPlan.serial_writer_fallback_action.tool, "llm_wiki_commit_pages")
   const finalPatches = finalPlan.page_requirements.map((requirement) => ({
     ...requirement.patch_scaffold,
     content: `# ${requirement.title}\n\n## Overview\n\nA semantically reconciled grounded page.\n`,

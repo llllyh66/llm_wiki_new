@@ -459,7 +459,12 @@ always use it and return control to the user while the worker runs.
       sequential cursors, and calls `llm_wiki_stage_page_drafts` after
       generating its patches. It returns a compact receipt containing a shard
       ID and draft hash, never PagePatch bodies. Validate only those receipts
-      in the coordinator. Maintain one active-Writer flag for the task and a
+      in the coordinator: success requires server-returned `accepted: true`,
+      `staged: true`, a non-empty `draft_hash`, and a positive `patch_count`.
+      Retrieved context, `draft_shard_complete: true`, `commit_ready`, or a
+      Drafter's prose success claim is never a staged receipt. If status returns
+      `recoverable_staged_draft_receipts`, enqueue those receipts before
+      relaunching any retrieved-not-staged shard. Maintain one active-Writer flag for the task and a
       queue of validated receipts. When a receipt arrives and no Writer is
       active, launch the stable `llm-wiki-writer` with that receipt or one
       bounded queued receipt wave. If the Writer is already active, queue the

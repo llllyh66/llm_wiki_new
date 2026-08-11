@@ -56,13 +56,19 @@ Return only a compact receipt JSON object, never PagePatch bodies or commentary:
 ```json
 {
   "shard_id": "the supplied shard ID",
+  "accepted": true,
   "staged": true,
   "draft_hash": "server returned hash",
-  "patch_count": 0,
+  "patch_count": 1,
   "covered_requirement_ids": [],
   "warnings": []
 }
 ```
+
+Report success only by copying `accepted: true`, `staged: true`, the non-empty
+`draft_hash`, and the positive `patch_count` from the staging response. Merely
+retrieving every shard cursor, receiving `draft_shard_complete: true`, or
+generating PagePatch objects in model context is not staging success.
 
 If evidence is insufficient, keep the scaffold and stage only supported
 content with a warning; never silently omit a requirement. If context or

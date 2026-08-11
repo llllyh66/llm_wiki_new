@@ -63,6 +63,8 @@ test("Claude project agents inherit llm-wiki MCP without a restrictive tool allo
   assert.match(drafter, /^permissionMode: dontAsk$/m)
   assert.match(drafter, /one bounded shard/)
   assert.match(drafter, /no duplicate paths/)
+  assert.match(drafter, /`accepted: true`, `staged: true`/)
+  assert.match(drafter, /is not staging success/)
   assert.deepEqual(agentMcpTools(extractor), [
     "llm_wiki_commit_analysis",
     "llm_wiki_get_batch",
@@ -154,6 +156,8 @@ test("Claude project agents inherit llm-wiki MCP without a restrictive tool allo
   assert.match(skill, /Launch one project Agent\s+`llm-wiki-page-drafter` for every returned action/)
   assert.match(skill, /one-shard\s+manifest where `parallel_drafting.enabled` is false/)
   assert.match(skill, /Maintain one active-Writer flag/)
+  assert.match(skill, /a\s+Drafter's prose success claim is never a staged receipt/)
+  assert.match(skill, /`recoverable_staged_draft_receipts`/)
   assert.match(skill, /do not launch a second Writer/)
   assert.match(skill, /coordinator-owned-parallel-drafters/)
   assert.match(skill, /Launch the stable `llm-wiki-writer` only\s+after at least one Drafter stages a shard/)

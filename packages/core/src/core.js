@@ -349,6 +349,11 @@ export class LlmWikiCore {
         projection.draftShardSeenCursors[shardId] = []
         delete projection.draftShardCursorReads[shardId]
       }
+      projection.stagedDraftReceipts = Object.fromEntries(
+        Object.entries(projection.stagedDraftReceipts ?? {}).filter(([shardId]) => (
+          !repaired.has(shardId) && !validCommittedShardIds.includes(shardId)
+        )),
+      )
       await Promise.all(repairedShardIds.map((shardId) => rm(pageDraftPath(record.paths, projection.projectionId, shardId), { force: true }).catch(() => {})))
       if (repairedShardIds.length > 0) {
         projection.coverageRepair = {
@@ -1039,8 +1044,10 @@ export class LlmWikiCore {
     const manifest = snapshot.draftManifest ?? buildPageDraftManifest(snapshot.context.required_pages ?? [])
     projection.draftShardCount = manifest.length
     const committedShardIds = new Set(projection.committedDraftShardIds ?? [])
+    const stagedDraftReceipts = projectionStagedDraftReceipts(projection)
+    const stagedShardIds = new Set(stagedDraftReceipts.map((receipt) => receipt.shard_id))
     const pendingShards = manifest.filter((shard) => !committedShardIds.has(shard.shard_id))
-    const availableShards = pendingShards.slice(0, 4)
+    const availableShards = pendingShards.filter((shard) => !stagedShardIds.has(shard.shard_id)).slice(0, 4)
     const nextShard = availableShards[0] ?? null
     projection.pagePlanTraversal = {
       projectionId: projection.projectionId,
@@ -1071,6 +1078,8 @@ export class LlmWikiCore {
         requirement_count: manifest.reduce((sum, shard) => sum + shard.requirement_ids.length, 0),
         committed_shard_count: committedShardIds.size,
         pending_shard_count: pendingShards.length,
+        staged_uncommitted_shard_count: stagedDraftReceipts.length,
+        recoverable_staged_draft_receipts: stagedDraftReceipts.slice(0, 8),
         returned_shard_count: availableShards.length,
         shards: availableShards,
         complete_manifest_persisted_server_side: true,
@@ -1118,7 +1127,19 @@ export class LlmWikiCore {
       domain_schema: pagePlanDomainSchemaMetadata(record.task.domainSchema),
       pagination: { cursor: 0, next_cursor: null, returned_items: manifest.length, total_items: manifest.length, truncated: false },
       next_cursor: null,
-      next_action: nextShard
+      next_action: stagedDraftReceipts.length > 0
+        ? {
+            tool: "llm_wiki_get_staged_page_drafts",
+            action_owner: "writer",
+            delegate_to: "llm-wiki-writer",
+            arguments: {
+              task_id: record.task.taskId,
+              writer_id: projection.writerId,
+              projection_id: projection.projectionId,
+              draft_receipts: stagedDraftReceipts.slice(0, 8),
+            },
+          }
+        : nextShard
         ? {
             tool: "llm_wiki_get_page_plan_context",
             action_owner: "coordinator",
@@ -1286,7 +1307,14 @@ export class LlmWikiCore {
       revision_scope: "target-pages",
       page_plan_complete: true,
       draft_shard_complete: page.pagination.next_cursor === null,
-      commit_ready: page.pagination.next_cursor === null,
+      context_retrieval_complete: page.pagination.next_cursor === null,
+      draft_generation_required: page.pagination.next_cursor === null,
+      staging_required: page.pagination.next_cursor === null,
+      staged: false,
+      writer_commit_ready: false,
+      // Retained for compatibility, but a retrieved context is never itself
+      // commit-ready. Only a hash-bound staging receipt makes Writer work ready.
+      commit_ready: false,
       projection: publicProjection(projection),
       provisional: projection.mode === "incremental",
       ...(projection.mode === "incremental" ? {
@@ -1313,7 +1341,24 @@ export class LlmWikiCore {
             },
           }
         : {
+            tool: "llm_wiki_stage_page_drafts",
+            action_owner: "drafter",
+            delegate_to: "llm-wiki-page-drafter",
+            arguments: {
+              task_id: record.task.taskId,
+              writer_id: projection.writerId,
+              projection_id: projection.projectionId,
+              shard_id: shard.shard_id,
+            },
+            required_generated_arguments: ["patches", "idempotency_key"],
+            success_receipt_required: ["accepted", "staged", "draft_hash", "patch_count"],
+          },
+      serial_writer_fallback_action: page.pagination.next_cursor === null
+        ? {
             tool: "llm_wiki_commit_pages",
+            action_owner: "writer",
+            delegate_to: "llm-wiki-writer",
+            execution_mode: "explicit-serial-writer-fallback-only",
             arguments: {
               task_id: record.task.taskId,
               writer_id: projection.writerId,
@@ -1322,7 +1367,9 @@ export class LlmWikiCore {
               projection_complete: false,
               draft_shard_ids: [shard.shard_id],
             },
-          },
+            required_generated_arguments: ["patches", "idempotency_key"],
+          }
+        : null,
     }
   }
 
@@ -1464,7 +1511,11 @@ export class LlmWikiCore {
       shardId,
       patches: input?.patches,
     })
-    if (exactReplay) return { ...exactReplay, idempotent_replay: true }
+    if (exactReplay) {
+      recordProjectionStagedDraftReceipt(projection, exactReplay)
+      await saveTask(record.paths, record.task)
+      return { ...exactReplay, idempotent_replay: true }
+    }
     const requirements = Array.isArray(snapshot?.context?.required_pages)
       ? snapshot.context.required_pages
       : pageRequirementsWithPatchScaffolds(
@@ -1526,6 +1577,7 @@ export class LlmWikiCore {
           content_chars: contentChars,
           staged_at: stagedAt,
           main_agent_payload: "receipt-only",
+          writer_commit_ready: true,
           next_action: {
             tool: "llm_wiki_get_staged_page_drafts",
             action_owner: "writer",
@@ -1538,6 +1590,8 @@ export class LlmWikiCore {
             },
           },
         }
+        recordProjectionStagedDraftReceipt(projection, response)
+        await saveTask(record.paths, record.task)
         await persistResponse(response)
         return response
       },
@@ -1588,11 +1642,12 @@ export class LlmWikiCore {
         continue
       }
       const expectedHash = requestedReceipts.find((receipt) => receipt.shard_id === shardId)?.draft_hash
-      if (draft.draft_hash !== expectedHash) {
+      const actualContentHash = stagedDraftContentHash(draft)
+      if (draft.draft_hash !== expectedHash || actualContentHash !== expectedHash) {
         fail("STAGED_DRAFT_HASH_MISMATCH", `The staged draft changed after its receipt was issued: ${shardId}.`, {
           retryable: true,
           taskId: record.task.taskId,
-          details: { shard_id: shardId, expected_draft_hash: expectedHash, actual_draft_hash: draft.draft_hash, atomic_commit_applied: false },
+          details: { shard_id: shardId, expected_draft_hash: expectedHash, actual_draft_hash: actualContentHash ?? draft.draft_hash, atomic_commit_applied: false },
           suggestedAction: "Do not commit this shard. Return control to the coordinator and relaunch the matching Drafter in a new projection.",
         })
       }
@@ -2145,11 +2200,12 @@ export class LlmWikiCore {
           })
         }
         const expectedHash = stagedDraftReceipts.find((receipt) => receipt.shard_id === shardId)?.draft_hash
-        if (expectedHash && staged.draft_hash !== expectedHash) {
+        const actualContentHash = stagedDraftContentHash(staged)
+        if (!actualContentHash || staged.draft_hash !== actualContentHash || (expectedHash && actualContentHash !== expectedHash)) {
           fail("STAGED_DRAFT_HASH_MISMATCH", `The staged draft no longer matches its accepted receipt: ${shardId}.`, {
             retryable: true,
             taskId: record.task.taskId,
-            details: { shard_id: shardId, expected_draft_hash: expectedHash, actual_draft_hash: staged.draft_hash, atomic_commit_applied: false },
+            details: { shard_id: shardId, expected_draft_hash: expectedHash ?? staged.draft_hash, actual_draft_hash: actualContentHash ?? staged.draft_hash, atomic_commit_applied: false },
             suggestedAction: "Do not commit this shard. Return control to the coordinator and relaunch the matching Drafter in a new projection.",
           })
         }
@@ -2218,7 +2274,7 @@ export class LlmWikiCore {
           retryable: true,
           taskId: record.task.taskId,
           details: { submitted_draft_shard_ids: [], atomic_commit_applied: false },
-          suggestedAction: "Copy draft_shard_ids from the shard's returned llm_wiki_commit_pages next_action.",
+          suggestedAction: "For explicit serial Writer fallback, copy draft_shard_ids from the shard's serial_writer_fallback_action.",
         })
       }
       if (submittedManifestShardIds.some((shardId) => !knownShardIds.has(shardId))) {
@@ -2226,7 +2282,7 @@ export class LlmWikiCore {
           retryable: true,
           taskId: record.task.taskId,
           details: { submitted_draft_shard_ids: submittedManifestShardIds, available_draft_shard_ids: [...knownShardIds].slice(0, 100), atomic_commit_applied: false },
-          suggestedAction: "Copy draft_shard_ids from the shard's returned llm_wiki_commit_pages next_action.",
+          suggestedAction: "For explicit serial Writer fallback, copy draft_shard_ids from the shard's serial_writer_fallback_action.",
         })
       }
       const alreadyCommitted = submittedManifestShardIds.filter((shardId) => (commitProjection.committedDraftShardIds ?? []).includes(shardId))
@@ -2423,6 +2479,10 @@ export class LlmWikiCore {
           projection.committedDraftShardIds = uniqueStrings([...(projection.committedDraftShardIds ?? []), ...submittedManifestShardIds])
           const submittedSet = new Set(submittedManifestShardIds)
           projection.retrievedDraftShardIds = (projection.retrievedDraftShardIds ?? []).filter((shardId) => !submittedSet.has(shardId))
+          projection.stagedDraftReceipts = projection.stagedDraftReceipts && typeof projection.stagedDraftReceipts === "object"
+            ? projection.stagedDraftReceipts
+            : {}
+          for (const shardId of submittedManifestShardIds) delete projection.stagedDraftReceipts[shardId]
         }
         projection.coverageAuditAt = nowIso()
         projection.coverageAuditWikiRevision = journal.wikiRevision
@@ -2863,11 +2923,46 @@ export class LlmWikiCore {
       const workspace = await this.workspace({ skipWikiRevision: true })
       const record = await loadTask(workspace.paths, input?.task_id)
       const repair = await this.#repairProjectionState(workspace, record)
+      const stagedRecovery = await this.#recoverProjectionStagedDraftReceipts(record)
       const response = statusResponse(record.task)
-      return repair.repaired_shard_ids.length > 0
-        ? { ...response, projection_recovery: { repaired: true, repaired_shard_ids: repair.repaired_shard_ids } }
+      return repair.repaired_shard_ids.length > 0 || stagedRecovery.recovered_shard_ids.length > 0
+        ? {
+            ...response,
+            projection_recovery: {
+              repaired: repair.repaired_shard_ids.length > 0,
+              repaired_shard_ids: repair.repaired_shard_ids,
+              recovered_staged_draft_receipts: stagedRecovery.recovered_shard_ids,
+            },
+          }
         : response
     }, operationSignal(input))
+  }
+
+  async #recoverProjectionStagedDraftReceipts(record) {
+    const projection = projectionState(record.task).lease
+    if (!projection || projection.pagePlanTraversal?.serverSideManifest !== true
+      || !Number.isFinite(Date.parse(projection.expiresAt)) || Date.parse(projection.expiresAt) <= Date.now()) {
+      return { changed: false, recovered_shard_ids: [] }
+    }
+    const previous = projectionStagedDraftReceipts(projection)
+    const committed = new Set(projection.committedDraftShardIds ?? [])
+    const recovered = []
+    projection.stagedDraftReceipts = {}
+    for (const shardId of uniqueStrings(projection.retrievedDraftShardIds ?? [])) {
+      if (committed.has(shardId)) continue
+      const draft = await readJson(pageDraftPath(record.paths, projection.projectionId, shardId), null)
+      if (!draft || draft.task_id !== record.task.taskId || draft.projection_id !== projection.projectionId
+        || draft.writer_id !== projection.writerId || draft.shard_id !== shardId
+        || !/^[0-9a-f]{64}$/.test(String(draft.draft_hash ?? ""))
+        || stagedDraftContentHash(draft) !== draft.draft_hash) continue
+      recordProjectionStagedDraftReceipt(projection, draft)
+      if (!previous.some((receipt) => receipt.shard_id === shardId && receipt.draft_hash === draft.draft_hash)) {
+        recovered.push(shardId)
+      }
+    }
+    const changed = stableStringify(previous) !== stableStringify(projectionStagedDraftReceipts(projection))
+    if (changed) await saveTask(record.paths, record.task)
+    return { changed, recovered_shard_ids: recovered }
   }
 
   async listTasks(input = {}) {
@@ -3291,6 +3386,13 @@ function pageProjectionStatus(task) {
     const cooldownBoundary = lastCommittedAt === null ? now : lastCommittedAt + state.debounceMs
     nextReadyAt = new Date(Math.max(ageBoundary, cooldownBoundary)).toISOString()
   }
+  const stagedDraftReceipts = state.lease ? projectionStagedDraftReceipts(state.lease) : []
+  const stagedDraftShardIds = new Set(stagedDraftReceipts.map((receipt) => receipt.shard_id))
+  const retrievedNotStagedDraftShards = state.lease && Array.isArray(state.lease.retrievedDraftShardIds)
+    ? state.lease.retrievedDraftShardIds.filter((shardId) => (
+        !(state.lease.committedDraftShardIds ?? []).includes(shardId) && !stagedDraftShardIds.has(shardId)
+      )).length
+    : 0
   return {
     enabled: true,
     ready,
@@ -3340,6 +3442,9 @@ function pageProjectionStatus(task) {
       retrieved_uncommitted_draft_shards: Array.isArray(state.lease.retrievedDraftShardIds)
         ? state.lease.retrievedDraftShardIds.filter((shardId) => !(state.lease.committedDraftShardIds ?? []).includes(shardId)).length
         : 0,
+      retrieved_not_staged_draft_shards: retrievedNotStagedDraftShards,
+      staged_uncommitted_draft_shards: stagedDraftReceipts.length,
+      recoverable_staged_draft_receipts: stagedDraftReceipts.slice(0, 8),
       pending_draft_shards: Number.isInteger(state.lease.draftShardCount)
         ? Math.max(0, state.lease.draftShardCount - (state.lease.committedDraftShardIds ?? []).length)
         : null,
@@ -3398,6 +3503,7 @@ function acquirePageProjection(task, input) {
     draftShardNextCursors: {},
     draftShardSeenCursors: {},
     draftShardCursorReads: {},
+    stagedDraftReceipts: {},
     coverageAuditAt: null,
     coverageAuditWikiRevision: null,
   }
@@ -3422,6 +3528,8 @@ function requirePageProjectionLease(task, input) {
 }
 
 function publicProjection(projection) {
+  const stagedDraftReceipts = projectionStagedDraftReceipts(projection)
+  const stagedDraftShardIds = new Set(stagedDraftReceipts.map((receipt) => receipt.shard_id))
   return {
     projection_id: projection.projectionId,
     writer_id: projection.writerId,
@@ -3435,6 +3543,13 @@ function publicProjection(projection) {
     retrieved_uncommitted_draft_shards: Array.isArray(projection.retrievedDraftShardIds)
       ? projection.retrievedDraftShardIds.filter((shardId) => !(projection.committedDraftShardIds ?? []).includes(shardId)).length
       : 0,
+    retrieved_not_staged_draft_shards: Array.isArray(projection.retrievedDraftShardIds)
+      ? projection.retrievedDraftShardIds.filter((shardId) => (
+          !(projection.committedDraftShardIds ?? []).includes(shardId) && !stagedDraftShardIds.has(shardId)
+        )).length
+      : 0,
+    staged_uncommitted_draft_shards: stagedDraftReceipts.length,
+    recoverable_staged_draft_receipts: stagedDraftReceipts.slice(0, 8),
     pending_draft_shards: Number.isInteger(projection.draftShardCount)
       ? Math.max(0, projection.draftShardCount - (projection.committedDraftShardIds ?? []).length)
       : null,
@@ -4354,6 +4469,42 @@ function normalizeStagedDraftReceipts(value, fieldName) {
   })
 }
 
+function projectionStagedDraftReceipts(projection) {
+  const committed = new Set(projection?.committedDraftShardIds ?? [])
+  const receipts = projection?.stagedDraftReceipts && typeof projection.stagedDraftReceipts === "object"
+    ? projection.stagedDraftReceipts
+    : {}
+  return Object.entries(receipts)
+    .filter(([shardId, receipt]) => (
+      /^draft-[0-9]{4,}$/.test(shardId)
+      && !committed.has(shardId)
+      && /^[0-9a-f]{64}$/.test(String(receipt?.draft_hash ?? ""))
+    ))
+    .map(([shardId, receipt]) => ({ shard_id: shardId, draft_hash: receipt.draft_hash }))
+    .sort((left, right) => left.shard_id.localeCompare(right.shard_id))
+}
+
+function recordProjectionStagedDraftReceipt(projection, receipt) {
+  const shardId = normalizeDraftShardId(receipt?.shard_id)
+  const draftHash = String(receipt?.draft_hash ?? "")
+  if (!/^[0-9a-f]{64}$/.test(draftHash)) {
+    fail("INVALID_INPUT", "A staged draft receipt must contain a lowercase SHA-256 draft_hash.")
+  }
+  projection.stagedDraftReceipts = projection.stagedDraftReceipts && typeof projection.stagedDraftReceipts === "object"
+    ? projection.stagedDraftReceipts
+    : {}
+  projection.stagedDraftReceipts[shardId] = {
+    draft_hash: draftHash,
+    ...(Number.isInteger(receipt?.patch_count) ? { patch_count: receipt.patch_count } : {}),
+    ...(Number.isInteger(receipt?.content_chars) ? { content_chars: receipt.content_chars } : {}),
+    ...(typeof receipt?.staged_at === "string" ? { staged_at: receipt.staged_at } : {}),
+  }
+}
+
+function stagedDraftContentHash(draft) {
+  return Array.isArray(draft?.patches) ? sha256(stableStringify(draft.patches)) : null
+}
+
 function pageDraftPath(paths, projectionId, shardId) {
   const key = sha256(`${String(projectionId)}\n${String(shardId)}`)
   return path.join(paths.pageDrafts, `${key}.json`)
@@ -4451,6 +4602,20 @@ function projectionAction(task, wikiProjection = pageProjectionStatus(task)) {
         writer_id: lease.writerId,
         projection_id: lease.projectionId,
         based_on_wiki_revision: lease.wikiRevision,
+      },
+    }
+  }
+  const stagedDraftReceipts = lease ? projectionStagedDraftReceipts(lease).slice(0, 8) : []
+  if (lease?.pagePlanTraversal?.serverSideManifest === true && stagedDraftReceipts.length > 0) {
+    return {
+      tool: "llm_wiki_get_staged_page_drafts",
+      action_owner: "writer",
+      delegate_to: "llm-wiki-writer",
+      arguments: {
+        task_id: task.taskId,
+        writer_id: lease.writerId,
+        projection_id: lease.projectionId,
+        draft_receipts: stagedDraftReceipts,
       },
     }
   }

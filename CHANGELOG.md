@@ -1,5 +1,23 @@
 # 更新日志
 
+## [1.0.6.1] - 2026-08-11
+
+- Make a completed `draft-shard` context explicitly require
+  `llm_wiki_stage_page_drafts`; direct PagePatch commit is now exposed only as
+  the explicit serial Writer fallback action.
+- Separate context retrieval from staging readiness with
+  `context_retrieval_complete`, `retrieved_not_staged_draft_shards`, and
+  `staged_uncommitted_draft_shards`; `commit_ready` is false for an unstaged
+  Drafter context.
+- Persist hash-bound staged receipts in projection state and recover older or
+  response-lost receipts from task-scoped draft files. `status` now routes the
+  stable Writer to those receipts before launching replacement Drafters.
+- Require coordinators and Drafters to treat only server-returned
+  `accepted=true`, `staged=true`, a non-empty `draft_hash`, and a positive
+  `patch_count` as staging success.
+- Add Core, MCP STDIO, and prompt-contract regression coverage for the complete
+  retrieved → staged → committed state transition.
+
 ## [1.0.5.2] - 2026-08-10
 
 - Add a complete project-level `.cac/` integration that mirrors `.claude/`

@@ -98,7 +98,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_stage_page_drafts",
-    description: "Persist one fully retrieved, path-disjoint semantic PagePatch shard in task-scoped temporary staging without writing Wiki pages. A coordinator-launched Drafter uses this receipt-only handoff and returns the receipt to the coordinator; only then is the stable Writer launched to commit it server-side.",
+    description: "Persist one fully retrieved, path-disjoint semantic PagePatch shard in task-scoped temporary staging without writing Wiki pages. Success requires accepted=true, staged=true, a non-empty draft_hash, and a positive patch_count. Core persists the hash-bound receipt so status can recover a lost Drafter response; only then is the stable Writer launched to commit it server-side.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
@@ -160,7 +160,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_status",
-    description: "Return one current-workspace task's persisted status, current parallel worker recommendation and batch quantum, next action, and resumable worker reservations. Leases do not indicate live SubAgent processes; after a worker invocation ends, the same worker_id resumes any remaining reservation immediately.",
+    description: "Return one current-workspace task's persisted status, current parallel worker recommendation and batch quantum, next action, resumable worker reservations, and recoverable staged draft receipts. Projection status distinguishes retrieved-not-staged from staged-uncommitted shards. Leases do not indicate live SubAgent processes; after a worker invocation ends, the same worker_id resumes any remaining reservation immediately.",
     inputSchema: closedObject({ task_id: taskId }, ["task_id"]),
   },
   {

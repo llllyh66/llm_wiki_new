@@ -1876,8 +1876,20 @@ test("page drafters stage receipt-only shards and the Writer commits them server
   assert.equal(action.delegate_to, "llm-wiki-page-drafter")
   const shard = await f.core.getPagePlanContext(action.arguments)
   assert.equal(shard.draft_shard_complete, true)
+  assert.equal(shard.context_retrieval_complete, true)
+  assert.equal(shard.commit_ready, false)
+  assert.equal(shard.staged, false)
+  assert.equal(shard.writer_commit_ready, false)
+  assert.equal(shard.next_action.tool, "llm_wiki_stage_page_drafts")
+  assert.equal(shard.next_action.action_owner, "drafter")
+  assert.equal(shard.next_action.delegate_to, "llm-wiki-page-drafter")
+  assert.equal(shard.serial_writer_fallback_action.tool, "llm_wiki_commit_pages")
+  assert.equal(shard.serial_writer_fallback_action.execution_mode, "explicit-serial-writer-fallback-only")
   assert.equal(shard.draft_context_limits.max_response_chars, 40_000)
   assert.equal(shard.draft_context_limits.full_existing_pages_remain_server_side, true)
+  const retrievedOnlyStatus = await f.core.status({ task_id: imported.task_id })
+  assert.equal(retrievedOnlyStatus.wiki_projection.retrieved_not_staged_draft_shards, 1)
+  assert.equal(retrievedOnlyStatus.wiki_projection.staged_uncommitted_draft_shards, 0)
   const patches = shard.page_requirements.map((requirement) => ({
     ...requirement.patch_scaffold,
     content: `# ${requirement.title}\n\n## Summary\n\nA server-staged semantic draft.\n`,
@@ -1892,11 +1904,41 @@ test("page drafters stage receipt-only shards and the Writer commits them server
     idempotency_key: "stage-page-draft-v1",
   })
   assert.equal(staged.accepted, true)
+  assert.equal(staged.staged, true)
+  assert.equal(staged.writer_commit_ready, true)
   assert.equal(staged.main_agent_payload, "receipt-only")
   assert.equal(staged.patches, undefined)
   assert.equal(staged.next_action.action_owner, "writer")
   assert.equal(staged.next_action.delegate_to, "llm-wiki-writer")
   assert.deepEqual(staged.next_action.arguments.draft_receipts, [{ shard_id: shard.shard.shard_id, draft_hash: staged.draft_hash }])
+  const stagedTaskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
+  const persistedAfterStage = JSON.parse(await readFile(stagedTaskPath, "utf8"))
+  delete persistedAfterStage.pageProjection.lease.stagedDraftReceipts
+  await writeFile(stagedTaskPath, JSON.stringify(persistedAfterStage))
+  const recoveredStatus = await f.core.status({ task_id: imported.task_id })
+  assert.deepEqual(recoveredStatus.projection_recovery.recovered_staged_draft_receipts, [shard.shard.shard_id])
+  assert.equal(recoveredStatus.wiki_projection.retrieved_not_staged_draft_shards, 0)
+  assert.equal(recoveredStatus.wiki_projection.staged_uncommitted_draft_shards, 1)
+  assert.deepEqual(recoveredStatus.wiki_projection.recoverable_staged_draft_receipts, [
+    { shard_id: shard.shard.shard_id, draft_hash: staged.draft_hash },
+  ])
+  assert.equal(recoveredStatus.next_action.tool, "llm_wiki_get_staged_page_drafts")
+  assert.equal(recoveredStatus.next_action.action_owner, "writer")
+  const stagedDraftDir = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "page-drafts")
+  const stagedDraftPath = path.join(stagedDraftDir, (await readdir(stagedDraftDir))[0])
+  const persistedDraft = JSON.parse(await readFile(stagedDraftPath, "utf8"))
+  const tamperedDraft = {
+    ...persistedDraft,
+    patches: persistedDraft.patches.map((patch, index) => (
+      index === 0 ? { ...patch, content: `${patch.content}\nTampered after staging.\n` } : patch
+    )),
+  }
+  await writeFile(stagedDraftPath, JSON.stringify(tamperedDraft))
+  await assert.rejects(
+    () => f.core.getStagedPageDrafts(staged.next_action.arguments),
+    (error) => error instanceof LlmWikiError && error.code === "STAGED_DRAFT_HASH_MISMATCH",
+  )
+  await writeFile(stagedDraftPath, JSON.stringify(persistedDraft))
   await assert.rejects(
     () => f.core.getStagedPageDrafts({
       task_id: imported.task_id,

@@ -22,6 +22,6 @@ try {
 }
 await writeFile(
   new URL("../dist/build-info.json", import.meta.url),
-  `${JSON.stringify({ schemaVersion: 1, packageVersion: "1.0.5", gitCommit, builtAt: new Date().toISOString() }, null, 2)}\n`,
+  `${JSON.stringify({ schemaVersion: 1, packageVersion: "1.0.6.1", gitCommit, builtAt: new Date().toISOString() }, null, 2)}\n`,
   "utf8",
 )
