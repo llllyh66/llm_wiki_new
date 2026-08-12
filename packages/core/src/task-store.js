@@ -118,6 +118,8 @@ export async function createTask(workspace, sources, options = {}) {
       lease: null,
       lastCommittedAt: null,
       finalCompleted: false,
+      finalizationMode: null,
+      fastFinalizationAudit: null,
       provisionalPagePaths: [],
       completedProjectionLeases: [],
     },

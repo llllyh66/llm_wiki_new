@@ -138,8 +138,10 @@ incrementally updates affected pages while extractors continue. Each projection
 is capped at eight batches;
 one coordinator orchestration invocation drains up to six ready projections
 (48 batches) when a backlog exists. Incremental plans include full content only for affected pages
-and compact catalog metadata for unrelated pages. A final all-batch reconciliation stabilizes
-the pages before Finalize.
+and compact catalog metadata for unrelated pages. After incremental catch-up,
+the coordinator calls Finalize directly. Core promotes the existing pages
+without another semantic rewrite only when its persisted audit proves complete
+unique requirement coverage, current task-owned hashes, and exact evidence.
 The coordinator requests each server-side page manifest. The manifest declares
 the hard 50-patch commit limit and returns bounded draft shards of at most six
 canonical paths. Each accepted shard is a durable checkpoint identified by
@@ -151,9 +153,10 @@ fetches manifest or shard context in normal mode. The
 legacy full page-plan cursor mode remains available for compatibility.
 Incremental pages use concise grounded drafts. When extraction finishes, Core
 first drains any remaining bounded projections instead of creating one giant
-all-batch final prompt. Final reconciliation always processes the server-side
-shard manifest, even when pages already have coverage, so semantic rewriting
-is never skipped.
+all-batch final prompt. If the Finalize audit finds ambiguity, contradictions,
+review items, incomplete coverage, stale hashes, or incomplete SourceRefs, it
+persists those reasons and returns the exact server-side final-projection
+action. Only that fallback processes the all-batch shard manifest.
 
 Each extractor invocation handles a bounded quantum of up to six batches,
 persisting an independent checkpoint after every batch. This amortizes Agent
@@ -288,7 +291,8 @@ For large Schemas, `get_batch` now performs deterministic batch-text matching
 against canonical type IDs, names, aliases, and property labels and embeds the
 bounded complete definitions directly. Most batches therefore need no separate
 Schema call. Extraction also skips BM25/embedding retrieval by default because
-the leased batch is complete evidence and final projection reconciles batches;
+the leased batch is complete evidence and the finalization audit or semantic
+fallback reconciles batches;
 retrieval remains available for explicit cross-batch ambiguity and remains the
 default multi-route path for user questions.
 
@@ -307,8 +311,13 @@ paths are persisted as provisional task state and excluded from retrieval
 across every active task. Large projections may use several commits of at most
 50 patches each; the lease is released only by the final commit. Backlogs
 bypass the normal cooldown while at least four unprojected batches remain, but
-each projection stays bounded and independently checkpointed. Finalize is
-blocked until one full reconciliation clears all provisional paths.
+each projection stays bounded and independently checkpointed. After catch-up,
+Finalize first audits that every batch and requirement is represented exactly
+once, no contradiction or review item remains, provisional page hashes still
+match the task commits, and exact SourceRefs remain valid. Passing pages are
+promoted without a second semantic rewrite. A failed audit persists its reasons
+and returns the exact full-reconciliation action; Finalize remains blocked until
+that semantic fallback clears all provisional paths.
 Different tasks may run one Writer each. Core serializes their workspace write
 transactions and validates only the exact target page paths and hashes, so an
 unrelated page commit no longer invalidates another Writer's paginated plan.

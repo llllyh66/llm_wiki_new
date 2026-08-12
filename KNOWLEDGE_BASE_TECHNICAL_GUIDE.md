@@ -123,16 +123,22 @@ draft-shard 的服务端响应硬上限约为 40K 字符；对既有超大页面
 
 抽取与页面生成同时进行时，协调器使用 4 个后台 Agent 的共享预算，通常分配为 2 个 extractor + 2 个 page drafter；不会中断正在处理 batch 的 extractor，而是在 worker quantum 结束后调整补位。抽取完成后可将 4 个槽位全部用于页面分片。这样可避免 extractor 持续占满并发槽导致 writer backlog 无限增长。
 
-### 2.5 最终语义重写
+### 2.5 快速收口与语义重写兜底
 
-所有 batch 完成后，Core 会创建 final projection，交给同一个 Wiki Writer 做完整语义协调：
+所有 batch 和增量 catch-up 完成后，协调器先直接调用 `llm_wiki_finalize`。
+Core 执行快速审计：确认所有 batch 已投影、requirement 完整且唯一、不存在矛盾或
+待复核项、provisional 文件 hash 与任务最新提交一致，且 SourceRef 仍能通过原始
+chunk 验证。全部通过时直接清除 provisional 状态，不启动第二轮 LLM 页面重写。
+
+只有审计失败时，Core 才返回 `FINAL_PROJECTION_REQUIRED` 及精确的 final projection
+动作，交给同一个 Wiki Writer 做完整语义协调：
 
 1. `llm_wiki_get_page_plan_context(view="manifest")` 在服务端冻结完整计划，只返回紧凑分片清单和提交限制；
 2. 每个 page drafter 按自己的 `draft_action` 读取一个 `view="draft-shard"`，仅在分片内综合相关 batch 的实体、声明、关系、冲突和现有页面，然后调用 `llm_wiki_stage_page_drafts`；
 3. Writer 用 `llm_wiki_get_staged_page_drafts(draft_receipts)` 检查 `{shard_id, draft_hash}` receipt，并让 Core 通过 `staged_draft_receipts` 统一、原子提交；页面正文不经过主 Agent；
 4. 原始 chunk 只放在简洁的来源证据区；
 5. 每个小 wave 以 `projection_complete=false` 原子提交，并回传服务端给出的 `committed_staged_draft_receipts`；这些持久化的 ID + hash 证明 final Writer 确实处理了该 shard，不会因旧页已有 coverage 而跳过语义重写。成功后立即丢弃该分片上下文；所有 shard 处理后用空 patch 和 `projection_complete=true` 完成最终覆盖审计；
-6. 最终 projection 完成后，由 Finalize 更新 `index.md` 和 `overview.md` 等全局汇总页。
+6. 最终 projection 完成后重新调用 Finalize，更新 `index.md` 和 `overview.md` 等全局汇总页。
 
 如果 Drafter 在 shard cursor 处中断，协调器使用同一 projection ID、shard ID 和准确 cursor 重启该 Drafter；如果 Writer 在 receipt 提交处中断，则重放相同 `{shard_id, draft_hash}` receipt 与幂等键。上下文压缩后直接按状态返回的未覆盖 shard 恢复，无需重放已接受页面。`llm_wiki_apply_projection` 只是兼容入口，会返回同一 compact manifest，不会自动渲染页面。
 
@@ -151,6 +157,8 @@ Related 不是在单一阶段一次性生成，而是分三步完成：
 
 `llm_wiki_finalize` 完成 Core 拥有的收尾工作：
 
+- 对已投影页面做快速完整性与可追溯性审计，通过时免语义重写发布；
+- 审计不通过时返回需要重写的 final projection 动作；
 - 生成或更新 source 页面；
 - 更新 `index.md`、`overview.md`、`log.md`；
 - 更新确定性索引，并对 Related 关系进行双向补全；

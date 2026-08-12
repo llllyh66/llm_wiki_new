@@ -43,6 +43,7 @@ test("Claude project agents inherit llm-wiki MCP without a restrictive tool allo
   const skill = await readFile(new URL("../../../.agents/skills/llm-wiki-builder/SKILL.md", import.meta.url), "utf8")
   const analysisRules = await readFile(new URL("../../../.agents/skills/llm-wiki-builder/references/analysis-rules.md", import.meta.url), "utf8")
   const domainSchema = await readFile(new URL("../../../.agents/skills/llm-wiki-builder/references/domain-schema.md", import.meta.url), "utf8")
+  const recovery = await readFile(new URL("../../../.agents/skills/llm-wiki-builder/references/recovery.md", import.meta.url), "utf8")
 
   for (const agent of [extractor, writer, drafter]) {
     assert.doesNotMatch(agent, /^tools:/m)
@@ -182,6 +183,13 @@ test("Claude project agents inherit llm-wiki MCP without a restrictive tool allo
   assert.match(skill, /including a task with exactly one batch/)
   assert.match(skill, /Do not call `llm_wiki_get_batch` or perform semantic extraction in the main/)
   assert.match(skill, /only after a worker creation was attempted and failed/)
+  assert.match(skill, /If its tool is `llm_wiki_finalize`, call Finalize immediately/)
+  assert.match(skill, /An eligible audit promotes those pages without another semantic\s+rewrite/)
+  assert.match(skill, /If Finalize returns `FINAL_PROJECTION_REQUIRED`, follow its exact\s+`details.next_action`/)
+  assert.match(skill, /fast Finalize can publish an incrementally\s+generated page only when its latest task-owned commit still carries every\s+covered requirement and exact SourceRef/)
+  assert.doesNotMatch(skill, /ensure a `final` projection\s+completes.*Then call\s+`llm_wiki_finalize`/s)
+  assert.match(recovery, /persisted fast finalization audit/)
+  assert.match(recovery, /follow `details.next_action`/)
 })
 
 function agentMcpTools(agent) {
@@ -230,6 +238,7 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
   assert.equal(domainPageQuery.inputSchema.properties.max_chars.maximum, 240000)
   assert.equal(domainPageQuery.inputSchema.properties.filters.additionalProperties, false)
   assert.equal(domainPageQuery.inputSchema.properties.filters.properties.classification_path_prefix.type, "string")
+  assert.match(TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_finalize").description, /Eligible pages are promoted without a second semantic rewrite/)
   for (const tool of TOOL_DEFINITIONS) {
     assert.match(tool.name, /^llm_wiki_[a-z_]+$/)
     assert.equal(typeof tool.description, "string")

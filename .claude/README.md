@@ -68,13 +68,15 @@ launches path-disjoint `llm-wiki-page-drafter` agents. Each Drafter reads one
 bounded shard and stages it server-side. Only after a receipt exists does the
 coordinator launch `llm-wiki-writer`, which commits hash-bound receipts without reading
 page bodies. Incremental pages remain provisional and excluded from retrieval
-until final all-batch reconciliation. The main Agent remains responsive for
+until the Finalize audit either promotes them or requires final semantic
+reconciliation. The main Agent remains responsive for
 questions: retrieval defaults to BM25 + embedding while the task is building,
 then adds the Wiki channel automatically after Finalize.
 Incremental pages are concise grounded drafts. Completed extraction drains any
-remaining incremental backlog before final mode. Final mode always performs
-semantic reconciliation over the persisted shard manifest, even when coverage
-is already complete and unique.
+remaining incremental backlog and then calls Finalize directly. Core skips a
+second semantic rewrite only when the existing pages pass its coverage, hash,
+conflict, and exact-evidence audit; otherwise final mode reconciles the
+persisted shard manifest.
 
 Every initial and replacement slot must use the exact project Agent type
 `llm-wiki-extractor`; a generic "Worker N", `general-purpose` Agent, or Team
@@ -121,8 +123,9 @@ content and hashes appear only in their matching shard. The Writer never
 launches Drafters and never fetches manifest/draft-shard context in normal
 mode. Serial Writer drafting is permitted only after a concrete Drafter
 creation failure and an explicit `explicit-serial-writer-fallback-only`
-handoff. This keeps large final reconciliation out of model context and lets
-recovery resume at the first uncovered shard after context compaction.
+handoff. When the Finalize audit requires semantic reconciliation, this keeps
+the large fallback projection out of model context and lets recovery resume at
+the first uncovered shard after context compaction.
 
 At the beginning of a later user turn, the coordinator calls
 `llm_wiki_status`. Its `worker_recovery.leases` list contains each persisted

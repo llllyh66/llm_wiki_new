@@ -886,7 +886,7 @@ test("a smaller get_batch request never repartitions another worker's live lease
   )
 })
 
-test("micro-batch Wiki projection uses one writer, hides provisional pages, and requires final reconciliation", async (t) => {
+test("micro-batch Wiki projection uses one writer, hides provisional pages, and falls back after a failed final audit", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
   const files = []
@@ -1125,6 +1125,18 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(caughtUp.projection_complete, true)
   assert.equal(caughtUp.wiki_projection.mode, "final")
   assert.equal(caughtUp.wiki_projection.ready, true)
+  assert.equal(caughtUp.next_action.tool, "llm_wiki_finalize")
+  await assert.rejects(
+    () => f.core.finalize({ task_id: imported.task_id }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "FINAL_PROJECTION_REQUIRED"
+      && error.details.fast_finalization_audit.issues.some((issue) => issue.code === "MISSING_REQUIREMENT_SOURCE_REFS")
+      && error.details.next_action.tool === "llm_wiki_get_page_plan_context",
+  )
+  const fallbackStatus = await f.core.status({ task_id: imported.task_id })
+  assert.equal(fallbackStatus.wiki_projection.finalize_first, false)
+  assert.equal(fallbackStatus.wiki_projection.fast_finalization_audit.eligible, false)
+  assert.equal(fallbackStatus.next_action.tool, "llm_wiki_get_page_plan_context")
 
   const finalPlan = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 100_000 })
   assert.equal(finalPlan.page_plan_complete, true)
@@ -1187,6 +1199,63 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   const recoveredCore = await LlmWikiCore.open(f.workspace)
   assert.equal((await recoveredCore.status({ task_id: imported.task_id })).status, "completed")
   assert.deepEqual(JSON.parse(await readFile(recoveryResultPath, "utf8")), finalized)
+})
+
+test("Finalize promotes audited incremental pages without running a second semantic projection", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const batch = await f.core.getBatch({ task_id: imported.task_id, worker_id: "fast-finalize-extractor" })
+  const { analysis } = analysisFor(imported.task_id, batch)
+  await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    worker_id: batch.worker_id,
+    analysis,
+    idempotency_key: "fast-finalize-analysis-v1",
+  })
+
+  const incrementalPlan = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    max_chars: 100_000,
+  })
+  assert.equal(incrementalPlan.projection.mode, "incremental")
+  const patchesByPath = new Map()
+  for (const requirement of incrementalPlan.page_requirements) {
+    const existing = patchesByPath.get(requirement.patch_scaffold.path)
+    if (existing) {
+      existing.covers = [...new Set([...existing.covers, requirement.requirement_id])]
+      existing.sourceRefs = [...new Set([...existing.sourceRefs, requirement.requirement_id])]
+      continue
+    }
+    patchesByPath.set(requirement.patch_scaffold.path, {
+      ...requirement.patch_scaffold,
+      content: `# ${requirement.title}\n\nAuditedIncrementalMarker for ${requirement.title}.\n`,
+      summary: `Incremental page for ${requirement.title}.`,
+      tags: [requirement.page_kind],
+    })
+  }
+  const incremental = await f.core.commitPages({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: incrementalPlan.projection.projection_id,
+    based_on_wiki_revision: incrementalPlan.based_on_wiki_revision,
+    projection_complete: true,
+    patches: [...patchesByPath.values()],
+    idempotency_key: "fast-finalize-incremental-pages-v1",
+  })
+  assert.equal(incremental.wiki_projection.mode, "final")
+  assert.equal(incremental.next_action.tool, "llm_wiki_finalize")
+
+  const finalized = await f.core.finalize({ task_id: imported.task_id })
+  assert.equal(finalized.status, "completed")
+  assert.equal(finalized.projection_finalization.mode, "fast-audit")
+  assert.equal(finalized.projection_finalization.semantic_rewrite_performed, false)
+  assert.equal(finalized.projection_finalization.fast_audit.eligible, true)
+  const retrieved = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["AuditedIncrementalMarker"] })
+  assert.equal(retrieved.retrieval_phase, "knowledge-base-complete")
+  assert.equal(retrieved.hits.some((hit) => hit.path.startsWith("wiki/")), true)
 })
 
 test("Wiki writer drains a backlog in bounded projections without resending unrelated page bodies", async (t) => {

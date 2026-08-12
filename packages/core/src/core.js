@@ -667,7 +667,7 @@ export class LlmWikiCore {
         retrieval_required: false,
         default: "skip_retrieve_context",
         use_retrieval_only_for: ["explicit cross-batch reference", "unresolved alias or duplicate ambiguity", "user-requested cross-source reconciliation"],
-        rationale: "The leased batch is complete evidence; final Wiki reconciliation handles cross-batch canonicalization.",
+        rationale: "The leased batch is complete evidence. The Finalize audit verifies cumulative coverage and exact references; its semantic fallback handles cross-batch canonicalization when required.",
       },
       extraction_hot_path: {
         expected_worker_tool_calls: domainSchema
@@ -1122,7 +1122,7 @@ export class LlmWikiCore {
         writer_guidance: {
           mode: "concise-incremental-draft",
           recommended_body_chars: { min: 300, max: 1_200 },
-          instruction: "Write only grounded facts newly required by these batches. Avoid generic filler and defer broad cross-batch synthesis to final reconciliation.",
+          instruction: "Write grounded facts required by these batches, preserve existing grounded material retained in the authoritative page, and avoid generic filler. Do not rely on a later rewrite: fast Finalize promotes only pages whose latest task-owned commit carries complete requirement coverage and exact SourceRefs; otherwise Core requires final semantic reconciliation.",
         },
       } : {}),
       ...(projection?.mode === "final" ? { finalization_hint: finalizationHint } : {}),
@@ -1545,7 +1545,7 @@ export class LlmWikiCore {
         writer_guidance: {
           mode: "concise-incremental-draft",
           recommended_body_chars: { min: 300, max: 1_200 },
-          instruction: "Write only grounded facts newly required by these batches. Avoid generic filler and defer broad cross-batch synthesis to final reconciliation.",
+          instruction: "Write grounded facts required by these batches, preserve existing grounded material retained in the authoritative page, and avoid generic filler. Do not rely on a later rewrite: fast Finalize promotes only pages whose latest task-owned commit carries complete requirement coverage and exact SourceRefs; otherwise Core requires final semantic reconciliation.",
         },
       } : {}),
       ...(projection.mode === "final" && snapshot.finalizationHint ? { finalization_hint: snapshot.finalizationHint } : {}),
@@ -2655,9 +2655,11 @@ export class LlmWikiCore {
           await rm(record.paths.pagePlan, { force: true }).catch(() => {})
           this.#clearPagePlanCaches(record.task.taskId, projection.projectionId)
           if (projection.mode === "incremental") {
+            state.fastFinalizationAudit = null
             record.task.status = record.task.completedBatchIds.length === record.task.batchCount ? "planning" : "extracting"
           } else {
             state.finalCompleted = true
+            state.finalizationMode = "semantic-rewrite"
             state.provisionalPagePaths = []
             record.task.status = "committing"
           }
@@ -2755,22 +2757,14 @@ export class LlmWikiCore {
               },
             }
           : projection?.mode === "incremental" && wikiProjection?.ready
-          ? {
-              tool: "llm_wiki_get_page_plan_context",
-              action_owner: "coordinator",
-              arguments: { task_id: record.task.taskId, writer_id: projection.writerId, view: "manifest" },
-            }
+          ? projectionAction(record.task, wikiProjection)
           : projection?.mode === "incremental"
           ? { tool: "llm_wiki_status", action_owner: "coordinator", arguments: { task_id: record.task.taskId } }
           : projection?.mode === "final" && wikiProjection?.ready
           ? projectionAction(record.task, wikiProjection)
           : { tool: "llm_wiki_finalize", action_owner: "coordinator", arguments: { task_id: record.task.taskId } },
         coordinator_next_action: projection?.mode === "incremental" && wikiProjection?.ready
-          ? {
-              tool: "llm_wiki_get_page_plan_context",
-              action_owner: "coordinator",
-              arguments: { task_id: record.task.taskId, writer_id: projection.writerId, view: "manifest" },
-            }
+          ? projectionAction(record.task, wikiProjection)
           : null,
         writer_next_action: null,
       }
@@ -2889,13 +2883,36 @@ export class LlmWikiCore {
     assertTaskStatus(record.task, ["planning", "committing", "finalizing", "failed"])
     const pageProjection = projectionState(record.task)
     const projectionUsed = pageProjection.revision > 0 || pageProjection.lease || pageProjection.provisionalPagePaths.length > 0
+    const commits = await readJson(record.paths.commits, [])
+    const pageHistory = await committedPageRecords(workspace, commits)
+    const pageRecords = latestPageRecords(pageHistory)
+    const analyses = await loadAnalyses(record, record.task.completedBatchIds)
+    const requirements = derivePageRequirements(analyses, await this.#taskDomainSchema(record), record.task.domainSchema)
     if (projectionUsed && (!pageProjection.finalCompleted || pageProjection.lease || pageProjection.provisionalPagePaths.length > 0)) {
-      fail("FINAL_PROJECTION_REQUIRED", "Incremental Wiki pages remain provisional; complete one final full page projection before Finalize.", {
-        retryable: true,
-        taskId: record.task.taskId,
-        details: { provisional_pages: pageProjection.provisionalPagePaths },
-        suggestedAction: "Call llm_wiki_get_page_plan_context with the Wiki writer ID, reconcile every batch, then commit that final projection.",
-      })
+      const audit = await fastFinalizeProjectionAudit(workspace, record, analyses, requirements, pageRecords)
+      pageProjection.fastFinalizationAudit = audit
+      if (audit.eligible) {
+        pageProjection.finalCompleted = true
+        pageProjection.finalizationMode = "fast-audit"
+        pageProjection.provisionalPagePaths = []
+        pageProjection.revision += 1
+        pageProjection.lastCommittedAt = nowIso()
+        record.task.status = "committing"
+        await saveTask(record.paths, record.task)
+      } else {
+        await saveTask(record.paths, record.task)
+        const nextAction = projectionAction(record.task, pageProjectionStatus(record.task))
+        fail("FINAL_PROJECTION_REQUIRED", "Existing Wiki pages did not pass the fast finalization audit; run semantic reconciliation before Finalize.", {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: {
+            provisional_pages: pageProjection.provisionalPagePaths,
+            fast_finalization_audit: audit,
+            next_action: nextAction,
+          },
+          suggestedAction: "Follow details.next_action to reconcile the affected Wiki through the final projection, then call llm_wiki_finalize again.",
+        })
+      }
     }
     record.task.status = "finalizing"
     await saveTask(record.paths, record.task)
@@ -2911,11 +2928,6 @@ export class LlmWikiCore {
       inputWikiRevision: workspace.revision,
     }
     await writeJsonAtomic(finalizationPath, finalization)
-    const commits = await readJson(record.paths.commits, [])
-    const pageHistory = await committedPageRecords(workspace, commits)
-    const pageRecords = latestPageRecords(pageHistory)
-    const analyses = await loadAnalyses(record, record.task.completedBatchIds)
-    const requirements = derivePageRequirements(analyses, await this.#taskDomainSchema(record), record.task.domainSchema)
     const domainMetadataRefresh = await this.#refreshDomainPageMetadata(workspace, record, requirements)
     await this.#writeSourcePages(workspace, record, analyses, pageRecords)
     await enrichWikiRelations(workspace.paths.wiki, requirements)
@@ -3004,6 +3016,13 @@ export class LlmWikiCore {
       indexing: { bm25: "completed", embedding: embeddingIndex.status, vector: "completed", vector_fallback: "completed", graph: "completed" },
       wiki_revision: wikiRevision,
       generation_id: generationId,
+      ...(pageProjection.finalizationMode ? {
+        projection_finalization: {
+          mode: pageProjection.finalizationMode,
+          semantic_rewrite_performed: pageProjection.finalizationMode === "semantic-rewrite",
+          ...(pageProjection.fastFinalizationAudit ? { fast_audit: pageProjection.fastFinalizationAudit } : {}),
+        },
+      } : {}),
       ...(domainMetadataRefresh.updated_pages > 0 ? { domain_metadata_refresh: domainMetadataRefresh } : {}),
     }
     await writeJsonAtomic(finalizationPath, {
@@ -3180,11 +3199,11 @@ export class LlmWikiCore {
     }
     const pageProjection = projectionState(record.task)
     if (pageProjection.provisionalPagePaths.length > 0) {
-      fail("ABORT_BLOCKED_BY_PROVISIONAL_PAGES", "The task has provisional Wiki changes that require final reconciliation before cancellation.", {
+      fail("ABORT_BLOCKED_BY_PROVISIONAL_PAGES", "The task has provisional Wiki changes that require the Finalize audit before cancellation.", {
         retryable: true,
         taskId: record.task.taskId,
         details: { provisional_pages: pageProjection.provisionalPagePaths },
-        suggestedAction: "Finish extraction and the final Wiki projection so provisional pages are either reconciled or deliberately replaced.",
+        suggestedAction: "Finish extraction and incremental catch-up, then call llm_wiki_finalize. If its audit returns FINAL_PROJECTION_REQUIRED, complete the supplied final semantic projection before cancelling.",
       })
     }
     await rm(path.join(record.paths.root, "staging"), { recursive: true, force: true })
@@ -3523,6 +3542,12 @@ function projectionState(task) {
     lease: current.lease && typeof current.lease === "object" ? current.lease : null,
     lastCommittedAt: typeof current.lastCommittedAt === "string" ? current.lastCommittedAt : null,
     finalCompleted: current.finalCompleted === true,
+    finalizationMode: ["fast-audit", "semantic-rewrite"].includes(current.finalizationMode)
+      ? current.finalizationMode
+      : null,
+    fastFinalizationAudit: current.fastFinalizationAudit && typeof current.fastFinalizationAudit === "object"
+      ? current.fastFinalizationAudit
+      : null,
     provisionalPagePaths: Array.isArray(current.provisionalPagePaths) ? current.provisionalPagePaths : [],
     completedProjectionLeases: Array.isArray(current.completedProjectionLeases)
       ? current.completedProjectionLeases.filter((item) => item && typeof item.projectionId === "string").slice(0, 20)
@@ -3551,8 +3576,8 @@ function pageProjectionStatus(task) {
   const ageReady = unprojected.length > 0 && now - oldestUnprojectedAt >= state.debounceMs
   const cooldownReady = lastCommittedAt === null || now - lastCommittedAt >= state.debounceMs
   // Finish projecting any extraction backlog in bounded incremental windows
-  // before opening final reconciliation. The old behavior put every batch in
-  // one giant final projection as soon as extraction happened to finish.
+  // before routing to the Finalize audit. Semantic final reconciliation opens
+  // only when that audit proves the existing pages cannot be promoted safely.
   const catchupReady = allComplete && unprojected.length > 0
   const finalReady = allComplete && unprojected.length === 0 && !state.finalCompleted
   // A real backlog bypasses the debounce/cooldown. The lease itself is capped,
@@ -3613,6 +3638,9 @@ function pageProjectionStatus(task) {
       commit_strategy: "single-writer-durable-waves",
     },
     final_completed: state.finalCompleted,
+    finalization_mode: state.finalizationMode,
+    finalize_first: finalReady && state.fastFinalizationAudit?.eligible !== false,
+    ...(state.fastFinalizationAudit ? { fast_finalization_audit: state.fastFinalizationAudit } : {}),
     projection_complete: state.finalCompleted && !state.lease,
     in_progress: Boolean(state.lease),
     ...(state.lease ? {
@@ -3817,8 +3845,126 @@ function semanticFinalizationHint(task, projection, requirements, existingPages,
     duplicate_requirement_coverage_count: duplicateRequirementIds.length,
     missing_provisional_page_count: missingProvisionalPaths.length,
     instruction: eligible
-      ? "All batches are covered, but a final semantic Writer pass is still required to synthesize coherent summaries and related-page links."
-      : "Complete a full semantic reconciliation after correcting coverage or contradiction issues.",
+      ? "The failed Finalize audit requires this semantic Writer pass even though basic coverage is present; synthesize coherent summaries, exact evidence, and related-page links."
+      : "Complete the semantic reconciliation requested by the failed Finalize audit after correcting coverage or contradiction issues.",
+  }
+}
+
+async function fastFinalizeProjectionAudit(workspace, record, analyses, requirements, pageRecords) {
+  const state = projectionState(record.task)
+  const issues = []
+  const addIssue = (code, details = {}) => issues.push({ code, ...details })
+  const completedBatchIds = Array.isArray(record.task.completedBatchIds) ? record.task.completedBatchIds : []
+  const projectedBatchIds = new Set(state.projectedBatchIds)
+  const unprojectedBatchIds = completedBatchIds.filter((batchId) => !projectedBatchIds.has(batchId))
+  const contradictionCount = analyses.reduce((sum, analysis) => sum + (analysis.contradictions?.length ?? 0), 0)
+  const reviewItemCount = analyses.reduce((sum, analysis) => sum + (analysis.reviewItems?.length ?? 0), 0)
+
+  if (state.lease) addIssue("ACTIVE_PROJECTION_LEASE", { projection_id: state.lease.projectionId })
+  if (completedBatchIds.length !== record.task.batchCount) {
+    addIssue("INCOMPLETE_EXTRACTION", { completed_batches: completedBatchIds.length, total_batches: record.task.batchCount })
+  }
+  if (unprojectedBatchIds.length > 0) addIssue("UNPROJECTED_BATCHES", { count: unprojectedBatchIds.length })
+  if (contradictionCount > 0) addIssue("ANALYSIS_CONTRADICTIONS", { count: contradictionCount })
+  if (reviewItemCount > 0) addIssue("OPEN_REVIEW_ITEMS", { count: reviewItemCount })
+
+  const coverage = await pageRequirementCoverageAudit(workspace.paths.wiki, requirements, [])
+  if (coverage.missing.length > 0) addIssue("MISSING_PAGE_REQUIREMENTS", { count: coverage.missing.length })
+  if (coverage.duplicates.length > 0) addIssue("DUPLICATE_PAGE_COVERAGE", { count: coverage.duplicates.length })
+
+  const latestByPath = new Map(pageRecords.map((page) => [page.path, page]))
+  const provisionalPaths = uniqueStrings(state.provisionalPagePaths)
+  const provisionalSet = new Set(provisionalPaths)
+  const requirementById = new Map(requirements.map((requirement) => [requirement.requirement_id, requirement]))
+  const committedRequirementIds = new Set(pageRecords.flatMap((page) => page.covers ?? []))
+  const requirementsNotWrittenByTask = requirements.filter((requirement) => !committedRequirementIds.has(requirement.requirement_id))
+  if (requirementsNotWrittenByTask.length > 0) {
+    addIssue("REQUIREMENTS_NOT_WRITTEN_BY_TASK", { count: requirementsNotWrittenByTask.length })
+  }
+
+  const invalidPages = []
+  for (const pagePath of provisionalPaths) {
+    const pageRecord = latestByPath.get(pagePath)
+    if (!pageRecord) {
+      invalidPages.push({ path: pagePath, code: "MISSING_COMMIT_RECORD" })
+      continue
+    }
+    const currentFileHash = coverage.pageHashes.get(pagePath)
+    if (!currentFileHash) {
+      invalidPages.push({ path: pagePath, code: "MISSING_PAGE_FILE" })
+      continue
+    }
+    if (currentFileHash !== pageRecord.fileHash) {
+      invalidPages.push({ path: pagePath, code: "PAGE_HASH_CHANGED" })
+      continue
+    }
+    if (!Array.isArray(pageRecord.sourceRefs) || pageRecord.sourceRefs.length === 0) {
+      invalidPages.push({ path: pagePath, code: "MISSING_SOURCE_REFS" })
+      continue
+    }
+    try {
+      validateSourceRefs(pageRecord.sourceRefs, record.task, record.batches, workspace.config.limits)
+    } catch (error) {
+      invalidPages.push({ path: pagePath, code: asLlmWikiError(error).code ?? "INVALID_SOURCE_REF" })
+    }
+  }
+  if (invalidPages.length > 0) addIssue("INVALID_PROVISIONAL_PAGES", { count: invalidPages.length })
+
+  const missingRequirementSourceRefs = []
+  for (const requirement of requirements) {
+    const ownerPaths = [...new Set(coverage.ownersByRequirement.get(requirement.requirement_id) ?? [])]
+    if (ownerPaths.length !== 1) continue
+    const pageRecord = latestByPath.get(ownerPaths[0])
+    if (!pageRecord || !provisionalSet.has(ownerPaths[0])) continue
+    const committedSourceRefs = new Set((pageRecord.sourceRefs ?? []).map((sourceRef) => stableStringify(sourceRef)))
+    const missing = (requirementById.get(requirement.requirement_id)?.source_refs ?? [])
+      .filter((sourceRef) => !committedSourceRefs.has(stableStringify(sourceRef)))
+    if (missing.length > 0) {
+      missingRequirementSourceRefs.push({
+        requirement_id: requirement.requirement_id,
+        path: ownerPaths[0],
+        missing_count: missing.length,
+      })
+    }
+  }
+  if (missingRequirementSourceRefs.length > 0) {
+    addIssue("MISSING_REQUIREMENT_SOURCE_REFS", { count: missingRequirementSourceRefs.length })
+  }
+
+  const requiredPathsOutsideTask = []
+  for (const requirement of requirements) {
+    const ownerPaths = [...new Set(coverage.ownersByRequirement.get(requirement.requirement_id) ?? [])]
+    if (ownerPaths.length === 1 && !provisionalSet.has(ownerPaths[0])) {
+      requiredPathsOutsideTask.push({ requirement_id: requirement.requirement_id, path: ownerPaths[0] })
+    }
+  }
+  if (requiredPathsOutsideTask.length > 0) {
+    addIssue("REQUIREMENT_PAGES_NOT_PROVISIONAL", { count: requiredPathsOutsideTask.length })
+  }
+
+  const eligible = issues.length === 0
+  return {
+    schema_version: 1,
+    attempted_at: nowIso(),
+    eligible,
+    strategy: eligible ? "promote-existing-pages" : "semantic-rewrite-required",
+    completed_batches: completedBatchIds.length,
+    projected_batches: projectedBatchIds.size,
+    requirement_count: requirements.length,
+    provisional_page_count: provisionalPaths.length,
+    contradiction_count: contradictionCount,
+    review_item_count: reviewItemCount,
+    missing_requirement_count: coverage.missing.length,
+    duplicate_requirement_count: coverage.duplicates.length,
+    invalid_page_count: invalidPages.length,
+    missing_requirement_source_ref_count: missingRequirementSourceRefs.length,
+    requirements_not_written_by_task_count: requirementsNotWrittenByTask.length,
+    requirement_pages_not_provisional_count: requiredPathsOutsideTask.length,
+    issues: issues.slice(0, 100),
+    ...(invalidPages.length > 0 ? { invalid_pages: invalidPages.slice(0, 100) } : {}),
+    ...(missingRequirementSourceRefs.length > 0
+      ? { missing_requirement_source_refs: missingRequirementSourceRefs.slice(0, 100) }
+      : {}),
   }
 }
 
@@ -4391,14 +4537,19 @@ function recommendedSections(pageKind) {
 }
 
 async function pageRequirementCoverageAudit(wikiRoot, requirements, patches) {
-  if (requirements.length === 0) return { missing: [], duplicates: [] }
+  if (requirements.length === 0) return { missing: [], duplicates: [], ownersByRequirement: new Map(), pageHashes: new Map() }
   const coversByPath = new Map()
+  const pageHashes = new Map()
   const files = await listFilesRecursive(wikiRoot, (candidate) => candidate.endsWith(".md"))
   const existingCovers = await mapWithConcurrency(files, 16, async (file) => {
-    const parsed = parseWikiPage(await readFile(file, "utf8"))
-    return [`wiki/${relativePosix(wikiRoot, file)}`, parsed.covers]
+    const content = await readFile(file, "utf8")
+    const parsed = parseWikiPage(content)
+    return [`wiki/${relativePosix(wikiRoot, file)}`, parsed.covers, sha256(content)]
   })
-  for (const [pagePath, covers] of existingCovers) coversByPath.set(pagePath, new Set(covers))
+  for (const [pagePath, covers, fileHash] of existingCovers) {
+    coversByPath.set(pagePath, new Set(covers))
+    pageHashes.set(pagePath, fileHash)
+  }
   for (const patch of patches) {
     coversByPath.set(patch.path, new Set(patch.covers ?? []))
   }
@@ -4412,6 +4563,8 @@ async function pageRequirementCoverageAudit(wikiRoot, requirements, patches) {
       const paths = [...new Set(owners.get(requirement.requirement_id))]
       return paths.length > 1 ? [{ requirement_id: requirement.requirement_id, title: requirement.title, paths }] : []
     }),
+    ownersByRequirement: owners,
+    pageHashes,
   }
 }
 
@@ -4911,7 +5064,16 @@ function nextAction(task, wikiProjection = pageProjectionStatus(task)) {
 }
 
 function projectionAction(task, wikiProjection = pageProjectionStatus(task)) {
-  const lease = projectionState(task).lease
+  const state = projectionState(task)
+  const lease = state.lease
+  if (!lease && wikiProjection.mode === "final" && state.fastFinalizationAudit?.eligible !== false) {
+    return {
+      tool: "llm_wiki_finalize",
+      action_owner: "coordinator",
+      execution_mode: "fast-projection-audit-first",
+      arguments: { task_id: task.taskId },
+    }
+  }
   if (lease?.pagePlanTraversal?.complete === true && lease.pagePlanTraversal?.serverSideManifest !== true) {
     return {
       tool: "llm_wiki_commit_pages",

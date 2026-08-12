@@ -127,8 +127,12 @@ debounce.
 
 Call `llm_wiki_status`. Repair only deterministic lint errors that can be fixed
 from existing evidence, then retry `llm_wiki_finalize`, which is idempotent.
-`FINAL_PROJECTION_REQUIRED` means the single Wiki writer must run a final
-all-batch reconciliation first; it is not an MCP transport failure.
+`FINAL_PROJECTION_REQUIRED` means the persisted fast finalization audit found
+that the existing pages cannot be promoted safely. Inspect its exact issue
+codes and follow `details.next_action` to the single Writer's final semantic
+projection; it is not an MCP transport failure. After that projection
+completes, call Finalize once more. Do not retry Finalize against the unchanged
+failed audit or reconstruct a different projection action.
 
 ## Abort
 
@@ -136,4 +140,6 @@ Use `llm_wiki_abort` only when the user requests cancellation or safe progress
 is impossible. Aborting removes uncommitted staging and retains committed pages.
 Abort is intentionally blocked while provisional pages remain because silently
 publishing or abandoning those pages would violate retrieval integrity. Finish
-the final projection before cancelling.
+all remaining incremental projection work and retry Finalize so its fast audit
+can promote eligible pages. If that audit returns `FINAL_PROJECTION_REQUIRED`,
+finish the supplied final semantic projection before cancelling.

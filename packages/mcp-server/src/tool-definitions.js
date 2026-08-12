@@ -227,12 +227,12 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_finalize",
-    description: "Idempotently generate Core-owned source/index/overview/log pages, update deterministic indexes, lint, and complete a task. For a completed domain-Schema task, set refresh_page_metadata=true to backfill type frontmatter and Domain Classification sections without re-running extraction.",
+    description: "Finalize-first publication entry point. After incremental catch-up, Core audits complete and unique requirement coverage, contradictions/review items, provisional page hashes, task commit ownership, and exact SourceRefs. Eligible pages are promoted without a second semantic rewrite; otherwise FINAL_PROJECTION_REQUIRED returns the exact semantic projection next action. Then idempotently generate Core-owned source/index/overview/log pages, update deterministic indexes, lint, and complete the task. For a completed domain-Schema task, set refresh_page_metadata=true to backfill type frontmatter and Domain Classification sections without re-running extraction.",
     inputSchema: closedObject({ task_id: taskId, refresh_page_metadata: { type: "boolean", description: "Refresh existing Wiki pages from the persisted task Schema and page coverage metadata." } }, ["task_id"]),
   },
   {
     name: "llm_wiki_status",
-    description: "Return one current-workspace task's persisted status, current parallel worker recommendation and batch quantum, next action, resumable worker reservations, and recoverable staged draft receipts. Projection status distinguishes retrieved-not-staged from staged-uncommitted shards. Leases do not indicate live SubAgent processes; after a worker invocation ends, the same worker_id resumes any remaining reservation immediately.",
+    description: "Return one current-workspace task's persisted status, current parallel worker recommendation and batch quantum, finalize-first audit state, next action, resumable worker reservations, and recoverable staged draft receipts. Projection status distinguishes retrieved-not-staged from staged-uncommitted shards. Leases do not indicate live SubAgent processes; after a worker invocation ends, the same worker_id resumes any remaining reservation immediately.",
     inputSchema: closedObject({ task_id: taskId }, ["task_id"]),
   },
   {

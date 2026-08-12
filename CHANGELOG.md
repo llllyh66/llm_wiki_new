@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [1.0.7] - 2026-08-12
+
+- Make Finalize the first final-reconciliation action after incremental catch-up.
+  Core now promotes existing provisional pages without another LLM rewrite only
+  after auditing batch projection, unique requirement coverage, contradictions
+  and review items, task-owned page hashes, and exact SourceRefs. Failed audits
+  persist their reasons and route status to the semantic final projection.
 - Add `llm_wiki_query_domain_pages` for exact, workspace-level Domain Schema
   metadata queries. It can inspect a page's Schema snapshot and Domain → ABE →
   BE classifications, or paginate pages matching schema and hierarchy filters

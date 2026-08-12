@@ -240,8 +240,9 @@ documented fallback; never yield after starting only the first worker.
       `#/field/0` are accepted; array indexes are numeric. Do not search or paginate the Schema, read the original Schema
       directory, or infer omitted classifications from memory.
    3. Follow `extraction_context_policy`: retrieval is not required for normal
-      extraction because the leased batch is complete evidence and the final
-      Wiki projection reconciles cross-batch duplicates. Skip
+      extraction because the leased batch is complete evidence. The Finalize
+      audit verifies cumulative coverage and exact references; when it requires
+      a final semantic projection, that fallback reconciles cross-batch duplicates. Skip
       `llm_wiki_retrieve_context` by default. Use it only for an explicit
       cross-batch reference, unresolved alias/duplicate ambiguity, or a user
       request for cross-source reconciliation. In that exceptional case, make
@@ -378,9 +379,10 @@ documented fallback; never yield after starting only the first worker.
      next bounded worker invocation in that freed slot with the same stable ID;
      `get_batch` will lease the next available batch or return `waiting` when
      all remaining work is already reserved.
-   - If `wiki_projection.ready: true`, start the coordinator-owned projection
-     orchestration loop
-     immediately. Use a total background budget of four project Agents while
+   - If `wiki_projection.ready: true`, follow its exact coordinator-owned
+     `next_action` immediately. Call `llm_wiki_finalize` directly when that is
+     the returned tool; start manifest/Drafter projection orchestration only
+     for a page-plan action. Use a total background budget of four project Agents while
      page drafting is active: keep at most two extraction workers and reserve
      up to two slots for page drafters. Do not interrupt an extractor in the
      middle of its bounded quantum; apply the cap as workers return, and resume
@@ -414,10 +416,18 @@ documented fallback; never yield after starting only the first worker.
    without an actual transport exception from a tool call. Background-agent
    disappearance is an orchestration event, not task-state or MCP data loss.
 7. Inspect `wiki_projection` in every analysis commit report and status result.
-   When `ready: true` and `in_progress: false`, run the bounded projection
-   orchestration loop in the main coordinator with stable writer ID
-   `wiki-writer-1`, starting from the exact coordinator-owned `next_action`
-   returned by status or `commit_analysis`. A `view: "manifest"` action starts
+   When `ready: true` and `in_progress: false`, follow the exact
+   coordinator-owned `next_action` returned by status or `commit_analysis`.
+   If its tool is `llm_wiki_finalize`, call Finalize immediately. Core first
+   audits the already generated pages for complete projected batches, unique
+   requirement coverage, no contradictions or review items, task-owned current
+   file hashes, complete exact requirement SourceRefs, and provisional path
+   ownership. An eligible audit promotes those pages without another semantic
+   rewrite. If Finalize returns `FINAL_PROJECTION_REQUIRED`, follow its exact
+   `details.next_action`; the failed audit is persisted and status resumes the
+   final semantic projection without a Finalize loop. Only a page-plan action
+   starts the bounded projection orchestration loop in the main coordinator
+   with stable writer ID `wiki-writer-1`. A `view: "manifest"` action starts
    or refreshes manifest coordination; a resumed `view: "draft-shard"` action
    must be delegated unchanged to the named Drafter. Do not coerce one action
    into the other. The coordinator performs only fast manifest coordination,
@@ -446,13 +456,14 @@ documented fallback; never yield after starting only the first worker.
    `explicit-serial-writer-fallback-only` mode for one exact shard. That Writer
    drafts directly and still never launches a Drafter. The coordinator still
    does not draft or commit. Never run two stable Writers for one task. The
-   Core normally opens a
-   projection after four new batches, after the 30-second debounce, or
-   immediately for final reconciliation when all batches finish. Each
+   Core normally opens a projection after four new batches or after the
+   30-second debounce. When all batches finish, it first drains unprojected
+   batches and then routes directly to Finalize; only a failed fast
+   finalization audit opens final semantic reconciliation. Each
    incremental projection leases at most eight batches. The Writer
    processes each projection independently and commits semantic pages before
    continuing; if extraction finishes with unprojected batches, drain those
-   projections before opening the final full reconciliation.
+   projections before calling Finalize.
 8. The coordinator starts each new projection with
    `llm_wiki_get_page_plan_context` and `view: "manifest"`. When status or a
    commit resumes an existing projection with an exact coordinator-owned
@@ -536,9 +547,13 @@ documented fallback; never yield after starting only the first worker.
       batch IDs. Reuse canonical paths, merge with existing grounded content,
       and avoid speculative or duplicate pages. Follow `writer_guidance`: keep
       an incremental page to a concise grounded draft (normally 300–1,200 body
-      characters), add only facts introduced by the leased batches, and omit
-      generic filler. Rich cross-batch synthesis belongs in final mode, not in
-      every repeated incremental update. For `final` mode, reconcile all
+      characters), add facts introduced by the leased batches, preserve any
+      existing grounded material that remains in the authoritative page, and
+      omit generic filler. Do not assume a later rewrite will repair an
+      incomplete cumulative page: fast Finalize can publish an incrementally
+      generated page only when its latest task-owned commit still carries every
+      covered requirement and exact SourceRef. If that proof is incomplete,
+      Core requires final semantic reconciliation. For `final` mode, reconcile all
       batch-derived analyses and evidence supplied in the assigned shard,
       including cross-batch duplicates and contradictions, and
       explicitly review every existing page marked `provisional: true`.
@@ -598,8 +613,8 @@ documented fallback; never yield after starting only the first worker.
       accepted serial-fallback Writer call must copy the returned
       `draft_shard_ids`; staged receipt commits instead copy
       `committed_staged_draft_shard_ids`. These IDs, rather than pre-existing
-      page coverage, are the durable proof that final semantic
-      rewriting actually processed the shard. Each accepted
+      page coverage, are the durable proof that the active semantic projection
+      actually processed the shard. Each accepted
       wave is a durable checkpoint; immediately follow its returned
       `next_action` to the next missing shard and never regenerate or resubmit
       an accepted wave. When the server says no shard remains, send the
@@ -626,8 +641,9 @@ documented fallback; never yield after starting only the first worker.
       repartition the not-yet-accepted local wave before regenerating prose.
       Never go back to the first manifest shard.
    6. Treat incremental writes and incomplete multipart writes as provisional.
-      They are deliberately excluded from retrieval. Only a completed `final`
-      projection clears provisional state.
+      They are deliberately excluded from retrieval. Provisional state clears
+      only after either the Finalize fast audit succeeds or a semantic `final`
+      projection completes; never clear or bypass it in the coordinator.
    7. After a completed staged commit, the Writer stops. Inspect
       `coordinator_next_action` or the returned `next_action.action_owner`.
       When it is coordinator-owned and requests a manifest, the coordinator
@@ -651,11 +667,15 @@ documented fallback; never yield after starting only the first worker.
    do not retry in a loop or create a new task. Resume and finalize the returned
    `owner_task_id`; Core invalidates the waiting task's uncommitted page-plan
    snapshot so its next manifest is rebuilt against the published Wiki.
-10. When completed batches equal total batches, ensure a `final` projection
-    completes and `wiki_projection.final_completed` is true. Then call
-    `llm_wiki_finalize`. Never Finalize while provisional pages remain.
-11. If Finalize reports repairable validation problems, repair only what the
-    evidence supports and retry.
+10. When completed batches equal total batches, drain every remaining
+    incremental projection, then follow the exact coordinator action and call
+    `llm_wiki_finalize` first. Do not manually reject Finalize merely because
+    pages are provisional: Finalize owns the audit that can safely promote
+    them. If it returns `FINAL_PROJECTION_REQUIRED`, complete only the supplied
+    final semantic projection action and call Finalize again. Never bypass the
+    audit, invent a final action, or alternate between status and Finalize.
+11. If Finalize reports other repairable validation problems, repair only what
+    the evidence supports and retry.
 12. Report processed and rejected attachments, duplicates, task ID, created and
     updated pages, review items, lint findings, and index status.
 

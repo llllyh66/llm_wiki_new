@@ -73,8 +73,9 @@ the same classified facts in claims and candidate pages unless they add
 distinct reusable knowledge; entity and concept requirements are derived
 automatically.
 After `get_batch` succeeds, do not call status. Skip retrieval by default; the
-batch is complete evidence and final projection performs cross-batch
-reconciliation. Only for explicit cross-batch or unresolved alias ambiguity,
+batch is complete evidence. Core's Finalize audit checks cumulative coverage
+and exact references, while a required final semantic projection performs
+cross-batch reconciliation. Only for explicit cross-batch or unresolved alias ambiguity,
 make one bounded retrieval call (`limit: 6`, `max_chars: 4000`). Never search
 memories for Schema/evidence, and make at most two commit attempts: one scaffold-based
 submission plus one validation-directed correction.

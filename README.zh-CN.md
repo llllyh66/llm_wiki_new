@@ -341,8 +341,8 @@ Skill 会先调用 `llm_wiki_list_tasks` 和 `llm_wiki_status`，然后按 `next
 
 页面生成使用“微批次投影”：
 
-- 新增 4 个已抽取 batch、最旧未投影 batch 等待超过 30 秒，或全部 batch
-  完成时，Core 会开放一个 Wiki 投影窗口。
+- 新增 4 个已抽取 batch 或最旧未投影 batch 等待超过 30 秒时，
+  Core 会开放增量 Wiki 投影窗口；全部 batch 完成时只先排空未投影积压。
 - 每个增量 projection 最多包含 8 个 batch；积压时 Writer 一次最多连续处理 6 个 projection。
 - 增量投影只更新受当前 batch 影响的页面，并标记为 provisional。
 - Writer 使用已验证分析、服务端保存的精确 SourceRef 和 `page_requirement + patch_scaffold`
@@ -351,8 +351,11 @@ Skill 会先调用 `llm_wiki_list_tasks` 和 `llm_wiki_status`，然后按 `next
   不跨 shard；drafter 通过 MCP 只读取自己的有界上下文并暂存 receipt，唯一 Writer 统一校验和原子提交。
 - provisional 页面在所有未完成任务的检索中都被排除，不会污染用户问答。
 - 超大页面计划可在同一租约下分多次提交，每次最多 50 个 PagePatch。
-- 全部抽取完成后必须进行一次全局去重、矛盾合并和 provisional 复核；
-  在此之前 `finalize` 会被可恢复地拒绝。
+- 全部抽取和增量 catch-up 完成后，先直接调用 `finalize`。Core 会审计
+  batch 投影、requirement 完整性/唯一性、矛盾与待复核项、页面 hash、任务提交归属
+  和精确 SourceRef；通过时直接将已有页面转为正式页面，不再重写全文。
+- 审计不通过时 `FINAL_PROJECTION_REQUIRED` 会返回精确语义投影动作；失败原因会
+  持久化，后续 status 不会重复尝试快速 `finalize`。
 
 `llm_wiki_retrieve_context` 会并行考虑受管理的源文档块、已提交分析和 Wiki
 页面分段。任务构建期间默认先用 BM25 + Embedding 并以 RRF 融合，主 Agent
