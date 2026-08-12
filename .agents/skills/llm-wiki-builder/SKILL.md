@@ -97,7 +97,9 @@ An Agent/Team lifecycle warning, a persisted lease, a validation rejection, or
 the expectation that direct work might be faster is not a fallback condition.
 Record the failed worker attempt and state the reason before using the
 coordinator. If the host supports background/run-in-background execution,
-always use it and return control to the user while the worker runs.
+always use it. Return control to the user only after the complete initial
+worker wave has been launched or one concrete launch failure has selected a
+documented fallback; never yield after starting only the first worker.
 
 ## Workflow
 
@@ -149,9 +151,25 @@ always use it and return control to the user while the worker runs.
    Agent questions while extraction continues. Never create more workers than
    recommended and never let a worker import files, plan pages, commit pages,
    finalize, or answer the user.
-   Launch `extractor-1` first and require a successful initialization response
-   before launching `extractor-2` through `extractor-N` in the same turn. This
-   is an Agent lifecycle check, not an MCP capability probe. If it returns
+   Launch `extractor-1` first and inspect only the immediate result of that
+   `Agent` spawn call before launching `extractor-2` through `extractor-N` in
+   the same coordinator turn. `Backgrounded agent`, `Running`, a background
+   task/agent ID, or any equivalent host acknowledgement that the subagent was
+   accepted is the successful initialization response. It is sufficient even
+   though the worker has not called MCP or completed a batch yet. Do not wait
+   for a completion notification, worker transcript, MCP call, lease, status
+   change, or another user turn. Do not poll the first worker. Immediately add
+   `extractor-1` to `running_worker_ids` and issue all remaining independent
+   background `Agent` calls up to the recommended count.
+
+   The initial wave is one indivisible coordinator action: do not narrate
+   "waiting for extractor-1 initialization", summarize the import, promise to
+   launch the remaining workers later, or send a user-facing response between
+   the first successful spawn acknowledgement and the remaining spawn calls.
+   Only after every recommended slot has either returned a successful spawn
+   acknowledgement or one concrete spawn error has been handled may the
+   coordinator report that extraction is running and yield. This is an Agent
+   lifecycle check, not an MCP capability probe. If the first spawn returns
    `Team "..." does not exist`, `Call spawnTeam first`, or the equivalent,
    the coordinator accidentally requested a teammate. Do not call `spawnTeam`
    or `TeamCreate`, do not repeat the same failing launch for the remaining
@@ -161,8 +179,9 @@ always use it and return control to the user while the worker runs.
    creation failure and use the permitted coordinator extraction fallback for
    this session; tell the user to disable experimental Agent Teams and restart
    the host before the next run.
-   Treat a host response that says the requested background agents were
-   launched as success even if it also contains an unrelated Team warning.
+   Treat a host response that says a requested background agent was
+   backgrounded, started, running, or launched as success even if it also
+   contains an unrelated Team warning.
    Add those worker IDs to `running_worker_ids` and do not simultaneously run
    the same extraction quantum in the coordinator. Fall back to coordinator
    extraction only after a worker creation was attempted and failed, or when a

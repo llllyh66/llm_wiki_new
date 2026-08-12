@@ -150,6 +150,9 @@ Claude Code。
 这样其 Agent 定义中的 MCP 和 Skill 才会正常预加载。如果旧会话出现
 `Team "wiki-build" does not exist`，拉取最新配置后应完全退出并重新启动 Claude
 Code。协调器必须省略 `team_name`，而不是创建 `wiki-build` Team。
+宿主返回 `Backgrounded agent` 就表示 subagent 已成功启动；协调器必须在同一轮
+立即启动初始 wave 中的其余 worker，不能等待 extractor-1 完成，也不能只启动一个
+worker 后先输出导入摘要并结束当前轮次。
 
 ## CAC 配置
 

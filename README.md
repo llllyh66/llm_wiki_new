@@ -93,6 +93,10 @@ are independent named background subagents, so their Agent definitions preload
 the shared MCP server and Skill. If an old session reports `Team "wiki-build"
 does not exist`, fully restart Claude Code after pulling the project settings;
 the coordinator must omit `team_name` rather than creating that Team.
+An immediate `Backgrounded agent` acknowledgement is a successful spawn, so
+the coordinator launches the rest of the initial worker wave in the same turn;
+it does not wait for extractor-1 to finish or emit an intermediate import
+summary after only one of the recommended workers has started.
 
 Claude-compatible CAC hosts receive the same project integration under `.cac/`:
 settings, all three Agents, and the `llm-wiki-builder` Skill mirror `.claude/`
