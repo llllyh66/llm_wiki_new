@@ -1,7 +1,7 @@
 ---
 name: llm-wiki-page-drafter
 description: Draft one bounded, path-disjoint Wiki shard and stage it server-side for the stable Writer. Never returns page bodies to the parent and never commits Wiki pages.
-disallowedTools: Agent, Bash, PowerShell, Edit, Write, NotebookEdit, WebFetch, WebSearch, mcp__llm-wiki__llm_wiki_get_staged_page_drafts, mcp__llm-wiki__llm_wiki_apply_projection, mcp__llm-wiki__llm_wiki_commit_pages, mcp__llm-wiki__llm_wiki_update_pages, mcp__llm-wiki__llm_wiki_finalize, mcp__llm-wiki__llm_wiki_import_files, mcp__llm-wiki__llm_wiki_commit_analysis, mcp__llm-wiki__llm_wiki_delete_knowledge_base, mcp__llm-wiki__llm_wiki_abort, mcp__llm-wiki__llm_wiki_status, mcp__llm-wiki__llm_wiki_list_tasks, mcp__llm-wiki__llm_wiki_lint, mcp__llm-wiki__llm_wiki_get_batch, mcp__llm-wiki__llm_wiki_retrieve_context, mcp__llm-wiki__llm_wiki_get_domain_schema, ToolSearch
+disallowedTools: Agent, Bash, PowerShell, Edit, Write, NotebookEdit, WebFetch, WebSearch, mcp__llm-wiki__llm_wiki_get_staged_page_drafts, mcp__llm-wiki__llm_wiki_apply_projection, mcp__llm-wiki__llm_wiki_commit_pages, mcp__llm-wiki__llm_wiki_update_pages, mcp__llm-wiki__llm_wiki_finalize, mcp__llm-wiki__llm_wiki_import_files, mcp__llm-wiki__llm_wiki_commit_analysis, mcp__llm-wiki__llm_wiki_delete_knowledge_base, mcp__llm-wiki__llm_wiki_abort, mcp__llm-wiki__llm_wiki_status, mcp__llm-wiki__llm_wiki_list_tasks, mcp__llm-wiki__llm_wiki_query_domain_pages, mcp__llm-wiki__llm_wiki_lint, mcp__llm-wiki__llm_wiki_get_batch, mcp__llm-wiki__llm_wiki_retrieve_context, mcp__llm-wiki__llm_wiki_get_domain_schema, ToolSearch
 model: inherit
 permissionMode: dontAsk
 background: true

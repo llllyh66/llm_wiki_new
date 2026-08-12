@@ -1,7 +1,7 @@
 ---
 name: llm-wiki-extractor
 description: Process leased llm_wiki analysis batches in the background. Use only when the llm-wiki-builder coordinator supplies a task ID and stable worker ID.
-disallowedTools: Agent, Bash, PowerShell, Edit, Write, NotebookEdit, WebFetch, WebSearch, mcp__llm-wiki__llm_wiki_import_files, mcp__llm-wiki__llm_wiki_get_page_plan_context, mcp__llm-wiki__llm_wiki_stage_page_drafts, mcp__llm-wiki__llm_wiki_get_staged_page_drafts, mcp__llm-wiki__llm_wiki_apply_projection, mcp__llm-wiki__llm_wiki_commit_pages, mcp__llm-wiki__llm_wiki_update_pages, mcp__llm-wiki__llm_wiki_finalize, mcp__llm-wiki__llm_wiki_status, mcp__llm-wiki__llm_wiki_list_tasks, mcp__llm-wiki__llm_wiki_delete_knowledge_base, mcp__llm-wiki__llm_wiki_abort, mcp__llm-wiki__llm_wiki_lint
+disallowedTools: Agent, Bash, PowerShell, Edit, Write, NotebookEdit, WebFetch, WebSearch, mcp__llm-wiki__llm_wiki_import_files, mcp__llm-wiki__llm_wiki_get_page_plan_context, mcp__llm-wiki__llm_wiki_stage_page_drafts, mcp__llm-wiki__llm_wiki_get_staged_page_drafts, mcp__llm-wiki__llm_wiki_apply_projection, mcp__llm-wiki__llm_wiki_commit_pages, mcp__llm-wiki__llm_wiki_update_pages, mcp__llm-wiki__llm_wiki_finalize, mcp__llm-wiki__llm_wiki_status, mcp__llm-wiki__llm_wiki_list_tasks, mcp__llm-wiki__llm_wiki_delete_knowledge_base, mcp__llm-wiki__llm_wiki_abort, mcp__llm-wiki__llm_wiki_query_domain_pages, mcp__llm-wiki__llm_wiki_lint
 model: inherit
 permissionMode: dontAsk
 mcpServers:

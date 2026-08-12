@@ -360,6 +360,7 @@ export class HeadlessToolRouter {
       case "llm_wiki_get_batch": return this.core.getBatch(args)
       case "llm_wiki_get_domain_schema": return this.core.getDomainSchema(args)
       case "llm_wiki_retrieve_context": return this.core.retrieveContext(args)
+      case "llm_wiki_query_domain_pages": return this.core.queryDomainPages(args)
       case "llm_wiki_commit_analysis": return this.core.commitAnalysis(args)
       case "llm_wiki_get_page_plan_context": return this.core.getPagePlanContext(args)
       case "llm_wiki_stage_page_drafts": return this.core.stagePageDrafts(args)

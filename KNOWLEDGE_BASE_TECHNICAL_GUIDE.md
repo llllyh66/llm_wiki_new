@@ -178,6 +178,7 @@ Embedding 配置位于 `.llm-wiki/config.json` 的 `retrieval.embedding`，包�
 | `llm_wiki_get_batch` | 获取并租约一个抽取 batch |
 | `llm_wiki_get_domain_schema` | 按 Domain → ABE → BE 逐级读取完整 JSON |
 | `llm_wiki_retrieve_context` | BM25 + Embedding + Wiki 多路召回 |
+| `llm_wiki_query_domain_pages` | 反查页面的 Domain Schema 分类，或按 Schema/Domain/ABE/BE 分页召回页面 |
 | `llm_wiki_commit_analysis` | 校验并持久化一个 batch 的结构化分析 |
 | `llm_wiki_get_page_plan_context` | 返回服务端 manifest 或有界 draft shard，传统 plan cursor 仅作兼容 |
 | `llm_wiki_apply_projection` | 兼容入口：获取 compact manifest，不自动写页面 |

@@ -199,6 +199,7 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
     "llm_wiki_get_batch",
     "llm_wiki_get_domain_schema",
     "llm_wiki_retrieve_context",
+    "llm_wiki_query_domain_pages",
     "llm_wiki_commit_analysis",
     "llm_wiki_get_page_plan_context",
     "llm_wiki_apply_projection",
@@ -222,6 +223,13 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
   assert.match(importOptions.domain_schema_path.description, /progressive-directory-v2/)
   const schemaProperties = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_get_domain_schema").inputSchema.properties
   assert.deepEqual(Object.keys(schemaProperties).sort(), ["abe_file", "domain_folder", "level", "task_id"])
+  const domainPageQuery = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_query_domain_pages")
+  assert.deepEqual(domainPageQuery.inputSchema.properties.action.enum, ["inspect", "search"])
+  assert.equal(domainPageQuery.inputSchema.properties.paths.maxItems, 20)
+  assert.equal(domainPageQuery.inputSchema.properties.limit.maximum, 200)
+  assert.equal(domainPageQuery.inputSchema.properties.max_chars.maximum, 240000)
+  assert.equal(domainPageQuery.inputSchema.properties.filters.additionalProperties, false)
+  assert.equal(domainPageQuery.inputSchema.properties.filters.properties.classification_path_prefix.type, "string")
   for (const tool of TOOL_DEFINITIONS) {
     assert.match(tool.name, /^llm_wiki_[a-z_]+$/)
     assert.equal(typeof tool.description, "string")
@@ -565,6 +573,7 @@ test("every registered MCP tool routes errors without terminating the router", a
     getBatch: failing,
     getDomainSchema: failing,
     retrieveContext: failing,
+    queryDomainPages: failing,
     commitAnalysis: failing,
     getPagePlanContext: failing,
     stagePageDrafts: failing,

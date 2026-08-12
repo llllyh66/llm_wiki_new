@@ -1,5 +1,12 @@
 # 更新日志
 
+## [Unreleased]
+
+- Add `llm_wiki_query_domain_pages` for exact, workspace-level Domain Schema
+  metadata queries. It can inspect a page's Schema snapshot and Domain → ABE →
+  BE classifications, or paginate pages matching schema and hierarchy filters
+  without returning bulk page bodies.
+
 ## [1.0.6-1] - 2026-08-12
 
 - Normalize the repository and internal workspace dependencies to the valid

@@ -61,6 +61,19 @@ const incrementalWikiUpdate = closedObject({
   source_refs: { type: "array", maxItems: 500, items: { type: "object" }, description: "Exact SourceRefs from this task that ground every added, replaced, or appended section." },
   rationale: { type: "string", minLength: 1, maxLength: 2000 },
 }, ["update_id", "path", "expected_file_hash", "changes", "rationale"])
+const domainPageFilters = closedObject({
+  domain_schema_id: { type: "string", minLength: 1, maxLength: 500, description: "Exact domain_schema_id stored in page frontmatter." },
+  snapshot_hash: { type: "string", minLength: 1, maxLength: 500, description: "Exact progressive Domain Schema snapshot hash." },
+  layout: { type: "string", minLength: 1, maxLength: 500, description: "Exact schema layout, normally progressive-directory-v2." },
+  status: { enum: ["classified", "unresolved"] },
+  kind: { enum: ["entity", "concept"] },
+  domain: { type: "string", minLength: 1, maxLength: 500, description: "Exact Domain key or name, case-insensitive." },
+  abe: { type: "string", minLength: 1, maxLength: 500, description: "Exact ABE key or name, case-insensitive." },
+  be: { type: "string", minLength: 1, maxLength: 500, description: "Exact BE key or name, case-insensitive." },
+  classification_path: { type: "string", minLength: 1, maxLength: 500, description: "Exact Domain/ABE/BE classification path." },
+  classification_path_prefix: { type: "string", minLength: 1, maxLength: 500, description: "Domain or Domain/ABE path prefix; matches that node and every descendant." },
+  page_kind: { type: "string", minLength: 1, maxLength: 100 },
+})
 
 const toolDefinitions = [
   {
@@ -110,6 +123,22 @@ const toolDefinitions = [
       limit: { type: "number", minimum: 1, maximum: 100 },
       max_chars: { type: "number", minimum: 1000, maximum: 120000 },
     }, ["task_id", "queries"]),
+  },
+  {
+    name: "llm_wiki_query_domain_pages",
+    description: "Inspect which Domain Schema and Domain/ABE/BE classifications belong to specific Wiki pages, or search all classified Wiki pages using exact schema, hierarchy, status, kind, and page-kind filters. Search returns bounded metadata and summaries with cursor pagination, never bulk page bodies.",
+    inputSchema: closedObject({
+      action: { enum: ["inspect", "search"] },
+      paths: {
+        type: "array", minItems: 1, maxItems: 20, uniqueItems: true,
+        items: { type: "string", pattern: "^wiki/(sources|entities|concepts|topics|comparisons|queries|synthesis|findings|methodology|thesis|meetings|decisions|projects|stakeholders|goals|habits|reflections|chapters|characters|themes|plot-threads|journal)/.+\\.md$" },
+        description: "Required for inspect. Returns Domain Schema metadata for these exact managed Wiki paths.",
+      },
+      filters: domainPageFilters,
+      cursor: { type: "integer", minimum: 0, description: "Zero-based search result cursor returned by the previous call." },
+      limit: { type: "integer", minimum: 1, maximum: 200, description: "Search page size; defaults to 50." },
+      max_chars: { type: "integer", minimum: 5000, maximum: 240000, description: "Approximate metadata character budget per search response; defaults to 80000 and may shorten a page before limit." },
+    }, ["action"]),
   },
   {
     name: "llm_wiki_commit_analysis",
@@ -235,6 +264,7 @@ const TOOL_RESULT_LIMITS = Object.freeze({
   llm_wiki_get_batch: 80_000,
   llm_wiki_get_domain_schema: 120_000,
   llm_wiki_retrieve_context: 120_000,
+  llm_wiki_query_domain_pages: 240_000,
   llm_wiki_get_page_plan_context: 120_000,
   llm_wiki_update_pages: 240_000,
   llm_wiki_status: 120_000,

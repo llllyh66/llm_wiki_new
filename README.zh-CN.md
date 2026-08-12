@@ -110,7 +110,7 @@ claude
 `.claude/settings.json` 中的 `SessionStart` hook 使用 `CLAUDE_PROJECT_DIR`
 和无 shell 的跨平台 `command + args` 形式幂等启动 supervisor；Windows 下
 后台 Node 进程会隐藏控制台窗口。worker 崩溃后 supervisor 指数退避重启，Claude Code
-2.1.121 及以上会自动重连 HTTP MCP。服务器共 17 个工具并保持
+2.1.121 及以上会自动重连 HTTP MCP。服务器共 18 个工具并保持
 `alwaysLoad`。这些配置会随仓库同步：每台设备都在自己的 clone 内启动
 localhost daemon，PID 和日志只写入该 clone 的 `.llm-wiki/`。第一次打开
 项目时，请批准项目 MCP 和 hook。
@@ -135,7 +135,7 @@ llm-wiki: http://127.0.0.1:31982/mcp (HTTP) - Connected
 /mcp
 ```
 
-`llm-wiki` 应显示 `Connected` 和 17 个工具。
+`llm-wiki` 应显示 `Connected` 和 18 个工具。
 
 页面规划上下文会自动分页，Skill 会持续读取到 `next_cursor` 为空；大请求和大结果
 也有明确预算，超过限制时会返回可恢复错误，而不是关闭 MCP 连接。
@@ -167,7 +167,7 @@ CAC 客户端必须明确支持这些项目级 settings、hook 和 `CAC_PROJECT_
 仅能读取根目录 `.mcp.json` 并不代表其命令行程序一定名为 `cac`。在每台设备完成
 `npm ci` 和 `npm run build` 后，从项目根目录打开 CAC 客户端，首次
 使用时批准项目 MCP 和 hook。若此前已经打开该项目，请完全退出并重新启动 CAC，
-再在 MCP 页面确认 `llm-wiki` 为 `Connected` 且包含 17 个工具。
+再在 MCP 页面确认 `llm-wiki` 为 `Connected` 且包含 18 个工具。
 
 多批次任务默认按 `parallel_extraction.recommended_workers` 启动后台抽取
 Agent，当前最多 4 个；`get_batch` 不内联大型 Schema，worker 会按三级 disclosure
@@ -201,7 +201,7 @@ extractor 数量。`status.next_action` 也会在投影就绪时
 在协调器中重复抽取。
 首次启动和补位都必须显式使用项目 Agent 类型 `llm-wiki-extractor`，不能改用
 `general-purpose`、动态“Worker N”或 Agent Team teammate，因为它们不会加载该
-Agent 文件的 `mcpServers` 配置。项目同时显式允许 17 个 MCP 工具名，每个工具
+Agent 文件的 `mcpServers` 配置。项目同时显式允许 18 个 MCP 工具名，每个工具
 都发布 `anthropic/alwaysLoad` 元数据；如果宿主仍延迟加载，Worker 会先使用
 ToolSearch 发现工具，而不是直接判定 MCP 不可用。
 `.claude/agents/llm-wiki-writer.md` 使用同样的 MCP 复用方式，且每个任务同时
@@ -366,6 +366,12 @@ Skill 会先调用 `llm_wiki_list_tasks` 和 `llm_wiki_status`，然后按 `next
 已完成的旧 Wiki 页在新任务构建期仍可通过 BM25/Embedding 召回；只有
 未完成投影生成的 provisional 路径会被排除。
 
+`llm_wiki_query_domain_pages` 提供 Domain Schema 元数据的精确查询：
+`action: "inspect"` 可反查指定 Wiki 页面所属的 Schema snapshot 及
+Domain → ABE → BE 分类链；`action: "search"` 可按 `domain_schema_id`、
+`snapshot_hash`、Domain、ABE、BE、分类状态或路径前缀组合过滤全部已分类页面。
+搜索结果只返回路径、标题、摘要和分类元数据，并通过 `next_cursor` 分页，不批量返回页面正文。
+
 Embedding 默认关闭；此时该通道自动使用本地 feature-hash 后备，不影响 BM25
 与 Wiki 通道。配置 OpenAI-compatible 服务：
 
@@ -452,7 +458,7 @@ test -f .claude/skills/llm-wiki-builder/SKILL.md
 
 ### MCP 已连接，但工具无法调用
 
-1. 在 Claude Code 中运行 `/mcp`，确认已批准且工具数为 17。
+1. 在 Claude Code 中运行 `/mcp`，确认已批准且工具数为 18。
 2. 运行 `npm run build`，然后重启 Claude Code。
 3. 确保是从项目根目录启动。
 4. 显式测试：
@@ -497,9 +503,9 @@ npm test
 ```
 
 然后完全退出 Claude Code，从该项目根目录重新运行 `claude`，批准项目 MCP 和 hook，
-并用 `/mcp` 确认 `llm-wiki` 为 `Connected` 且有 17 个工具。最新版包含空闲
-心跳、worker 崩溃重启和新 HTTP 会话恢复 17 个工具的回归测试。现在
-17 个工具的所有异常都作为普通工具结果返回，不再进入
+并用 `/mcp` 确认 `llm-wiki` 为 `Connected` 且有 18 个工具。最新版包含空闲
+心跳、worker 崩溃重启和新 HTTP 会话恢复 18 个工具的回归测试。现在
+18 个工具的所有异常都作为普通工具结果返回，不再进入
 MCP `isError` 通道。失败结果包含 `ok: false`、`accepted: false`、
 `error`、`next_action` 和 `mcp_connection_usable: true`。Agent 应按
 `next_action` 修正或恢复，不需要执行 `/mcp`。

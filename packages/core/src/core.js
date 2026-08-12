@@ -723,6 +723,75 @@ export class LlmWikiCore {
     return retrieveContext(workspace, record, queries, { channels: input?.channels, limit: input?.limit, maxChars: input?.max_chars, currentBatchId: input?.batch_id })
   }
 
+  async queryDomainPages(input = {}) {
+    const workspace = await this.workspace()
+    const action = String(input?.action ?? "search").trim().toLowerCase()
+    if (!new Set(["inspect", "search"]).has(action)) fail("INVALID_INPUT", "action must be inspect or search.")
+
+    if (action === "inspect") {
+      const paths = Array.isArray(input?.paths) ? input.paths : []
+      if (paths.length === 0 || paths.length > 20) fail("INVALID_INPUT", "inspect requires 1 to 20 Wiki page paths.")
+      const pages = []
+      const seen = new Set()
+      for (const requestedPath of paths) {
+        const page = await readManagedWikiPage(workspace, requestedPath)
+        if (seen.has(page.path)) fail("INVALID_INPUT", `Duplicate inspect path: ${page.path}`)
+        seen.add(page.path)
+        pages.push(domainPageMetadata(page.path, page.parsed))
+      }
+      return {
+        accepted: true,
+        action,
+        wiki_revision: workspace.revision,
+        pages,
+      }
+    }
+
+    const filters = normalizeDomainPageFilters(input?.filters)
+    const cursor = normalizeDomainPageCursor(input?.cursor)
+    const limit = Math.min(Math.max(Number(input?.limit) || 50, 1), 200)
+    const maxChars = Math.min(Math.max(Number(input?.max_chars) || 80_000, 5_000), 240_000)
+    const files = await listFilesRecursive(workspace.paths.wiki, (candidate) => candidate.endsWith(".md"))
+    const snapshots = await mapWithConcurrency(files, 16, async (file) => {
+      const content = await readFile(file, "utf8")
+      const pagePath = `wiki/${relativePosix(workspace.paths.wiki, file)}`
+      return domainPageMetadata(pagePath, parseWikiPage(content))
+    })
+    const matches = snapshots
+      .filter((page) => page.classified && domainPageMatches(page, filters))
+      .sort((left, right) => left.path.localeCompare(right.path))
+    if (cursor > matches.length) fail("INVALID_INPUT", `cursor ${cursor} exceeds the ${matches.length} matching pages.`)
+    const pages = []
+    let returnedChars = 0
+    for (const page of matches.slice(cursor, cursor + limit)) {
+      const chars = JSON.stringify(page).length
+      if (pages.length > 0 && returnedChars + chars > maxChars) break
+      pages.push(page)
+      returnedChars += chars
+    }
+    const nextCursor = cursor + pages.length < matches.length ? cursor + pages.length : null
+    return {
+      accepted: true,
+      action,
+      wiki_revision: workspace.revision,
+      filters,
+      total_matches: matches.length,
+      cursor,
+      limit,
+      max_chars: maxChars,
+      returned_chars: returnedChars,
+      returned: pages.length,
+      next_cursor: nextCursor,
+      pages,
+      ...(nextCursor === null ? {} : {
+        next_action: {
+          tool: "llm_wiki_query_domain_pages",
+          arguments: { action: "search", filters, cursor: nextCursor, limit, max_chars: maxChars },
+        },
+      }),
+    }
+  }
+
   async commitAnalysis(input) {
     return this.#withTaskLock(input?.task_id, () => this.#commitAnalysis(input), operationSignal(input))
   }
@@ -3809,6 +3878,104 @@ async function readManagedWikiPage(workspace, requestedPath) {
   if (!info.isFile() || info.isSymbolicLink()) fail("INVALID_PAGE_PATH", `Wiki page is not a regular file: ${relative}`)
   const content = await readFile(target, "utf8")
   return { path: relative, target, content, fileHash: sha256(content), parsed: parseWikiPage(content) }
+}
+
+function domainPageMetadata(pagePath, parsed) {
+  const totalClassifications = Math.max(
+    parsed.schemaClassificationKinds.length,
+    parsed.schemaDomainKeys.length,
+    parsed.schemaDomainNames.length,
+    parsed.schemaAbeKeys.length,
+    parsed.schemaAbeNames.length,
+    parsed.schemaBeKeys.length,
+    parsed.schemaBeNames.length,
+    parsed.schemaClassificationPaths.length,
+  )
+  const count = Math.min(totalClassifications, 100)
+  const bounded = (value, max = 500) => {
+    const text = String(value ?? "").trim()
+    return text ? text.slice(0, max) : null
+  }
+  const classifications = Array.from({ length: count }, (_, index) => ({
+    kind: bounded(parsed.schemaClassificationKinds[index], 100),
+    status: bounded(parsed.schemaClassificationStatus, 100),
+    path: bounded(parsed.schemaClassificationPaths[index]
+      || [parsed.schemaDomainKeys[index], parsed.schemaAbeKeys[index], parsed.schemaBeKeys[index]].filter(Boolean).join("/")
+      || null),
+    domain: {
+      key: bounded(parsed.schemaDomainKeys[index]),
+      name: bounded(parsed.schemaDomainNames[index]),
+    },
+    abe: {
+      key: bounded(parsed.schemaAbeKeys[index]),
+      name: bounded(parsed.schemaAbeNames[index]),
+    },
+    be: {
+      key: bounded(parsed.schemaBeKeys[index]),
+      name: bounded(parsed.schemaBeNames[index]),
+    },
+  }))
+  return {
+    path: pagePath,
+    title: bounded(parsed.title || path.basename(pagePath, ".md")),
+    page_kind: normalizePageKind(parsed.type) ?? pageKindForPath(pagePath),
+    summary: bounded(parsed.summary),
+    classified: classifications.length > 0,
+    classification_count: totalClassifications,
+    ...(totalClassifications > count ? { classifications_truncated: true } : {}),
+    domain_schema: {
+      id: bounded(parsed.domainSchemaId),
+      version: bounded(parsed.domainSchemaVersion, 100),
+      layout: bounded(parsed.schemaLayout, 100),
+      snapshot_hash: bounded(parsed.schemaSnapshotHash),
+    },
+    classifications,
+  }
+}
+
+function normalizeDomainPageFilters(value) {
+  if (value === undefined) return {}
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail("INVALID_INPUT", "filters must be an object.")
+  const allowed = new Set([
+    "domain_schema_id", "snapshot_hash", "layout", "status", "kind",
+    "domain", "abe", "be", "classification_path", "classification_path_prefix", "page_kind",
+  ])
+  const filters = {}
+  for (const [key, raw] of Object.entries(value)) {
+    if (!allowed.has(key)) fail("INVALID_INPUT", `Unsupported Domain page filter: ${key}`)
+    if (typeof raw !== "string" || !raw.trim() || raw.length > 500) fail("INVALID_INPUT", `filters.${key} must be a non-empty string with at most 500 characters.`)
+    filters[key] = raw.normalize("NFKC").trim()
+  }
+  return filters
+}
+
+function normalizeDomainPageCursor(value) {
+  if (value === undefined || value === null) return 0
+  const cursor = Number(value)
+  if (!Number.isInteger(cursor) || cursor < 0) fail("INVALID_INPUT", "cursor must be a non-negative integer.")
+  return cursor
+}
+
+function domainPageMatches(page, filters) {
+  const equal = (left, right) => String(left ?? "").normalize("NFKC").trim().toLocaleLowerCase() === String(right ?? "").normalize("NFKC").trim().toLocaleLowerCase()
+  if (filters.domain_schema_id && !equal(page.domain_schema.id, filters.domain_schema_id)) return false
+  if (filters.snapshot_hash && !equal(page.domain_schema.snapshot_hash, filters.snapshot_hash)) return false
+  if (filters.layout && !equal(page.domain_schema.layout, filters.layout)) return false
+  if (filters.page_kind && !equal(page.page_kind, filters.page_kind)) return false
+  return page.classifications.some((classification) => {
+    if (filters.status && !equal(classification.status, filters.status)) return false
+    if (filters.kind && !equal(classification.kind, filters.kind)) return false
+    if (filters.domain && ![classification.domain.key, classification.domain.name].some((value) => equal(value, filters.domain))) return false
+    if (filters.abe && ![classification.abe.key, classification.abe.name].some((value) => equal(value, filters.abe))) return false
+    if (filters.be && ![classification.be.key, classification.be.name].some((value) => equal(value, filters.be))) return false
+    if (filters.classification_path && !equal(classification.path, filters.classification_path)) return false
+    if (filters.classification_path_prefix) {
+      const candidate = String(classification.path ?? "").normalize("NFKC").trim().toLocaleLowerCase()
+      const prefix = filters.classification_path_prefix.normalize("NFKC").trim().replace(/\/+$/g, "").toLocaleLowerCase()
+      if (candidate !== prefix && !candidate.startsWith(`${prefix}/`)) return false
+    }
+    return true
+  })
 }
 
 function validateIncrementalSectionChanges(value, limits, updateIndex) {
