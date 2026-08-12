@@ -1,6 +1,6 @@
 {
   "name": "@llm-wiki/core",
-  "version": "1.0.6.1",
+  "version": "1.0.6-1",
   "type": "module",
   "exports": "./src/index.js",
   "files": [

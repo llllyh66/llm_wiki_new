@@ -25,7 +25,7 @@ export function createProtocolServer(router, options = {}) {
   const isDegraded = typeof options.isDegraded === "function" ? options.isDegraded : () => false
   const maxRetries = options.maxRetries ?? readInteger("LLM_WIKI_MCP_MAX_RETRIES", DEFAULT_MCP_MAX_RETRIES, { maximum: 5 })
   const retryBaseMs = options.retryBaseMs ?? readInteger("LLM_WIKI_MCP_RETRY_BASE_MS", DEFAULT_MCP_RETRY_BASE_MS, { minimum: 50, maximum: 5_000 })
-  const server = new Server({ name: "llm-wiki", version: "1.0.6.1" }, { capabilities: { tools: {} } })
+  const server = new Server({ name: "llm-wiki", version: "1.0.6-1" }, { capabilities: { tools: {} } })
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: router.listTools() }))
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {

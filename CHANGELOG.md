@@ -1,6 +1,10 @@
 # 更新日志
 
-## [1.0.6.1] - 2026-08-11
+## [1.0.6-1] - 2026-08-12
+
+- Normalize the repository and internal workspace dependencies to the valid
+  npm SemVer version `1.0.6-1`, preventing npm from attempting to download the
+  private `@llm-wiki/core` workspace package from the configured registry.
 
 - Make a completed `draft-shard` context explicitly require
   `llm_wiki_stage_page_drafts`; direct PagePatch commit is now exposed only as
