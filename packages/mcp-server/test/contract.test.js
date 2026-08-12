@@ -81,6 +81,7 @@ test("Claude project agents inherit llm-wiki MCP without a restrictive tool allo
     "llm_wiki_get_staged_page_drafts",
   ])
   assert.equal(settings.enableAllProjectMcpServers, true)
+  assert.equal(settings.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS, "0")
   const sessionStartHook = settings.hooks.SessionStart[0].hooks[0]
   assert.equal(sessionStartHook.command, "node")
   assert.deepEqual(sessionStartHook.args, [
@@ -103,6 +104,10 @@ test("Claude project agents inherit llm-wiki MCP without a restrictive tool allo
   assert.match(skill, /do not simultaneously run\s+the same extraction quantum in the coordinator/)
   assert.match(skill, /do not retry with a\s+`general-purpose`/)
   assert.match(skill, /Agent type\s+`llm-wiki-extractor` explicitly/)
+  assert.match(skill, /Agent\s+call must omit `team_name` entirely/)
+  assert.match(skill, /Launch `extractor-1` first and require a successful initialization response/)
+  assert.match(skill, /Do not call `spawnTeam`\s+or `TeamCreate`/)
+  assert.match(skill, /do not repeat the same failing launch for the remaining\s+slots/)
   assert.match(skill, /Never launch these slots as `general-purpose`/)
   assert.match(skill, /worker_batch_quantum/)
   assert.match(skill, /never more than six/)

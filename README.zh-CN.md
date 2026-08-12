@@ -146,6 +146,11 @@ llm-wiki: http://127.0.0.1:31982/mcp (HTTP) - Connected
 文件写入和外部网络工具会直接拒绝而不是询问。修改配置后需完全退出并重新启动
 Claude Code。
 
+项目会显式关闭实验性的 Agent Teams；抽取 worker 是独立的命名后台 subagent，
+这样其 Agent 定义中的 MCP 和 Skill 才会正常预加载。如果旧会话出现
+`Team "wiki-build" does not exist`，拉取最新配置后应完全退出并重新启动 Claude
+Code。协调器必须省略 `team_name`，而不是创建 `wiki-build` Team。
+
 ## CAC 配置
 
 项目同时为支持 Claude Code 兼容项目配置的 CAC 客户端提供实体目录 `.cac/`，其 `settings.json`、三个 Agent 和

@@ -129,6 +129,13 @@ always use it and return control to the user while the worker runs.
    `parallel_extraction.recommended_workers` background project subagents
    (currently capped at four) by invoking the project Agent type
    `llm-wiki-extractor` explicitly for every initial and replacement worker.
+   These are independent subagents, not Agent Team teammates. Invoke `Agent`
+   with only the named `subagent_type`, the bounded worker prompt, a short
+   description, and the host's background/run-in-background flag. The Agent
+   call must omit `team_name` entirely; never pass `wiki-build`, an empty team
+   name, or any other team identifier. Do not describe these workers as a
+   team in the spawn prompt because weaker hosts may translate that wording
+   into an implicit `team_name` argument.
    Never launch these slots as `general-purpose`, a dynamically composed
    "Worker N", or an Agent Team teammate: those invocations do not apply
    project `llm-wiki-extractor` definition and therefore may not receive its
@@ -142,6 +149,18 @@ always use it and return control to the user while the worker runs.
    Agent questions while extraction continues. Never create more workers than
    recommended and never let a worker import files, plan pages, commit pages,
    finalize, or answer the user.
+   Launch `extractor-1` first and require a successful initialization response
+   before launching `extractor-2` through `extractor-N` in the same turn. This
+   is an Agent lifecycle check, not an MCP capability probe. If it returns
+   `Team "..." does not exist`, `Call spawnTeam first`, or the equivalent,
+   the coordinator accidentally requested a teammate. Do not call `spawnTeam`
+   or `TeamCreate`, do not repeat the same failing launch for the remaining
+   slots, and do not claim MCP failed. Retry `extractor-1` exactly once as an
+   independent background subagent with the `team_name` field absent. If the
+   host still injects a Team after that exact retry, record one concrete worker-
+   creation failure and use the permitted coordinator extraction fallback for
+   this session; tell the user to disable experimental Agent Teams and restart
+   the host before the next run.
    Treat a host response that says the requested background agents were
    launched as success even if it also contains an unrelated Team warning.
    Add those worker IDs to `running_worker_ids` and do not simultaneously run

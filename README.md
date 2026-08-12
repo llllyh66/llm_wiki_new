@@ -88,6 +88,11 @@ the canonical shared Skill, while
 `.claude/settings.json` pre-approves all `llm-wiki` tools for the main and
 background agents and uses `dontAsk` for unattended extraction. Approve project
 trust on first use, then restart Claude Code after changing these files.
+The project explicitly disables experimental Agent Teams: extraction workers
+are independent named background subagents, so their Agent definitions preload
+the shared MCP server and Skill. If an old session reports `Team "wiki-build"
+does not exist`, fully restart Claude Code after pulling the project settings;
+the coordinator must omit `team_name` rather than creating that Team.
 
 Claude-compatible CAC hosts receive the same project integration under `.cac/`:
 settings, all three Agents, and the `llm-wiki-builder` Skill mirror `.claude/`
