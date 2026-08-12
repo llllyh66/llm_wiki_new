@@ -1,5 +1,48 @@
+import { analysisSchema } from "@llm-wiki/core"
+
 const taskId = { type: "string", description: "Task ID in the current workspace." }
 const closedObject = (properties, required = []) => ({ type: "object", properties, required, additionalProperties: false })
+
+function namespaceSchema(schema, namespace) {
+  const rewrite = (value) => {
+    if (Array.isArray(value)) return value.map(rewrite)
+    if (!value || typeof value !== "object") return value
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [
+      key,
+      key === "$ref" && typeof entry === "string" && entry.startsWith("#/$defs/")
+        ? `#/$defs/${namespace}_${entry.slice("#/$defs/".length)}`
+        : rewrite(entry),
+    ]))
+  }
+  const rewritten = rewrite(schema)
+  const definitions = Object.fromEntries(Object.entries(rewritten.$defs ?? {}).map(([key, value]) => [`${namespace}_${key}`, value]))
+  const { $id: _id, $defs: _defs, ...shape } = rewritten
+  return { shape, definitions }
+}
+
+const commitAnalysisContract = namespaceSchema(analysisSchema, "analysis")
+commitAnalysisContract.shape.required = [...new Set([...commitAnalysisContract.shape.required, "sourceRefMode"])]
+commitAnalysisContract.shape.properties.sourceRefs = {
+  ...commitAnalysisContract.shape.properties.sourceRefs,
+  description: "Copy the complete numeric evidence-index catalog from get_batch.analysis_scaffold unchanged.",
+  items: { type: "integer", minimum: 0 },
+}
+commitAnalysisContract.definitions.analysis_sourceRefList = {
+  ...commitAnalysisContract.definitions.analysis_sourceRefList,
+  description: "One or more evidence_catalog.evidence_index integers from the current batch.",
+  items: { type: "integer", minimum: 0 },
+}
+const commitAnalysisInputSchema = closedObject({
+  task_id: taskId,
+  batch_id: { type: "string" },
+  worker_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
+  analysis: {
+    ...commitAnalysisContract.shape,
+    description: "Copy get_batch.analysis_scaffold first, then fill semantic arrays. Keep numeric confidence values, sourceRefMode, the numeric top-level evidence catalog, and candidate evidence_index sourceRefs.",
+  },
+  idempotency_key: { type: "string", minLength: 8, maxLength: 200 },
+}, ["task_id", "batch_id", "analysis", "idempotency_key"])
+commitAnalysisInputSchema.$defs = commitAnalysisContract.definitions
 const stagedDraftReceipt = closedObject({
   shard_id: { type: "string", pattern: "^draft-[0-9]{4,}$" },
   draft_hash: { type: "string", pattern: "^[0-9a-f]{64}$" },
@@ -70,8 +113,8 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_commit_analysis",
-    description: "Resolve server-generated evidence indexes, safely canonicalize uniquely matched quotes, enforce progressive Schema classification, and persist one worker's analysis.",
-    inputSchema: closedObject({ task_id: taskId, batch_id: { type: "string" }, worker_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" }, analysis: { type: "object" }, idempotency_key: { type: "string", minLength: 8, maxLength: 200 } }, ["task_id", "batch_id", "analysis", "idempotency_key"]),
+    description: "Submit an AnalysisEnvelope by copying get_batch.analysis_scaffold and filling its semantic arrays. The nested tool schema constrains required fields, numeric confidence values, evidence-index sourceRefs, and classification shape before the call. Core then resolves evidence, enforces progressive Schema classification, and persists the batch.",
+    inputSchema: commitAnalysisInputSchema,
   },
   {
     name: "llm_wiki_get_page_plan_context",

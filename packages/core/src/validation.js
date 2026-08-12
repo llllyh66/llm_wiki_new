@@ -21,19 +21,31 @@ const PAGE_PATCH_FIELDS = new Set(["patchId", "path", "operation", "expectedFile
 
 export function normalizeAnalysisEnvelope(analysis, options = {}) {
   if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) {
-    return { analysis, resolvedSourceRefIndexes: 0, normalizedUnresolvedQuestions: 0 }
+    return { analysis, resolvedSourceRefIndexes: 0, normalizedUnresolvedQuestions: 0, normalizedNumericConfidences: 0, inferredBatchEvidenceMode: false }
   }
-  if (analysis.sourceRefMode === "batch-evidence-index") {
-    return normalizeBatchEvidenceEnvelope(analysis, options.evidenceCatalog)
+  const confidenceNormalization = normalizeNumericConfidenceStrings(analysis)
+  const normalizedInput = confidenceNormalization.analysis
+  const inferredBatchEvidenceMode = normalizedInput.sourceRefMode === undefined
+    && Array.isArray(options.evidenceCatalog)
+    && options.evidenceCatalog.length > 0
+    && Array.isArray(normalizedInput.sourceRefs)
+    && normalizedInput.sourceRefs.length > 0
+    && normalizedInput.sourceRefs.every((ref) => Number.isInteger(ref) && ref >= 0 && ref < options.evidenceCatalog.length)
+  if (normalizedInput.sourceRefMode === "batch-evidence-index" || inferredBatchEvidenceMode) {
+    const normalized = normalizeBatchEvidenceEnvelope(
+      inferredBatchEvidenceMode ? { ...normalizedInput, sourceRefMode: "batch-evidence-index" } : normalizedInput,
+      options.evidenceCatalog,
+    )
+    return { ...normalized, normalizedNumericConfidences: confidenceNormalization.normalized, inferredBatchEvidenceMode }
   }
-  const catalog = Array.isArray(analysis.sourceRefs) ? analysis.sourceRefs : []
+  const catalog = Array.isArray(normalizedInput.sourceRefs) ? normalizedInput.sourceRefs : []
   const errors = []
   let resolvedSourceRefIndexes = 0
-  const unresolved = normalizeUnresolvedQuestions(analysis.unresolvedQuestions)
-  const normalized = { ...analysis, ...(unresolved.value ? { unresolvedQuestions: unresolved.value } : {}) }
+  const unresolved = normalizeUnresolvedQuestions(normalizedInput.unresolvedQuestions)
+  const normalized = { ...normalizedInput, ...(unresolved.value ? { unresolvedQuestions: unresolved.value } : {}) }
   for (const collection of GROUNDED_ANALYSIS_COLLECTIONS) {
-    if (!Array.isArray(analysis[collection])) continue
-    normalized[collection] = analysis[collection].map((item, itemIndex) => {
+    if (!Array.isArray(normalizedInput[collection])) continue
+    normalized[collection] = normalizedInput[collection].map((item, itemIndex) => {
       if (!item || typeof item !== "object" || Array.isArray(item) || !Array.isArray(item.sourceRefs)) return item
       const sourceRefs = item.sourceRefs.map((ref, refIndex) => {
         if (typeof ref !== "number") return ref
@@ -57,7 +69,42 @@ export function normalizeAnalysisEnvelope(analysis, options = {}) {
       details: { validation_errors: errors.slice(0, MAX_ANALYSIS_VALIDATION_ERRORS), validation_error_count: errors.length },
     })
   }
-  return { analysis: normalized, resolvedSourceRefIndexes, normalizedUnresolvedQuestions: unresolved.normalized }
+  return {
+    analysis: normalized,
+    resolvedSourceRefIndexes,
+    normalizedUnresolvedQuestions: unresolved.normalized,
+    normalizedNumericConfidences: confidenceNormalization.normalized,
+    inferredBatchEvidenceMode: false,
+  }
+}
+
+function normalizeNumericConfidenceStrings(analysis) {
+  let normalized = 0
+  const coerce = (value) => {
+    if (typeof value !== "string" || !value.trim()) return value
+    const trimmed = value.trim()
+    if (!/^(?:0(?:\.\d+)?|1(?:\.0+)?)$/.test(trimmed)) return value
+    const numeric = Number(trimmed)
+    if (!Number.isFinite(numeric) || numeric < 0 || numeric > 1) return value
+    normalized += 1
+    return numeric
+  }
+  const result = { ...analysis }
+  for (const collection of GROUNDED_ANALYSIS_COLLECTIONS) {
+    if (!Array.isArray(analysis[collection])) continue
+    result[collection] = analysis[collection].map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return item
+      const candidate = { ...item }
+      if (candidate.confidence !== undefined) candidate.confidence = coerce(candidate.confidence)
+      for (const field of ["schemaClassification", "schema_classification"]) {
+        if (!candidate[field] || typeof candidate[field] !== "object" || Array.isArray(candidate[field])) continue
+        candidate[field] = { ...candidate[field] }
+        if (candidate[field].confidence !== undefined) candidate[field].confidence = coerce(candidate[field].confidence)
+      }
+      return candidate
+    })
+  }
+  return { analysis: result, normalized }
 }
 
 function normalizeBatchEvidenceEnvelope(analysis, evidenceCatalog) {

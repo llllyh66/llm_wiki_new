@@ -30,6 +30,7 @@ Use this shape on every entity and concept:
 {
   "schemaClassification": {
     "status": "classified",
+    "snapshotHash": "<copy classification_scaffold.snapshotHash exactly>",
     "confidence": 0.91,
     "domain": { "key": "Customer_Domain", "name": "客户域", "file": "Customer_Domain/Customer_Domain_domain.json" },
     "abe": { "key": "customer_management", "name": "客户管理", "file": "Customer_Domain/customer_management.json" },
@@ -37,6 +38,10 @@ Use this shape on every entity and concept:
   }
 }
 ```
+
+`confidence` is a JSON number, not a quoted string. Preserve
+`classification_scaffold.snapshotHash`; replace only the `be` placeholders
+using one exact `be_pointer_hints` entry.
 
 `sourceRefs` prove facts in imported documents. The Schema snapshot and JSON
 Pointer separately prove where the classification was selected.

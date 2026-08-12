@@ -252,6 +252,23 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
   assert.match(pageUpdate.description, /rebuilds retrieval indexes/i)
   assert.match(pagePlan.description, /parallel drafting.*coordinator/i)
   assert.match(pagePlan.description, /sole committer/i)
+  const analysisCommit = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_commit_analysis")
+  const analysisInput = analysisCommit.inputSchema.properties.analysis
+  assert.equal(analysisInput.additionalProperties, false)
+  assert.equal(analysisInput.required.includes("schemaVersion"), true)
+  assert.equal(analysisInput.required.includes("sourceRefs"), true)
+  assert.equal(analysisInput.required.includes("sourceRefMode"), true)
+  assert.equal(analysisInput.properties.sourceRefs.items.type, "integer")
+  assert.equal(analysisInput.properties.entities.items.$ref, "#/$defs/analysis_groundedCandidate")
+  assert.equal(analysisCommit.inputSchema.$defs.analysis_groundedCandidate.properties.confidence.type, "number")
+  assert.equal(analysisCommit.inputSchema.$defs.analysis_sourceRefList.items.type, "integer")
+  assert.equal(analysisCommit.inputSchema.$defs.analysis_groundedCandidate.properties.schemaClassification.properties.snapshotHash.type, "string")
+  const schemaText = JSON.stringify(analysisCommit.inputSchema)
+  const references = [...schemaText.matchAll(/"\$ref":"#\/\$defs\/([^"]+)"/g)]
+  assert.equal(references.length > 0, true)
+  for (const ref of references) {
+    assert.equal(Object.hasOwn(analysisCommit.inputSchema.$defs, ref[1]), true, `missing tool schema definition ${ref[1]}`)
+  }
 })
 
 test("MCP router returns structured Core errors", async (t) => {

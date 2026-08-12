@@ -137,6 +137,8 @@ test("server-generated evidence indexes avoid quote transcription and persist co
   assert.equal(evidenceIndex >= 0, true)
   assert.equal(batch.analysis_scaffold.sourceRefMode, "batch-evidence-index")
   assert.deepEqual(batch.analysis_scaffold.sourceRefs, batch.evidence_catalog.map((entry) => entry.evidence_index))
+  assert.equal(batch.analysis_contract.required_fields.includes("sourceRefMode"), true)
+  assert.match(batch.analysis_contract.source_refs, /use only evidence_catalog\.evidence_index integers/)
 
   const committed = await f.core.commitAnalysis({
     task_id: imported.task_id,
@@ -151,6 +153,49 @@ test("server-generated evidence indexes avoid quote transcription and persist co
   assert.equal(committed.accepted, true)
   assert.equal(committed.normalized_source_ref_indexes, 1)
   const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
+  assert.equal(plan.analysis_summary.entities[0].sourceRefs[0].quote, "Business Entity is the canonical business object.")
+})
+
+test("analysis normalization safely repairs omitted evidence mode and numeric confidence strings", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  const evidenceIndex = batch.evidence_catalog.findIndex((entry) => entry.quote === "Business Entity is the canonical business object.")
+  const { sourceRefMode: _sourceRefMode, ...scaffoldWithoutMode } = batch.analysis_scaffold
+
+  await assert.rejects(
+    () => f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      idempotency_key: "unsafe-analysis-normalization-v0",
+      analysis: {
+        ...scaffoldWithoutMode,
+        entities: [{ localId: "entity-business", name: "Business Entity", confidence: "91%", sourceRefs: [evidenceIndex] }],
+      },
+    }),
+    (error) => error?.code === "INVALID_ANALYSIS"
+      && error.details.validation_errors.includes("entities[0].confidence must be between 0 and 1"),
+  )
+
+  const committed = await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    idempotency_key: "safe-analysis-normalization-v1",
+    analysis: {
+      ...scaffoldWithoutMode,
+      entities: [{ localId: "entity-business", name: "Business Entity", confidence: "0.91", sourceRefs: [evidenceIndex] }],
+      candidatePages: [{ localId: "page-business", title: "Business Entity", confidence: "0.8", sourceRefs: [evidenceIndex] }],
+      batchSummary: "Defines Business Entity.",
+    },
+  })
+
+  assert.equal(committed.accepted, true)
+  assert.equal(committed.inferred_batch_evidence_mode, true)
+  assert.equal(committed.normalized_numeric_confidences, 2)
+  const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
+  assert.equal(plan.analysis_summary.entities[0].confidence, 0.91)
+  assert.equal(plan.candidate_pages[0].confidence, 0.8)
   assert.equal(plan.analysis_summary.entities[0].sourceRefs[0].quote, "Business Entity is the canonical business object.")
 })
 

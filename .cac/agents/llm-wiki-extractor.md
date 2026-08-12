@@ -54,6 +54,13 @@ the grounded candidate with `status: "unresolved"` and put the reason in
 drop it. On `INVALID_DOMAIN_ANALYSIS`, correct only from the returned
 `classification_hints` instead of guessing alternate file or pointer forms.
 Build the payload by copying `get_batch.analysis_scaffold`, not from memory.
+Before generating candidates, treat the scaffold and the
+`llm_wiki_commit_analysis` nested input Schema as the submission contract.
+Use candidate objects shaped like
+`{localId, name|title|content, confidence: 0.9, sourceRefs: [evidence_index]}`:
+`confidence` is a JSON number, never a quoted string. For Domain Schema tasks,
+copy `classification_scaffold` including `snapshotHash`, `domain`, and `abe`;
+replace only its `be` placeholders from one exact `be_pointer_hints` entry.
 When `evidence_catalog` is present, leave the scaffold's `sourceRefMode` and
 numeric source catalog unchanged and cite `evidence_index` values directly in
 candidate `sourceRefs`. Do not retype quotes or use Read on the original source;

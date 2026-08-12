@@ -602,19 +602,19 @@ export class LlmWikiCore {
         domain_schema: schemaContext.value,
         domain_schema_disclosure: schemaContext.disclosure,
         domain_extraction_instructions: domainSchema
-          ? "Use progressive Schema disclosure. First call llm_wiki_get_domain_schema with level=domains to read all_domains.json. Group candidates by selected domain, then call level=domain for each domain. For each selected ABE, call level=abe and read the complete returned JSON. Copy its classification_scaffold and choose a BE from be_pointer_hints; do not reconstruct folder/file names or guess pointer variants. Put the result in schemaClassification with domain, abe, be, pointer, confidence, and status. The input JSON shape is unrestricted. Keep sourceRefs for document evidence separate from schema references. If classification is ambiguous, preserve the candidate with status=unresolved and add a plain string to unresolvedQuestions."
+          ? "Use progressive Schema disclosure. First call llm_wiki_get_domain_schema with level=domains to read all_domains.json. Group candidates by selected domain, then call level=domain for each domain. For each selected ABE, call level=abe and read the complete returned JSON. Copy classification_scaffold exactly, including snapshotHash and its nested domain, abe, and be objects. Replace only the be placeholders from one exact be_pointer_hints entry, and add numeric confidence between 0 and 1. Do not reconstruct folder/file names or guess pointer variants. The input JSON shape is unrestricted. Keep sourceRefs for document evidence separate from schema references. If classification is ambiguous, preserve the candidate with status=unresolved and add a plain string to unresolvedQuestions."
           : null,
       },
       analysis_contract: {
         schema_id: "https://llm-wiki.local/schemas/analysis-envelope-v1.json",
         schema_version: 1,
         required_fields: [
-          "schemaVersion", "taskId", "batchId", "sourceRefs", "entities", "concepts",
+          "schemaVersion", "taskId", "batchId", "sourceRefMode", "sourceRefs", "entities", "concepts",
           "claims", "relations", "contradictions", "candidatePages", "reviewItems",
           "batchSummary", "unresolvedQuestions",
         ],
         top_level_additional_properties: false,
-        source_refs: "In batch-evidence-index mode, the scaffold's numeric catalog selects server-generated evidence and every nested candidate uses the same evidence_index. Legacy complete SourceRef objects remain accepted.",
+        source_refs: "Copy the scaffold's numeric catalog unchanged and use only evidence_catalog.evidence_index integers in every nested candidate.sourceRefs.",
         grounded_candidates_require_source_refs: true,
         review_item_shape: { content: "string", sourceRefs: [0] },
         max_quote_chars: 1000,
@@ -652,12 +652,16 @@ export class LlmWikiCore {
       analysis_preflight: {
         start_from_scaffold: true,
         schema_version_type: "number",
-        source_ref_templates: "Use the prefilled batch-evidence indexes. Legacy manual SourceRefs must copy chunk.source_ref_templates exactly; never reconstruct sheetName or cellRange.",
+        source_ref_templates: "Use the prefilled batch-evidence indexes; do not generate complete SourceRef objects or reconstruct sheetName and cellRange on the current hot path.",
         nested_source_refs: "In batch-evidence-index mode, use evidence_catalog.evidence_index values directly in candidate sourceRefs and leave the scaffold catalog unchanged.",
         evidence: "Do not retype quotes or read the source file. The server generated every evidence_catalog quote as an exact contiguous batch substring.",
         relation_grounding: "Put the directly supported relationship statement in relation.content and cite the evidence entry containing it.",
         review_items: "Use {content, sourceRefs} objects only when a batch quote directly supports the concern; otherwise use unresolvedQuestions.",
         unresolved_questions: "Use plain strings only. Common legacy {question|reason|content|message|text} objects are normalized, but current workers must emit strings.",
+        candidate_shape: "Use candidate objects such as {localId, name|title|content, confidence: 0.9, sourceRefs: [evidence_index]}; confidence is a JSON number, never a quoted string.",
+        domain_classification: domainSchema
+          ? "Every entity and concept must include schemaClassification copied from the selected ABE classification_scaffold, including snapshotHash; replace its be placeholders from one be_pointer_hints entry and keep confidence numeric."
+          : "schemaClassification is not required because this task has no Domain Schema.",
       },
       extraction_context_policy: {
         retrieval_required: false,
@@ -793,6 +797,8 @@ export class LlmWikiCore {
         normalized_source_ref_indexes: normalized.resolvedSourceRefIndexes,
         normalized_source_ref_quotes: normalizedSourceRefQuotes,
         normalized_unresolved_questions: normalized.normalizedUnresolvedQuestions,
+        normalized_numeric_confidences: normalized.normalizedNumericConfidences,
+        inferred_batch_evidence_mode: normalized.inferredBatchEvidenceMode,
         domain_validation: domainApplied.report,
         wiki_projection: wikiProjection,
         next_action: projectionNextAction ?? extractionNextAction,
