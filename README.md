@@ -290,11 +290,12 @@ match one unique source span.
 For large Schemas, `get_batch` now performs deterministic batch-text matching
 against canonical type IDs, names, aliases, and property labels and embeds the
 bounded complete definitions directly. Most batches therefore need no separate
-Schema call. Extraction also skips BM25/embedding retrieval by default because
-the leased batch is complete evidence and the finalization audit or semantic
-fallback reconciles batches;
-retrieval remains available for explicit cross-batch ambiguity and remains the
-default multi-route path for user questions.
+Schema call. Only an extractor analyzing a complete leased batch skips
+BM25/embedding retrieval by default because the finalization audit or semantic
+fallback reconciles batches. That optimization does not apply to
+coordinator-owned user questions: before answering a factual question about
+imported sources or the generated Wiki, the coordinator must call
+`llm_wiki_retrieve_context` and ground the answer in its returned hits.
 
 Large-task storage and coordination are also bounded. Task batches retain only
 the table locator metadata needed for extraction instead of duplicating complete

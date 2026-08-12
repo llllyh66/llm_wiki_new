@@ -330,7 +330,10 @@ Skill 会先调用 `llm_wiki_list_tasks` 和 `llm_wiki_status`，然后按 `next
 
 ### 使用已生成的 Wiki
 
-可直接向主 Agent 提问，Skill 会使用 `llm_wiki_retrieve_context` 召回证据；
+可直接向主 Agent 提问。凡是答案可能存在于已导入文档或生成的 Wiki 中，
+Skill 都会在回答前调用 `llm_wiki_retrieve_context` 召回证据，不会只凭对话记忆
+作答。普通全任务问答不传 `batch_id`；任务仍在构建时，回答会明确保留
+`retrieval_phase: building` 的不完整性提示。
 也可以明确让 Agent 综合 `wiki/`：
 
 ```text

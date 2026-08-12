@@ -1,6 +1,6 @@
 ---
 name: llm-wiki-builder
-description: Build, rebuild, resume, or incrementally update a source-grounded local llm_wiki knowledge base from attached documents or explicit local paths.
+description: Build, update, resume, or query a source-grounded local llm_wiki knowledge base from attached documents or explicit local paths. Use for knowledge-base questions about imported sources or generated Wiki pages.
 ---
 
 # Claude Code entrypoint

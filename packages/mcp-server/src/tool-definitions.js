@@ -114,7 +114,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_retrieve_context",
-    description: "Recall source chunks, committed analysis, and Wiki sections with RRF. batch_id is optional for task-wide user questions and may be supplied to prioritize one worker batch. Defaults to BM25 plus Embedding while building, then adds Wiki recall after completion.",
+    description: "Search the llm_wiki knowledge base for evidence needed to answer a user's question. Call this before answering factual questions about imported documents or generated Wiki content, even when an answer appears in prior conversation context. Returns relevant source chunks, committed analysis, and stable Wiki sections with identifiers and locators. Omit batch_id for normal task-wide questions; supply it only to prioritize one extractor batch. Results use BM25 plus Embedding while building and add Wiki title, path, and link-graph recall after completion.",
     inputSchema: closedObject({
       task_id: taskId,
       batch_id: { type: "string" },

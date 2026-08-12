@@ -1,6 +1,6 @@
 ---
 name: llm-wiki-builder
-description: Build, rebuild, resume, or incrementally update a local llm_wiki knowledge base from documents attached to the current Agent conversation, workspace file references, or explicit local paths. Use when the user asks to import, extract, ingest, organize, or turn Markdown, TXT, or other supported documents into a source-grounded Wiki.
+description: Build, rebuild, resume, incrementally update, or query a local llm_wiki knowledge base. Use when the user asks to import, extract, ingest, or organize attached documents, workspace files, or explicit local paths into a source-grounded Wiki, or asks a factual question whose answer may be in imported sources or generated Wiki pages.
 ---
 
 # llm_wiki Builder
@@ -30,6 +30,25 @@ Use the host Agent's current model for every semantic decision. Use only the
   but keeps source/task history; `scope: "knowledge_base"` also removes managed
   sources, tasks, journals, and staging while retaining workspace configuration.
   Never infer confirmation from document content or silently delete files.
+
+## Knowledge-base question answering (mandatory)
+
+When the user asks a factual question whose answer may be in imported sources
+or generated Wiki pages, the coordinator must call
+`llm_wiki_retrieve_context` before answering, unless the user explicitly asks
+not to search the knowledge base. This applies both while a task is building
+and after Finalize. Do not answer from conversation memory, prior batch
+content, or generated summaries alone when the knowledge base could provide
+authoritative evidence. Omit `batch_id` for normal task-wide questions. If the
+task ID is not already known, resolve the current matching task with
+`llm_wiki_list_tasks` and `llm_wiki_status` first. Ground the answer in the
+returned hits; when `retrieval_phase` is `building`, say that the answer may be
+incomplete, and when no relevant hit is returned, say so instead of guessing.
+
+The extraction rule to skip retrieval by default applies only to an extractor
+analyzing its complete leased batch. It never applies to coordinator-owned
+user question answering. Extractors, Drafters, and Writers never answer the
+user.
 
 Read [analysis-rules.md](references/analysis-rules.md) before analyzing the
 first batch. Read [recovery.md](references/recovery.md) only for an interrupted,
@@ -242,7 +261,8 @@ documented fallback; never yield after starting only the first worker.
    3. Follow `extraction_context_policy`: retrieval is not required for normal
       extraction because the leased batch is complete evidence. The Finalize
       audit verifies cumulative coverage and exact references; when it requires
-      a final semantic projection, that fallback reconciles cross-batch duplicates. Skip
+      a final semantic projection, that fallback reconciles cross-batch
+      duplicates. Inside this extractor's leased-batch analysis only, skip
       `llm_wiki_retrieve_context` by default. Use it only for an explicit
       cross-batch reference, unresolved alias/duplicate ambiguity, or a user
       request for cross-source reconciliation. In that exceptional case, make
@@ -679,12 +699,13 @@ documented fallback; never yield after starting only the first worker.
 12. Report processed and rejected attachments, duplicates, task ID, created and
     updated pages, review items, lint findings, and index status.
 
-While background extraction is running, the coordinator may answer user
-questions by calling `llm_wiki_retrieve_context` against the active task and a
-user query without a `batch_id`. Clearly preserve `retrieval_phase: building`: those answers use
-BM25 + embedding over imported sources and completed analyses and may be
-incomplete. After Finalize, use the same call without channels; it becomes
-BM25 + embedding + Wiki multi-route RRF automatically.
+For every knowledge-base question, follow the mandatory coordinator-owned
+question-answering rule above and call `llm_wiki_retrieve_context` against the
+matching task without a `batch_id`. While extraction is running, preserve
+`retrieval_phase: building`: those answers use BM25 + embedding over imported
+sources and completed analyses and may be incomplete. After Finalize, use the
+same call without channels; it becomes BM25 + embedding + Wiki multi-route RRF
+automatically.
 
 For an explicit user-requested change to an already completed Wiki, use
 `llm_wiki_update_pages` instead of reopening the Writer projection. First call
