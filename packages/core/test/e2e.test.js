@@ -1487,7 +1487,7 @@ test("knowledge-base deletion requires confirmation, blocks active tasks, and pr
   await access(path.join(f.workspace, "llm-wiki.schema.md"))
 })
 
-test("concurrent task writers serialize transactions and accept stale global revisions for different pages", async (t) => {
+test("workspace publication ownership serializes task publishers until finalize", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
   const secondSource = path.join(f.incoming, "second-product.md")
@@ -1531,24 +1531,24 @@ test("concurrent task writers serialize transactions and accept stale global rev
   ])
   assert.equal(firstPlan.based_on_wiki_revision, secondPlan.based_on_wiki_revision)
 
-  const results = await Promise.all([
-    f.core.commitPages({
-      task_id: firstTask.task_id,
-      based_on_wiki_revision: firstPlan.based_on_wiki_revision,
-      idempotency_key: "concurrent-writer-first-page",
-      patches: [{
-        patchId: "concurrent-first",
-        path: "wiki/topics/concurrent-first.md",
-        operation: "create",
-        title: "Concurrent First",
-        pageKind: "topic",
-        content: "# Concurrent First\n\nFirst task content.",
-        covers: firstPlan.page_requirements.map((requirement) => requirement.requirement_id),
-        sourceRefs: [firstRef],
-        rationale: "Exercise workspace transaction serialization.",
-      }],
-    }),
-    f.core.commitPages({
+  const firstResult = await f.core.commitPages({
+    task_id: firstTask.task_id,
+    based_on_wiki_revision: firstPlan.based_on_wiki_revision,
+    idempotency_key: "concurrent-writer-first-page",
+    patches: [{
+      patchId: "concurrent-first",
+      path: "wiki/topics/concurrent-first.md",
+      operation: "create",
+      title: "Concurrent First",
+      pageKind: "topic",
+      content: "# Concurrent First\n\nFirst task content.",
+      covers: firstPlan.page_requirements.map((requirement) => requirement.requirement_id),
+      sourceRefs: [firstRef],
+      rationale: "Exercise workspace transaction serialization.",
+    }],
+  })
+  await assert.rejects(
+    () => f.core.commitPages({
       task_id: secondTask.task_id,
       based_on_wiki_revision: secondPlan.based_on_wiki_revision,
       idempotency_key: "concurrent-writer-second-page",
@@ -1564,12 +1564,130 @@ test("concurrent task writers serialize transactions and accept stale global rev
         rationale: "Exercise workspace transaction serialization.",
       }],
     }),
-  ])
+    (error) => error instanceof LlmWikiError
+      && error.code === "WIKI_PUBLICATION_BUSY"
+      && error.details.owner_task_id === firstTask.task_id,
+  )
 
-  assert.equal(results.every((result) => result.accepted), true)
-  assert.equal(results.filter((result) => result.unrelated_wiki_changes_accepted).length, 1)
+  assert.equal(firstResult.accepted, true)
+  const blocked = await f.core.status({ task_id: secondTask.task_id })
+  assert.equal(blocked.wiki_publication.state, "waiting")
+  assert.equal(blocked.wiki_projection.blocked_by_publication, true)
+  assert.equal(blocked.wiki_projection.blocked_by_task_id, firstTask.task_id)
+  await f.core.finalize({ task_id: firstTask.task_id })
+
+  const refreshedSecondPlan = await f.core.getPagePlanContext({ task_id: secondTask.task_id })
+  const secondResult = await f.core.commitPages({
+    task_id: secondTask.task_id,
+    based_on_wiki_revision: refreshedSecondPlan.based_on_wiki_revision,
+    idempotency_key: "concurrent-writer-second-page-after-owner-finalize",
+    patches: [{
+      patchId: "concurrent-second",
+      path: "wiki/topics/concurrent-second.md",
+      operation: "create",
+      title: "Concurrent Second",
+      pageKind: "topic",
+      content: "# Concurrent Second\n\nSecond task content.",
+      covers: refreshedSecondPlan.page_requirements.map((requirement) => requirement.requirement_id),
+      sourceRefs: [secondRef],
+      rationale: "Publish after the previous task finalizes.",
+    }],
+  })
+  assert.equal(secondResult.accepted, true)
   assert.match(await readFile(path.join(f.workspace, "wiki", "topics", "concurrent-first.md"), "utf8"), /First task content/)
   assert.match(await readFile(path.join(f.workspace, "wiki", "topics", "concurrent-second.md"), "utf8"), /Second task content/)
+})
+
+test("blocked projection commits discard stale pending manifests before retry", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const waiterSource = path.join(f.incoming, "waiter.md")
+  await writeFile(waiterSource, "# Waiting Product\n\nWaiting Product is a distinct canonical object.\n")
+  const owner = await f.core.importFiles({ files: [{ path: f.source }] })
+  const waiter = await f.core.importFiles({ files: [{ path: waiterSource }] })
+  const ownerRef = await analyzeAll(f.core, owner)
+  const waiterBatch = await f.core.getBatch({ task_id: waiter.task_id })
+  const waiterChunk = waiterBatch.chunks[0]
+  const waiterRef = waiterChunk.source_ref_templates[0]
+  await f.core.commitAnalysis({
+    task_id: waiter.task_id,
+    batch_id: waiterBatch.batch_id,
+    idempotency_key: "waiting-projection-analysis",
+    analysis: {
+      schemaVersion: 1,
+      taskId: waiter.task_id,
+      batchId: waiterBatch.batch_id,
+      sourceRefs: [waiterRef],
+      entities: [{ localId: "waiting-product", name: "Waiting Product", sourceRefs: [0] }],
+      concepts: [], claims: [], relations: [], contradictions: [], candidatePages: [], reviewItems: [],
+      batchSummary: "Defines Waiting Product.",
+      unresolvedQuestions: [],
+    },
+  })
+
+  const ownerPlan = await f.core.getPagePlanContext({ task_id: owner.task_id })
+  await f.core.commitPages({
+    task_id: owner.task_id,
+    based_on_wiki_revision: ownerPlan.based_on_wiki_revision,
+    idempotency_key: "waiting-projection-owner-publish",
+    patches: [{
+      patchId: "waiting-projection-owner-page",
+      path: "wiki/topics/waiting-owner.md",
+      operation: "create",
+      title: "Waiting Owner",
+      pageKind: "topic",
+      content: "# Waiting Owner\n\nOwner content.",
+      covers: ownerPlan.page_requirements.map((requirement) => requirement.requirement_id),
+      sourceRefs: [ownerRef],
+      rationale: "Hold durable publication ownership.",
+    }],
+  })
+
+  const manifest = await f.core.getPagePlanContext({ task_id: waiter.task_id, writer_id: "wiki-writer-1", view: "manifest" })
+  const shardAction = manifest.draft_manifest.draft_actions[0].arguments
+  let shard = await f.core.getPagePlanContext(shardAction)
+  const requirements = [...shard.page_requirements]
+  while (shard.next_cursor !== null) {
+    shard = await f.core.getPagePlanContext({ ...shardAction, cursor: shard.next_cursor })
+    requirements.push(...shard.page_requirements)
+  }
+  const patchesByPath = new Map()
+  for (const requirement of requirements) {
+    const existing = patchesByPath.get(requirement.patch_scaffold.path)
+    if (existing) {
+      existing.covers = [...new Set([...existing.covers, ...requirement.patch_scaffold.covers])]
+      existing.sourceRefs = [...new Set([...existing.sourceRefs, ...requirement.patch_scaffold.sourceRefs])]
+      continue
+    }
+    patchesByPath.set(requirement.patch_scaffold.path, {
+      ...requirement.patch_scaffold,
+      content: `# ${requirement.title}\n\nWaiting projection content.`,
+      summary: "Waiting projection content.",
+      tags: [requirement.page_kind],
+    })
+  }
+  await assert.rejects(
+    () => f.core.commitPages({
+      task_id: waiter.task_id,
+      writer_id: "wiki-writer-1",
+      projection_id: manifest.projection.projection_id,
+      based_on_wiki_revision: manifest.based_on_wiki_revision,
+      idempotency_key: "waiting-projection-blocked-wave",
+      projection_complete: false,
+      draft_shard_ids: [shardAction.shard_id],
+      patches: [...patchesByPath.values()],
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "WIKI_PUBLICATION_BUSY"
+      && error.details.projection_plan_invalidated === true,
+  )
+
+  const waiterTaskPath = path.join(f.workspace, ".llm-wiki", "tasks", waiter.task_id, "task.json")
+  const waiterTask = JSON.parse(await readFile(waiterTaskPath, "utf8"))
+  assert.equal(waiterTask.pageProjection.lease.pagePlanTraversal, null)
+  assert.equal(waiterTask.pageProjection.lease.planInvalidationReason, "WIKI_PUBLICATION_BUSY")
+  assert.deepEqual(waiterTask.pageProjection.lease.stagedDraftReceipts, {})
+  await assert.rejects(() => access(path.join(path.dirname(waiterTaskPath), "page-plan.json")))
 })
 
 test("duplicate content is reused and task recovery and abort stay workspace-scoped", async (t) => {
@@ -1582,11 +1700,22 @@ test("duplicate content is reused and task recovery and abort stay workspace-sco
   assert.equal(second.accepted.length, 0)
   assert.equal(second.duplicates.length, 1)
   assert.equal(second.duplicates[0].duplicate_of, first.sources[0].source_id)
+  assert.equal(second.reused_task, true)
+  assert.equal(second.task_id, first.task_id)
   const listed = await f.core.listTasks({ status: ["prepared"] })
-  assert.equal(listed.tasks.length, 2)
-  const aborted = await f.core.abort({ task_id: second.task_id, reason: "test cancellation" })
+  assert.equal(listed.tasks.length, 1)
+  await assert.rejects(
+    () => f.core.importFiles({ files: [{ path: duplicatePath }], options: { force_reanalyze: true } }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "EQUIVALENT_TASK_ACTIVE"
+      && error.details.existing_task_id === first.task_id,
+  )
+  const aborted = await f.core.abort({ task_id: first.task_id, reason: "test cancellation" })
   assert.equal(aborted.status, "cancelled")
-  assert.equal((await f.core.status({ task_id: second.task_id })).status, "cancelled")
+  assert.equal((await f.core.status({ task_id: first.task_id })).status, "cancelled")
+  const forced = await f.core.importFiles({ files: [{ path: duplicatePath }], options: { force_reanalyze: true } })
+  assert.equal(forced.reused_task, false)
+  assert.notEqual(forced.task_id, first.task_id)
 })
 
 test("get_batch repairs an 81K single-line legacy batch in place and preserves its worker lease", async (t) => {

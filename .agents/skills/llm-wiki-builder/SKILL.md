@@ -108,6 +108,10 @@ always use it and return control to the user while the worker runs.
    Never pass a Schema JSON file or inline Schema object.
 2. Call `llm_wiki_import_files` with each Agent-visible local path and a safe
    display name. Let the tool initialize the current workspace.
+   When the result reports `reused_task: true`, resume that exact task and its
+   returned `next_action`; never create a competing task for the same source,
+   Domain Schema, and target language. `force_reanalyze` is valid only after an
+   equivalent task reaches a terminal state.
 3. Record the returned task ID in working context.
 4. Use background extraction for every non-empty task. After import, verify
    the task once by calling `llm_wiki_status` directly in the coordinator. Do not call `llm_wiki_get_batch` or perform semantic extraction in the main
@@ -604,6 +608,11 @@ always use it and return control to the user while the worker runs.
    Core serializes workspace transactions and checks exact target-page
    hashes, so a write to an unrelated page does not invalidate another task's
    projection or block retrieval.
+   Wiki publication itself is workspace-owned from the first provisional
+   transaction through Finalize. If a commit returns `WIKI_PUBLICATION_BUSY`,
+   do not retry in a loop or create a new task. Resume and finalize the returned
+   `owner_task_id`; Core invalidates the waiting task's uncommitted page-plan
+   snapshot so its next manifest is rebuilt against the published Wiki.
 10. When completed batches equal total batches, ensure a `final` projection
     completes and `wiki_projection.final_completed` is true. Then call
     `llm_wiki_finalize`. Never Finalize while provisional pages remain.

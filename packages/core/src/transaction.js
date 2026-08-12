@@ -5,6 +5,7 @@ import { fail } from "./errors.js"
 import { assertNoSymlinkEscape, validatePagePath } from "./validation.js"
 import { acquireProcessFileLock, ensureDir, hashDirectory, nowIso, pathExists, readJson, sha256, writeJsonAtomic, writeTextAtomic } from "./utils.js"
 import { prepareWikiPageContent } from "./wiki-page.js"
+import { claimPublicationOwner, releaseUnusedPublicationClaim } from "./publication-store.js"
 
 export async function commitPageTransaction(workspace, task, patches, basedOnWikiRevision) {
   const lockPath = path.join(workspace.paths.locks, "write.lock")
@@ -22,8 +23,13 @@ export async function commitPageTransaction(workspace, task, patches, basedOnWik
   const targets = []
   const applied = []
   let journal
+  let publicationClaimed = false
   try {
     const actualRevision = await hashDirectory(workspace.paths.wiki)
+    if (task.status !== "completed") {
+      const publication = await claimPublicationOwner(workspace, task, actualRevision)
+      publicationClaimed = publication.claimed
+    }
     // The Wiki revision covers the whole workspace. Another task may have
     // safely changed an unrelated page after this Writer collected its plan.
     // Rejecting that transaction creates needless global contention. The
@@ -140,6 +146,9 @@ export async function commitPageTransaction(workspace, task, patches, basedOnWik
         rolledBackAt: nowIso(),
         cleanupEligibleAt: cleanupEligibleAt(workspace, nowIso()),
       }).catch(() => {})
+    }
+    if (publicationClaimed && applied.length === 0) {
+      await releaseUnusedPublicationClaim(workspace, task.taskId).catch(() => {})
     }
     throw error
   } finally {

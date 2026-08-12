@@ -34,6 +34,7 @@ const ATOMIC_PAGE_REJECTION_CODES = new Set([
   "DUPLICATE_PAGE_COVERAGE",
   "FILE_HASH_CONFLICT",
   "PROVISIONAL_PAGE_CONFLICT",
+  "WIKI_PUBLICATION_BUSY",
   "WORKSPACE_LOCKED",
 ])
 
@@ -174,6 +175,7 @@ function pageCommitRetryScope(code) {
   if (code === "PAGE_DRAFT_STAGING_UNAVAILABLE") return "resume_the_active_manifest_projection_before_server_commit"
   if (code === "INCOMPLETE_PAGE_COVERAGE") return "entire_rejected_patch_set_plus_missing_coverage"
   if (code === "DUPLICATE_PAGE_COVERAGE") return "entire_rejected_patch_set_after_unique_coverage_reconciliation"
+  if (code === "WIKI_PUBLICATION_BUSY") return "unchanged_patch_set_after_publication_owner_finishes_and_rebase"
   if (["FILE_HASH_CONFLICT", "PROVISIONAL_PAGE_CONFLICT"].includes(code)) return "entire_rejected_patch_set_after_rebase"
   return "entire_rejected_patch_set"
 }
@@ -188,11 +190,15 @@ function pageCommitRetryInstruction(code) {
   if (code === "PAGE_DRAFT_STAGING_UNAVAILABLE") return "Return control to the coordinator so it can resume the active manifest and stage the shard before restarting the Writer."
   if (code === "INCOMPLETE_PAGE_COVERAGE") return "Add the reported missing coverage to the rejected set and resubmit it; no patch from the rejected call was stored."
   if (code === "DUPLICATE_PAGE_COVERAGE") return "Keep every requirement ID on one canonical path, repair all reported duplicate owners, and resubmit the whole rejected set."
+  if (code === "WIKI_PUBLICATION_BUSY") return "Do not create another task or retry in a loop. Resume the owning task, then refresh this projection against the published Wiki before retrying."
   if (["FILE_HASH_CONFLICT", "PROVISIONAL_PAGE_CONFLICT"].includes(code)) return "Rebase the conflicting target, then resubmit the whole rejected atomic patch set; do not retry only one patch."
   return "Correct every reported invalid patch and resubmit the whole rejected atomic patch set with a new idempotency key; do not retry only the failing patch."
 }
 
 function recoveryAction(tool, args, error) {
+  if (error.code === "WIKI_PUBLICATION_BUSY" && typeof error.details?.owner_task_id === "string") {
+    return { tool: "llm_wiki_status", arguments: { task_id: error.details.owner_task_id } }
+  }
   if (error.code === "TASK_BUSY") {
     return typeof args?.task_id === "string"
       ? { tool: "llm_wiki_status", arguments: { task_id: args.task_id } }

@@ -490,6 +490,33 @@ test("parallel draft coverage conflicts remain recoverable without disconnecting
   assert.equal(response.structuredContent.mcp_connection_usable, true)
 })
 
+test("publication ownership conflicts direct recovery to the owning task", async () => {
+  const router = new HeadlessToolRouter({
+    commitPages: async () => {
+      throw new LlmWikiError("WIKI_PUBLICATION_BUSY", "Another task owns publication.", {
+        retryable: true,
+        details: { owner_task_id: "task-owner", atomic_commit_applied: false },
+      })
+    },
+  })
+  const response = await router.callMcp("llm_wiki_commit_pages", {
+    task_id: "task-waiter",
+    writer_id: "wiki-writer-1",
+    projection_id: "projection-example",
+    based_on_wiki_revision: "a".repeat(64),
+    patches: [{ patchId: "patch-a" }],
+    idempotency_key: "publication-owner-wait-v1",
+  })
+  assert.equal(response.structuredContent.error.code, "WIKI_PUBLICATION_BUSY")
+  assert.equal(response.structuredContent.atomic_commit_applied, false)
+  assert.equal(response.structuredContent.page_commit_recovery.retry_scope, "unchanged_patch_set_after_publication_owner_finishes_and_rebase")
+  assert.deepEqual(response.structuredContent.next_action, {
+    tool: "llm_wiki_status",
+    arguments: { task_id: "task-owner" },
+  })
+  assert.equal(response.structuredContent.mcp_connection_usable, true)
+})
+
 test("every registered MCP tool routes errors without terminating the router", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-mcp-routes-"))
   t.after(() => rm(root, { recursive: true, force: true }))

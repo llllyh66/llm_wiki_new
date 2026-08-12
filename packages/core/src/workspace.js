@@ -84,6 +84,7 @@ export function workspacePaths(root) {
     indexes: path.join(state, "indexes"),
     generations: path.join(state, "generations"),
     currentGeneration: path.join(state, "current-generation.json"),
+    publicationOwner: path.join(state, "publication-owner.json"),
     locks: path.join(state, "locks"),
     journal: path.join(state, "journal"),
     importStaging: path.join(state, "import-staging"),

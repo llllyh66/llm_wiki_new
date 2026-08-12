@@ -24,6 +24,21 @@ const BATCH_FILE_CACHE_LIMIT = 4
 const BATCH_FILE_CACHE_MAX_BYTES = 32 * 1024 * 1024
 const batchFileCache = new Map()
 
+export function taskBuildKey(sourceIds, domainSchemaHash, targetLanguage) {
+  return sha256(stableStringify({
+    version: 1,
+    sourceIds: [...sourceIds].map(String).sort(),
+    domainSchemaHash: domainSchemaHash ?? null,
+    targetLanguage: targetLanguage ?? "zh-CN",
+  }))
+}
+
+export function buildKeyForTask(task) {
+  return typeof task?.buildKey === "string" && task.buildKey
+    ? task.buildKey
+    : taskBuildKey(task?.sourceIds ?? [], task?.domainSchema?.hash ?? null, task?.options?.targetLanguage)
+}
+
 export function taskPaths(workspacePaths, taskId) {
   const root = path.join(workspacePaths.tasks, taskId)
   return {
@@ -70,11 +85,17 @@ export async function createTask(workspace, sources, options = {}) {
   )
   const batches = makeBatches(taskId, allChunks, maxBatchChars)
   const timestamp = nowIso()
+  const buildKey = taskBuildKey(
+    sources.map((source) => source.source_id),
+    options.domainSchema?.metadata?.hash ?? null,
+    options.targetLanguage ?? workspace.config.targetLanguage,
+  )
   const task = {
     schemaVersion: 1,
     taskId,
     workspaceId: workspace.config.workspaceId,
     sourceIds: sources.map((source) => source.source_id),
+    buildKey,
     status: "prepared",
     createdAt: timestamp,
     updatedAt: timestamp,

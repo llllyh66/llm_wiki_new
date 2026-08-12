@@ -17,15 +17,18 @@ import { importSources, loadSourceManifest } from "./source-store.js"
 import {
   ACTIVE_TASK_STATUSES,
   assertTaskStatus,
+  buildKeyForTask,
   createTask,
   ensureBoundedTaskBatches,
   loadTask,
   readExactIdempotencyReplay,
   saveTask,
+  taskBuildKey,
   taskPaths,
   withIdempotency,
 } from "./task-store.js"
 import { cleanupTransactionArtifacts, commitPageTransaction, committedPageRecords, markPageTransactionCommitted, recoverPendingPageTransactions } from "./transaction.js"
+import { publicationState, releasePublicationOwner } from "./publication-store.js"
 import {
   assertNoSymlinkEscape,
   canonicalizeAnalysisSourceRefQuotes,
@@ -383,8 +386,47 @@ export class LlmWikiCore {
     if (imported.all.length === 0) {
       fail("SOURCE_IMPORT_FAILED", "No supported source files were imported.", { details: { rejected: imported.rejected } })
     }
+    const effectiveTargetLanguage = targetLanguage ?? workspace.config.targetLanguage
+    const buildKey = taskBuildKey(
+      imported.all.map((source) => source.source_id),
+      domainSchema?.metadata?.hash ?? null,
+      effectiveTargetLanguage,
+    )
+    const equivalent = await findEquivalentTask(workspace, buildKey)
+    const forceReanalyze = input?.options?.force_reanalyze === true
+    if (equivalent && ACTIVE_TASK_STATUSES.includes(equivalent.status) && forceReanalyze) {
+      fail("EQUIVALENT_TASK_ACTIVE", `Equivalent task ${equivalent.taskId} is still active.`, {
+        retryable: true,
+        taskId: equivalent.taskId,
+        details: { existing_task_id: equivalent.taskId, existing_status: equivalent.status, build_key: buildKey },
+        suggestedAction: `Resume task ${equivalent.taskId}; force_reanalyze is only available after the equivalent task reaches a terminal state.`,
+      })
+    }
+    if (equivalent && !forceReanalyze && (ACTIVE_TASK_STATUSES.includes(equivalent.status) || equivalent.status === "completed")) {
+      const wikiPublication = await publicationState(workspace, equivalent.taskId)
+      const existingStatus = withPublicationStatus(statusResponse(equivalent), wikiPublication)
+      return {
+        workspace_initialized: workspace.initialized,
+        task_id: equivalent.taskId,
+        status: equivalent.status,
+        reused_task: true,
+        reuse_reason: "equivalent-source-schema-task",
+        build_key: buildKey,
+        sources: imported.all.map(stripInternalSource),
+        accepted: imported.accepted.map(stripInternalSource),
+        duplicates: imported.duplicates.map(stripInternalSource),
+        rejected: imported.rejected,
+        batch_count: equivalent.batchCount,
+        parallel_extraction: existingStatus.parallel_extraction,
+        wiki_projection: existingStatus.wiki_projection,
+        wiki_publication: wikiPublication,
+        wiki_revision: equivalent.wikiRevision,
+        domain_schema: equivalent.domainSchema ?? null,
+        next_action: existingStatus.next_action,
+      }
+    }
     const { task, batches } = await createTask(workspace, imported.all, {
-      targetLanguage: targetLanguage ?? workspace.config.targetLanguage,
+      targetLanguage: effectiveTargetLanguage,
       maxBatchChars: input?.options?.max_batch_chars,
       domainSchema,
     })
@@ -393,6 +435,8 @@ export class LlmWikiCore {
     return {
       workspace_initialized: workspace.initialized,
       task_id: task.taskId,
+      reused_task: false,
+      build_key: task.buildKey,
       status: task.status,
       sources: imported.all.map(stripInternalSource),
       accepted: imported.accepted.map(stripInternalSource),
@@ -2146,6 +2190,26 @@ export class LlmWikiCore {
       fail("INVALID_PAGE_PATCH", "patches must not be empty outside a leased page projection.")
     }
     const commitProjection = projectionCommit ? requirePageProjectionLease(record.task, input) : null
+    if (commitProjection) {
+      const publication = await publicationState(workspace, record.task.taskId)
+      if (publication.state === "waiting") {
+        await this.#invalidatePendingProjectionPlan(record, commitProjection, "WIKI_PUBLICATION_BUSY")
+        fail("WIKI_PUBLICATION_BUSY", `Task ${publication.owner_task_id} owns Wiki publication.`, {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: {
+            owner_task_id: publication.owner_task_id,
+            owner_status: publication.owner_status,
+            owner_provisional_pages: publication.owner_provisional_pages,
+            acquired_at: publication.acquired_at,
+            atomic_commit_applied: false,
+            projection_plan_invalidated: true,
+            resume_view: "manifest",
+          },
+          suggestedAction: `Resume and finalize ${publication.owner_task_id} before rebuilding this task's projection manifest.`,
+        })
+      }
+    }
     if (stagedDraftShardIds.length > 0 && (!commitProjection || commitProjection.pagePlanTraversal?.serverSideManifest !== true)) {
       fail("PAGE_DRAFT_STAGING_UNAVAILABLE", "Staged draft receipts require an active server-side manifest projection.", {
         retryable: true,
@@ -2467,7 +2531,21 @@ export class LlmWikiCore {
           })
         }
       }
-      const journal = await commitPageTransaction(workspace, record.task, normalizedPatches, input?.based_on_wiki_revision)
+      let journal
+      try {
+        journal = await commitPageTransaction(workspace, record.task, normalizedPatches, input?.based_on_wiki_revision)
+      } catch (error) {
+        const normalized = asLlmWikiError(error)
+        if (projection && ["WIKI_PUBLICATION_BUSY", "FILE_HASH_CONFLICT", "PROVISIONAL_PAGE_CONFLICT"].includes(normalized.code)) {
+          await this.#invalidatePendingProjectionPlan(record, projection, normalized.code)
+          normalized.details = {
+            ...(normalized.details ?? {}),
+            projection_plan_invalidated: true,
+            resume_view: "manifest",
+          }
+        }
+        throw normalized
+      }
       const commits = await readJson(record.paths.commits, [])
       commits.push(journal.transactionId)
       await writeJsonAtomic(record.paths.commits, commits)
@@ -2627,6 +2705,31 @@ export class LlmWikiCore {
     return { ...idempotent.response, idempotent_replay: idempotent.replayed }
   }
 
+  async #invalidatePendingProjectionPlan(record, projection, reason) {
+    const committed = new Set(projection.committedDraftShardIds ?? [])
+    const stagedShardIds = Object.keys(projection.stagedDraftReceipts ?? {})
+    const retrievedShardIds = projection.retrievedDraftShardIds ?? []
+    const pendingShardIds = uniqueStrings([...stagedShardIds, ...retrievedShardIds])
+      .filter((shardId) => !committed.has(shardId))
+    await Promise.all(pendingShardIds.map((shardId) => (
+      rm(pageDraftPath(record.paths, projection.projectionId, shardId), { force: true }).catch(() => {})
+    )))
+    projection.retrievedDraftShardIds = []
+    projection.stagedDraftReceipts = {}
+    projection.draftShardNextCursors = {}
+    projection.draftShardSeenCursors = {}
+    projection.draftShardCursorReads = {}
+    projection.nextDraftShardId = null
+    projection.draftShardCount = null
+    projection.pagePlanTraversal = null
+    projection.wikiRevision = null
+    projection.planInvalidatedAt = nowIso()
+    projection.planInvalidationReason = reason
+    await rm(record.paths.pagePlan, { force: true }).catch(() => {})
+    this.#clearPagePlanCaches(record.task.taskId, projection.projectionId)
+    await saveTask(record.paths, record.task)
+  }
+
   async finalize(input) {
     return this.#withWorkspaceWriteLock(() => this.#withTaskLock(input?.task_id, () => (
       this.#withWorkspaceFileLock("finalize", input?.task_id, () => this.#finalize(input))
@@ -2638,7 +2741,10 @@ export class LlmWikiCore {
     const record = await loadTask(workspace.paths, input?.task_id)
     if (record.task.status === "completed") {
       const result = await readJson(record.paths.result)
-      if (input?.refresh_page_metadata !== true || !record.task.domainSchema) return result
+      if (input?.refresh_page_metadata !== true || !record.task.domainSchema) {
+        await releasePublicationOwner(workspace, record.task)
+        return result
+      }
       const analyses = await loadAnalyses(record, record.task.completedBatchIds)
       const requirements = derivePageRequirements(analyses, await this.#taskDomainSchema(record), record.task.domainSchema)
       const refresh = await this.#refreshDomainPageMetadata(workspace, record, requirements)
@@ -2697,10 +2803,12 @@ export class LlmWikiCore {
           result: refreshedResult,
           completedAt: nowIso(),
         })
+        await releasePublicationOwner(workspace, record.task)
         return refreshedResult
       }
       const refreshedResult = { ...result, domain_metadata_refresh: refresh, wiki_revision: record.task.wikiRevision }
       await writeJsonAtomic(record.paths.result, refreshedResult)
+      await releasePublicationOwner(workspace, record.task)
       return refreshedResult
     }
     assertTaskStatus(record.task, ["planning", "committing", "finalizing", "failed"])
@@ -2861,6 +2969,7 @@ export class LlmWikiCore {
       result,
       completedAt: nowIso(),
     })
+    await releasePublicationOwner(workspace, record.task)
     return result
   }
 
@@ -2925,16 +3034,17 @@ export class LlmWikiCore {
       const repair = await this.#repairProjectionState(workspace, record)
       const stagedRecovery = await this.#recoverProjectionStagedDraftReceipts(record)
       const response = statusResponse(record.task)
+      const enriched = withPublicationStatus(response, await publicationState(workspace, record.task.taskId))
       return repair.repaired_shard_ids.length > 0 || stagedRecovery.recovered_shard_ids.length > 0
         ? {
-            ...response,
+            ...enriched,
             projection_recovery: {
               repaired: repair.repaired_shard_ids.length > 0,
               repaired_shard_ids: repair.repaired_shard_ids,
               recovered_staged_draft_receipts: stagedRecovery.recovered_shard_ids,
             },
           }
-        : response
+        : enriched
     }, operationSignal(input))
   }
 
@@ -3065,6 +3175,7 @@ export class LlmWikiCore {
     await clear(workspace.paths.indexes, "indexes")
     await clear(workspace.paths.generations, "generations")
     await rm(workspace.paths.currentGeneration, { force: true })
+    await rm(workspace.paths.publicationOwner, { force: true })
     await rm(path.join(workspace.paths.state, "lint.json"), { force: true })
     if (scope === "knowledge_base") {
       await clear(workspace.paths.tasks, "tasks")
@@ -4523,6 +4634,21 @@ function pagePlanDomainSchemaMetadata(metadata) {
   }
 }
 
+async function findEquivalentTask(workspace, buildKey) {
+  const entries = await readdir(workspace.paths.tasks, { withFileTypes: true })
+  const matches = []
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("task-")) continue
+    const task = await readJson(taskPaths(workspace.paths, entry.name).task, null)
+    if (task && buildKeyForTask(task) === buildKey) matches.push(task)
+  }
+  const priority = (task) => ACTIVE_TASK_STATUSES.includes(task.status) ? 2 : task.status === "completed" ? 1 : 0
+  return matches.sort((left, right) => (
+    priority(right) - priority(left)
+    || String(right.updatedAt).localeCompare(String(left.updatedAt))
+  ))[0] ?? null
+}
+
 function statusResponse(task) {
   const wikiProjection = pageProjectionStatus(task)
   const remainingBatches = Math.max(0, task.batchCount - task.completedBatchIds.length)
@@ -4577,6 +4703,28 @@ function statusResponse(task) {
     pipeline_concurrency: pipelineConcurrency,
     ...(task.lastError ? { last_error: task.lastError } : {}),
     next_action: nextAction(task, wikiProjection),
+  }
+}
+
+function withPublicationStatus(response, publication) {
+  const blocked = publication.state === "waiting"
+    && (response.wiki_projection.ready || response.wiki_projection.in_progress)
+  if (!blocked) return { ...response, wiki_publication: publication }
+  const extractionRemaining = response.completed_batches < response.total_batches
+  return {
+    ...response,
+    wiki_publication: publication,
+    wiki_projection: {
+      ...response.wiki_projection,
+      semantic_ready: response.wiki_projection.ready,
+      ready: false,
+      publish_ready: false,
+      blocked_by_publication: true,
+      blocked_by_task_id: publication.owner_task_id,
+    },
+    next_action: extractionRemaining
+      ? { tool: "llm_wiki_get_batch", arguments: { task_id: response.task_id } }
+      : { tool: "llm_wiki_status", arguments: { task_id: publication.owner_task_id } },
   }
 }
 
