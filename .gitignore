@@ -29,4 +29,5 @@ pnpm-debug.log*
 
 # Local Agent scratch state, not shared project Skills/configuration
 .superpowers/
+.docx_work/
 AGENTS.md
