@@ -13,6 +13,13 @@ Use only the current manifest → draft-shard → staged receipt → single Writ
 - Use only files the user attached, named, or placed in the current workspace.
 - Do not read managed source objects directly. Use `llm_wiki_get_batch`, `llm_wiki_retrieve_context`, and returned evidence catalogs.
 - Preserve exact task, worker, lease, projection, shard, receipt, source, chunk, and generation identifiers.
+- Preserve the language of directly supporting source evidence in extracted
+  candidates and authored Wiki pages. Do not translate source-authored titles,
+  summaries, facts, relations, or questions merely to match the workspace
+  `target_language`; that setting is only a fallback for language-neutral or
+  genuinely undetermined metadata. For a page supported by multilingual
+  evidence, use the predominant evidence language consistently and preserve
+  proper names and source terminology in their original form.
 - Use a new idempotency key for a changed payload. Reuse the same key only for an unchanged retry.
 - Do not claim a source or channel is searchable unless structured readiness says it is ready.
 - Do not answer factual questions from conversation memory when the Wiki may contain the answer; retrieve first and cite returned source locators.
@@ -90,6 +97,14 @@ effective_workers = min(recommended_workers, max_background_agents_total, host_a
 
 Launch only `effective_workers`. A worker uses one stable, unique `worker_id` for its lifetime. If some launches fail, keep successful workers and reduce the effective count; do not duplicate their batches.
 
+During extraction/Projection overlap, never hard-code a `2 Extractors + 1
+Drafter` topology. Read `pipeline_concurrency` and
+`subagent_recovery.roles.*.desired_live_invocations` from the latest status.
+Core allocates actual shard demand to Drafters, up to roughly half of the
+background budget while extraction remains, and gives unused projection slots
+back to Extractors. A one-shard manifest therefore uses one Drafter; a larger
+manifest and host budget may use several concurrently.
+
 After each extractor invocation returns, remove its `worker_id` from
 `running_worker_ids` even when it returned a successful batch checkpoint. If
 status still reports extraction demand, immediately resume its persisted lease
@@ -108,9 +123,12 @@ Each worker repeats:
 3. If work may pass half the remaining lease time, call `llm_wiki_renew_lease` with the exact batch/worker/token tuple.
 4. Start from `analysis_scaffold` without changing its identity fields.
 5. Use `evidence_catalog.evidence_index` integers in nested `sourceRefs`; never retype quotes.
-6. For progressive Domain Schema tasks, disclose `domains`, then selected `domain`, then selected `abe`; copy the returned classification scaffold and exact BE pointer.
-7. Commit with `llm_wiki_commit_analysis`, including the same `worker_id` and `lease_token`.
-8. Continue for at most `worker_batch_quantum` batches, then return a compact checkpoint to the coordinator.
+6. Keep candidate names, titles, content, summaries, relations, and questions in
+   the language of their cited evidence; never translate them to
+   `workspace_context.target_language`.
+7. For progressive Domain Schema tasks, disclose `domains`, then selected `domain`, then selected `abe`; copy the returned classification scaffold and exact BE pointer.
+8. Commit with `llm_wiki_commit_analysis`, including the same `worker_id` and `lease_token`.
+9. Continue for at most `worker_batch_quantum` batches, then return a compact checkpoint to the coordinator.
 
 Never submit after `LEASE_FENCED`. Reacquire work and discard the superseded response. Do not reuse a worker name for two concurrent invocations.
 
@@ -146,6 +164,13 @@ The coordinator calls `llm_wiki_get_page_plan_context` with:
 
 Save `projection_id`. Every continuation must include it. The ID is an opaque fencing credential; a call with only the same writer name cannot join an active projection.
 
+If manifest acquisition returns `waiting=true`, branch only on its structured
+`waiting_reason`. `projection_not_ready` means keep schedulable Extractors live
+and re-check at `next_ready_at`; it never means all Extractors must finish.
+`projection_lease_held` means execute the returned exact recovery action with
+the persisted Writer/projection identities immediately. Never invent an
+all-Extractor completion barrier.
+
 If the projection may run longer than half its lease, renew it with `llm_wiki_renew_lease` using `task_id`, `projection_id`, and `writer_id`.
 
 ### 3.2 Draft path-disjoint shards
@@ -156,7 +181,10 @@ For each manifest `draft_action`, launch at most the returned capacity. Each Dra
 2. Follows every returned cursor until `draft_shard_complete=true`.
 3. Creates exactly one PagePatch per assigned canonical path.
 4. Copies each requirement’s `patch_scaffold`; unions `covers`, `sourceRefs`, classifications, and related paths when several requirements share a path.
-5. Adds grounded semantic content without changing path, operation, expected hash, or requirement identifiers.
+5. Adds grounded semantic content in the original language of the directly
+   supporting evidence without changing path, operation, expected hash, or
+   requirement identifiers. It does not translate pages to make the Wiki
+   monolingual.
 6. Calls `llm_wiki_stage_page_drafts` with the exact projection/shard identity and a new idempotency key.
 7. Returns only the accepted `{shard_id, draft_hash}` receipt.
 

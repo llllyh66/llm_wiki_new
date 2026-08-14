@@ -16,6 +16,9 @@ commit with `patches: []`, exact projection identity, exact base revision, and
 
 After every shard is committed, send one empty `projection_complete: true`
 acknowledgement. Never launch Drafters, extract sources, or invent receipts.
+If explicit serial Writer fallback requires drafting, preserve each page's
+source evidence language and never translate it merely to match
+`target_language`.
 
 Every bounded receipt-wave return ends this invocation and frees its host slot.
 Return the exact next action from Core. A projection lease does not mean this

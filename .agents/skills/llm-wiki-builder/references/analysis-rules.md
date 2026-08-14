@@ -2,7 +2,13 @@
 
 ## Analysis
 
-- Follow the workspace target language while preserving original proper names.
+- Keep every extracted name, title, statement, relation, summary, and question
+  in the language used by its directly supporting source evidence. Do not
+  translate source-authored knowledge to the workspace target language. The
+  target language is only a fallback for language-neutral or genuinely
+  undetermined metadata. For multilingual evidence supporting one page, use
+  the predominant evidence language consistently and preserve proper names and
+  source terminology in their original form.
 - Distinguish entities, concepts, processes, metrics, claims, and relations.
 - Do not create an entity for every noun.
 - Ground each important fact in at least one SourceRef from the current task.
@@ -72,6 +78,9 @@ standalone envelope):
 - Split pages when concepts have distinct definitions or lifecycles; merge only
   when they are semantically identical.
 - Preserve useful existing content unless newer evidence supersedes it.
+- Keep each page in the original language of its directly supporting evidence.
+  Do not rewrite an English source page in Chinese, or a Chinese source page in
+  English, merely to make the workspace uniform.
 - Record conflicting sourced claims without silently choosing a winner.
 - Create review items for contradictions that cannot be resolved from evidence.
 - Use only Agent-writable collections exposed by the PagePatch schema.

@@ -383,14 +383,19 @@ function withDomainClassificationSection(body, classifications) {
   const headings = /^#{2,6}\s+(?:Domain Classification|领域分类|领域类型)\s*$/im
   const match = normalizedBody.match(headings)
   if (classifications.length === 0) return normalizedBody
-  const language = classifications.some((item) => /[\u3400-\u9fff]/u.test(item.typeName)) ? "zh" : "en"
-  const heading = language === "zh" ? "## 领域分类" : "## Domain Classification"
+  const language = pageContentLanguage(normalizedBody, classifications.map((item) => item.typeName).join(" "))
+  const headingLevel = match?.[0]?.match(/^#{2,6}/)?.[0] ?? "##"
+  const heading = `${headingLevel} ${language === "zh" ? "领域分类" : "Domain Classification"}`
   const lines = classifications.map((item) => {
-    const unresolved = item.status === "unresolved" || item.resolved === false ? "（待分类）" : ""
-    const domain = item.domain?.name || item.domain?.key || "未知 Domain"
-    const abe = item.abe?.name || item.abe?.key || "待分类 ABE"
-    const be = item.be?.name || item.be?.key || "待分类 BE"
-    return `- Domain：${domain}（\`${item.domain?.key || "?"}\`） → ABE：${abe}（\`${item.abe?.key || "?"}\`） → BE：${be}（\`${item.be?.key || "?"}\`）${unresolved}`
+    const unresolved = item.status === "unresolved" || item.resolved === false
+      ? language === "zh" ? "（待分类）" : " (unresolved)"
+      : ""
+    const domain = item.domain?.name || item.domain?.key || (language === "zh" ? "未知 Domain" : "Unknown Domain")
+    const abe = item.abe?.name || item.abe?.key || (language === "zh" ? "待分类 ABE" : "Unclassified ABE")
+    const be = item.be?.name || item.be?.key || (language === "zh" ? "待分类 BE" : "Unclassified BE")
+    return language === "zh"
+      ? `- Domain：${domain}（\`${item.domain?.key || "?"}\`） → ABE：${abe}（\`${item.abe?.key || "?"}\`） → BE：${be}（\`${item.be?.key || "?"}\`）${unresolved}`
+      : `- Domain: ${domain} (\`${item.domain?.key || "?"}\`) → ABE: ${abe} (\`${item.abe?.key || "?"}\`) → BE: ${be} (\`${item.be?.key || "?"}\`)${unresolved}`
   })
   const section = `${heading}\n\n${lines.join("\n")}`
   if (!match || match.index === undefined) return `${normalizedBody}\n\n${section}`.trim()
@@ -425,8 +430,10 @@ export function setWikiPageRelated(content, related) {
 function withRelatedSection(body, related) {
   const normalizedBody = String(body ?? "").trim()
   if (related.length === 0) return normalizedBody
-  const section = `## Related\n\n${related.map((slug) => `- [[${slug}]]`).join("\n")}`
   const match = normalizedBody.match(/^#{2,6}\s+(?:Related(?:\s+Pages?)?|相关页面|关联页面)\s*$/im)
+  const headingLevel = match?.[0]?.match(/^#{2,6}/)?.[0] ?? "##"
+  const heading = `${headingLevel} ${pageContentLanguage(normalizedBody) === "zh" ? "相关页面" : "Related"}`
+  const section = `${heading}\n\n${related.map((slug) => `- [[${slug}]]`).join("\n")}`
   if (!match || match.index === undefined) return `${normalizedBody}\n\n${section}`.trim()
   const start = match.index
   const afterHeading = start + match[0].length
@@ -434,6 +441,16 @@ function withRelatedSection(body, related) {
   const nextHeading = remainder.search(/^##\s+/m)
   const end = nextHeading < 0 ? normalizedBody.length : afterHeading + nextHeading
   return `${normalizedBody.slice(0, start).trimEnd()}\n\n${section}\n\n${normalizedBody.slice(end).trimStart()}`.trim()
+}
+
+function pageContentLanguage(content, fallback = "") {
+  const normalized = String(content ?? "").normalize("NFKC")
+  const title = normalized.match(/^#\s+(.+)$/m)?.[1] ?? ""
+  if (/[\u3400-\u9fff]/u.test(title)) return "zh"
+  const sample = `${normalized}\n${String(fallback ?? "")}`
+  const hanCount = [...sample.matchAll(/[\u3400-\u9fff]/gu)].length
+  const latinCount = [...sample.matchAll(/[A-Za-z]/g)].length
+  return hanCount >= 4 && hanCount * 2 >= latinCount ? "zh" : "en"
 }
 
 export function extractWikiLinks(content) {

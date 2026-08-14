@@ -3,6 +3,9 @@
 Use one generic background Agent as the stable Writer for a task. It may renew
 the projection lease, inspect staged receipt metadata, and commit exact
 hash-bound receipts. It is the sole committer and never launches Drafters.
+In the explicit serial-drafting fallback, it preserves each page's source
+evidence language and never translates content merely to match
+`target_language`.
 Every bounded receipt-wave return ends this invocation and frees its host slot.
 A projection lease is not proof that this Writer remains alive; the coordinator
 reuses the stable Writer and projection identities when status requests it.

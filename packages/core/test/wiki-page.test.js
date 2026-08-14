@@ -40,7 +40,7 @@ test("plain Wiki paths in Related sections become matching frontmatter and canon
   assert.doesNotMatch(prepared, /wiki\/entities\/ueinitiateddetach\.md/)
 })
 
-test("Markdown Wiki links and localized Related headings normalize without duplicating sections", () => {
+test("Markdown Wiki links normalize Related headings to the page language without duplication", () => {
   const prepared = prepareWikiPageContent(pagePatch(`# SGSNInitiatedDetach
 
 See [UE initiated detach](wiki/entities/ueinitiateddetach.md).
@@ -55,6 +55,28 @@ See [UE initiated detach](wiki/entities/ueinitiateddetach.md).
   assert.equal((prepared.match(/^## Related$/gm) ?? []).length, 1)
   assert.doesNotMatch(prepared, /^## 相关页面$/m)
   assert.match(prepared, /- \[\[entities\/sessionrelease\]\]/)
+})
+
+test("Chinese pages receive localized Core-owned navigation and classification sections", () => {
+  const prepared = prepareWikiPageContent({
+    ...pagePatch("# 业务实体\n\n业务实体是标准业务对象。", ["concepts/业务模型"]),
+    title: "业务实体",
+    domainClassifications: [{
+      kind: "entity",
+      typeId: "business-entity",
+      typeName: "Business Entity",
+      schemaId: "schema-1",
+      schemaVersion: "1",
+      domain: { key: "business", name: "Business" },
+      abe: { key: "core", name: "Core" },
+      be: { key: "entity", name: "Entity" },
+    }],
+  })
+
+  assert.match(prepared, /^## 相关页面$/m)
+  assert.match(prepared, /^## 领域分类$/m)
+  assert.doesNotMatch(prepared, /^## Related$/m)
+  assert.doesNotMatch(prepared, /^## Domain Classification$/m)
 })
 
 test("replace drops stale body facts while merge explicitly retains them", () => {

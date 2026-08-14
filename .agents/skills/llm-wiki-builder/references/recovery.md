@@ -145,6 +145,14 @@ worker leases, or a projection lease exist. Waiting requires current host
 handles for all desired invocations. If status reports work but those handles
 are absent, this is a relaunch condition, not a wait condition.
 
+When manifest acquisition returns `waiting=true`, do not infer a reason from
+that compatibility flag. Read `waiting_reason`. For
+`projection_lease_held`, execute the returned exact `next_action` using the
+persisted Writer/projection identities; the lease is not a live Writer. For
+`projection_not_ready`, keep the reported Extractor demand live and re-check at
+`next_ready_at`. `wait_for_all_extractors=false` is authoritative: incremental
+Projection can overlap extraction.
+
 ## Failed Finalize
 
 Call `llm_wiki_status`. Repair only deterministic lint errors that can be fixed

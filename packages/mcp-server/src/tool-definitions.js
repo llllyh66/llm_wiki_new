@@ -160,12 +160,12 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_commit_analysis",
-    description: "Submit an AnalysisEnvelope by copying get_batch.analysis_scaffold and filling its semantic arrays. The nested tool schema constrains required fields, numeric confidence values, evidence-index sourceRefs, and classification shape before the call. Core then resolves evidence, enforces progressive Schema classification, and persists the batch.",
+    description: "Submit an AnalysisEnvelope by copying get_batch.analysis_scaffold and filling its semantic arrays in the original language of their directly supporting source evidence; do not translate source-authored knowledge to target_language. The nested tool schema constrains required fields, numeric confidence values, evidence-index sourceRefs, and classification shape before the call. Core then resolves evidence, enforces progressive Schema classification, and persists the batch.",
     inputSchema: commitAnalysisInputSchema,
   },
   {
     name: "llm_wiki_get_page_plan_context",
-    description: "Coordinator-owned projection tool. The coordinator calls view=manifest, delegates bounded path-disjoint draft-shard actions within reported host capacity, copies each TTL-bound draft_claim_token through every shard cursor, and starts the sole Writer only after hash-bound staged receipts exist. Claims fence stale Drafters but do not prove process liveness.",
+    description: "Coordinator-owned projection tool. The coordinator calls view=manifest as soon as wiki_projection.ready=true even while Extractors remain, delegates bounded path-disjoint draft-shard actions within reported host capacity, preserves each page's source-evidence language, copies each TTL-bound draft_claim_token through every shard cursor, and starts the sole Writer only after hash-bound staged receipts exist. A waiting response includes an exact waiting_reason; never infer that all Extractors must finish. Claims and projection leases fence stale work but do not prove process liveness.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },

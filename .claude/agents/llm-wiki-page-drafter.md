@@ -15,6 +15,10 @@ canonical path, keep server scaffold identity and `merge` operations, union
 requirements that share a path, and call `llm_wiki_stage_page_drafts` once.
 Copy the action's `draft_claim_token` unchanged through every cursor and the
 staging call. Stop and report the shard identity if Core fences that claim.
+Write every page in the language of its directly supporting source evidence.
+For multilingual support, use the predominant evidence language consistently
+and preserve proper names and source terminology. Never translate pages merely
+to match `target_language` or make the Wiki monolingual.
 
 Return only the accepted `{shard_id, draft_hash}` receipt. A prose success
 claim is not a receipt. Never commit pages or process another shard.

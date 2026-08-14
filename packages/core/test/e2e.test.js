@@ -712,6 +712,13 @@ test("page commits repair legacy quote formatting and prefer requirement-ID Sour
   })
   assert.equal(committed.accepted, true)
   assert.equal(committed.normalized_page_source_ref_quotes, 1)
+  const finalized = await f.core.finalize({ task_id: imported.task_id })
+  assert.equal(finalized.status, "completed")
+  const sourcePage = await readFile(path.join(f.workspace, "wiki", "sources", `${imported.sources[0].source_id}.md`), "utf8")
+  assert.match(sourcePage, /^## 摘要$/m)
+  assert.match(sourcePage, /^## 关键实体与概念$/m)
+  assert.match(sourcePage, /^## 来源信息$/m)
+  assert.doesNotMatch(sourcePage, /^## Summary$/m)
 })
 
 test("single-batch tasks still require a background extractor", async (t) => {
@@ -1032,6 +1039,204 @@ test("a smaller get_batch request never repartitions another worker's live lease
   )
 })
 
+test("one completed batch can start source-language-preserving Projection while Extractors remain", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const files = []
+  for (let index = 0; index < 4; index += 1) {
+    const file = path.join(f.incoming, `overlap-${index}.md`)
+    await writeFile(file, `# 并行抽取 ${index}\n\n业务实体是标准业务对象。${"中文语境。".repeat(130)}\n`)
+    files.push({ path: file })
+  }
+  const imported = await f.core.importFiles({
+    files,
+    options: {
+      max_batch_chars: 1_000,
+      target_language: "en-US",
+      host_capabilities: { max_total_agents: 4, coordinator_slots: 1 },
+    },
+  })
+  assert.equal(imported.batch_count, 4)
+  const batch = await f.core.getBatch({ task_id: imported.task_id, worker_id: "overlap-extractor-a" })
+  assert.equal(batch.workspace_context.target_language, "en-US")
+  assert.equal(batch.workspace_context.content_language_policy.mode, "preserve-source-language-per-page")
+  assert.equal(batch.workspace_context.content_language_policy.translate_source_authored_knowledge, false)
+  assert.match(batch.analysis_preflight.source_language, /Do not translate source-authored knowledge/)
+  const evidence = batch.evidence_catalog.find((item) => item.quote.includes("业务实体是标准业务对象")) ?? batch.evidence_catalog[0]
+  await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    worker_id: batch.worker_id,
+    lease_token: batch.lease_token,
+    idempotency_key: "overlap-source-language-analysis-v1",
+    analysis: {
+      ...batch.analysis_scaffold,
+      entities: [{ localId: "entity-business-zh", name: "业务实体", content: "业务实体是标准业务对象。", sourceRefs: [evidence.evidence_index] }],
+      batchSummary: "该批次定义了业务实体。",
+    },
+  })
+
+  const early = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "overlap-writer",
+    view: "manifest",
+  })
+  assert.equal(early.waiting, true)
+  assert.equal(early.waiting_reason, "projection_not_ready")
+  assert.equal(early.wait_for_all_extractors, false)
+  assert.equal(early.projection_can_overlap_extraction, true)
+  assert.equal(early.coordinator_action_required, false)
+
+  const taskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
+  const persistedTask = JSON.parse(await readFile(taskPath, "utf8"))
+  persistedTask.batchCompletedAt[persistedTask.completedBatchIds[0]] = new Date(Date.now() - 31_000).toISOString()
+  await writeFile(taskPath, JSON.stringify(persistedTask))
+
+  const ready = await f.core.status({ task_id: imported.task_id })
+  assert.equal(ready.status, "extracting")
+  assert.equal(ready.completed_batches, 1)
+  assert.equal(ready.total_batches, 4)
+  assert.equal(ready.wiki_projection.ready, true)
+  assert.equal(ready.next_action.tool, "llm_wiki_get_page_plan_context")
+  assert.deepEqual(ready.pipeline_concurrency, {
+    max_background_agents_total: 3,
+    recommended_extractors: 2,
+    max_drafters: 1,
+    recommended_projection_agents: 1,
+    recommended_drafters: 1,
+    recommended_writers: 0,
+  })
+
+  const manifest = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "overlap-writer",
+    view: "manifest",
+  })
+  assert.equal(manifest.waiting, undefined)
+  assert.equal(manifest.projection.mode, "incremental")
+  assert.deepEqual(manifest.projection.batch_ids, [batch.batch_id])
+  assert.equal(manifest.content_language_policy.mode, "preserve-source-language-per-page")
+  assert.equal(manifest.content_language_policy.fallback_target_language, "en-US")
+  assert.match(manifest.page_patch_scaffold_contract.instruction, /original language/)
+
+  const competing = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "other-writer",
+    view: "manifest",
+  })
+  assert.equal(competing.waiting, true)
+  assert.equal(competing.waiting_reason, "projection_lease_held")
+  assert.equal(competing.wait_for_all_extractors, false)
+  assert.equal(competing.automatic_recovery_required, true)
+  assert.equal(competing.next_action.arguments.projection_id, manifest.projection.projection_id)
+
+  const overlapping = await f.core.status({ task_id: imported.task_id })
+  assert.equal(overlapping.subagent_recovery.roles.extractor.desired_live_invocations, 2)
+  assert.equal(overlapping.subagent_recovery.roles.drafter.desired_live_invocations, 1)
+  assert.equal(overlapping.subagent_recovery.wait_policy.includes("launch or relaunch the missing role immediately"), true)
+  const shard = await f.core.getPagePlanContext(manifest.draft_manifest.draft_actions[0].arguments)
+  assert.equal(shard.content_language_policy.translate_source_authored_knowledge, false)
+  assert.match(shard.writer_guidance.instruction, /original language/)
+})
+
+test("overlap scheduling scales to multiple Drafters when host capacity and shard demand allow it", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const statements = Array.from({ length: 13 }, (_, index) => `Entity ${index + 1} is a supported business object.`)
+  const files = []
+  for (let index = 0; index < 8; index += 1) {
+    const file = path.join(f.incoming, `scaled-overlap-${index}.md`)
+    const content = index === 0
+      ? `# Scaled overlap\n\n${statements.join("\n")}\n${"Context. ".repeat(30)}`
+      : `# Remaining extraction ${index}\n\n${"Pending extraction context. ".repeat(30)}`
+    await writeFile(file, content)
+    files.push({ path: file })
+  }
+  const imported = await f.core.importFiles({
+    files,
+    options: {
+      max_batch_chars: 1_000,
+      host_capabilities: { max_total_agents: 7, coordinator_slots: 1 },
+    },
+  })
+  assert.equal(imported.batch_count, 8)
+  assert.equal(imported.wiki_projection.parallel_page_drafting.extraction_workers_during_drafting, 3)
+  assert.equal(imported.wiki_projection.parallel_page_drafting.recommended_drafters_when_extraction_overlaps, 3)
+
+  const batch = await f.core.getBatch({ task_id: imported.task_id, worker_id: "scaled-overlap-extractor" })
+  const evidence = batch.evidence_catalog.find((entry) => statements.every((statement) => entry.quote.includes(statement)))
+    ?? batch.evidence_catalog[0]
+  await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    worker_id: batch.worker_id,
+    lease_token: batch.lease_token,
+    idempotency_key: "scaled-overlap-analysis-v1",
+    analysis: {
+      ...batch.analysis_scaffold,
+      entities: statements.map((content, index) => ({
+        localId: `scaled-entity-${index + 1}`,
+        name: `Entity ${index + 1}`,
+        content,
+        sourceRefs: [evidence.evidence_index],
+      })),
+      batchSummary: "Thirteen supported business entities.",
+    },
+  })
+  const taskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
+  const persistedTask = JSON.parse(await readFile(taskPath, "utf8"))
+  persistedTask.batchCompletedAt[persistedTask.completedBatchIds[0]] = new Date(Date.now() - 31_000).toISOString()
+  await writeFile(taskPath, JSON.stringify(persistedTask))
+
+  const ready = await f.core.status({ task_id: imported.task_id })
+  assert.deepEqual(ready.pipeline_concurrency, {
+    max_background_agents_total: 6,
+    recommended_extractors: 3,
+    max_drafters: 3,
+    recommended_projection_agents: 3,
+    recommended_drafters: 3,
+    recommended_writers: 0,
+  })
+  const manifest = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "scaled-overlap-writer",
+    view: "manifest",
+  })
+  assert.equal(manifest.draft_manifest.returned_shard_count, 3)
+  assert.equal(manifest.parallel_drafting.concurrent_extractors, 3)
+  assert.equal(manifest.parallel_drafting.recommended_drafters, 3)
+  const overlapping = await f.core.status({ task_id: imported.task_id })
+  assert.equal(overlapping.subagent_recovery.roles.extractor.desired_live_invocations, 3)
+  assert.equal(overlapping.subagent_recovery.roles.drafter.desired_live_invocations, 3)
+  const firstShardAction = manifest.draft_manifest.draft_actions[0].arguments
+  const firstShard = await f.core.getPagePlanContext(firstShardAction)
+  assert.equal(firstShard.draft_shard_complete, true)
+  await f.core.stagePageDrafts({
+    task_id: imported.task_id,
+    writer_id: firstShardAction.writer_id,
+    projection_id: firstShardAction.projection_id,
+    shard_id: firstShardAction.shard_id,
+    draft_claim_token: firstShardAction.draft_claim_token,
+    idempotency_key: "scaled-overlap-first-shard-v1",
+    patches: firstShard.page_requirements.map((requirement) => ({
+      ...requirement.patch_scaffold,
+      content: `# ${requirement.title}\n\n${requirement.title} is supported by the source.`,
+    })),
+  })
+  const writerWave = await f.core.status({ task_id: imported.task_id })
+  assert.deepEqual(writerWave.pipeline_concurrency, {
+    max_background_agents_total: 6,
+    recommended_extractors: 5,
+    max_drafters: 3,
+    recommended_projection_agents: 1,
+    recommended_drafters: 0,
+    recommended_writers: 1,
+  })
+  assert.equal(writerWave.subagent_recovery.roles.extractor.desired_live_invocations, 5)
+  assert.equal(writerWave.subagent_recovery.roles.drafter.desired_live_invocations, 0)
+  assert.equal(writerWave.subagent_recovery.roles.writer.desired_live_invocations, 1)
+})
+
 test("micro-batch Wiki projection uses one writer, hides provisional pages, and falls back after a failed final audit", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
@@ -1058,6 +1263,7 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
     max_background_agents_total: 3,
     extraction_workers_during_drafting: 2,
     max_drafters_when_extraction_overlaps: 1,
+    recommended_drafters_when_extraction_overlaps: 1,
     partition_key: "patch_scaffold.path",
     drafter_handoff: "server-side-temporary-draft-receipt",
     stage_tool: "llm_wiki_stage_page_drafts",
@@ -1118,7 +1324,9 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
     max_background_agents_total: 3,
     recommended_extractors: 2,
     max_drafters: 1,
+    recommended_projection_agents: 1,
     recommended_drafters: 1,
+    recommended_writers: 0,
   })
   assert.equal(ready.parallel_extraction.recommended_workers, 2)
   assert.equal(ready.parallel_extraction.restart_on_worker_completion, true)
@@ -1141,6 +1349,9 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(incrementalPlan.commit_ready, true)
   const competingWriter = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-2" })
   assert.equal(competingWriter.waiting, true)
+  assert.equal(competingWriter.waiting_reason, "projection_lease_held")
+  assert.equal(competingWriter.wait_for_all_extractors, false)
+  assert.equal(competingWriter.automatic_recovery_required, true)
   assert.equal(competingWriter.projection.writer_busy, true)
   const leasedStatus = await f.core.status({ task_id: imported.task_id })
   assert.equal(leasedStatus.wiki_projection.page_plan_complete, true)
@@ -2167,7 +2378,7 @@ test("server-side page manifests keep 50-plus-page projections in durable bounde
   assert.equal(manifest.page_commit_limits.max_patches_per_call, 50)
   assert.equal(manifest.draft_manifest.page_count, 52)
   assert.equal(manifest.draft_manifest.shard_count, 9)
-  assert.equal(manifest.draft_manifest.returned_shard_count, 4)
+  assert.equal(manifest.draft_manifest.returned_shard_count, 3)
   assert.equal(manifest.draft_manifest.complete_manifest_persisted_server_side, true)
   assert.equal(manifest.draft_manifest.shards.every((shard) => shard.page_count <= 6), true)
   assert.equal(manifest.page_requirements, undefined)

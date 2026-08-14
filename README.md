@@ -135,7 +135,10 @@ path-disjoint drafters, and hands their receipts to exactly one stable
 background Wiki Writer; only that Writer calls the staged-draft and page-commit
 tools. After four new batches, or after a 30-second debounce, the pipeline
 incrementally updates affected pages while extractors continue. Each projection
-is capped at eight batches;
+is capped at eight batches. Overlap capacity is workload-aware rather than a
+fixed 2+1 split: pending draft shards may use multiple Drafters, up to roughly
+half the available background slots, while unused projection capacity returns
+to Extractors;
 one coordinator orchestration invocation drains up to six ready projections
 (48 batches) when a backlog exists. Incremental plans include full content only for affected pages
 and compact catalog metadata for unrelated pages. After incremental catch-up,
@@ -151,7 +154,13 @@ It launches path-disjoint Drafters, then launches the stable Writer only with
 completed hash-bound staged receipts. The Writer never launches Drafters and never
 fetches manifest or shard context in normal mode. The
 whole-plan cursor responses are not exposed by the current protocol.
-Incremental pages use concise grounded drafts. When extraction finishes, Core
+Incremental pages use concise grounded drafts. Extracted candidates and Wiki
+pages preserve the language of their directly supporting source evidence;
+`target_language` is only a fallback for language-neutral or undetermined
+metadata, not a translation request. Multilingual evidence uses one predominant
+page language while preserving proper names and source terminology. Core also
+normalizes Related and Domain Classification headings to the page language and
+generates each source page in its source-analysis language. When extraction finishes, Core
 first drains any remaining bounded projections instead of creating one giant
 all-batch final prompt. If the Finalize audit finds ambiguity, contradictions,
 review items, incomplete coverage, stale hashes, or incomplete SourceRefs, it

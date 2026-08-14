@@ -18,8 +18,11 @@ For each batch:
 2. Preserve `batch_id`, `lease_token`, and `lease_epoch`.
 3. Renew with `llm_wiki_renew_lease` before half the remaining lease elapses.
 4. Copy `analysis_scaffold` and cite `evidence_catalog.evidence_index` values.
-5. Commit with the same worker ID and lease token.
-6. Stop immediately on `LEASE_FENCED`; never submit superseded work.
+5. Keep extracted names, titles, statements, summaries, relations, and
+   questions in the language of their directly supporting source evidence.
+   Never translate source-authored knowledge merely to match `target_language`.
+6. Commit with the same worker ID and lease token.
+7. Stop immediately on `LEASE_FENCED`; never submit superseded work.
 
 Commit one durable batch at a time. Do not read files directly, draft pages,
 launch Agents, or perform coordinator work.
