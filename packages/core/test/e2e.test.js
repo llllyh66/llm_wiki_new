@@ -724,10 +724,29 @@ test("single-batch tasks still require a background extractor", async (t) => {
   assert.equal(imported.parallel_extraction.mode, "background-agent-first")
   assert.equal(imported.parallel_extraction.single_batch_background, true)
   assert.equal(imported.parallel_extraction.recommended_workers, 1)
+  assert.equal(imported.subagent_recovery.process_liveness_known, false)
+  assert.equal(imported.subagent_recovery.roles.extractor.desired_live_invocations, 1)
+  assert.equal(imported.subagent_recovery.roles.drafter.desired_live_invocations, 0)
+  assert.equal(imported.subagent_recovery.roles.writer.desired_live_invocations, 0)
   const status = await f.core.status({ task_id: imported.task_id })
   assert.equal(status.parallel_extraction.enabled, true)
   assert.equal(status.parallel_extraction.required, true)
   assert.equal(status.parallel_extraction.single_batch_background, true)
+})
+
+test("Finalize before extraction starts routes to exact automatic catch-up", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  await assert.rejects(
+    () => f.core.finalize({ task_id: imported.task_id }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "FINALIZE_CATCHUP_REQUIRED"
+      && error.details.remaining_extraction_batches === 1
+      && error.details.next_action.tool === "llm_wiki_get_batch"
+      && error.details.completion_gate.automatic_continuation_required === true
+      && error.details.completion_gate.user_confirmation_required === false,
+  )
 })
 
 test("parallel workers lease distinct batches and concurrent commits preserve every result", async (t) => {
@@ -844,6 +863,27 @@ test("a worker invocation can resume its leased batch by stable worker ID after 
   const imported = await f.core.importFiles({ files: [{ path: f.source }] })
   const leased = await f.core.getBatch({ task_id: imported.task_id, worker_id: "extractor-resume-1" })
   const status = await f.core.status({ task_id: imported.task_id })
+  assert.equal(status.subagent_recovery.process_liveness_known, false)
+  assert.equal(status.subagent_recovery.reconcile_before_waiting, true)
+  assert.deepEqual(status.subagent_recovery.coordinator_live_sets, [
+    "running_worker_ids",
+    "running_draft_shard_ids",
+    "running_writer_projection_ids",
+  ])
+  assert.equal(status.subagent_recovery.roles.extractor.work_remaining, true)
+  assert.equal(status.subagent_recovery.roles.extractor.desired_live_invocations, 1)
+  assert.equal(status.subagent_recovery.roles.extractor.persisted_reservations, 1)
+  assert.equal(status.subagent_recovery.roles.extractor.reservations_are_live_invocations, false)
+  assert.deepEqual(status.subagent_recovery.roles.extractor.resume_actions, [{
+    tool: "llm_wiki_get_batch",
+    action_owner: "extractor",
+    delegate_to: "llm-wiki-extractor",
+    arguments: {
+      task_id: imported.task_id,
+      worker_id: "extractor-resume-1",
+      batch_id: leased.batch_id,
+    },
+  }])
   assert.equal(status.worker_recovery.leases_are_live_agents, false)
   assert.deepEqual(status.worker_recovery.leases.map(({ worker_id, batch_id }) => ({ worker_id, batch_id })), [{
     worker_id: "extractor-resume-1",
@@ -1144,9 +1184,20 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(catchupReady.status, "planning")
   assert.equal(catchupReady.wiki_projection.ready, true)
   assert.equal(catchupReady.wiki_projection.mode, "incremental")
+  assert.equal(catchupReady.completion_gate.task_complete, false)
+  assert.equal(catchupReady.completion_gate.may_report_completion, false)
+  assert.equal(catchupReady.completion_gate.user_confirmation_required, false)
+  assert.equal(catchupReady.completion_gate.automatic_continuation_required, true)
+  assert.equal(catchupReady.completion_gate.finalize_ready, false)
+  assert.equal(catchupReady.completion_gate.outstanding.unprojected_batches, 2)
+  assert.equal(catchupReady.completion_gate.next_action.tool, "llm_wiki_get_page_plan_context")
   await assert.rejects(
     () => f.core.finalize({ task_id: imported.task_id }),
-    (error) => error instanceof LlmWikiError && error.code === "FINAL_PROJECTION_REQUIRED",
+    (error) => error instanceof LlmWikiError
+      && error.code === "FINALIZE_CATCHUP_REQUIRED"
+      && error.details.unprojected_batch_count === 2
+      && error.details.next_action.tool === "llm_wiki_get_page_plan_context"
+      && error.details.completion_gate.user_confirmation_required === false,
   )
 
   const catchupPlan = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 100_000 })
@@ -1164,12 +1215,16 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(caughtUp.wiki_projection.mode, "final")
   assert.equal(caughtUp.wiki_projection.ready, true)
   assert.equal(caughtUp.next_action.tool, "llm_wiki_finalize")
+  assert.equal(caughtUp.completion_gate.finalize_ready, true)
+  assert.equal(caughtUp.completion_gate.automatic_continuation_required, true)
   await assert.rejects(
     () => f.core.finalize({ task_id: imported.task_id }),
     (error) => error instanceof LlmWikiError
       && error.code === "FINAL_PROJECTION_REQUIRED"
       && error.details.fast_finalization_audit.issues.some((issue) => issue.code === "MISSING_REQUIREMENT_SOURCE_REFS")
-      && error.details.next_action.tool === "llm_wiki_get_page_plan_context",
+      && error.details.next_action.tool === "llm_wiki_get_page_plan_context"
+      && error.details.completion_gate.automatic_continuation_required === true
+      && error.details.completion_gate.user_confirmation_required === false,
   )
   const fallbackStatus = await f.core.status({ task_id: imported.task_id })
   assert.equal(fallbackStatus.wiki_projection.finalize_first, false)
@@ -1214,6 +1269,10 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(finalized.created_pages.includes("wiki/topics/projected-entity.md"), true)
   assert.equal(finalized.created_pages.includes("wiki/index.md"), true)
   assert.deepEqual(finalized.updated_pages, [])
+  const completedStatus = await f.core.status({ task_id: imported.task_id })
+  assert.equal(completedStatus.completion_gate.task_complete, true)
+  assert.equal(completedStatus.completion_gate.may_report_completion, true)
+  assert.equal(completedStatus.completion_gate.automatic_continuation_required, false)
   // A final drafter receives bounded context, so an existing page defaults to
   // merge and cannot silently delete unseen grounded provisional material.
   const completed = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["reconciled cross-batch summary"] })
@@ -1864,6 +1923,9 @@ test("duplicate content is reused and task recovery and abort stay workspace-sco
   assert.equal(second.duplicates[0].duplicate_of, first.sources[0].source_id)
   assert.equal(second.reused_task, true)
   assert.equal(second.task_id, first.task_id)
+  assert.equal(second.completion_gate.task_complete, false)
+  assert.equal(second.completion_gate.automatic_continuation_required, true)
+  assert.equal(second.subagent_recovery.roles.extractor.desired_live_invocations, 1)
   const listed = await f.core.listTasks({ status: ["prepared"] })
   assert.equal(listed.tasks.length, 1)
   await assert.rejects(
@@ -1874,7 +1936,16 @@ test("duplicate content is reused and task recovery and abort stay workspace-sco
   )
   const aborted = await f.core.abort({ task_id: first.task_id, reason: "test cancellation" })
   assert.equal(aborted.status, "cancelled")
-  assert.equal((await f.core.status({ task_id: first.task_id })).status, "cancelled")
+  const cancelledStatus = await f.core.status({ task_id: first.task_id })
+  assert.equal(cancelledStatus.status, "cancelled")
+  assert.equal(cancelledStatus.completion_gate.task_complete, false)
+  assert.equal(cancelledStatus.completion_gate.task_terminal, true)
+  assert.equal(cancelledStatus.completion_gate.automatic_continuation_required, false)
+  assert.equal(cancelledStatus.completion_gate.partial_progress_is_terminal, true)
+  assert.equal(cancelledStatus.parallel_extraction.enabled, false)
+  assert.equal(cancelledStatus.subagent_recovery.roles.extractor.desired_live_invocations, 0)
+  assert.equal(cancelledStatus.subagent_recovery.roles.drafter.desired_live_invocations, 0)
+  assert.equal(cancelledStatus.subagent_recovery.roles.writer.desired_live_invocations, 0)
   const forced = await f.core.importFiles({ files: [{ path: duplicatePath }], options: { force_reanalyze: true } })
   assert.equal(forced.reused_task, false)
   assert.notEqual(forced.task_id, first.task_id)
@@ -2181,6 +2252,17 @@ test("page drafters stage receipt-only shards and the Writer commits them server
   const retrievedOnlyStatus = await f.core.status({ task_id: imported.task_id })
   assert.equal(retrievedOnlyStatus.wiki_projection.retrieved_not_staged_draft_shards, 1)
   assert.equal(retrievedOnlyStatus.wiki_projection.staged_uncommitted_draft_shards, 0)
+  assert.equal(retrievedOnlyStatus.wiki_projection.in_progress_semantics, "persisted-projection-lease-not-live-agent")
+  assert.equal(retrievedOnlyStatus.wiki_projection.process_liveness_known, false)
+  assert.equal(retrievedOnlyStatus.wiki_projection.projection_lease_is_live_writer, false)
+  assert.equal(retrievedOnlyStatus.wiki_projection.pending_shards_are_live_drafters, false)
+  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.extractor.desired_live_invocations, 0)
+  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.work_remaining, true)
+  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.desired_live_invocations, 1)
+  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.retrieved_not_staged_shards, 1)
+  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.pending_shards_are_live_invocations, false)
+  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.reconcile_action.arguments.view, "manifest")
+  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.writer.desired_live_invocations, 0)
   const patches = shard.page_requirements.map((requirement) => ({
     ...requirement.patch_scaffold,
     content: `# ${requirement.title}\n\n## Summary\n\nA server-staged semantic draft.\n`,
@@ -2215,6 +2297,11 @@ test("page drafters stage receipt-only shards and the Writer commits them server
   ])
   assert.equal(recoveredStatus.next_action.tool, "llm_wiki_get_staged_page_drafts")
   assert.equal(recoveredStatus.next_action.action_owner, "writer")
+  assert.equal(recoveredStatus.subagent_recovery.roles.drafter.desired_live_invocations, 0)
+  assert.equal(recoveredStatus.subagent_recovery.roles.writer.work_ready, true)
+  assert.equal(recoveredStatus.subagent_recovery.roles.writer.desired_live_invocations, 1)
+  assert.equal(recoveredStatus.subagent_recovery.roles.writer.projection_lease_is_live_invocation, false)
+  assert.deepEqual(recoveredStatus.subagent_recovery.roles.writer.resume_action, recoveredStatus.next_action)
   const stagedDraftDir = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "page-drafts")
   const stagedDraftPath = path.join(stagedDraftDir, (await readdir(stagedDraftDir))[0])
   const persistedDraft = JSON.parse(await readFile(stagedDraftPath, "utf8"))

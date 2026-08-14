@@ -16,3 +16,12 @@ commit with `patches: []`, exact projection identity, exact base revision, and
 
 After every shard is committed, send one empty `projection_complete: true`
 acknowledgement. Never launch Drafters, extract sources, or invent receipts.
+
+Every bounded receipt-wave return ends this invocation and frees its host slot.
+Return the exact next action from Core. A projection lease does not mean this
+Writer remains alive; the coordinator may restart the same stable Writer with
+the same projection identity when status reports Writer demand.
+
+The projection-complete acknowledgement closes only this bounded projection
+window, not the task. Return Core's exact next action so the coordinator can
+automatically drain newly completed extraction batches before Finalize.

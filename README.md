@@ -170,6 +170,24 @@ workflow therefore does not depend on background Agent or MCP-client lifetime
 across turns, and it does not infer a disconnect when a successful status call
 shows the current connection is usable.
 
+The same liveness rule now covers all background roles. Status exposes a
+unified `subagent_recovery` block for Extractor, Drafter, and Writer demand.
+The coordinator separately tracks `running_worker_ids`,
+`running_draft_shard_ids`, and `running_writer_projection_ids` from current
+host-runtime handles. Leases, `in_progress`, pending shards, and staged receipts
+are durable recovery state, not live-process signals. After every completion,
+failure, Writer wave, task resume, or context compaction, missing desired slots
+are relaunched immediately; the coordinator cannot report waiting with work
+remaining and no matching live handle.
+
+Status also exposes a `completion_gate`. Completing all shards in one manifest
+closes only that bounded projection window; extraction can finish more batches
+in parallel and create another catch-up window. While automatic continuation
+is required, the coordinator executes the returned action without asking the
+user whether to process the remainder. Finalize is called only when the gate
+explicitly reports it ready; premature calls return
+`FINALIZE_CATCHUP_REQUIRED` with the exact recovery action.
+
 Page planning restores the original rich-Wiki behavior without restoring the
 desktop runtime. Every important extracted entity, concept, and explicit page
 candidate becomes a paginated `page_requirement`; a projection cannot complete

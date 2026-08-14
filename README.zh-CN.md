@@ -226,6 +226,20 @@ ToolSearch 发现工具，而不是直接判定 MCP 不可用。
 如果租约已消失但 batch 尚未全部完成，立即用该 ID 领取下一批。
 不会再因为“两个 lease 都 active”而等待另一个 Agent 完成。
 
+同一套存活对账现在覆盖所有后台角色。`llm_wiki_status` 会通过统一的
+`subagent_recovery` 分别报告 Extractor、Drafter 和 Writer 的期望活跃数；主 Agent
+则只根据宿主当前进程句柄维护 `running_worker_ids`、`running_draft_shard_ids` 和
+`running_writer_projection_ids`。租约、`in_progress`、pending shard 和 staged receipt
+都只是可恢复的持久化状态，不表示对应 SubAgent 仍然存活。任何 Agent 完成、失败、
+Writer wave 返回、任务恢复或上下文压缩后都必须重新对账并立即补齐空槽；只要还有
+工作但缺少对应活跃句柄，就不能显示“等待完成”。
+
+状态现在还会返回 `completion_gate`。一个 manifest 的所有 shard 完成，仅代表当前
+有界 projection 窗口完成；并行抽取可能在此期间产生新的 batch 和下一轮 catch-up
+窗口。只要状态要求自动续接，协调器就必须执行精确 next action，不能询问用户是否
+处理剩余内容。只有 gate 明确报告 Finalize 就绪时才允许调用 Finalize；过早调用会
+返回 `FINALIZE_CATCHUP_REQUIRED` 及精确恢复动作。
+
 ### 3. 检查 Skill
 
 项目必须存在真实文件：

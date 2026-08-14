@@ -17,6 +17,31 @@ Use only the current manifest → draft-shard → staged receipt → single Writ
 - Do not claim a source or channel is searchable unless structured readiness says it is ready.
 - Do not answer factual questions from conversation memory when the Wiki may contain the answer; retrieve first and cite returned source locators.
 
+### Subagent liveness reconciliation
+
+Core persists work, leases, manifests, and receipts, but it cannot observe the
+host runtime's live background processes. The coordinator is the sole owner of
+three live sets: `running_worker_ids`, `running_draft_shard_ids`, and
+`running_writer_projection_ids`. Never infer any of those sets from a lease,
+`in_progress`, a pending shard, a staged receipt, or an earlier launch message.
+
+At task start or resume, and after every SubAgent completion, failure, bounded
+checkpoint, Writer wave, or context compaction:
+
+1. Remove every invocation that ended from its live set before scheduling.
+2. Call `llm_wiki_status` and read `subagent_recovery` plus `next_action`.
+3. Compare each role's `desired_live_invocations` with host-confirmed live
+   invocations. Resume persisted identities first, then fill every missing slot.
+4. For a Drafter, refresh its manifest and relaunch only exact uncovered shard
+   actions. For the Writer, reuse the stable Writer and projection identities.
+5. Do not say “waiting”, end the orchestration turn, or save a wait checkpoint
+   while a desired slot is missing or a coordinator-owned action remains.
+
+An initial “backgrounded” acknowledgement proves only that one invocation was
+created at that moment. It is not durable liveness. Waiting is valid only when
+the host runtime currently confirms all required invocations are running, or
+when status reports no delegated work.
+
 ## 1. Import and immediate retrieval
 
 Call `llm_wiki_import_files` once with all materialized local paths. Include host capacity:
@@ -65,6 +90,13 @@ effective_workers = min(recommended_workers, max_background_agents_total, host_a
 
 Launch only `effective_workers`. A worker uses one stable, unique `worker_id` for its lifetime. If some launches fail, keep successful workers and reduce the effective count; do not duplicate their batches.
 
+After each extractor invocation returns, remove its `worker_id` from
+`running_worker_ids` even when it returned a successful batch checkpoint. If
+status still reports extraction demand, immediately resume its persisted lease
+or reuse that stable ID for unleased work. Active leases are reservations, not
+live extractors; never wait for lease expiry or for a different worker to free
+the slot.
+
 Use native named-role adapters when available. Otherwise launch a generic
 background Agent with the versioned contracts in `.agents/agents/`; do not
 copy host-specific `subagent_type` arguments between runtimes.
@@ -93,7 +125,10 @@ Never submit after `LEASE_FENCED`. Reacquire work and discard the superseded res
 
 ## 3. Projection coordination
 
-Status is the only scheduler. When it returns a page projection action, use one stable, unique `writer_id` for that task.
+Status is the only scheduler. When it returns a page projection action, use one stable, unique `writer_id` for that task. Treat
+`wiki_projection.in_progress` as a persisted projection lease only. Before
+waiting, reconcile `subagent_recovery.roles.drafter` and `.writer` against the
+host runtime; Core cannot assert either process is alive.
 
 ### 3.1 Acquire the manifest
 
@@ -125,6 +160,13 @@ For each manifest `draft_action`, launch at most the returned capacity. Each Dra
 6. Calls `llm_wiki_stage_page_drafts` with the exact projection/shard identity and a new idempotency key.
 7. Returns only the accepted `{shard_id, draft_hash}` receipt.
 
+Record a shard in `running_draft_shard_ids` only after the host confirms its
+launch. Remove it on every success, failure, or stopped notification. A
+retrieved-but-not-staged shard is incomplete durable work, not a running
+Drafter; refresh the manifest and relaunch it immediately when its live handle
+is absent. After any Drafter notification, refill all available Drafter slots
+before waiting.
+
 For an existing page, preserve server scaffold operation `merge`. Never change it to authoritative replacement. Core keeps unseen grounded sections server-side.
 
 ### 3.3 Commit with one Writer
@@ -139,6 +181,22 @@ Only the stable Writer commits. Start it after at least one staged receipt exist
 
 The coordinator continues manifest actions until every shard is committed. Then the Writer sends one empty completion acknowledgement with `projection_complete: true`. An acknowledgement never substitutes for semantic coverage; Finalize recomputes the ledger.
 
+`projection_complete=true` completes only the current bounded projection
+window. It does not complete the task. Immediately call status and inspect
+`completion_gate`: extraction may have completed additional batches while the
+window was being drafted. If `unprojected_batches > 0`, acquire and drain the
+next catch-up manifest automatically. Call Finalize only when
+`completion_gate.finalize_ready=true` and `next_action.tool` is
+`llm_wiki_finalize`.
+
+Track at most one live Writer invocation per projection. Remove it from
+`running_writer_projection_ids` whenever its bounded receipt wave returns or
+fails. A projection lease and staged receipts are replayable state, not a live
+Writer; if status reports Writer demand and no matching live invocation, start
+the same stable Writer immediately. After its response, reconcile status and
+launch the next Drafter wave or Writer acknowledgement instead of entering an
+unverified wait.
+
 If a Drafter cannot be launched, the stable Writer may process that same shard serially. Do not create a second committer.
 
 ## 4. Finalize and publication
@@ -152,7 +210,12 @@ Call `llm_wiki_finalize` only when status directs it. Finalize must validate:
 - generation-scoped pages, BM25, real Embedding state, feature fallback, graph, lint, and manifest;
 - atomic publication pointer.
 
-If Finalize returns `FINAL_PROJECTION_REQUIRED`, follow its exact manifest action and reconcile missing requirements. Never acknowledge an empty final projection as a workaround.
+If Finalize returns `FINALIZE_CATCHUP_REQUIRED`, the current projection window
+finished but extraction or unprojected batches remain. Execute its exact
+`next_action` automatically; do not run a final semantic audit yet and do not
+ask the user whether to continue. If Finalize returns
+`FINAL_PROJECTION_REQUIRED`, follow its exact manifest action and reconcile
+missing requirements. Never acknowledge an empty final projection as a workaround.
 
 Success requires `status=completed`, `generation_id`, zero lint errors, and channel completeness consistent with the result. Report created/updated pages from the returned generation diff.
 
@@ -189,4 +252,9 @@ Tell the user:
 - unresolved review items;
 - whether the answer came from task-local building evidence or a published generation.
 
-Never report full completion while readiness, coverage, lint, or requested channel state says otherwise.
+Never report full completion while readiness, coverage, lint, or requested channel state says otherwise. A progress summary such as “all shards in this
+wave were submitted” is not a completion response. While
+`completion_gate.task_complete=false`, continue its next action automatically
+and do not ask whether the user wants remaining batches or requirements
+processed. Ask only when continuation requires new authority or input that
+cannot be recovered from durable task state.

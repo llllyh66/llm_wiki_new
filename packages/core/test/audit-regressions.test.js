@@ -31,11 +31,29 @@ test("progressive import registers first and publishes each parsed source to BM2
   assert.equal(imported.status, "importing")
   assert.equal(imported.batch_count, 0)
   assert.equal(imported.pending_sources.length, files.length)
+  assert.equal(imported.completion_gate.task_complete, false)
+  assert.equal(imported.completion_gate.automatic_continuation_required, false)
+  assert.equal(imported.completion_gate.background_progress_expected, true)
+  assert.equal(imported.completion_gate.next_action, undefined)
+  assert.equal(imported.subagent_recovery.roles.extractor.desired_live_invocations, 0)
+  assert.equal(imported.subagent_recovery.roles.drafter.desired_live_invocations, 0)
+  assert.equal(imported.subagent_recovery.roles.writer.desired_live_invocations, 0)
 
   let intermediateRetrieval = null
   let finalStatus = null
+  let importingGateChecked = false
   for (let attempt = 0; attempt < 600; attempt += 1) {
     const status = await f.core.status({ task_id: imported.task_id })
+    if (!importingGateChecked && ["importing", "parsing"].includes(status.status)) {
+      assert.equal(status.completion_gate.task_complete, false)
+      assert.equal(status.completion_gate.automatic_continuation_required, false)
+      assert.equal(status.completion_gate.user_confirmation_required, false)
+      assert.equal(status.completion_gate.background_progress_expected, true)
+      assert.equal(status.completion_gate.next_action, undefined)
+      assert.equal(status.next_action.tool, "llm_wiki_retrieve_context")
+      assert.equal(status.subagent_recovery.roles.extractor.desired_live_invocations, 0)
+      importingGateChecked = true
+    }
     if (!intermediateRetrieval && status.retrieval_readiness?.sources?.bm25_indexed > 0) {
       intermediateRetrieval = await f.core.retrieveContext({
         task_id: imported.task_id,
@@ -51,6 +69,7 @@ test("progressive import registers first and publishes each parsed source to BM2
   }
 
   assert.ok(intermediateRetrieval, "at least one source must become queryable before the import job finishes")
+  assert.equal(importingGateChecked, true)
   assert.equal(intermediateRetrieval.available_channels.includes("bm25"), true)
   assert.equal(intermediateRetrieval.hits.some((hit) => hit.snippet.includes("FIRST_SOURCE_READY_MARKER")), true)
   assert.equal(intermediateRetrieval.answer_scope, "task-local-ready-sources")

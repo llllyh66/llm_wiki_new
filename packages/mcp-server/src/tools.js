@@ -154,6 +154,9 @@ function errorResult(error, context = {}) {
     ...(Array.isArray(normalized.details?.grounding_warnings)
       ? { grounding_warnings: normalized.details.grounding_warnings }
       : {}),
+    ...(normalized.details?.completion_gate && typeof normalized.details.completion_gate === "object"
+      ? { completion_gate: normalized.details.completion_gate }
+      : {}),
     ...(analysisRetry ? {
       worker_restart: {
         required: false,
@@ -213,6 +216,11 @@ function pageCommitRetryInstruction(code) {
 }
 
 function recoveryAction(tool, args, error) {
+  if (tool === "llm_wiki_finalize"
+    && ["FINALIZE_CATCHUP_REQUIRED", "FINAL_PROJECTION_REQUIRED"].includes(error.code)
+    && error.details?.next_action?.tool) {
+    return error.details.next_action
+  }
   if (error.code === "WIKI_PUBLICATION_BUSY" && typeof error.details?.owner_task_id === "string") {
     return { tool: "llm_wiki_status", arguments: { task_id: error.details.owner_task_id } }
   }

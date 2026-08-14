@@ -97,6 +97,16 @@ test("project agents and canonical Skill expose only the current capacity-aware 
   assert.match(skill, /lease_token/)
   assert.match(skill, /llm_wiki_renew_lease/)
   assert.match(skill, /manifest → draft-shard → staged receipt → single Writer → audited Finalize/)
+  assert.match(skill, /running_worker_ids/)
+  assert.match(skill, /running_draft_shard_ids/)
+  assert.match(skill, /running_writer_projection_ids/)
+  assert.match(skill, /Do not say “waiting”/)
+  assert.match(skill, /completion_gate\.finalize_ready=true/)
+  assert.match(skill, /FINALIZE_CATCHUP_REQUIRED/)
+  assert.match(skill, /do not ask whether the user wants remaining batches or requirements/i)
+  assert.match(extractor, /active lease does not mean this Agent remains alive/)
+  assert.match(drafter, /Pending or retrieved shard state does not mean this\s+Drafter remains alive/)
+  assert.match(writer, /projection lease does not mean this\s+Writer remains alive/i)
   assert.match(skill, /feature fallback/)
   assert.match(skill, /retry the exact original tool and arguments/i)
   assert.doesNotMatch(skill, /apply_projection|view.?[=:].?['"]plan|staged_draft_shard_ids|vector\/graph|old server|legacy/i)
@@ -153,6 +163,12 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
   assert.equal(domainPageQuery.inputSchema.properties.filters.additionalProperties, false)
   assert.equal(domainPageQuery.inputSchema.properties.filters.properties.classification_path_prefix.type, "string")
   assert.match(TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_finalize").description, /Eligible pages are promoted without a second semantic rewrite/)
+  assert.match(TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_finalize").description, /FINALIZE_CATCHUP_REQUIRED/)
+  const statusTool = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_status")
+  assert.match(statusTool.description, /subagent_recovery/)
+  assert.match(statusTool.description, /completion_gate/)
+  assert.match(statusTool.description, /Extractor, Drafter, and Writer/)
+  assert.match(statusTool.description, /cannot observe host process liveness/)
   for (const tool of TOOL_DEFINITIONS) {
     assert.match(tool.name, /^llm_wiki_[a-z_]+$/)
     assert.equal(typeof tool.description, "string")
@@ -509,6 +525,39 @@ test("publication ownership conflicts direct recovery to the owning task", async
     tool: "llm_wiki_status",
     arguments: { task_id: "task-owner" },
   })
+  assert.equal(response.structuredContent.mcp_connection_usable, true)
+})
+
+test("premature Finalize routes directly to catch-up without asking for user confirmation", async () => {
+  const nextAction = {
+    tool: "llm_wiki_get_page_plan_context",
+    action_owner: "coordinator",
+    arguments: { task_id: "task-example", writer_id: "wiki-writer-1", view: "manifest", cursor: 0, max_chars: 40_000 },
+  }
+  const completionGate = {
+    task_complete: false,
+    may_report_completion: false,
+    user_confirmation_required: false,
+    automatic_continuation_required: true,
+    next_action: nextAction,
+  }
+  const router = new HeadlessToolRouter({
+    finalize: async () => {
+      throw new LlmWikiError("FINALIZE_CATCHUP_REQUIRED", "One projection window remains.", {
+        retryable: true,
+        details: {
+          unprojected_batch_count: 1,
+          next_action: nextAction,
+          completion_gate: completionGate,
+        },
+      })
+    },
+  })
+  const response = await router.callMcp("llm_wiki_finalize", { task_id: "task-example" })
+  assert.equal(response.structuredContent.error.code, "FINALIZE_CATCHUP_REQUIRED")
+  assert.deepEqual(response.structuredContent.next_action, nextAction)
+  assert.deepEqual(response.structuredContent.completion_gate, completionGate)
+  assert.equal(response.structuredContent.completion_gate.user_confirmation_required, false)
   assert.equal(response.structuredContent.mcp_connection_usable, true)
 })
 

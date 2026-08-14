@@ -16,3 +16,8 @@ requirements that share a path, and call `llm_wiki_stage_page_drafts` once.
 
 Return only the accepted `{shard_id, draft_hash}` receipt. A prose success
 claim is not a receipt. Never commit pages or process another shard.
+
+Every return ends this invocation and frees its host slot. If staging did not
+succeed, return the exact `shard_id` with an incomplete/failure reason rather
+than a success claim. Pending or retrieved shard state does not mean this
+Drafter remains alive; the coordinator may relaunch the exact shard action.

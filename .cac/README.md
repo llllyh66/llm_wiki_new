@@ -146,6 +146,25 @@ still owns a lease, the same ID resumes that batch; otherwise it requests the
 next available batch. It never waits for a different extractor merely because
 both reservations were present before the completion notification.
 
+The same rule applies to every background role. The coordinator owns separate
+`running_worker_ids`, `running_draft_shard_ids`, and
+`running_writer_projection_ids` sets sourced only from current host-runtime
+handles. On task resume, SubAgent completion/failure, Writer-wave completion,
+or context compaction, it calls `llm_wiki_status`, reads
+`subagent_recovery.roles`, removes ended invocations, and immediately fills all
+missing desired slots. `wiki_projection.in_progress`, pending/retrieved shards,
+staged receipts, and projection leases are durable work state, not evidence of
+live Drafters or a live Writer. The coordinator never reports “waiting” unless
+the host currently confirms every required invocation is running and no
+coordinator-owned action remains.
+
+A projection-complete acknowledgement closes one bounded projection window,
+not the build task. Extraction may finish more batches while that window is
+being drafted. The coordinator immediately reads `completion_gate`; while
+`automatic_continuation_required=true` it executes the exact next action and
+never asks whether the user wants remaining batches or requirements processed.
+Finalize runs only when `finalize_ready=true`.
+
 If a worker's concrete MCP call reports `mcp_ready: false`, the Skill does not
 retry with a `general-purpose` agent. It continues in the coordinator, because
 changing the agent name cannot repair an MCP server that was not inherited by

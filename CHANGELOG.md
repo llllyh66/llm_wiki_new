@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+- Add unified `subagent_recovery` status for Extractor, Drafter, and Writer
+  demand. Persisted leases, projections, shards, and receipts are explicitly
+  separated from host process liveness, and coordinator contracts now require
+  immediate live-set reconciliation and slot refill after every completion,
+  failure, resume, Writer wave, or context compaction.
+- Add a durable `completion_gate` and `FINALIZE_CATCHUP_REQUIRED` preflight so
+  completing one bounded shard manifest cannot be mistaken for task
+  completion. Newly extracted or unprojected batches now route directly into
+  the next catch-up action without requesting user confirmation.
 - Replace aggregate lexical-overlap grounding with Grounding Quality Gate v2.
   Source provenance remains exact, while relation endpoints and predicates,
   strong identifiers, numeric/unit anchors, and polarity are validated

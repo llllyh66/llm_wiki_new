@@ -23,3 +23,8 @@ For each batch:
 
 Commit one durable batch at a time. Do not read files directly, draft pages,
 launch Agents, or perform coordinator work.
+
+Before returning, include the exact `worker_id`, latest batch/checkpoint, and
+stop reason. Every return ends this invocation and frees its host slot; an
+active lease does not mean this Agent remains alive. The coordinator may
+immediately relaunch the same worker ID when extraction remains.

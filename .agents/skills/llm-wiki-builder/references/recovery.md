@@ -17,7 +17,10 @@ exception. A successful `llm_wiki_status` call proves the current turn's MCP
 connection is usable.
 
 Lease state does not expose process liveness. Maintain live subagents in the
-coordinator's own `running_worker_ids` set. When a worker completion
+coordinator's own `running_worker_ids`, `running_draft_shard_ids`, and
+`running_writer_projection_ids` sets. Rebuild these sets only from current
+host-runtime handles, never from persisted task state or an earlier turn's
+launch acknowledgements. When a worker completion
 notification arrives, remove that ID first. If status still lists a lease for
 the completed ID, restart it immediately with that same worker and batch ID.
 If no lease remains but batches are incomplete, reuse the freed ID to request
@@ -109,7 +112,9 @@ durable and are not part of this retry.
 
 If a multipart projection invocation stops, inspect `wiki_projection` in
 status. While `in_progress` remains true, keep the same projection and Writer
-ID. The coordinator resumes the returned manifest/Drafter action; it does not
+ID, but do not interpret `in_progress` as a live Writer or Drafter. Clear the
+ended invocation from the matching live set, read `subagent_recovery`, and
+resume every missing desired slot before waiting. The coordinator resumes the returned manifest/Drafter action; it does not
 launch the Writer until hash-bound staged receipts exist. If a Drafter stopped before
 staging, relaunch only that Drafter with the exact shard action. If the Writer
 stopped during a receipt commit, replay the same `{shard_id, draft_hash}` receipts and idempotency
@@ -125,6 +130,17 @@ capped at eight batches, so one orchestration invocation can drain up to 48
 queued batches. A ready backlog of at least four batches bypasses the normal
 debounce.
 
+The quantum bounds one orchestration invocation, not the user's build request.
+After the quantum or a `projection_complete=true` acknowledgement, call status.
+If `completion_gate.automatic_continuation_required=true`, begin the next
+bounded invocation immediately. Never convert an unprojected batch or missing
+requirement count into a “continue?” question.
+
+Never emit a progress line ending in “waiting” solely because pending shards,
+worker leases, or a projection lease exist. Waiting requires current host
+handles for all desired invocations. If status reports work but those handles
+are absent, this is a relaunch condition, not a wait condition.
+
 ## Failed Finalize
 
 Call `llm_wiki_status`. Repair only deterministic lint errors that can be fixed
@@ -135,6 +151,11 @@ codes and follow `details.next_action` to the single Writer's final semantic
 projection; it is not an MCP transport failure. After that projection
 completes, call Finalize once more. Do not retry Finalize against the unchanged
 failed audit or reconstruct a different projection action.
+
+`FINALIZE_CATCHUP_REQUIRED` occurs earlier than the semantic audit. It means a
+projection window was completed while extraction or another incremental window
+remains. Follow its exact `details.next_action`; do not summarize missing
+requirements as final audit failures and do not request user confirmation.
 
 ## Abort
 
