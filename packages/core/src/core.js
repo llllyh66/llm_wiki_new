@@ -79,6 +79,7 @@ import {
 
 const BATCH_LEASE_MS = 30 * 60 * 1_000
 const PAGE_PROJECTION_LEASE_MS = 60 * 60 * 1_000
+const DRAFT_SHARD_CLAIM_MS = 15 * 60 * 1_000
 // Drafters receive one path-disjoint shard at a time. Keep the server-side
 // response bounded even if a caller passes the legacy 200K page-plan limit;
 // full page bodies remain available to Core through the patch scaffold/hash
@@ -362,6 +363,7 @@ export class LlmWikiCore {
         projection.draftShardNextCursors[shardId] = 0
         projection.draftShardSeenCursors[shardId] = []
         delete projection.draftShardCursorReads[shardId]
+        releaseDraftShardClaim(projection, shardId)
       }
       projection.stagedDraftReceipts = Object.fromEntries(
         Object.entries(projection.stagedDraftReceipts ?? {}).filter(([shardId]) => (
@@ -1140,7 +1142,7 @@ export class LlmWikiCore {
     }
     let projection
     if (projectionRequested) {
-      assertTaskStatus(record.task, ["extracting", "planning", "committing"])
+      assertTaskStatus(record.task, ["extracting", "planning", "committing", "failed"])
       const acquired = await acquirePageProjection(record, input)
       await saveTask(record.paths, record.task)
       if (!acquired.lease) {
@@ -1386,6 +1388,9 @@ export class LlmWikiCore {
     const stagedShardIds = new Set(stagedDraftReceipts.map((receipt) => receipt.shard_id))
     const pendingShards = manifest.filter((shard) => !committedShardIds.has(shard.shard_id))
     const availableShards = pendingShards.filter((shard) => !stagedShardIds.has(shard.shard_id)).slice(0, 4)
+    const availableShardClaims = new Map(availableShards.map((shard) => (
+      [shard.shard_id, ensureDraftShardClaim(projection, shard.shard_id)]
+    )))
     const nextShard = availableShards[0] ?? null
     projection.pagePlanTraversal = {
       projectionId: projection.projectionId,
@@ -1421,7 +1426,9 @@ export class LlmWikiCore {
         returned_shard_count: availableShards.length,
         shards: availableShards,
         complete_manifest_persisted_server_side: true,
-        workflow: "The coordinator reconciles returned draft_actions against host-confirmed running_draft_shard_ids and immediately launches every missing slot. Each drafter fetches and stages exactly one shard, then returns a hash-bound receipt and releases its invocation slot. A pending or retrieved shard is persisted work, never proof of a live Drafter. Only after a staged receipt exists does the coordinator launch the stable Writer, which commits {shard_id,draft_hash} receipts without fetching draft-shard context. After every shard is covered, the Writer sends one empty projection_complete=true acknowledgement.",
+        workflow: "The coordinator reconciles returned draft_actions against host-confirmed running_draft_shard_ids and immediately launches every missing slot. Each action carries a persisted TTL-bound draft_claim_token that fences stale Drafters but is not proof of a live process. Each drafter fetches and stages exactly one shard, then returns a hash-bound receipt and releases its invocation slot. Only after a staged receipt exists does the coordinator launch the stable Writer, which commits {shard_id,draft_hash} receipts without fetching draft-shard context. After every shard is covered, the Writer sends one empty projection_complete=true acknowledgement.",
+        claims_are_live_drafters: false,
+        claim_ttl_ms: DRAFT_SHARD_CLAIM_MS,
         draft_actions: availableShards.map((shard) => ({
           tool: "llm_wiki_get_page_plan_context",
           action_owner: "coordinator",
@@ -1432,6 +1439,7 @@ export class LlmWikiCore {
             projection_id: projection.projectionId,
             view: "draft-shard",
             shard_id: shard.shard_id,
+            draft_claim_token: availableShardClaims.get(shard.shard_id).claimToken,
             cursor: 0,
             max_chars: 40_000,
           },
@@ -1492,6 +1500,7 @@ export class LlmWikiCore {
               projection_id: projection.projectionId,
               view: "draft-shard",
               shard_id: nextShard.shard_id,
+              draft_claim_token: availableShardClaims.get(nextShard.shard_id).claimToken,
               cursor: 0,
               max_chars: 40_000,
             },
@@ -1522,6 +1531,7 @@ export class LlmWikiCore {
       details: { shard_id: shardId, available_shard_ids: manifest.map((item) => item.shard_id).slice(0, 100) },
       suggestedAction: "Use a shard_id returned by this projection's manifest.",
     })
+    const draftClaim = requireDraftShardClaim(projection, shard.shard_id, input?.draft_claim_token, record.task.taskId)
     const shardCacheKey = `${record.task.taskId}:${projection.projectionId}:${shard.shard_id}`
     let shardContext = this.pageDraftShardCache.get(shardCacheKey)
     if (!shardContext) {
@@ -1622,6 +1632,7 @@ export class LlmWikiCore {
     return {
       task_id: record.task.taskId,
       view: "draft-shard",
+      draft_claim: publicDraftShardClaim(shard.shard_id, draftClaim),
       shard: {
         ...shard,
         complete: page.pagination.next_cursor === null,
@@ -1678,6 +1689,7 @@ export class LlmWikiCore {
               projection_id: projection.projectionId,
               view: "draft-shard",
               shard_id: shard.shard_id,
+              draft_claim_token: draftClaim.claimToken,
               cursor: page.pagination.next_cursor,
               max_chars: Math.min(Math.max(effectiveMaxChars, 1_000), workspace.config.limits.maxPagePlanChars),
             },
@@ -1691,6 +1703,7 @@ export class LlmWikiCore {
               writer_id: projection.writerId,
               projection_id: projection.projectionId,
               shard_id: shard.shard_id,
+              draft_claim_token: draftClaim.claimToken,
             },
             required_generated_arguments: ["patches", "idempotency_key"],
             success_receipt_required: ["accepted", "staged", "draft_hash", "patch_count"],
@@ -1855,9 +1868,12 @@ export class LlmWikiCore {
     })
     if (exactReplay) {
       recordProjectionStagedDraftReceipt(projection, exactReplay)
+      releaseDraftShardClaim(projection, shardId)
       await saveTask(record.paths, record.task)
       return { ...exactReplay, idempotent_replay: true }
     }
+    const existingReceipt = projectionStagedDraftReceipts(projection).find((receipt) => receipt.shard_id === shardId)
+    if (!existingReceipt) requireDraftShardClaim(projection, shardId, input?.draft_claim_token, record.task.taskId)
     const requirements = Array.isArray(snapshot?.context?.required_pages)
       ? snapshot.context.required_pages
       : pageRequirementsWithPatchScaffolds(
@@ -1933,6 +1949,7 @@ export class LlmWikiCore {
           },
         }
         recordProjectionStagedDraftReceipt(projection, response)
+        releaseDraftShardClaim(projection, shardId)
         await saveTask(record.paths, record.task)
         await persistResponse(response)
         return response
@@ -2835,7 +2852,10 @@ export class LlmWikiCore {
           projection.stagedDraftReceipts = projection.stagedDraftReceipts && typeof projection.stagedDraftReceipts === "object"
             ? projection.stagedDraftReceipts
             : {}
-          for (const shardId of submittedManifestShardIds) delete projection.stagedDraftReceipts[shardId]
+          for (const shardId of submittedManifestShardIds) {
+            delete projection.stagedDraftReceipts[shardId]
+            releaseDraftShardClaim(projection, shardId)
+          }
         }
         projection.coverageAuditAt = nowIso()
         projection.coverageAuditWikiRevision = journal.wikiRevision
@@ -2911,32 +2931,15 @@ export class LlmWikiCore {
           provisional_pages: projectionState(record.task).provisionalPagePaths,
           wiki_projection: wikiProjection,
         } : {}),
-        next_action: stagedDraftShardIds.length > 0 && projection && !projectionComplete && nextDraftShard
+        next_action: projection && !projectionComplete && nextDraftShard
           ? {
               tool: "llm_wiki_get_page_plan_context",
               action_owner: "coordinator",
-              delegate_to: "llm-wiki-page-drafter",
               arguments: {
                 task_id: record.task.taskId,
                 writer_id: projection.writerId,
                 projection_id: projection.projectionId,
                 view: "manifest",
-                cursor: 0,
-                max_chars: 40_000,
-              },
-            }
-          : projection && !projectionComplete && nextDraftShard
-          ? {
-              tool: "llm_wiki_get_page_plan_context",
-              action_owner: "writer",
-              delegate_to: "llm-wiki-writer",
-              execution_mode: "explicit-serial-writer-fallback-only",
-              arguments: {
-                task_id: record.task.taskId,
-                writer_id: projection.writerId,
-                projection_id: projection.projectionId,
-                view: "draft-shard",
-                shard_id: nextDraftShard.shard_id,
                 cursor: 0,
                 max_chars: 40_000,
               },
@@ -2987,6 +2990,7 @@ export class LlmWikiCore {
     )))
     projection.retrievedDraftShardIds = []
     projection.stagedDraftReceipts = {}
+    projection.draftShardClaims = {}
     projection.draftShardNextCursors = {}
     projection.draftShardSeenCursors = {}
     projection.draftShardCursorReads = {}
@@ -3099,7 +3103,9 @@ export class LlmWikiCore {
           next_action: catchupAction,
           completion_gate: completionGate(record.task, projectionStatus, catchupAction),
         },
-        suggestedAction: "Execute details.next_action and continue automatically until status.next_action explicitly directs llm_wiki_finalize. Do not ask the user whether to process the remaining batches or requirements.",
+        suggestedAction: catchupAction
+          ? "Execute details.next_action and continue automatically until status.next_action explicitly directs llm_wiki_finalize. Do not ask the user whether to process the remaining batches or requirements."
+          : "This task failed before its remaining extraction batches became schedulable. Do not loop on Finalize or launch Extractors; inspect last_error and use an explicit restart or abort path.",
       })
     }
     assertTaskStatus(record.task, ["planning", "committing", "finalizing", "failed"])
@@ -3675,9 +3681,9 @@ function recommendedWorkerCount(batchCount, maximumWorkers = 3) {
 function pipelineConcurrencyPlan({ remainingBatches, extractionOverlaps, maxBackgroundAgents = 3 }) {
   const maxBackgroundAgentsTotal = Math.max(1, Math.min(16, Number(maxBackgroundAgents) || 3))
   const recommendedExtractors = extractionOverlaps
-    ? Math.min(Math.max(1, maxBackgroundAgentsTotal - 1), Math.max(0, remainingBatches))
+    ? Math.min(Math.max(0, maxBackgroundAgentsTotal - 1), Math.max(0, remainingBatches))
     : Math.min(maxBackgroundAgentsTotal, Math.max(0, remainingBatches))
-  const maxDrafters = extractionOverlaps ? Math.max(1, maxBackgroundAgentsTotal - recommendedExtractors) : maxBackgroundAgentsTotal
+  const maxDrafters = extractionOverlaps ? maxBackgroundAgentsTotal - recommendedExtractors : maxBackgroundAgentsTotal
   return {
     max_background_agents_total: maxBackgroundAgentsTotal,
     recommended_extractors: recommendedExtractors,
@@ -3839,6 +3845,7 @@ function pageProjectionStatus(task) {
     nextReadyAt = new Date(Math.max(ageBoundary, cooldownBoundary)).toISOString()
   }
   const stagedDraftReceipts = state.lease ? projectionStagedDraftReceipts(state.lease) : []
+  const draftShardClaims = state.lease ? projectionDraftShardClaims(state.lease) : {}
   const stagedDraftShardIds = new Set(stagedDraftReceipts.map((receipt) => receipt.shard_id))
   const retrievedNotStagedDraftShards = state.lease && Array.isArray(state.lease.retrievedDraftShardIds)
     ? state.lease.retrievedDraftShardIds.filter((shardId) => (
@@ -3905,6 +3912,8 @@ function pageProjectionStatus(task) {
       retrieved_not_staged_draft_shards: retrievedNotStagedDraftShards,
       staged_uncommitted_draft_shards: stagedDraftReceipts.length,
       recoverable_staged_draft_receipts: stagedDraftReceipts.slice(0, 8),
+      claimed_draft_shards: Object.keys(draftShardClaims).length,
+      draft_claims_are_live_drafters: false,
       pending_draft_shards: Number.isInteger(state.lease.draftShardCount)
         ? Math.max(0, state.lease.draftShardCount - (state.lease.committedDraftShardIds ?? []).length)
         : null,
@@ -3975,6 +3984,7 @@ async function acquirePageProjection(record, input) {
     draftShardNextCursors: {},
     draftShardSeenCursors: {},
     draftShardCursorReads: {},
+    draftShardClaims: {},
     stagedDraftReceipts: {},
     coverageAuditAt: null,
     coverageAuditWikiRevision: null,
@@ -4001,6 +4011,7 @@ function requirePageProjectionLease(task, input) {
 
 function publicProjection(projection) {
   const stagedDraftReceipts = projectionStagedDraftReceipts(projection)
+  const draftShardClaims = projectionDraftShardClaims(projection)
   const stagedDraftShardIds = new Set(stagedDraftReceipts.map((receipt) => receipt.shard_id))
   return {
     projection_id: projection.projectionId,
@@ -4026,6 +4037,8 @@ function publicProjection(projection) {
       : 0,
     staged_uncommitted_draft_shards: stagedDraftReceipts.length,
     recoverable_staged_draft_receipts: stagedDraftReceipts.slice(0, 8),
+    claimed_draft_shards: Object.keys(draftShardClaims).length,
+    draft_claims_are_live_drafters: false,
     pending_draft_shards: Number.isInteger(projection.draftShardCount)
       ? Math.max(0, projection.draftShardCount - (projection.committedDraftShardIds ?? []).length)
       : null,
@@ -5294,6 +5307,73 @@ function normalizeStagedDraftReceipts(value, fieldName) {
   })
 }
 
+function projectionDraftShardClaims(projection) {
+  const committed = new Set(projection?.committedDraftShardIds ?? [])
+  const staged = new Set(projectionStagedDraftReceipts(projection).map((receipt) => receipt.shard_id))
+  const claims = projection?.draftShardClaims && typeof projection.draftShardClaims === "object" && !Array.isArray(projection.draftShardClaims)
+    ? projection.draftShardClaims
+    : {}
+  const now = Date.now()
+  const active = Object.fromEntries(Object.entries(claims).filter(([shardId, claim]) => (
+    /^draft-[0-9]{4,}$/.test(shardId)
+    && !committed.has(shardId)
+    && !staged.has(shardId)
+    && typeof claim?.claimToken === "string"
+    && Number.isFinite(Date.parse(claim.expiresAt))
+    && Date.parse(claim.expiresAt) > now
+  )))
+  if (projection) projection.draftShardClaims = active
+  return active
+}
+
+function ensureDraftShardClaim(projection, shardId) {
+  const normalizedShardId = normalizeDraftShardId(shardId)
+  const claims = projectionDraftShardClaims(projection)
+  const existing = claims[normalizedShardId]
+  if (existing) return existing
+  const timestamp = nowIso()
+  const claim = {
+    claimToken: newId("draft-claim"),
+    claimedAt: timestamp,
+    expiresAt: new Date(Date.now() + DRAFT_SHARD_CLAIM_MS).toISOString(),
+  }
+  claims[normalizedShardId] = claim
+  projection.draftShardClaims = claims
+  return claim
+}
+
+function requireDraftShardClaim(projection, shardId, claimToken, taskId) {
+  const normalizedShardId = normalizeDraftShardId(shardId)
+  const claims = projectionDraftShardClaims(projection)
+  const claim = claims[normalizedShardId]
+  if (!claim || typeof claimToken !== "string" || claim.claimToken !== claimToken) {
+    fail("DRAFT_SHARD_CLAIM_FENCED", `The claim for draft shard ${normalizedShardId} is missing, expired, or superseded.`, {
+      retryable: true,
+      taskId,
+      details: { shard_id: normalizedShardId },
+      suggestedAction: "Refresh the active manifest and relaunch this shard only with its current draft_claim_token.",
+    })
+  }
+  claim.expiresAt = new Date(Date.now() + DRAFT_SHARD_CLAIM_MS).toISOString()
+  return claim
+}
+
+function releaseDraftShardClaim(projection, shardId) {
+  if (!projection?.draftShardClaims || typeof projection.draftShardClaims !== "object") return
+  delete projection.draftShardClaims[normalizeDraftShardId(shardId)]
+}
+
+function publicDraftShardClaim(shardId, claim) {
+  return {
+    shard_id: normalizeDraftShardId(shardId),
+    draft_claim_token: claim.claimToken,
+    claimed_at: claim.claimedAt,
+    expires_at: claim.expiresAt,
+    process_liveness_known: false,
+    claim_is_live_drafter: false,
+  }
+}
+
 function projectionStagedDraftReceipts(projection) {
   const committed = new Set(projection?.committedDraftShardIds ?? [])
   const receipts = projection?.stagedDraftReceipts && typeof projection.stagedDraftReceipts === "object"
@@ -5448,12 +5528,14 @@ function statusResponse(task) {
       restart_strategy: "same-worker-id",
     },
     worker_recovery: {
-      resumable: true,
-      strategy: "restart-same-worker-id",
+      resumable: extractionSchedulable,
+      strategy: extractionSchedulable ? "restart-same-worker-id" : "none",
       leases: workerLeases,
       process_liveness_known: false,
       leases_are_live_agents: false,
-      note: "A lease is a persisted batch reservation, not proof that a SubAgent process is running. On every worker completion notification, free that slot and restart the same worker_id immediately when extraction remains; resume its lease first and otherwise lease the next batch. Do not wait for another worker or lease expiry.",
+      note: extractionSchedulable
+        ? "A lease is a persisted batch reservation, not proof that a SubAgent process is running. On every worker completion notification, free that slot and restart the same worker_id immediately when extraction remains; resume its lease first and otherwise lease the next batch. Do not wait for another worker or lease expiry."
+        : "Extraction is not schedulable in the current task state. Preserve any durable reservation for diagnostics, but do not launch or resume an Extractor until status explicitly enables extraction.",
     },
     updated_at: task.updatedAt,
     ...(task.generationId ? { generation_id: task.generationId, generation_manifest_sha256: task.generationManifestSha256 } : {}),
@@ -5476,6 +5558,12 @@ function completionGate(task, wikiProjection, taskNextAction = null) {
   const pendingDraftShards = Number.isInteger(wikiProjection?.pending_draft_shards)
     ? wikiProjection.pending_draft_shards : 0
   const automaticContinuationRequired = !taskTerminal && Boolean(taskNextAction)
+  const finalizeReady = !taskTerminal
+    && taskNextAction?.tool === "llm_wiki_finalize"
+    && remainingExtractionBatches === 0
+    && unprojectedBatches === 0
+    && wikiProjection?.in_progress !== true
+    && pendingDraftShards === 0
   return {
     task_complete: taskComplete,
     task_terminal: taskTerminal,
@@ -5483,7 +5571,7 @@ function completionGate(task, wikiProjection, taskNextAction = null) {
     partial_progress_is_terminal: taskCancelled,
     user_confirmation_required: false,
     automatic_continuation_required: automaticContinuationRequired,
-    finalize_ready: !taskTerminal && taskNextAction?.tool === "llm_wiki_finalize",
+    finalize_ready: finalizeReady,
     outstanding: {
       extraction_batches: remainingExtractionBatches,
       unprojected_batches: unprojectedBatches,
@@ -5494,6 +5582,8 @@ function completionGate(task, wikiProjection, taskNextAction = null) {
       ? "The durable task status is completed; a final completion report is allowed."
       : taskCancelled
         ? "The task was cancelled. Do not launch SubAgents or report successful completion."
+        : task.status === "failed" && !taskNextAction
+          ? "The task failed in a state with no executable automatic recovery action. Do not launch SubAgents or loop on Finalize; inspect last_error and restart or abort only through an explicit recovery path."
         : "A completed shard manifest or projection window is only a checkpoint. Execute next_action automatically and do not ask the user whether to continue while durable work remains.",
     ...(taskNextAction ? { next_action: taskNextAction } : {}),
   }
@@ -5509,13 +5599,16 @@ function backgroundImportCompletionGate(task) {
 
 function subagentRecoveryStatus(task, wikiProjection, workerLeases = [], taskNextAction = null) {
   const remainingBatches = Math.max(0, task.batchCount - task.completedBatchIds.length)
-  const schedulingAllowed = !["completed", "cancelled"].includes(task.status)
+  const extractionSchedulingAllowed = ["prepared", "extracting"].includes(task.status)
+  const projectionSchedulingAllowed = !["completed", "cancelled"].includes(task.status)
+    && (wikiProjection.in_progress === true || wikiProjection.ready === true)
   const extractionOverlaps = !wikiProjection.projection_complete
     && !wikiProjection.final_completed
     && (wikiProjection.in_progress || wikiProjection.ready)
+    && extractionSchedulingAllowed
     && remainingBatches > 0
   const pipelineConcurrency = pipelineConcurrencyPlan({
-    remainingBatches,
+    remainingBatches: extractionSchedulingAllowed ? remainingBatches : 0,
     extractionOverlaps,
     maxBackgroundAgents: task.options?.maxBackgroundAgents,
   })
@@ -5566,12 +5659,12 @@ function subagentRecoveryStatus(task, wikiProjection, workerLeases = [], taskNex
     roles: {
       extractor: {
         role: "llm-wiki-extractor",
-        work_remaining: schedulingAllowed && remainingBatches > 0,
-        desired_live_invocations: schedulingAllowed ? pipelineConcurrency.recommended_extractors : 0,
+        work_remaining: extractionSchedulingAllowed && remainingBatches > 0,
+        desired_live_invocations: extractionSchedulingAllowed ? pipelineConcurrency.recommended_extractors : 0,
         persisted_reservations: workerLeases.length,
         reservations_are_live_invocations: false,
         resume_strategy: "restart-same-worker-id-immediately",
-        resume_actions: workerLeases.map((lease) => ({
+        resume_actions: extractionSchedulingAllowed ? workerLeases.map((lease) => ({
           tool: "llm_wiki_get_batch",
           action_owner: "extractor",
           delegate_to: "llm-wiki-extractor",
@@ -5580,15 +5673,17 @@ function subagentRecoveryStatus(task, wikiProjection, workerLeases = [], taskNex
             worker_id: lease.worker_id,
             batch_id: lease.batch_id,
           },
-        })),
+        })) : [],
       },
       drafter: {
         role: "llm-wiki-page-drafter",
-        work_remaining: schedulingAllowed && actionableDraftShards > 0,
-        desired_live_invocations: schedulingAllowed ? drafterDemand : 0,
+        work_remaining: projectionSchedulingAllowed && actionableDraftShards > 0,
+        desired_live_invocations: projectionSchedulingAllowed ? drafterDemand : 0,
         pending_shards: pendingDraftShards,
         retrieved_not_staged_shards: Number(wikiProjection.retrieved_not_staged_draft_shards) || 0,
         staged_uncommitted_shards: stagedDraftShards,
+        persisted_claims: Number(wikiProjection.claimed_draft_shards) || 0,
+        claims_are_live_invocations: false,
         pending_shards_are_live_invocations: false,
         resume_strategy: "refresh-manifest-then-relaunch-exact-uncovered-shards",
         ...(manifestRecoveryAction ? { reconcile_action: manifestRecoveryAction } : {}),
@@ -5596,11 +5691,11 @@ function subagentRecoveryStatus(task, wikiProjection, workerLeases = [], taskNex
       writer: {
         role: "llm-wiki-writer",
         singleton: true,
-        work_ready: schedulingAllowed && writerWorkReady,
-        desired_live_invocations: schedulingAllowed && writerWorkReady ? 1 : 0,
+        work_ready: projectionSchedulingAllowed && writerWorkReady,
+        desired_live_invocations: projectionSchedulingAllowed && writerWorkReady ? 1 : 0,
         projection_lease_is_live_invocation: false,
         resume_strategy: "reuse-stable-writer-and-projection-identities",
-        ...(writerWorkReady ? { resume_action: taskNextAction } : {}),
+        ...(projectionSchedulingAllowed && writerWorkReady ? { resume_action: taskNextAction } : {}),
       },
     },
   }
@@ -5614,6 +5709,32 @@ function withPublicationStatus(response, publication) {
   const publicationNextAction = extractionRemaining
     ? { tool: "llm_wiki_get_batch", arguments: { task_id: response.task_id } }
     : { tool: "llm_wiki_status", arguments: { task_id: publication.owner_task_id } }
+  const recovery = response.subagent_recovery
+  const publicationBlockedWriter = recovery ? {
+    ...recovery.roles.writer,
+    work_ready: false,
+    desired_live_invocations: 0,
+    blocked_by_publication: true,
+  } : null
+  if (publicationBlockedWriter) delete publicationBlockedWriter.resume_action
+  const publicationBlockedRecovery = recovery ? {
+    ...recovery,
+    blocked_by_publication: true,
+    blocked_by_task_id: publication.owner_task_id,
+    wait_policy: extractionRemaining
+      ? "Continue only the schedulable Extractor demand. Do not launch a Drafter or Writer while another task owns Wiki publication."
+      : "Do not launch a Drafter or Writer while another task owns Wiki publication. Follow next_action for the owning task before reconciling this task again.",
+    roles: {
+      ...recovery.roles,
+      drafter: {
+        ...recovery.roles.drafter,
+        work_remaining: false,
+        desired_live_invocations: 0,
+        blocked_by_publication: true,
+      },
+      writer: publicationBlockedWriter,
+    },
+  } : recovery
   return {
     ...response,
     wiki_publication: publication,
@@ -5631,6 +5752,7 @@ function withPublicationStatus(response, publication) {
       finalize_ready: false,
       next_action: publicationNextAction,
     },
+    ...(publicationBlockedRecovery ? { subagent_recovery: publicationBlockedRecovery } : {}),
     next_action: publicationNextAction,
   }
 }
@@ -5640,7 +5762,14 @@ function nextAction(task, wikiProjection = pageProjectionStatus(task)) {
   if (["prepared", "extracting"].includes(task.status)) return { tool: "llm_wiki_get_batch", arguments: { task_id: task.taskId } }
   if (task.status === "planning") return projectionAction(task, wikiProjection)
   if (task.status === "committing") return { tool: "llm_wiki_finalize", arguments: { task_id: task.taskId } }
-  if (task.status === "finalizing" || task.status === "failed") return { tool: "llm_wiki_finalize", arguments: { task_id: task.taskId } }
+  if (task.status === "finalizing") return { tool: "llm_wiki_finalize", arguments: { task_id: task.taskId } }
+  if (task.status === "failed") {
+    const remainingBatches = Math.max(0, task.batchCount - task.completedBatchIds.length)
+    const progressiveImportIncomplete = task.importProgress && task.importProgress.complete !== true
+    return remainingBatches === 0 && !progressiveImportIncomplete
+      ? { tool: "llm_wiki_finalize", arguments: { task_id: task.taskId } }
+      : null
+  }
   return null
 }
 
@@ -5687,13 +5816,11 @@ function projectionAction(task, wikiProjection = pageProjectionStatus(task)) {
     return {
       tool: "llm_wiki_get_page_plan_context",
       action_owner: "coordinator",
-      delegate_to: "llm-wiki-page-drafter",
       arguments: {
         task_id: task.taskId,
         writer_id: lease.writerId,
         projection_id: lease.projectionId,
-        view: "draft-shard",
-        shard_id: lease.nextDraftShardId,
+        view: "manifest",
         cursor: 0,
         max_chars: 40_000,
       },

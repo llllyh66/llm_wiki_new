@@ -180,6 +180,11 @@ failure, Writer wave, task resume, or context compaction, missing desired slots
 are relaunched immediately; the coordinator cannot report waiting with work
 remaining and no matching live handle.
 
+Manifest draft actions now carry TTL-bound `draft_claim_token` values. The
+same token must be copied through every shard cursor and staging call; an
+expired invocation is fenced and must refresh the manifest. A claim remains a
+durable reservation, not evidence that its Drafter process is alive.
+
 Status also exposes a `completion_gate`. Completing all shards in one manifest
 closes only that bounded projection window; extraction can finish more batches
 in parallel and create another catch-up window. While automatic continuation

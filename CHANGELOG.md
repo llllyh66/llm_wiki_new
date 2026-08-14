@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.0.8] - 2026-08-14
+
 - Add unified `subagent_recovery` status for Extractor, Drafter, and Writer
   demand. Persisted leases, projections, shards, and receipts are explicitly
   separated from host process liveness, and coordinator contracts now require
@@ -19,8 +21,13 @@
 - Return structured grounding diagnostics, keep validation repair in the same
   worker lease, preserve non-failing candidates, and report high SourceRef
   reuse as a warning instead of an unconditional whole-envelope rejection.
-
-## [1.0.8] - 2026-08-14
+- Make recovery scheduling state-safe and capacity-safe: failed partial imports
+  no longer loop Finalize or launch unusable Extractors, one host background
+  budget is shared across Extractor/Drafter/Writer roles, and publication waits
+  suppress stale Drafter/Writer demand.
+- Add TTL-bound persisted draft-shard claim tokens. Claims fence expired
+  Drafters and survive manifest recovery while remaining explicitly separate
+  from host process liveness.
 
 - Replace the mixed projection guidance with one capacity-aware manifest →
   draft-shard → hash-bound receipt → single Writer → audited Finalize protocol.

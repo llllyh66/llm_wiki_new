@@ -151,10 +151,7 @@ test("progressive directory Schema snapshots files and discloses Domain, ABE, th
   const shardView = await core.getPagePlanContext(manifestView.draft_manifest.draft_actions[0].arguments)
   assert.equal(shardView.page_requirements[0].domain_classifications[0].be.key, "individual_customer")
   const staged = await core.stagePageDrafts({
-    task_id: imported.task_id,
-    writer_id: "wiki-writer-1",
-    projection_id: manifestView.projection.projection_id,
-    shard_id: shardView.shard.shard_id,
+    ...shardView.next_action.arguments,
     patches: shardView.page_requirements.map((requirement) => ({
       ...requirement.patch_scaffold,
       content: `# ${requirement.title}\n\n客户实体。`,

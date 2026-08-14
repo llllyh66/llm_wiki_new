@@ -32,6 +32,7 @@ const ATOMIC_PAGE_REJECTION_CODES = new Set([
   "STAGED_DRAFT_EXISTS",
   "STAGED_DRAFT_HASH_MISMATCH",
   "PAGE_DRAFT_STAGING_UNAVAILABLE",
+  "DRAFT_SHARD_CLAIM_FENCED",
   "DUPLICATE_PAGE_COVERAGE",
   "FILE_HASH_CONFLICT",
   "PROVISIONAL_PAGE_CONFLICT",
@@ -128,7 +129,8 @@ function serializeResult(data) {
 function errorResult(error, context = {}) {
   const normalized = asLlmWikiError(error)
   const analysisRetry = context.tool === "llm_wiki_commit_analysis" && RECOVERABLE_ANALYSIS_CODES.has(normalized.code)
-  const atomicPageRejection = ["llm_wiki_commit_pages", "llm_wiki_update_pages"].includes(context.tool) && ATOMIC_PAGE_REJECTION_CODES.has(normalized.code)
+  const atomicPageRejection = ["llm_wiki_commit_pages", "llm_wiki_update_pages", "llm_wiki_stage_page_drafts"].includes(context.tool)
+    && ATOMIC_PAGE_REJECTION_CODES.has(normalized.code)
   const submittedItems = context.tool === "llm_wiki_update_pages" ? context.args?.updates : context.args?.patches
   const errorData = { ...normalized.toJSON(), retryable: normalized.retryable || analysisRetry }
   const busy = normalized.code === "TASK_BUSY" || normalized.code === "MCP_BUSY"
@@ -208,6 +210,7 @@ function pageCommitRetryInstruction(code) {
   if (code === "STAGED_DRAFT_NOT_FOUND") return "Return control to the coordinator so it can relaunch the reported Drafter; retry the Writer only after a replacement receipt exists."
   if (code === "STAGED_DRAFT_EXISTS") return "Do not resubmit an accepted shard; continue with the next uncommitted manifest shard."
   if (code === "PAGE_DRAFT_STAGING_UNAVAILABLE") return "Return control to the coordinator so it can resume the active manifest and stage the shard before restarting the Writer."
+  if (code === "DRAFT_SHARD_CLAIM_FENCED") return "Discard the stale Drafter result, refresh the active manifest, and relaunch only the newly claimed shard action."
   if (code === "INCOMPLETE_PAGE_COVERAGE") return "Add the reported missing coverage to the rejected set and resubmit it; no patch from the rejected call was stored."
   if (code === "DUPLICATE_PAGE_COVERAGE") return "Keep every requirement ID on one canonical path, repair all reported duplicate owners, and resubmit the whole rejected set."
   if (code === "WIKI_PUBLICATION_BUSY") return "Do not create another task or retry in a loop. Resume the owning task, then refresh this projection against the published Wiki before retrying."
@@ -289,13 +292,11 @@ function recoveryAction(tool, args, error) {
     return {
       tool: "llm_wiki_get_page_plan_context",
       action_owner: "coordinator",
-      delegate_to: "llm-wiki-page-drafter",
       arguments: {
         task_id: args?.task_id,
         writer_id: args?.writer_id,
         projection_id: args?.projection_id,
-        view: "draft-shard",
-        shard_id: error.details.next_draft_shard.shard_id,
+        view: "manifest",
         cursor: 0,
         max_chars: 40_000,
       },
@@ -334,6 +335,20 @@ function recoveryAction(tool, args, error) {
   if (tool === "llm_wiki_get_page_plan_context" && ["PAGE_PLAN_CURSOR_MISMATCH", "PAGE_PLAN_SNAPSHOT_MISSING", "PAGE_DRAFT_SHARD_NOT_FOUND"].includes(error.code)) {
     return {
       tool,
+      action_owner: "coordinator",
+      arguments: {
+        task_id: args?.task_id,
+        writer_id: args?.writer_id,
+        projection_id: args?.projection_id,
+        view: "manifest",
+        cursor: 0,
+        max_chars: 40_000,
+      },
+    }
+  }
+  if (["llm_wiki_get_page_plan_context", "llm_wiki_stage_page_drafts"].includes(tool) && error.code === "DRAFT_SHARD_CLAIM_FENCED") {
+    return {
+      tool: "llm_wiki_get_page_plan_context",
       action_owner: "coordinator",
       arguments: {
         task_id: args?.task_id,

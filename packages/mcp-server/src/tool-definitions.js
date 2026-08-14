@@ -165,28 +165,30 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_page_plan_context",
-    description: "Coordinator-owned projection tool. The coordinator calls view=manifest, delegates bounded path-disjoint draft-shard actions within reported host capacity, and starts the sole Writer only after hash-bound staged receipts exist.",
+    description: "Coordinator-owned projection tool. The coordinator calls view=manifest, delegates bounded path-disjoint draft-shard actions within reported host capacity, copies each TTL-bound draft_claim_token through every shard cursor, and starts the sole Writer only after hash-bound staged receipts exist. Claims fence stale Drafters but do not prove process liveness.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
       projection_id: { type: "string", minLength: 1, maxLength: 100 },
       view: { enum: ["manifest", "draft-shard"], description: "Use manifest first, then draft-shard with a returned shard_id." },
       shard_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^draft-[0-9]{4,}$" },
+      draft_claim_token: { type: "string", minLength: 8, maxLength: 120, description: "Required for draft-shard view. Copy the current TTL-bound token from the exact manifest draft_action." },
       cursor: { type: ["integer", "null"], minimum: 0 },
       max_chars: { type: "integer", minimum: 20000, maximum: 200000 },
     }, ["task_id", "writer_id", "view"]),
   },
   {
     name: "llm_wiki_stage_page_drafts",
-    description: "Persist one fully retrieved, path-disjoint semantic PagePatch shard in task-scoped temporary staging without writing Wiki pages. Success requires accepted=true, staged=true, a non-empty draft_hash, and a positive patch_count. Core persists the hash-bound receipt so status can recover a lost Drafter response; only then is the stable Writer launched to commit it server-side.",
+    description: "Persist one fully retrieved, path-disjoint semantic PagePatch shard in task-scoped temporary staging without writing Wiki pages. The Drafter must submit the exact current draft_claim_token; expired or superseded invocations are fenced. Success requires accepted=true, staged=true, a non-empty draft_hash, and a positive patch_count. Core persists the hash-bound receipt so status can recover a lost Drafter response; only then is the stable Writer launched to commit it server-side.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
       projection_id: { type: "string", minLength: 1, maxLength: 100 },
       shard_id: { type: "string", pattern: "^draft-[0-9]{4,}$" },
+      draft_claim_token: { type: "string", minLength: 8, maxLength: 120, description: "Exact current token returned with the draft shard; stale tokens are fenced." },
       patches: { type: "array", minItems: 1, maxItems: 6, items: { type: "object" } },
       idempotency_key: { type: "string", minLength: 8, maxLength: 200 },
-    }, ["task_id", "writer_id", "projection_id", "shard_id", "patches", "idempotency_key"]),
+    }, ["task_id", "writer_id", "projection_id", "shard_id", "draft_claim_token", "patches", "idempotency_key"]),
   },
   {
     name: "llm_wiki_get_staged_page_drafts",

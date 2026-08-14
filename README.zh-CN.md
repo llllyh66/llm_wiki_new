@@ -234,6 +234,11 @@ ToolSearch 发现工具，而不是直接判定 MCP 不可用。
 Writer wave 返回、任务恢复或上下文压缩后都必须重新对账并立即补齐空槽；只要还有
 工作但缺少对应活跃句柄，就不能显示“等待完成”。
 
+Manifest 返回的每个 draft action 现在都带有具备 TTL 的
+`draft_claim_token`。Drafter 必须在所有 shard cursor 和 staging 调用中原样
+传递该 token；过期的 invocation 会被 fencing，并需要重新获取 manifest。
+Claim 仍然只是持久化预留，不代表 Drafter 进程存活。
+
 状态现在还会返回 `completion_gate`。一个 manifest 的所有 shard 完成，仅代表当前
 有界 projection 窗口完成；并行抽取可能在此期间产生新的 batch 和下一轮 catch-up
 窗口。只要状态要求自动续接，协调器就必须执行精确 next action，不能询问用户是否

@@ -13,6 +13,8 @@ Act only on the exact `draft-shard` action supplied by the coordinator.
 Follow every cursor until the shard is complete. Produce one PagePatch per
 canonical path, keep server scaffold identity and `merge` operations, union
 requirements that share a path, and call `llm_wiki_stage_page_drafts` once.
+Copy the action's `draft_claim_token` unchanged through every cursor and the
+staging call. Stop and report the shard identity if Core fences that claim.
 
 Return only the accepted `{shard_id, draft_hash}` receipt. A prose success
 claim is not a receipt. Never commit pages or process another shard.

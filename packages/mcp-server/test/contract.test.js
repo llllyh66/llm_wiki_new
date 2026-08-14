@@ -106,6 +106,8 @@ test("project agents and canonical Skill expose only the current capacity-aware 
   assert.match(skill, /do not ask whether the user wants remaining batches or requirements/i)
   assert.match(extractor, /active lease does not mean this Agent remains alive/)
   assert.match(drafter, /Pending or retrieved shard state does not mean this\s+Drafter remains alive/)
+  assert.match(drafter, /draft_claim_token/)
+  assert.match(skill, /DRAFT_SHARD_CLAIM_FENCED/)
   assert.match(writer, /projection lease does not mean this\s+Writer remains alive/i)
   assert.match(skill, /feature fallback/)
   assert.match(skill, /retry the exact original tool and arguments/i)
@@ -183,6 +185,9 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
   const pagePlan = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_get_page_plan_context")
   assert.deepEqual(pagePlan.inputSchema.properties.view.enum, ["manifest", "draft-shard"])
   assert.equal(typeof pagePlan.inputSchema.properties.shard_id, "object")
+  assert.equal(typeof pagePlan.inputSchema.properties.draft_claim_token, "object")
+  const stageDrafts = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_stage_page_drafts")
+  assert.equal(stageDrafts.inputSchema.required.includes("draft_claim_token"), true)
   const pageCommit = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_commit_pages")
   assert.equal(pageCommit.inputSchema.properties.patches.maxItems, 50)
   assert.equal(pageCommit.inputSchema.properties.staged_draft_shard_ids, undefined)
@@ -463,13 +468,40 @@ test("unfinished server-side page shards recover without restarting or disconnec
   assert.deepEqual(response.structuredContent.next_action, {
     tool: "llm_wiki_get_page_plan_context",
     action_owner: "coordinator",
-    delegate_to: "llm-wiki-page-drafter",
     arguments: {
       task_id: "task-example",
       writer_id: "wiki-writer-1",
       projection_id: "projection-example",
-      view: "draft-shard",
-      shard_id: "draft-0007",
+      view: "manifest",
+      cursor: 0,
+      max_chars: 40_000,
+    },
+  })
+})
+
+test("a fenced Drafter claim routes through a fresh manifest", async () => {
+  const router = new HeadlessToolRouter({
+    getPagePlanContext: async () => {
+      throw new LlmWikiError("DRAFT_SHARD_CLAIM_FENCED", "The Drafter claim expired.", { retryable: true })
+    },
+  })
+  const response = await router.callMcp("llm_wiki_get_page_plan_context", {
+    task_id: "task-example",
+    writer_id: "wiki-writer-1",
+    projection_id: "projection-example",
+    view: "draft-shard",
+    shard_id: "draft-0007",
+    draft_claim_token: "draft-claim-expired",
+  })
+  assert.equal(response.structuredContent.error.code, "DRAFT_SHARD_CLAIM_FENCED")
+  assert.deepEqual(response.structuredContent.next_action, {
+    tool: "llm_wiki_get_page_plan_context",
+    action_owner: "coordinator",
+    arguments: {
+      task_id: "task-example",
+      writer_id: "wiki-writer-1",
+      projection_id: "projection-example",
+      view: "manifest",
       cursor: 0,
       max_chars: 40_000,
     },

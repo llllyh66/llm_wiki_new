@@ -154,6 +154,10 @@ live Drafters or a live Writer. The coordinator never reports “waiting” unle
 the host currently confirms every required invocation is running and no
 coordinator-owned action remains.
 
+Each manifest draft action carries a TTL-bound `draft_claim_token`. Drafters
+copy it through every cursor and staging call; fenced claims refresh from the
+manifest. Claims are persisted reservations and never count as live handles.
+
 A projection-complete acknowledgement closes one bounded projection window,
 not the build task. Extraction may finish more batches while that window is
 being drafted. The coordinator immediately reads `completion_gate`; while

@@ -160,6 +160,12 @@ For each manifest `draft_action`, launch at most the returned capacity. Each Dra
 6. Calls `llm_wiki_stage_page_drafts` with the exact projection/shard identity and a new idempotency key.
 7. Returns only the accepted `{shard_id, draft_hash}` receipt.
 
+Every manifest `draft_action` includes a TTL-bound `draft_claim_token`. Copy it
+unchanged through every shard cursor and the staging call. The token fences an
+expired or superseded Drafter, but it is a persisted reservation rather than
+proof that an Agent is alive. On `DRAFT_SHARD_CLAIM_FENCED`, discard unfinished
+generated content, refresh the manifest, and relaunch only the current action.
+
 Record a shard in `running_draft_shard_ids` only after the host confirms its
 launch. Remove it on every success, failure, or stopped notification. A
 retrieved-but-not-staged shard is incomplete durable work, not a running

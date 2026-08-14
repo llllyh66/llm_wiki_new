@@ -749,6 +749,75 @@ test("Finalize before extraction starts routes to exact automatic catch-up", asy
   )
 })
 
+test("failed tasks with unfinished extraction do not loop Finalize or relaunch Extractors", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const taskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
+  const task = JSON.parse(await readFile(taskPath, "utf8"))
+  task.status = "failed"
+  task.lastError = { code: "SYNTHETIC_IMPORT_FAILURE", message: "Synthetic partial progressive import failure." }
+  await writeFile(taskPath, JSON.stringify(task))
+
+  const status = await f.core.status({ task_id: imported.task_id })
+  assert.equal(status.parallel_extraction.enabled, false)
+  assert.equal(status.worker_recovery.resumable, false)
+  assert.equal(status.subagent_recovery.roles.extractor.work_remaining, false)
+  assert.equal(status.subagent_recovery.roles.extractor.desired_live_invocations, 0)
+  assert.equal(status.next_action, null)
+  assert.equal(status.completion_gate.automatic_continuation_required, false)
+  assert.equal(status.completion_gate.finalize_ready, false)
+  await assert.rejects(
+    () => f.core.finalize({ task_id: imported.task_id }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "FINALIZE_CATCHUP_REQUIRED"
+      && error.details.next_action === null
+      && error.details.completion_gate.automatic_continuation_required === false,
+  )
+})
+
+test("one background slot is shared by extraction and projection roles", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const files = []
+  for (let index = 0; index < 8; index += 1) {
+    const file = path.join(f.incoming, `single-slot-${index}.md`)
+    await writeFile(file, `# Business Entity ${index}\n\n${"Business Entity is the canonical business object. ".repeat(18)}`)
+    files.push({ path: file })
+  }
+  const imported = await f.core.importFiles({
+    files,
+    options: { max_batch_chars: 1_000, host_capabilities: { max_total_agents: 2, coordinator_slots: 1 } },
+  })
+  for (let index = 0; index < 4; index += 1) {
+    const batch = await f.core.getBatch({ task_id: imported.task_id, worker_id: `single-slot-worker-${index}` })
+    const evidence = batch.evidence_catalog.find((entry) => entry.quote.includes("Business Entity"))
+    await f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      worker_id: batch.worker_id,
+      lease_token: batch.lease_token,
+      idempotency_key: `single-slot-analysis-${index}`,
+      analysis: {
+        ...batch.analysis_scaffold,
+        entities: [{ localId: `single-slot-entity-${index}`, name: "Business Entity", confidence: 0.9, sourceRefs: [evidence.evidence_index] }],
+        batchSummary: "Defines Business Entity.",
+      },
+    })
+  }
+  const manifest = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "single-slot-writer", view: "manifest" })
+  assert.equal(manifest.draft_manifest.pending_shard_count > 0, true)
+  const status = await f.core.status({ task_id: imported.task_id })
+  const roles = status.subagent_recovery.roles
+  const desired = roles.extractor.desired_live_invocations
+    + roles.drafter.desired_live_invocations
+    + roles.writer.desired_live_invocations
+  assert.equal(status.pipeline_concurrency.max_background_agents_total, 1)
+  assert.equal(roles.extractor.desired_live_invocations, 0)
+  assert.equal(roles.drafter.desired_live_invocations, 1)
+  assert.equal(desired, 1)
+})
+
 test("parallel workers lease distinct batches and concurrent commits preserve every result", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
@@ -810,8 +879,8 @@ test("parallel workers lease distinct batches and concurrent commits preserve ev
   assert.equal(status.completed_batches, workerCount)
   assert.equal(status.leased_batches, 0)
   assert.equal(status.leased_batches_semantics, "persisted-reservations-not-live-agents")
-  assert.equal(status.worker_recovery.resumable, true)
-  assert.equal(status.worker_recovery.strategy, "restart-same-worker-id")
+  assert.equal(status.worker_recovery.resumable, false)
+  assert.equal(status.worker_recovery.strategy, "none")
   assert.equal(status.worker_recovery.process_liveness_known, false)
   assert.equal(status.worker_recovery.leases_are_live_agents, false)
   assert.equal(status.status, "planning")
@@ -1865,6 +1934,13 @@ test("blocked projection commits discard stale pending manifests before retry", 
   })
 
   const manifest = await f.core.getPagePlanContext({ task_id: waiter.task_id, writer_id: "wiki-writer-1", view: "manifest" })
+  const blockedStatus = await f.core.status({ task_id: waiter.task_id })
+  assert.equal(blockedStatus.wiki_publication.state, "waiting")
+  assert.equal(blockedStatus.next_action.tool, "llm_wiki_status")
+  assert.equal(blockedStatus.next_action.arguments.task_id, owner.task_id)
+  assert.equal(blockedStatus.subagent_recovery.blocked_by_publication, true)
+  assert.equal(blockedStatus.subagent_recovery.roles.drafter.desired_live_invocations, 0)
+  assert.equal(blockedStatus.subagent_recovery.roles.writer.desired_live_invocations, 0)
   const shardAction = manifest.draft_manifest.draft_actions[0].arguments
   let shard = await f.core.getPagePlanContext(shardAction)
   const requirements = [...shard.page_requirements]
@@ -2097,13 +2173,8 @@ test("server-side page manifests keep 50-plus-page projections in durable bounde
   assert.equal(manifest.page_requirements, undefined)
   await assert.rejects(
     () => f.core.getPagePlanContext({
-      task_id: imported.task_id,
-      writer_id: "wiki-writer-1",
-      projection_id: manifest.projection.projection_id,
-      view: "draft-shard",
-      shard_id: "draft-0001",
+      ...manifest.draft_manifest.draft_actions[0].arguments,
       cursor: 1,
-      max_chars: 40_000,
     }),
     (error) => error instanceof LlmWikiError
       && error.code === "PAGE_PLAN_CURSOR_MISMATCH"
@@ -2145,6 +2216,10 @@ test("server-side page manifests keep 50-plus-page projections in durable bounde
   const visitedShards = []
   while (action.tool === "llm_wiki_get_page_plan_context") {
     const shard = await f.core.getPagePlanContext(action.arguments)
+    if (shard.view === "manifest") {
+      action = shard.next_action
+      continue
+    }
     assert.equal(shard.view, "draft-shard")
     assert.equal(shard.draft_shard_complete, true)
     assert.equal(shard.page_requirements.length <= 6, true)
@@ -2233,9 +2308,29 @@ test("page drafters stage receipt-only shards and the Writer commits them server
     cursor: 0,
     max_chars: 40_000,
   })
-  const action = manifest.draft_manifest.draft_actions[0]
+  let action = manifest.draft_manifest.draft_actions[0]
   assert.equal(action.action_owner, "coordinator")
   assert.equal(action.delegate_to, "llm-wiki-page-drafter")
+  assert.equal(typeof action.arguments.draft_claim_token, "string")
+  const expiredClaimToken = action.arguments.draft_claim_token
+  const claimTaskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
+  const claimTask = JSON.parse(await readFile(claimTaskPath, "utf8"))
+  claimTask.pageProjection.lease.draftShardClaims[action.arguments.shard_id].expiresAt = new Date(0).toISOString()
+  await writeFile(claimTaskPath, JSON.stringify(claimTask))
+  await assert.rejects(
+    () => f.core.getPagePlanContext(action.arguments),
+    (error) => error instanceof LlmWikiError && error.code === "DRAFT_SHARD_CLAIM_FENCED",
+  )
+  const refreshedManifest = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: manifest.projection.projection_id,
+    view: "manifest",
+    cursor: 0,
+    max_chars: 40_000,
+  })
+  action = refreshedManifest.draft_manifest.draft_actions[0]
+  assert.notEqual(action.arguments.draft_claim_token, expiredClaimToken)
   const shard = await f.core.getPagePlanContext(action.arguments)
   assert.equal(shard.draft_shard_complete, true)
   assert.equal(shard.context_retrieval_complete, true)
@@ -2252,6 +2347,8 @@ test("page drafters stage receipt-only shards and the Writer commits them server
   const retrievedOnlyStatus = await f.core.status({ task_id: imported.task_id })
   assert.equal(retrievedOnlyStatus.wiki_projection.retrieved_not_staged_draft_shards, 1)
   assert.equal(retrievedOnlyStatus.wiki_projection.staged_uncommitted_draft_shards, 0)
+  assert.equal(retrievedOnlyStatus.wiki_projection.claimed_draft_shards, 1)
+  assert.equal(retrievedOnlyStatus.wiki_projection.draft_claims_are_live_drafters, false)
   assert.equal(retrievedOnlyStatus.wiki_projection.in_progress_semantics, "persisted-projection-lease-not-live-agent")
   assert.equal(retrievedOnlyStatus.wiki_projection.process_liveness_known, false)
   assert.equal(retrievedOnlyStatus.wiki_projection.projection_lease_is_live_writer, false)
@@ -2260,6 +2357,8 @@ test("page drafters stage receipt-only shards and the Writer commits them server
   assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.work_remaining, true)
   assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.desired_live_invocations, 1)
   assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.retrieved_not_staged_shards, 1)
+  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.persisted_claims, 1)
+  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.claims_are_live_invocations, false)
   assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.pending_shards_are_live_invocations, false)
   assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.reconcile_action.arguments.view, "manifest")
   assert.equal(retrievedOnlyStatus.subagent_recovery.roles.writer.desired_live_invocations, 0)
@@ -2269,10 +2368,7 @@ test("page drafters stage receipt-only shards and the Writer commits them server
     summary: "A server-staged semantic draft.",
   }))
   const staged = await f.core.stagePageDrafts({
-    task_id: imported.task_id,
-    writer_id: "wiki-writer-1",
-    projection_id: manifest.projection.projection_id,
-    shard_id: shard.shard.shard_id,
+    ...shard.next_action.arguments,
     patches,
     idempotency_key: "stage-page-draft-v1",
   })
@@ -2292,6 +2388,7 @@ test("page drafters stage receipt-only shards and the Writer commits them server
   assert.deepEqual(recoveredStatus.projection_recovery.recovered_staged_draft_receipts, [shard.shard.shard_id])
   assert.equal(recoveredStatus.wiki_projection.retrieved_not_staged_draft_shards, 0)
   assert.equal(recoveredStatus.wiki_projection.staged_uncommitted_draft_shards, 1)
+  assert.equal(recoveredStatus.wiki_projection.claimed_draft_shards, 0)
   assert.deepEqual(recoveredStatus.wiki_projection.recoverable_staged_draft_receipts, [
     { shard_id: shard.shard.shard_id, draft_hash: staged.draft_hash },
   ])
@@ -2335,10 +2432,7 @@ test("page drafters stage receipt-only shards and the Writer commits them server
   const changedPatches = patches.map((patch) => ({ ...patch, content: `${patch.content}\nChanged after receipt.\n` }))
   await assert.rejects(
     () => f.core.stagePageDrafts({
-      task_id: imported.task_id,
-      writer_id: "wiki-writer-1",
-      projection_id: manifest.projection.projection_id,
-      shard_id: shard.shard.shard_id,
+      ...shard.next_action.arguments,
       patches: changedPatches,
       idempotency_key: "stage-page-draft-v2",
     }),
@@ -2397,9 +2491,10 @@ test("status repairs a legacy empty-committed draft shard and resumes it", async
   assert.equal(recovered.wiki_projection.committed_draft_shards, 0)
   assert.equal(recovered.wiki_projection.next_draft_shard_id, shardId)
   assert.equal(recovered.next_action.tool, "llm_wiki_get_page_plan_context")
-  assert.equal(recovered.next_action.arguments.shard_id, shardId)
+  assert.equal(recovered.next_action.arguments.view, "manifest")
 
-  const shard = await f.core.getPagePlanContext(recovered.next_action.arguments)
+  const recoveredManifest = await f.core.getPagePlanContext(recovered.next_action.arguments)
+  const shard = await f.core.getPagePlanContext(recoveredManifest.draft_manifest.draft_actions[0].arguments)
   assert.equal(shard.draft_shard_complete, true)
   const patches = shard.page_requirements.map((requirement) => ({
     ...requirement.patch_scaffold,
@@ -2475,10 +2570,7 @@ test("aborting a task removes uncommitted server-side page drafts", async (t) =>
     summary: "Staged then cancelled.",
   }))
   await f.core.stagePageDrafts({
-    task_id: imported.task_id,
-    writer_id: "wiki-writer-1",
-    projection_id: manifest.projection.projection_id,
-    shard_id: shard.shard.shard_id,
+    ...shard.next_action.arguments,
     patches,
     idempotency_key: "stage-page-draft-abort-v1",
   })

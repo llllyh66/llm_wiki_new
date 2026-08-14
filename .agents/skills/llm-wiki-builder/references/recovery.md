@@ -123,6 +123,10 @@ from retrieval. After a configuration change, resume that same projection from
 cursor zero. Core shrinks an oversized incremental lease to the current bounded
 window and reports `projection.safely_repartitioned: true`; remaining batches
 stay queued and are not discarded.
+The manifest action's `draft_claim_token` must be copied through every cursor
+and staging call. A claim is a resumable reservation, not process liveness. If
+it is fenced or expired, discard the stale invocation result, refresh the
+manifest, and relaunch only the newly claimed action.
 After each Writer receipt wave returns, follow its coordinator-owned next
 action, launch the next Drafter wave, and launch the Writer again only after new
 receipts exist. The coordinator quantum is six projections and each lease is
