@@ -1,14 +1,18 @@
 {
   "name": "@llm-wiki/core",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "type": "module",
   "exports": "./src/index.js",
   "files": [
     "src"
   ],
   "dependencies": {
+    "@napi-rs/canvas": "^1.0.3",
+    "@tesseract.js-data/chi_sim": "^1.0.0",
+    "@tesseract.js-data/eng": "^1.0.0",
     "jszip": "^3.10.1",
-    "pdfjs-dist": "6.2.108"
+    "pdfjs-dist": "6.2.108",
+    "tesseract.js": "^7.0.0"
   },
   "scripts": {
     "build": "node --check src/index.js && node --check src/core.js",

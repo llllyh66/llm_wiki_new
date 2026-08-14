@@ -56,11 +56,15 @@ Related 的 canonical 格式是 frontmatter 中的 `collection/slug`，以及正
 - Word：`.docx`，保留表头、行列和合并单元格元数据
 - Excel：`.xlsx`，保留工作表名、A1 范围、合并单元格、隐藏行列、
   日期和公式缓存结果
-- PDF：带文本层的 `.pdf`，保留页码
+- PDF：`.pdf`，优先读取文本层，扫描页自动 OCR，保留页码
+- PowerPoint：`.pptx`、`.pptm`，提取幻灯片文本、表格，并对内嵌图片做 OCR
+- 图片：`.png`、`.jpg`、`.jpeg`、`.webp`、`.bmp`、`.tif`、`.tiff`，
+  使用离线中英文 OCR
 
-当前不支持老式 `.xls`、含宏 `.xlsm`、PPTX、图片、音频和扫描版 PDF OCR。
-请先将 `.xls` 另存为 `.xlsx`。Excel 公式不会被执行，Core 只读取文件中
-已保存的缓存结果，也不会访问外部链接。
+当前不支持老式 `.xls`、`.ppt`、含宏 `.xlsm`、音频和视频。
+请先将 `.xls` 另存为 `.xlsx`，将 `.ppt` 另存为 `.pptx`。Excel 公式和
+PowerPoint 宏都不会被执行，Core 也不会访问外链接。OCR 使用随包
+安装的简体中文和英文模型，不依赖运行时网络。
 
 ## 新电脑安装
 
@@ -361,14 +365,12 @@ Skill 都会在回答前调用 `llm_wiki_retrieve_context` 召回证据，不会
   持久化，后续 status 不会重复尝试快速 `finalize`。
 
 `llm_wiki_retrieve_context` 会并行考虑受管理的源文档块、已提交分析和 Wiki
-页面分段。任务构建期间默认先用 BM25 + Embedding 并以 RRF 融合，主 Agent
-无需等待 Wiki 完成即可回答问题；`finalize` 完成后，同一个无 `channels` 调用
-会自动切换为 BM25 + Embedding + Wiki 标题/路径/双向链接图三路 RRF。
-`retrieval_phase` 会明确返回 `building` 或 `knowledge-base-complete`。构建期
-回答可能不完整，主 Agent 应向用户保留这一状态。大型语料采用公平、有上限
-的候选集，返回值中的
-`corpus.truncated`、`corpus.max_documents` 和 `channel_status` 会说明是否截断
-或降级。
+页面分段。任务构建期间，每个 source 解析完就原子发布 task-local BM25；
+真实 Embedding 在后台异步追赶，不阻塞首次查询。因此主 Agent 无需等待慢速
+Wiki 构建就可先用已就绪的 BM25 + Embedding 召回；`finalize` 完成后再加入 Wiki
+标题/路径/双向链接图通道。响应会明确返回耐久阶段、逐 source 就绪度、
+请求通道、实际活跃通道与降级通道。持久索引不会因固定 10,000 候选上限
+静默遗漏后续 Chunk；输出本身仍有有界大小。
 已完成的旧 Wiki 页在新任务构建期仍可通过 BM25/Embedding 召回；只有
 未完成投影生成的 provisional 路径会被排除。
 
@@ -378,8 +380,8 @@ Domain → ABE → BE 分类链；`action: "search"` 可按 `domain_schema_id`�
 `snapshot_hash`、Domain、ABE、BE、分类状态或路径前缀组合过滤全部已分类页面。
 搜索结果只返回路径、标题、摘要和分类元数据，并通过 `next_cursor` 分页，不批量返回页面正文。
 
-Embedding 默认关闭；此时该通道自动使用本地 feature-hash 后备，不影响 BM25
-与 Wiki 通道。配置 OpenAI-compatible 服务：
+Embedding 默认关闭；此时本地 feature-hash 作为独立降级通道显式标记，
+不会冒充真实 Embedding，也不影响 BM25 与 Wiki 通道。配置 OpenAI-compatible 服务：
 
 ```bash
 export LLM_WIKI_EMBEDDING_PROVIDER=openai-compatible
@@ -389,12 +391,11 @@ export LLM_WIKI_EMBEDDING_API_KEY=运行时密钥  # 服务不要求时可省略
 ```
 
 使用 Ollama 时将 Provider 设为 `ollama` 并设置模型；默认地址为
-`http://127.0.0.1:11434/api/embed`。请求会分批、超时控制，并按内容哈希缓存到
-`.llm-wiki/indexes/embeddings/` 的分片目录。端点超时、断开或返回畸形向量时，
-工具会自动降级并保持 MCP 连接可用。可在 `.llm-wiki/config.json` 的
-`retrieval` 中调整 `maxDocuments`、`rrfK`，以及 Embedding 的 `batchSize`、
-`timeoutMs`、`totalTimeoutMs`、`maxInputChars` 和 `maxDocuments`；不要把 API
-Key 写入该文件。
+`http://127.0.0.1:11434/api/embed`。在线查询只生成有界 query vector，文档向量由后台生成并以
+generation-scoped float32 产物发布。端点超时、断开或返回畸形向量时，工具
+会显式降级并保持 MCP 连接可用。可在 `.llm-wiki/config.json` 的 `retrieval`
+中调整 `rrfK`，以及 Embedding 的 `batchSize`、`timeoutMs`、`totalTimeoutMs`和
+`maxInputChars`；不要把 API Key 写入该文件。
 
 ## CLI 用法
 
@@ -411,7 +412,6 @@ npm run cli -- lint --workspace .
 npm run cli -- abort <task-id> --workspace .
 npm run cli -- delete wiki --confirm-delete-knowledge-base --workspace .
 npm run cli -- delete knowledge_base --confirm-delete-knowledge-base --workspace .
-npm run cli -- migrate-legacy raw/sources --workspace .
 ```
 
 `import` 只创建待 Agent 分析的持久化任务，不会自动调用模型完成页面生成。
@@ -647,8 +647,10 @@ Core 会将 requirement ID 解析为任务中已验证的精确 quote 和 locato
 
 ### PDF 没有提取到文字
 
-当前只支持带文本层的 PDF。扫描件需要先使用 OCR 工具转换为可搜索 PDF
-或 UTF-8 文本。
+- 带文本层的页会直接提取，没有有效文本层的页会自动 OCR。
+- 默认识别简体中文和英文；手写、低分辨率、大角度旋转或严重压缩图像
+  仍可能识别不完整。
+- 查看提取后 `document.json` 的 `metadata.ocrPages`，可确认哪些页使用了 OCR。
 
 ## 安全边界
 

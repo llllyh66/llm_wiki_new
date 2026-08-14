@@ -144,13 +144,13 @@ without another semantic rewrite only when its persisted audit proves complete
 unique requirement coverage, current task-owned hashes, and exact evidence.
 The coordinator requests each server-side page manifest. The manifest declares
 the hard 50-patch commit limit and returns bounded draft shards of at most six
-canonical paths. Each accepted shard is a durable checkpoint identified by
-`draft_shard_ids`; after a restart or context compaction, the coordinator
+canonical paths. Each staged shard is a durable checkpoint identified by a
+hash-bound receipt; after a restart or context compaction, the coordinator
 resumes from the first unfinished shard instead of regenerating earlier pages.
 It launches path-disjoint Drafters, then launches the stable Writer only with
 completed hash-bound staged receipts. The Writer never launches Drafters and never
 fetches manifest or shard context in normal mode. The
-legacy full page-plan cursor mode remains available for compatibility.
+whole-plan cursor responses are not exposed by the current protocol.
 Incremental pages use concise grounded drafts. When extraction finishes, Core
 first drains any remaining bounded projections instead of creating one giant
 all-batch final prompt. If the Finalize audit finds ambiguity, contradictions,
@@ -203,8 +203,8 @@ Claude Code current model
 The host Agent owns semantic extraction and contradiction resolution. The Core
 owns deterministic validation, canonical projection of those validated facts,
 transactions, and indexes; it never launches a model, `codex`, `claude`, or an
-arbitrary shell command. Legacy Agent-authored page planning remains available
-for custom prose workflows, but is no longer on the default ingestion path.
+arbitrary shell command. Page generation follows one current manifest,
+draft-shard, hash-bound receipt, single-writer, and audited Finalize protocol.
 
 ## MCP tools
 
@@ -215,7 +215,6 @@ for custom prose workflows, but is no longer on the default ingestion path.
 - `llm_wiki_query_domain_pages`
 - `llm_wiki_commit_analysis`
 - `llm_wiki_get_page_plan_context`
-- `llm_wiki_apply_projection` (compatibility redirect)
 - `llm_wiki_stage_page_drafts`
 - `llm_wiki_get_staged_page_drafts`
 - `llm_wiki_commit_pages`
@@ -361,29 +360,38 @@ idempotency, transaction, and final result state survive Agent session restarts.
 - DOCX, including table rows, headers, column spans, and vertical merge metadata
 - XLSX workbooks, including sheet names, A1 ranges, cached formula results,
   merged cells, hidden rows/columns, and date normalization
-- PDF text layers with page-number SourceRef locators
+- PDF text layers plus OCR fallback for scanned pages, with page-number locators
+- PowerPoint `.pptx` and `.pptm`, including native slide text, tables, and OCR
+  for embedded images
+- PNG, JPEG, WebP, BMP, and TIFF images through offline English and Simplified
+  Chinese OCR
 
 DOCX macros and embedded objects are never executed. XLSX formulas are never
 evaluated, macros and external links are ignored, and only stored cell values
-are imported. Legacy `.xls` files must first be saved as `.xlsx`. PDF parsing
-disables dynamic evaluation and does not launch an external viewer. Scanned PDF
-OCR is a future parser adapter and is not silently treated as trustworthy text.
+are imported. Legacy `.xls` and `.ppt` files must first be saved as `.xlsx` and
+`.pptx`. PDF parsing disables dynamic evaluation and does not launch an external
+viewer. PowerPoint macros are never executed, and external relationships are
+not followed. OCR runs locally with bundled language data and records whether
+text came from a native layer or OCR in document metadata.
 
 ## Retrieval and writing safety
 
 Retrieval recalls source chunks, committed analysis, and Wiki sections through
 BM25, configurable real embeddings, and Wiki title/path/link-graph ranking,
 then combines the independent rankings with reciprocal-rank fusion (RRF).
-While a task is building, the default channels are BM25 + embedding so the
-main Agent can answer early questions without waiting for page generation.
-After Finalize, the same call automatically enables BM25 + embedding + Wiki.
-The response exposes this as `retrieval_phase`.
+While a task is building, task-local BM25 is published as soon as a source is
+parsed. Real embeddings join asynchronously when their durable index is ready,
+so the main Agent can answer early questions without waiting for Wiki generation
+or document embedding. After Finalize, the same call adds the Wiki channel. The
+response exposes the durable phase, per-source readiness, requested and active
+channels, and any fallback channels.
 Stable Wiki pages from earlier completed work remain searchable during a new
 build, but pages produced by an incomplete projection are excluded.
-Corpora and responses have explicit limits; results report truncation and each
-channel's status. Embedding requests are batched, timed out, cached by content
-hash in sharded files, and automatically degrade to the local feature-hash
-fallback without failing BM25 or Wiki recall.
+Responses have explicit output limits, while persisted indexes do not drop
+documents at a fixed corpus cutoff. Online embedding performs only a bounded
+query-vector request; document vectors are warmed in the background and stored
+as generation-scoped float32 artifacts. Endpoint failure is reported as a
+separate feature-hash fallback and never masquerades as real Embedding.
 
 Embedding is disabled by default. Configure an OpenAI-compatible endpoint at
 runtime without saving its API key in the repository:
@@ -398,8 +406,8 @@ export LLM_WIKI_EMBEDDING_API_KEY=your-runtime-key # omit when not required
 For Ollama, use `LLM_WIKI_EMBEDDING_PROVIDER=ollama` and set the model; the
 default endpoint is `http://127.0.0.1:11434/api/embed`. Persistent, non-secret
 tuning is available under `retrieval` in `.llm-wiki/config.json`, including
-`maxDocuments`, `rrfK`, and embedding `batchSize`, `timeoutMs`,
-`totalTimeoutMs`, `maxInputChars`, and `maxDocuments`.
+`rrfK` and embedding `batchSize`, `timeoutMs`, `totalTimeoutMs`, and
+`maxInputChars`.
 
 Agent page writes are limited to `wiki/sources/`, `wiki/entities/`,
 `wiki/concepts/`, `wiki/topics/`, and `wiki/comparisons/`. Each patch is checked
@@ -428,7 +436,6 @@ npm run cli -- lint --workspace .
 npm run cli -- abort <task-id> --workspace .
 npm run cli -- delete wiki --confirm-delete-knowledge-base --workspace .
 npm run cli -- delete knowledge_base --confirm-delete-knowledge-base --workspace .
-npm run cli -- migrate-legacy raw/sources --workspace .
 ```
 
 Deletion is deliberately explicit. `wiki` removes generated Wiki pages and
@@ -436,11 +443,6 @@ retrieval indexes but keeps imported sources and task history. `knowledge_base`
 also removes managed sources, task state, journals, and staging while retaining
 workspace configuration and the schema. Active tasks must be finished or
 aborted first.
-
-`migrate-legacy` is an explicit, one-time bridge for an existing desktop-era
-source tree. It imports supported files into content-addressed managed storage
-and creates a normal Agent task; the new runtime never watches or depends on the
-legacy directory.
 
 ## Development
 
@@ -452,5 +454,6 @@ npm test
 
 Tests use fixed AnalysisEnvelope and PagePatch fixtures. They do not call a real
 model or require a desktop/HTTP process. See
-[`plans/agent-first-refactor-progress.md`](plans/agent-first-refactor-progress.md)
-for the audit, phase status, test evidence, and remaining migration work.
+[`BUG_AUDIT_REPORT.md`](BUG_AUDIT_REPORT.md) and
+[`BUG_FIX_PLAN.md`](BUG_FIX_PLAN.md) for the 1.0.8 audit closure and test
+evidence.

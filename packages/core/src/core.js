@@ -1,4 +1,4 @@
-import { lstat, readFile, readdir, rm } from "node:fs/promises"
+import { lstat, readFile, readdir, rename, rm } from "node:fs/promises"
 import path from "node:path"
 import { LlmWikiError, asLlmWikiError, fail } from "./errors.js"
 import {
@@ -11,7 +11,7 @@ import {
 import { PROGRESSIVE_SCHEMA_MODE, resolveProgressiveClassificationReference } from "./schema-bundle.js"
 import { lintWiki } from "./lint.js"
 import { batchEvidenceCatalog, compactEvidenceCatalog } from "./evidence.js"
-import { buildRetrievalIndexes, retrieveContext } from "./retrieval.js"
+import { buildRetrievalIndexes, buildTaskRetrievalIndex, retrieveContext, warmTaskEmbeddingIndex } from "./retrieval.js"
 import { pagePatchSchema } from "./schemas.js"
 import { importSources, loadSourceManifest } from "./source-store.js"
 import {
@@ -25,6 +25,7 @@ import {
   saveTask,
   taskBuildKey,
   taskPaths,
+  updateImportTask,
   withIdempotency,
 } from "./task-store.js"
 import { cleanupTransactionArtifacts, commitPageTransaction, committedPageRecords, markPageTransactionCommitted, recoverPendingPageTransactions } from "./transaction.js"
@@ -72,6 +73,7 @@ import {
   sha256File,
   stableStringify,
   writeJsonAtomic,
+  writeBufferAtomic,
   writeTextAtomic,
 } from "./utils.js"
 
@@ -169,6 +171,7 @@ export class LlmWikiCore {
     this.taskAnalysisCache = new Map()
     this.pagePlanSnapshotCache = new Map()
     this.pageDraftShardCache = new Map()
+    this.importJobs = new Map()
   }
 
   async #recoverPendingState() {
@@ -178,6 +181,14 @@ export class LlmWikiCore {
     if (!(await pathExists(paths.workspace))) return
     const workspace = await ensureWorkspace(this.workspaceRoot, { skipWikiRevision: true })
     await recoverPendingPageTransactions(workspace)
+    const taskEntries = await readdir(workspace.paths.tasks, { withFileTypes: true }).catch(() => [])
+    for (const entry of taskEntries) {
+      if (!entry.isDirectory() || !entry.name.startsWith("task-")) continue
+      const paths = taskPaths(workspace.paths, entry.name)
+      const task = await readJson(paths.task, null)
+      const request = await readJson(paths.importRequest, null)
+      if (["importing", "parsing"].includes(task?.status) && request) this.#scheduleProgressiveImport(entry.name, request)
+    }
     await recoverPendingFinalizations(workspace)
     await cleanupTransactionArtifacts(workspace)
   }
@@ -375,6 +386,12 @@ export class LlmWikiCore {
   }
 
   async importFiles(input) {
+    if (input?.options?.progressive_import === true) {
+      // Registration must not hold sources.lock while the detached importer
+      // tries to acquire it. The in-process workspace queue makes task/request
+      // creation atomic; the background job owns the cross-process source lock.
+      return this.#withWorkspaceWriteLock(() => this.#importFiles(input), operationSignal(input))
+    }
     return this.#withWorkspaceWriteLock(() => this.#withNamedWorkspaceFileLock("sources.lock", "import", null, () => this.#importFiles(input)), operationSignal(input))
   }
 
@@ -382,7 +399,53 @@ export class LlmWikiCore {
     const targetLanguage = input?.options?.target_language ?? input?.options?.targetLanguage
     const workspace = await this.workspace({ targetLanguage })
     const domainSchema = await resolveDomainSchema(workspace, input?.options)
-    const imported = await importSources(workspace, input?.files)
+    if (input?.options?.progressive_import === true) {
+      const effectiveTargetLanguage = targetLanguage ?? workspace.config.targetLanguage
+      const { task, batches } = await createTask(workspace, [], {
+        targetLanguage: effectiveTargetLanguage,
+        maxBatchChars: input?.options?.max_batch_chars,
+        domainSchema,
+        hostCapabilities: normalizeHostCapabilities(input?.options?.host_capabilities),
+      })
+      task.status = "importing"
+      task.importProgress = {
+        accepted: 0,
+        parsed: 0,
+        bm25Indexed: 0,
+        embeddingIndexed: 0,
+        failed: 0,
+        complete: false,
+        updatedAt: nowIso(),
+        sources: input.files.map((file) => ({ display_name: file.display_name ?? file.displayName ?? path.basename(file.path), state: "pending" })),
+      }
+      await saveTask(taskPaths(workspace.paths, task.taskId), task)
+      const request = {
+        schemaVersion: 1,
+        files: input.files.map((file) => ({ path: file.path, ...(file.display_name ? { display_name: file.display_name } : {}) })),
+        options: {
+          target_language: effectiveTargetLanguage,
+          max_batch_chars: input?.options?.max_batch_chars,
+          host_capabilities: input?.options?.host_capabilities,
+        },
+      }
+      await writeJsonAtomic(taskPaths(workspace.paths, task.taskId).importRequest, request)
+      this.#scheduleProgressiveImport(task.taskId, request)
+      return {
+        workspace_initialized: workspace.initialized,
+        task_id: task.taskId,
+        reused_task: false,
+        status: "importing",
+        sources: [],
+        accepted: [],
+        duplicates: [],
+        rejected: [],
+        pending_sources: request.files.map((file) => file.display_name ?? path.basename(file.path)),
+        batch_count: batches.length,
+        retrieval_readiness: task.importProgress,
+        next_action: { tool: "llm_wiki_retrieve_context", arguments: { task_id: task.taskId, queries: ["initial source query"] } },
+      }
+    }
+    const imported = await importSources(workspace, input?.files, { signal: operationSignal(input) })
     if (imported.all.length === 0) {
       fail("SOURCE_IMPORT_FAILED", "No supported source files were imported.", { details: { rejected: imported.rejected } })
     }
@@ -429,8 +492,29 @@ export class LlmWikiCore {
       targetLanguage: effectiveTargetLanguage,
       maxBatchChars: input?.options?.max_batch_chars,
       domainSchema,
+      hostCapabilities: normalizeHostCapabilities(input?.options?.host_capabilities),
     })
-    const recommendedWorkers = recommendedWorkerCount(batches.length)
+    // Indexing is deliberately detached from the import response. BM25/source
+    // chunks are already queryable; real Embedding catches up in the
+    // background and retrieval reports its exact coverage meanwhile.
+    void warmTaskEmbeddingIndex(workspace, batches).then(async (result) => {
+      await this.#withTaskLock(task.taskId, async () => {
+        const latest = await loadTask(workspace.paths, task.taskId)
+        latest.task.importProgress = latest.task.importProgress ?? {
+          accepted: latest.task.sourceIds.length,
+          parsed: latest.task.sourceIds.length,
+          bm25Indexed: latest.task.sourceIds.length,
+          failed: 0,
+          complete: true,
+          sources: latest.task.sourceIds.map((sourceId) => ({ source_id: sourceId, state: "bm25-ready" })),
+        }
+        latest.task.importProgress.embeddingIndexed = Number(result.indexed_documents) || 0
+        latest.task.importProgress.updatedAt = nowIso()
+        await saveTask(latest.paths, latest.task)
+      })
+    }).catch(() => {})
+    await buildTaskRetrievalIndex({ task, batches, paths: taskPaths(workspace.paths, task.taskId) })
+    const recommendedWorkers = recommendedWorkerCount(batches.length, task.options.maxBackgroundAgents)
     const workerBatchQuantum = recommendedWorkerBatchQuantum(batches.length, recommendedWorkers)
     return {
       workspace_initialized: workspace.initialized,
@@ -454,7 +538,8 @@ export class LlmWikiCore {
         coordinator_direct_extraction: "fallback-only-after-worker-failure",
         single_batch_background: batches.length === 1,
         recommended_workers: recommendedWorkers,
-        max_workers: 4,
+        max_workers: task.options.maxBackgroundAgents,
+        max_background_agents_total: task.options.maxBackgroundAgents,
         worker_batch_quantum: workerBatchQuantum,
         recommended_batch_chars: task.options.maxBatchChars,
         checkpoint_each_batch: true,
@@ -478,13 +563,13 @@ export class LlmWikiCore {
           fallback_mode: "serial-writer-only",
           writer_launch_policy: "after-staged-drafter-receipt",
           writer_normal_mode: "staged-receipt-commit-only",
-          max_drafters: 4,
+          max_drafters: task.options.maxBackgroundAgents,
           max_paths_per_shard: 6,
           minimum_paths: 4,
-          pipeline_background_budget: 4,
-          max_background_agents_total: 4,
-          extraction_workers_during_drafting: 2,
-          max_drafters_when_extraction_overlaps: 2,
+          pipeline_background_budget: task.options.maxBackgroundAgents,
+          max_background_agents_total: task.options.maxBackgroundAgents,
+          extraction_workers_during_drafting: Math.min(2, task.options.maxBackgroundAgents),
+          max_drafters_when_extraction_overlaps: Math.max(1, task.options.maxBackgroundAgents - Math.min(2, task.options.maxBackgroundAgents)),
           partition_key: "patch_scaffold.path",
           drafter_handoff: "server-side-temporary-draft-receipt",
           stage_tool: "llm_wiki_stage_page_drafts",
@@ -494,14 +579,123 @@ export class LlmWikiCore {
       },
       wiki_revision: task.wikiRevision,
       domain_schema: task.domainSchema ?? null,
-      next_action: { tool: "llm_wiki_get_batch", arguments: { task_id: task.taskId } },
+        next_action: { tool: "llm_wiki_get_batch", arguments: { task_id: task.taskId } },
     }
+  }
+
+  #scheduleProgressiveImport(taskId, request) {
+    if (this.importJobs.has(taskId)) return this.importJobs.get(taskId)
+    const job = this.#withNamedWorkspaceFileLock("sources.lock", "progressive-import", taskId, async () => {
+      const workspace = await this.workspace({ skipWikiRevision: true })
+      const sources = []
+      let rejectedCount = 0
+      try {
+        const imported = await importSources(workspace, request.files, {
+          onSource: async (source, progress) => {
+            sources.push(source)
+            rejectedCount = progress.rejected.length
+            const record = await updateImportTask(workspace, taskId, sources, {
+              maxBatchChars: request.options?.max_batch_chars,
+              failed: rejectedCount,
+              complete: false,
+            })
+            await buildTaskRetrievalIndex(record)
+            void warmTaskEmbeddingIndex(workspace, record.batches).then(async (result) => {
+              await this.#withTaskLock(taskId, async () => {
+                const latest = await loadTask(workspace.paths, taskId)
+                if (!latest.task.importProgress) return
+                latest.task.importProgress.embeddingIndexed = Math.max(
+                  Number(latest.task.importProgress.embeddingIndexed) || 0,
+                  Number(result.indexed_documents) || 0,
+                )
+                latest.task.importProgress.updatedAt = nowIso()
+                await saveTask(latest.paths, latest.task)
+              })
+            }).catch(() => {})
+          },
+        })
+        rejectedCount = imported.rejected.length
+        if (sources.length === 0) fail("SOURCE_IMPORT_FAILED", "No supported source files were imported.", { details: { rejected: imported.rejected } })
+        const record = await updateImportTask(workspace, taskId, sources, {
+          maxBatchChars: request.options?.max_batch_chars,
+          failed: rejectedCount,
+          complete: false,
+        })
+        // Publish the complete task-local retrieval index before the task can
+        // report prepared. This is the durable readiness barrier: status can
+        // never outrun the final BM25/feature store write.
+        record.task.status = "prepared"
+        record.task.importProgress.complete = true
+        record.task.importProgress.updatedAt = nowIso()
+        record.task.buildKey = taskBuildKey(record.task.sourceIds, record.task.domainSchema?.hash ?? null, record.task.options.targetLanguage)
+        record.task.importCompletedAt = nowIso()
+        await buildTaskRetrievalIndex(record)
+        record.task.importResult = {
+          accepted: imported.accepted.map(stripInternalSource),
+          duplicates: imported.duplicates.map(stripInternalSource),
+          rejected: imported.rejected,
+        }
+        record.task.importProgress.sources = (record.task.importProgress.sources ?? []).map((source) => {
+          const rejected = imported.rejected.find((item) => item.display_name === source.display_name)
+          return rejected ? { ...source, state: "failed", error_code: rejected.error?.code ?? rejected.code ?? "SOURCE_IMPORT_FAILED" } : source
+        })
+        await saveTask(record.paths, record.task)
+        await rm(record.paths.importRequest, { force: true })
+      } catch (error) {
+        const record = await loadTask(workspace.paths, taskId).catch(() => null)
+        if (record) {
+          record.task.status = "failed"
+          record.task.lastError = asLlmWikiError(error).toJSON()
+          await saveTask(record.paths, record.task).catch(() => {})
+        }
+      }
+    }).finally(() => this.importJobs.delete(taskId))
+    this.importJobs.set(taskId, job)
+    return job
   }
 
   async getBatch(input) {
     const leased = await this.#withTaskLock(input?.task_id, () => this.#leaseBatch(input), operationSignal(input))
     if (leased.terminalResponse) return leased.terminalResponse
     return this.#buildBatchResponse(leased)
+  }
+
+  async renewLease(input) {
+    return this.#withTaskLock(input?.task_id, async () => {
+      const workspace = await this.workspace({ skipWikiRevision: true })
+      const record = await loadTask(workspace.paths, input?.task_id)
+      if (input?.projection_id !== undefined) {
+        const writerId = normalizeWorkerId(input?.writer_id, true)
+        const state = projectionState(record.task)
+        pageProjectionStatus(record.task)
+        const lease = state.lease
+        if (!lease || lease.projectionId !== input.projection_id || lease.writerId !== writerId) {
+          fail("LEASE_FENCED", "The projection lease is missing, expired, or superseded.", { retryable: true })
+        }
+        const maximumExpiry = Date.parse(lease.leasedAt) + 8 * 60 * 60 * 1_000
+        const nextExpiry = Math.min(Date.now() + PAGE_PROJECTION_LEASE_MS, maximumExpiry)
+        if (nextExpiry <= Date.now()) fail("LEASE_MAX_DURATION_EXCEEDED", "The projection lease reached its maximum duration.", { retryable: true })
+        lease.expiresAt = new Date(nextExpiry).toISOString()
+        lease.renewedAt = nowIso()
+        await saveTask(record.paths, record.task)
+        return { task_id: record.task.taskId, projection_id: lease.projectionId, writer_id: writerId, lease_expires_at: lease.expiresAt }
+      }
+      const workerId = normalizeWorkerId(input?.worker_id, true)
+      const batchId = String(input?.batch_id ?? "")
+      if (!batchId) fail("INVALID_INPUT", "batch_id is required for an extraction lease renewal.")
+      const lease = validBatchLeases(record.task)[batchId]
+      if (!lease || lease.workerId !== workerId || lease.leaseToken !== input?.lease_token) {
+        fail("LEASE_FENCED", "The extraction lease is missing, expired, or superseded.", { retryable: true })
+      }
+      const leasedAt = Date.parse(lease.leasedAt)
+      const maximumExpiry = leasedAt + 4 * 60 * 60 * 1_000
+      const nextExpiry = Math.min(Date.now() + BATCH_LEASE_MS, maximumExpiry)
+      if (nextExpiry <= Date.now()) fail("LEASE_MAX_DURATION_EXCEEDED", "The extraction lease reached its maximum duration.", { retryable: true })
+      lease.expiresAt = new Date(nextExpiry).toISOString()
+      lease.renewedAt = nowIso()
+      await saveTask(record.paths, record.task)
+      return { task_id: record.task.taskId, batch_id: batchId, worker_id: workerId, lease_token: lease.leaseToken, lease_epoch: lease.leaseEpoch, lease_expires_at: lease.expiresAt }
+    }, operationSignal(input))
   }
 
   async #leaseBatch(input) {
@@ -513,8 +707,8 @@ export class LlmWikiCore {
     const effectiveLimits = requestedBatchChars === null
       ? workspace.config.limits
       : { ...workspace.config.limits, maxBatchChars: Math.min(workspace.config.limits.maxBatchChars, requestedBatchChars) }
-    const workerId = normalizeWorkerId(input?.worker_id)
     const initialRecord = await loadTask(workspace.paths, input?.task_id)
+    const workerId = normalizeWorkerId(input?.worker_id, initialRecord.task.batchCount > 1)
     const requested = input?.batch_id
     const workerOwnedBatchId = requested ?? Object.entries(validBatchLeases(initialRecord.task))
       .find(([batchId, lease]) => lease.workerId === workerId && !initialRecord.task.completedBatchIds.includes(batchId))?.[0]
@@ -563,12 +757,22 @@ export class LlmWikiCore {
     }
     const leasedAt = nowIso()
     const expiresAt = new Date(Date.now() + BATCH_LEASE_MS).toISOString()
-    record.task.batchLeases[batch.batchId] = { workerId, leasedAt, expiresAt }
+    const priorLease = record.task.batchLeases[batch.batchId]
+    record.task.leaseEpoch = Number(record.task.leaseEpoch) || 0
+    const sameOwner = priorLease?.workerId === workerId && priorLease?.leaseToken
+    if (!sameOwner) record.task.leaseEpoch += 1
+    record.task.batchLeases[batch.batchId] = {
+      workerId,
+      leasedAt: sameOwner ? priorLease.leasedAt : leasedAt,
+      expiresAt,
+      leaseToken: sameOwner ? priorLease.leaseToken : newId("lease"),
+      leaseEpoch: sameOwner ? priorLease.leaseEpoch : record.task.leaseEpoch,
+    }
     await saveTask(record.paths, record.task)
-    return { workspace, record, batch, workerId, expiresAt, requestedBatchChars }
+    return { workspace, record, batch, workerId, expiresAt, lease: record.task.batchLeases[batch.batchId], requestedBatchChars }
   }
 
-  async #buildBatchResponse({ workspace, record, batch, workerId, expiresAt, requestedBatchChars }) {
+  async #buildBatchResponse({ workspace, record, batch, workerId, expiresAt, lease, requestedBatchChars }) {
     const domainSchema = await this.#taskDomainSchema(record)
     // The batch carries only immutable snapshot identity and disclosure
     // instructions. Domain, ABE, and complete BE-bearing JSON are loaded by
@@ -580,6 +784,8 @@ export class LlmWikiCore {
       task_id: record.task.taskId,
       batch_id: batch.batchId,
       worker_id: workerId,
+      lease_token: lease.leaseToken,
+      lease_epoch: lease.leaseEpoch,
       lease_expires_at: expiresAt,
       chunks: agentChunks,
       batch_limits: {
@@ -725,6 +931,7 @@ export class LlmWikiCore {
 
   async queryDomainPages(input = {}) {
     const workspace = await this.workspace()
+    const published = await publishedWikiSnapshot(workspace)
     const action = String(input?.action ?? "search").trim().toLowerCase()
     if (!new Set(["inspect", "search"]).has(action)) fail("INVALID_INPUT", "action must be inspect or search.")
 
@@ -734,7 +941,7 @@ export class LlmWikiCore {
       const pages = []
       const seen = new Set()
       for (const requestedPath of paths) {
-        const page = await readManagedWikiPage(workspace, requestedPath)
+        const page = await readPublishedWikiPage(workspace, published.wikiRoot, requestedPath)
         if (seen.has(page.path)) fail("INVALID_INPUT", `Duplicate inspect path: ${page.path}`)
         seen.add(page.path)
         pages.push(domainPageMetadata(page.path, page.parsed))
@@ -742,7 +949,8 @@ export class LlmWikiCore {
       return {
         accepted: true,
         action,
-        wiki_revision: workspace.revision,
+        wiki_revision: published.wikiRevision,
+        generation_id: published.generationId,
         pages,
       }
     }
@@ -751,10 +959,10 @@ export class LlmWikiCore {
     const cursor = normalizeDomainPageCursor(input?.cursor)
     const limit = Math.min(Math.max(Number(input?.limit) || 50, 1), 200)
     const maxChars = Math.min(Math.max(Number(input?.max_chars) || 80_000, 5_000), 240_000)
-    const files = await listFilesRecursive(workspace.paths.wiki, (candidate) => candidate.endsWith(".md"))
+    const files = await listFilesRecursive(published.wikiRoot, (candidate) => candidate.endsWith(".md"))
     const snapshots = await mapWithConcurrency(files, 16, async (file) => {
       const content = await readFile(file, "utf8")
-      const pagePath = `wiki/${relativePosix(workspace.paths.wiki, file)}`
+      const pagePath = `wiki/${relativePosix(published.wikiRoot, file)}`
       return domainPageMetadata(pagePath, parseWikiPage(content))
     })
     const matches = snapshots
@@ -773,7 +981,8 @@ export class LlmWikiCore {
     return {
       accepted: true,
       action,
-      wiki_revision: workspace.revision,
+      wiki_revision: published.wikiRevision,
+      generation_id: published.generationId,
       filters,
       total_matches: matches.length,
       cursor,
@@ -801,7 +1010,7 @@ export class LlmWikiCore {
     const record = await loadTask(workspace.paths, input?.task_id)
     const batch = record.batches.find((item) => item.batchId === input?.batch_id)
     if (!batch) fail("INVALID_ANALYSIS", "Batch does not belong to the task.")
-    const workerId = normalizeWorkerId(input?.worker_id)
+    const workerId = normalizeWorkerId(input?.worker_id, record.task.batchCount > 1)
     const exactIdempotencyRequest = {
       operation: "commit_analysis",
       batchId: batch.batchId,
@@ -821,6 +1030,13 @@ export class LlmWikiCore {
       fail("BATCH_LEASED", `Batch ${batch.batchId} is leased by another extraction worker.`, {
         retryable: true,
         details: { lease_expires_at: lease.expiresAt, lease_worker_id: lease.workerId },
+      })
+    }
+    if (record.task.batchCount > 1 && lease?.leaseToken && input?.lease_token !== lease.leaseToken) {
+      fail("LEASE_FENCED", `Batch ${batch.batchId} lease was superseded or the fencing token is missing.`, {
+        retryable: true,
+        details: { batch_id: batch.batchId, worker_id: workerId, lease_epoch: lease.leaseEpoch },
+        suggestedAction: "Reacquire the batch and retry only if the returned lease_token still represents this worker invocation.",
       })
     }
     const agentChunks = batch.chunks.map(agentChunkWithSourceRefTemplates)
@@ -857,6 +1073,7 @@ export class LlmWikiCore {
         ? projectionAction(record.task, wikiProjection)
         : null
       await saveTask(record.paths, record.task)
+      await buildTaskRetrievalIndex(record)
       const response = {
         accepted: true,
         analysis_revision: record.task.analysisRevision,
@@ -902,8 +1119,8 @@ export class LlmWikiCore {
     await this.#repairProjectionState(workspace, record)
     const requestedCursor = normalizePagePlanCursor(input?.cursor)
     const projectionRequested = input?.writer_id !== undefined || input?.projection_id !== undefined
-    const requestedView = normalizePagePlanView(input?.view, projectionRequested)
-    if (!projectionRequested && requestedView !== "plan") {
+    const requestedView = normalizePagePlanView(input?.view)
+    if (!projectionRequested && requestedView !== "internal-plan") {
       fail("INVALID_INPUT", `${requestedView} page-plan view requires writer_id or projection_id.`, {
         retryable: true,
         taskId: record.task.taskId,
@@ -913,7 +1130,7 @@ export class LlmWikiCore {
     let projection
     if (projectionRequested) {
       assertTaskStatus(record.task, ["extracting", "planning", "committing"])
-      const acquired = acquirePageProjection(record.task, input)
+      const acquired = await acquirePageProjection(record, input)
       await saveTask(record.paths, record.task)
       if (!acquired.lease) {
         return {
@@ -973,7 +1190,7 @@ export class LlmWikiCore {
     for (const { content, relative, parsed } of wikiSnapshots) {
       const metadata = {
         path: relative,
-        title: parsed.title || path.basename(file, ".md"),
+        title: parsed.title || path.posix.basename(relative, ".md"),
         page_kind: parsed.type || null,
         summary: parsed.summary,
         covers: parsed.covers,
@@ -1045,14 +1262,7 @@ export class LlmWikiCore {
         complete: false,
       }
       if (requestedView === "manifest") {
-        return this.#pagePlanManifestResponse(workspace, record, projection, {
-          schemaVersion: 1,
-          projectionId: projection.projectionId,
-          basedOnWikiRevision: planRevision,
-          context,
-          draftManifest,
-          finalizationHint,
-        })
+        return this.#pagePlanManifestResponse(workspace, record, projection, snapshot)
       }
     }
     const page = paginatePagePlan(context, requestedCursor, input?.max_chars, workspace.config.limits.maxPagePlanChars)
@@ -1096,10 +1306,10 @@ export class LlmWikiCore {
           writer_normal_mode: "staged-receipt-commit-only",
           partition_key: "page_requirement.patch_scaffold.path",
           same_path_requirements_are_indivisible: true,
-          max_drafters: 4,
+          max_drafters: record.task.options.maxBackgroundAgents,
           max_paths_per_shard: 6,
           minimum_paths: 4,
-          pipeline_background_budget: 4,
+          pipeline_background_budget: record.task.options.maxBackgroundAgents,
           extraction_workers_during_drafting: 2,
           drafter_has_mcp_access: true,
           drafter_handoff: "server-side-temporary-draft-receipt",
@@ -1108,8 +1318,6 @@ export class LlmWikiCore {
           sole_committer: projection?.writerId ?? null,
           commit_strategy: "single-writer-durable-waves",
         },
-        // Extraction has already enforced the task Schema. Page planning needs
-        // only stable identity metadata, never the multi-megabyte definitions.
         domain_schema: pagePlanDomainSchemaMetadata(record.task.domainSchema),
       } : {}),
       based_on_wiki_revision: planRevision,
@@ -1233,7 +1441,7 @@ export class LlmWikiCore {
         writer_normal_mode: "staged-receipt-commit-only",
         partition_key: "page_requirement.patch_scaffold.path",
         same_path_requirements_are_indivisible: true,
-        max_drafters: 4,
+        max_drafters: record.task.options.maxBackgroundAgents,
         max_paths_per_shard: limits.max_paths_per_draft_shard,
         max_patches_per_wave: limits.recommended_max_patches_per_wave,
         drafter_has_mcp_access: true,
@@ -1431,8 +1639,8 @@ export class LlmWikiCore {
       staging_required: page.pagination.next_cursor === null,
       staged: false,
       writer_commit_ready: false,
-      // Retained for compatibility, but a retrieved context is never itself
-      // commit-ready. Only a hash-bound staging receipt makes Writer work ready.
+      // A retrieved context is never commit-ready. Only a hash-bound staging
+      // receipt makes Writer work ready.
       commit_ready: false,
       projection: publicProjection(projection),
       provisional: projection.mode === "incremental",
@@ -1938,35 +2146,22 @@ export class LlmWikiCore {
     return normalizedPatches
   }
 
-  async applyWikiProjection(input) {
-    return this.#withTaskLock(input?.task_id, async () => {
-      const context = await this.#getPagePlanContext({
-        task_id: input?.task_id,
-        writer_id: input?.writer_id ?? "wiki-writer-1",
-        ...(input?.projection_id ? { projection_id: input.projection_id } : {}),
-        view: "manifest",
-        cursor: input?.cursor ?? 0,
-        max_chars: input?.max_chars ?? 40_000,
-      })
-      return { ...context, accepted: true, automated: false, renderer: "agent-semantic-writer-v1", writer_mode: "legacy-semantic", semantic_writer_required: true }
-    }, operationSignal(input))
-  }
-
   async #inspectWikiPages(input) {
     const workspace = await this.workspace()
     const record = await loadTask(workspace.paths, input?.task_id)
     assertTaskStatus(record.task, ["completed"])
+    const published = await publishedWikiSnapshot(workspace)
     const targets = Array.isArray(input?.targets) ? input.targets : []
     if (targets.length === 0 || targets.length > 20) {
       fail("INVALID_INPUT", "inspect requires 1 to 20 page targets.", { retryable: true, taskId: record.task.taskId })
     }
     const maxChars = Math.min(Math.max(Number(input?.max_chars) || 120_000, 1_000), 240_000)
-    const pageSourceRefs = await readJson(path.join(workspace.paths.indexes, "page-source-refs.json"), { schemaVersion: 1, pages: {} })
+    const pageSourceRefs = await readJson(path.join(workspace.paths.generations, published.generationId, "page-source-refs.json"), { schemaVersion: 1, pages: {} })
     const pages = []
     const seenPaths = new Set()
     let returnedChars = 0
     for (const target of targets) {
-      const page = await readManagedWikiPage(workspace, target?.path)
+      const page = await readPublishedWikiPage(workspace, published.wikiRoot, target?.path)
       if (seenPaths.has(page.path)) fail("INVALID_INPUT", `Duplicate inspect target path: ${page.path}`, { retryable: true, taskId: record.task.taskId })
       seenPaths.add(page.path)
       const heading = typeof target?.heading === "string" && target.heading.trim() ? target.heading.trim() : null
@@ -2004,7 +2199,8 @@ export class LlmWikiCore {
       accepted: true,
       action: "inspect",
       task_id: record.task.taskId,
-      wiki_revision: workspace.revision,
+      wiki_revision: published.wikiRevision,
+      generation_id: published.generationId,
       generation_id: record.task.generationId ?? null,
       returned_content_chars: returnedChars,
       max_chars: maxChars,
@@ -2165,7 +2361,7 @@ export class LlmWikiCore {
           status: "completed",
           updated_pages: uniqueStrings([...(previousResult.updated_pages ?? []), ...updatedPaths]),
           lint: { errors: built.lint.errors, warnings: built.lint.warnings, info: built.lint.info, findings: built.lint.findings },
-          indexing: { bm25: "completed", embedding: built.retrievalIndexes.embedding.status, vector: "completed", vector_fallback: "completed", graph: "completed" },
+          indexing: { bm25: "completed", embedding: built.retrievalIndexes.embedding.status, feature_hash: "completed", graph: "completed" },
           wiki_revision: built.wikiRevision,
           generation_id: generationId,
         }
@@ -2186,7 +2382,7 @@ export class LlmWikiCore {
             changed_sections: normalizedPatches.find((candidate) => candidate.path === patch.path)?.changedSections ?? [],
           })),
           lint: { errors: built.lint.errors, warnings: built.lint.warnings, info: built.lint.info },
-          indexing: { bm25: "completed", embedding: built.retrievalIndexes.embedding.status, vector: "completed", graph: "completed" },
+          indexing: { bm25: "completed", embedding: built.retrievalIndexes.embedding.status, feature_hash: "completed", graph: "completed" },
           next_action: null,
         }
         await writeJsonAtomic(finalizationPath, { ...finalization, state: "ready_to_publish", wikiRevision: built.wikiRevision, manifestSha256: built.manifestSha256, result: taskResult })
@@ -2230,22 +2426,11 @@ export class LlmWikiCore {
     const record = await loadTask(workspace.paths, input?.task_id)
     const projectionCommit = input?.projection_id !== undefined || input?.writer_id !== undefined
     const stagedDraftReceipts = normalizeStagedDraftReceipts(input?.staged_draft_receipts, "staged_draft_receipts")
-    const legacyStagedDraftShardIds = uniqueStrings((Array.isArray(input?.staged_draft_shard_ids) ? input.staged_draft_shard_ids : []).map(normalizeDraftShardId))
     const receiptShardIds = stagedDraftReceipts.map((receipt) => receipt.shard_id)
-    if (receiptShardIds.length > 0 && legacyStagedDraftShardIds.length > 0
-      && stableStringify(receiptShardIds) !== stableStringify(legacyStagedDraftShardIds)) {
-      fail("INVALID_INPUT", "staged_draft_receipts and staged_draft_shard_ids must identify the same shards when both are supplied.", {
-        retryable: true,
-        taskId: record.task.taskId,
-      })
-    }
-    const stagedDraftShardIds = receiptShardIds.length > 0 ? receiptShardIds : legacyStagedDraftShardIds
+    const stagedDraftShardIds = receiptShardIds
     const submittedPatches = Array.isArray(input?.patches) ? [...input.patches] : []
     const projectionComplete = input?.projection_complete !== false
     await this.#repairProjectionState(workspace, record, { force: projectionComplete })
-    if (input?.staged_draft_shard_ids !== undefined && !Array.isArray(input.staged_draft_shard_ids)) {
-      fail("INVALID_INPUT", "staged_draft_shard_ids must be an array of server-generated draft shard IDs.", { retryable: true, taskId: record.task.taskId })
-    }
     if (input?.draft_shard_ids !== undefined && !Array.isArray(input.draft_shard_ids)) {
       fail("INVALID_INPUT", "draft_shard_ids must be an array of server-generated draft shard IDs.", { retryable: true, taskId: record.task.taskId })
     }
@@ -2394,10 +2579,10 @@ export class LlmWikiCore {
       const retrievedShardIds = new Set(commitProjection.retrievedDraftShardIds ?? [])
       if (stagedDraftShardIds.length > 0 && explicitlySubmittedShardIds.length > 0
         && stableStringify(stagedDraftShardIds) !== stableStringify(explicitlySubmittedShardIds)) {
-        fail("INVALID_INPUT", "draft_shard_ids and staged_draft_shard_ids must identify the same shards when both are supplied.", {
+        fail("INVALID_INPUT", "draft_shard_ids and staged_draft_receipts must identify the same shards when both are supplied.", {
           retryable: true,
           taskId: record.task.taskId,
-          details: { draft_shard_ids: explicitlySubmittedShardIds, staged_draft_shard_ids: stagedDraftShardIds },
+          details: { draft_shard_ids: explicitlySubmittedShardIds, staged_draft_receipt_shard_ids: stagedDraftShardIds },
         })
       }
       submittedManifestShardIds = stagedDraftShardIds.length > 0 ? stagedDraftShardIds : explicitlySubmittedShardIds
@@ -2559,7 +2744,7 @@ export class LlmWikiCore {
       }
       if (projectionComplete) {
         if (projection?.pagePlanTraversal?.serverSideManifest === true) {
-          const snapshot = await this.#pagePlanSnapshot(record, projection.projectionId)
+          const snapshot = projection ? await this.#pagePlanSnapshot(record, projection.projectionId) : null
           const manifest = snapshot?.draftManifest ?? []
           const completedShardIds = new Set(projection.committedDraftShardIds ?? [])
           const missingShards = manifest.filter((shard) => !completedShardIds.has(shard.shard_id))
@@ -2574,7 +2759,7 @@ export class LlmWikiCore {
         }
         const coverage = await pageRequirementCoverageAudit(workspace.paths.wiki, commitRequirements, normalizedPatches)
         if (coverage.missing.length > 0) {
-          const snapshot = await this.#pagePlanSnapshot(record, projection.projectionId)
+          const snapshot = projection ? await this.#pagePlanSnapshot(record, projection.projectionId) : null
           const manifest = snapshot?.draftManifest ?? buildPageDraftManifest(pageRequirementsWithPatchScaffolds(commitRequirements, []))
           const nextDraftShard = manifest.find((shard) => shard.requirement_ids.includes(coverage.missing[0].requirement_id)) ?? null
           fail("INCOMPLETE_PAGE_COVERAGE", `The Wiki projection does not materialize every required entity, concept, and candidate page. Missing: ${coverage.missing.slice(0, 5).map((item) => item.title).join(", ")}${coverage.missing.length > 5 ? ", ..." : ""}.`, {
@@ -2700,8 +2885,7 @@ export class LlmWikiCore {
         normalized_page_requirement_source_refs: resolvedPageRequirementSourceRefs,
         normalized_page_source_ref_quotes: normalizedPageSourceRefQuotes,
         ...(stagedDraftShardIds.length > 0 ? {
-          committed_staged_draft_shard_ids: stagedDraftShardIds,
-          ...(stagedDraftReceipts.length > 0 ? { committed_staged_draft_receipts: stagedDraftReceipts } : {}),
+          committed_draft_receipts: stagedDraftReceipts,
           main_agent_payload: "receipt-only",
         } : {}),
         written_pages: journal.patches.map((patch) => ({ path: patch.path, file_hash: patch.fileHash })),
@@ -2888,7 +3072,11 @@ export class LlmWikiCore {
     const pageRecords = latestPageRecords(pageHistory)
     const analyses = await loadAnalyses(record, record.task.completedBatchIds)
     const requirements = derivePageRequirements(analyses, await this.#taskDomainSchema(record), record.task.domainSchema)
-    if (projectionUsed && (!pageProjection.finalCompleted || pageProjection.lease || pageProjection.provisionalPagePaths.length > 0)) {
+    // finalCompleted records a previous traversal result, not permission to
+    // skip semantic coverage validation.  Recompute the durable ledger on
+    // every publication attempt so empty acknowledgements and out-of-band
+    // page changes cannot bypass Finalize.
+    if (projectionUsed) {
       const audit = await fastFinalizeProjectionAudit(workspace, record, analyses, requirements, pageRecords)
       pageProjection.fastFinalizationAudit = audit
       if (audit.eligible) {
@@ -2935,7 +3123,7 @@ export class LlmWikiCore {
     await writeTextAtomic(path.join(workspace.paths.wiki, "overview.md"), await buildOverview(workspace.paths.wiki, record.task, pageRecords))
     await appendLog(path.join(workspace.paths.wiki, "log.md"), record.task, pageRecords)
     const wikiRevision = await hashDirectory(workspace.paths.wiki)
-    const pages = await snapshotWikiGeneration(workspace.paths.wiki, path.join(generationRoot, "wiki"))
+    const pages = await annotateGenerationPages(workspace, await snapshotWikiGeneration(workspace.paths.wiki, path.join(generationRoot, "wiki")))
     await writeJsonAtomic(finalizationPath, {
       ...finalization,
       state: "pages_published",
@@ -2947,12 +3135,14 @@ export class LlmWikiCore {
     const retrievalIndexes = await buildRetrievalIndexes(workspace, { wikiRoot: workspace.paths.wiki })
     const graph = await buildGraph(workspace.paths.wiki)
     const embeddingIndex = retrievalIndexes.embedding
+    const compactEmbedding = compactEmbeddingArtifact(embeddingIndex)
+    const compactFeatureHash = compactEmbeddingArtifact(retrievalIndexes.featureHash, "feature-hash.f32")
     const lint = await lintWiki(workspace)
     const artifactValues = {
       "page-source-refs.json": pageSourceRefsArtifact,
       "bm25.json": retrievalIndexes.bm25,
-      "vector.json": retrievalIndexes.vector,
-      "embedding.json": embeddingIndex,
+      "feature-hash.json": compactFeatureHash.metadata,
+      "embedding.json": compactEmbedding.metadata,
       "graph.json": graph,
       "lint.json": lint,
     }
@@ -2962,6 +3152,12 @@ export class LlmWikiCore {
       await writeJsonAtomic(artifactPath, value)
       artifacts[name] = { path: name, sha256: await sha256File(artifactPath) }
     }
+    const embeddingVectorPath = path.join(generationRoot, compactEmbedding.metadata.vector_path)
+    await writeBufferAtomic(embeddingVectorPath, compactEmbedding.buffer)
+    artifacts[compactEmbedding.metadata.vector_path] = { path: compactEmbedding.metadata.vector_path, sha256: await sha256File(embeddingVectorPath) }
+    const featureVectorPath = path.join(generationRoot, compactFeatureHash.metadata.vector_path)
+    await writeBufferAtomic(featureVectorPath, compactFeatureHash.buffer)
+    artifacts[compactFeatureHash.metadata.vector_path] = { path: compactFeatureHash.metadata.vector_path, sha256: await sha256File(featureVectorPath) }
     const manifest = {
       schemaVersion: 1,
       generationId,
@@ -2982,15 +3178,6 @@ export class LlmWikiCore {
       artifacts,
       lint: { errors: lint.errors, warnings: lint.warnings, info: lint.info },
     })
-    // Keep V1.0.1 fixed paths as a read-only compatibility projection. New
-    // readers use current-generation.json and never observe these writes as a
-    // generation boundary.
-    await writeJsonAtomic(path.join(workspace.paths.indexes, "page-source-refs.json"), pageSourceRefsArtifact)
-    await writeJsonAtomic(path.join(workspace.paths.indexes, "bm25.json"), retrievalIndexes.bm25)
-    await writeJsonAtomic(path.join(workspace.paths.indexes, "vector.json"), retrievalIndexes.vector)
-    await writeJsonAtomic(path.join(workspace.paths.indexes, "embedding.json"), embeddingIndex)
-    await writeJsonAtomic(path.join(workspace.paths.indexes, "graph.json"), graph)
-    await writeJsonAtomic(path.join(workspace.paths.state, "lint.json"), lint)
     if (lint.errors > 0) {
       await writeJsonAtomic(finalizationPath, {
         ...finalization,
@@ -3009,11 +3196,11 @@ export class LlmWikiCore {
       task_id: record.task.taskId,
       status: "completed",
       sources: record.task.sourceIds,
-      created_pages: pageRecords.filter((page) => page.createdByTask).map((page) => page.path),
-      updated_pages: pageRecords.filter((page) => !page.createdByTask).map((page) => page.path),
+      created_pages: pages.filter((page) => page.disposition === "created").map((page) => page.path),
+      updated_pages: pages.filter((page) => page.disposition === "updated").map((page) => page.path),
       review_items: await countReviewItems(record),
       lint: { errors: lint.errors, warnings: lint.warnings, info: lint.info, findings: lint.findings },
-      indexing: { bm25: "completed", embedding: embeddingIndex.status, vector: "completed", vector_fallback: "completed", graph: "completed" },
+      indexing: { bm25: "completed", embedding: embeddingIndex.status, feature_hash: "completed", graph: "completed" },
       wiki_revision: wikiRevision,
       generation_id: generationId,
       ...(pageProjection.finalizationMode ? {
@@ -3428,33 +3615,46 @@ export class LlmWikiCore {
   }
 }
 
-function normalizeWorkerId(value) {
-  if (value === undefined || value === null || value === "") return "worker-default"
+function normalizeWorkerId(value, required = false) {
+  if (value === undefined || value === null || value === "") {
+    if (required) fail("INVALID_INPUT", "worker_id is required for parallel extraction.")
+    return "worker-default"
+  }
   if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,100}$/.test(value)) {
     fail("INVALID_INPUT", "worker_id must contain 1 to 100 letters, numbers, dots, underscores, colons, or hyphens.")
   }
   return value
 }
 
-function recommendedWorkerCount(batchCount) {
+function recommendedWorkerCount(batchCount, maximumWorkers = 3) {
   if (batchCount <= 0) return 0
   if (batchCount === 1) return 1
   // get_batch returns only progressive-disclosure metadata, so a large Schema
   // is never duplicated wholesale across extraction worker responses.
-  return Math.min(4, batchCount)
+  return Math.min(Math.max(1, maximumWorkers), batchCount)
 }
 
-function pipelineConcurrencyPlan({ remainingBatches, extractionOverlaps }) {
-  const maxBackgroundAgentsTotal = 4
+function pipelineConcurrencyPlan({ remainingBatches, extractionOverlaps, maxBackgroundAgents = 3 }) {
+  const maxBackgroundAgentsTotal = Math.max(1, Math.min(16, Number(maxBackgroundAgents) || 3))
   const recommendedExtractors = extractionOverlaps
-    ? Math.min(2, Math.max(0, remainingBatches))
-    : Math.min(4, Math.max(0, remainingBatches))
-  const maxDrafters = extractionOverlaps ? 2 : 4
+    ? Math.min(Math.max(1, maxBackgroundAgentsTotal - 1), Math.max(0, remainingBatches))
+    : Math.min(maxBackgroundAgentsTotal, Math.max(0, remainingBatches))
+  const maxDrafters = extractionOverlaps ? Math.max(1, maxBackgroundAgentsTotal - recommendedExtractors) : maxBackgroundAgentsTotal
   return {
     max_background_agents_total: maxBackgroundAgentsTotal,
     recommended_extractors: recommendedExtractors,
     max_drafters: maxDrafters,
     recommended_drafters: maxDrafters,
+  }
+}
+
+function normalizeHostCapabilities(value) {
+  const maxTotalAgents = Math.max(1, Math.min(32, Number(value?.max_total_agents) || 4))
+  const coordinatorSlots = Math.max(1, Math.min(maxTotalAgents, Number(value?.coordinator_slots) || 1))
+  return {
+    maxTotalAgents,
+    coordinatorSlots,
+    maxBackgroundAgents: Math.max(1, maxTotalAgents - coordinatorSlots),
   }
 }
 
@@ -3472,6 +3672,7 @@ function agentChunkWithSourceRefTemplates(chunk) {
     ...(Number.isInteger(chunk.startOffset) ? { startOffset: chunk.startOffset } : {}),
     ...(Number.isInteger(chunk.endOffset) ? { endOffset: chunk.endOffset } : {}),
     ...(Number.isInteger(chunk.pageNumber) ? { page: chunk.pageNumber } : {}),
+    ...(Number.isInteger(chunk.slideNumber) ? { slide: chunk.slideNumber } : {}),
   }
   const spreadsheetLocators = []
   if (typeof chunk.sheetName === "string" || typeof chunk.cellRange === "string") {
@@ -3506,6 +3707,7 @@ function validBatchLeases(task) {
   return Object.fromEntries(Object.entries(leases).filter(([batchId, lease]) => (
     !task.completedBatchIds.includes(batchId)
     && lease && typeof lease.workerId === "string"
+    && typeof lease.leaseToken === "string"
     && Number.isFinite(Date.parse(lease.expiresAt))
     && Date.parse(lease.expiresAt) > now
   )))
@@ -3590,6 +3792,7 @@ function pageProjectionStatus(task) {
   const pipelineConcurrency = pipelineConcurrencyPlan({
     remainingBatches: Math.max(0, task.batchCount - completed.length),
     extractionOverlaps,
+    maxBackgroundAgents: task.options?.maxBackgroundAgents,
   })
   let nextReadyAt = null
   if (!ready && !state.lease && !allComplete && unprojected.length > 0) {
@@ -3623,7 +3826,7 @@ function pageProjectionStatus(task) {
       fallback_mode: "serial-writer-only",
       writer_launch_policy: "after-staged-drafter-receipt",
       writer_normal_mode: "staged-receipt-commit-only",
-      max_drafters: 4,
+      max_drafters: task.options?.maxBackgroundAgents ?? 3,
       max_paths_per_shard: 6,
       minimum_paths: 4,
       pipeline_background_budget: pipelineConcurrency.max_background_agents_total,
@@ -3668,13 +3871,23 @@ function pageProjectionStatus(task) {
   }
 }
 
-function acquirePageProjection(task, input) {
+async function acquirePageProjection(record, input) {
+  const task = record.task
   const state = projectionState(task)
+  const staleLease = state.lease && (!Number.isFinite(Date.parse(state.lease.expiresAt)) || Date.parse(state.lease.expiresAt) <= Date.now())
+    ? state.lease : null
   const status = pageProjectionStatus(task)
-  const writerId = normalizeWorkerId(input?.writer_id)
-  // Older servers leased every accumulated incremental batch at once. A
-  // restarted writer always recollects from cursor zero, so safely shrink that
-  // legacy lease in place and leave the remainder queued for later projections.
+  if (staleLease) {
+    const quarantine = path.join(record.paths.root, "orphans", `${staleLease.projectionId}-${Date.now()}`)
+    await ensureDir(quarantine)
+    if (await pathExists(record.paths.pagePlan)) await rename(record.paths.pagePlan, path.join(quarantine, "page-plan.json")).catch(() => {})
+    if (await pathExists(record.paths.pageDrafts)) await rename(record.paths.pageDrafts, path.join(quarantine, "page-drafts")).catch(() => {})
+    await ensureDir(record.paths.pageDrafts)
+  }
+  const writerId = normalizeWorkerId(input?.writer_id, true)
+  // A persisted lease may exceed today's bounded window after configuration
+  // changes. A restarted writer recollects from cursor zero, so shrink that
+  // lease in place and leave the remainder queued for later projections.
   if (state.lease?.mode === "incremental"
     && Array.isArray(state.lease.batchIds)
     && state.lease.batchIds.length > state.batchLimit
@@ -3691,7 +3904,9 @@ function acquirePageProjection(task, input) {
     return { lease: state.lease, status: pageProjectionStatus(task) }
   }
   if (state.lease) {
-    if (state.lease.writerId === writerId) return { lease: state.lease, status: pageProjectionStatus(task) }
+    // A stable writer name is human metadata, not a resume credential. Once a
+    // lease exists, even the same name must present its opaque projection_id;
+    // otherwise a second coordinator could silently join the first lease.
     return { lease: null, status: { ...status, writer_busy: true } }
   }
   if (!status.ready) return { lease: null, status }
@@ -3727,7 +3942,7 @@ function acquirePageProjection(task, input) {
 function requirePageProjectionLease(task, input) {
   const state = projectionState(task)
   pageProjectionStatus(task)
-  const writerId = normalizeWorkerId(input?.writer_id)
+  const writerId = normalizeWorkerId(input?.writer_id, true)
   if (!state.lease) {
     const completed = state.completedProjectionLeases.find((item) => (
       item.projectionId === input?.projection_id && item.writerId === writerId
@@ -3865,8 +4080,9 @@ async function fastFinalizeProjectionAudit(workspace, record, analyses, requirem
     addIssue("INCOMPLETE_EXTRACTION", { completed_batches: completedBatchIds.length, total_batches: record.task.batchCount })
   }
   if (unprojectedBatchIds.length > 0) addIssue("UNPROJECTED_BATCHES", { count: unprojectedBatchIds.length })
-  if (contradictionCount > 0) addIssue("ANALYSIS_CONTRADICTIONS", { count: contradictionCount })
-  if (reviewItemCount > 0) addIssue("OPEN_REVIEW_ITEMS", { count: reviewItemCount })
+  // Contradictions and review items are first-class requirements. Their
+  // presence is not itself a publication failure once the coverage ledger
+  // proves that each item has one grounded owner page.
 
   const coverage = await pageRequirementCoverageAudit(workspace.paths.wiki, requirements, [])
   if (coverage.missing.length > 0) addIssue("MISSING_PAGE_REQUIREMENTS", { count: coverage.missing.length })
@@ -3874,7 +4090,6 @@ async function fastFinalizeProjectionAudit(workspace, record, analyses, requirem
 
   const latestByPath = new Map(pageRecords.map((page) => [page.path, page]))
   const provisionalPaths = uniqueStrings(state.provisionalPagePaths)
-  const provisionalSet = new Set(provisionalPaths)
   const requirementById = new Map(requirements.map((requirement) => [requirement.requirement_id, requirement]))
   const committedRequirementIds = new Set(pageRecords.flatMap((page) => page.covers ?? []))
   const requirementsNotWrittenByTask = requirements.filter((requirement) => !committedRequirementIds.has(requirement.requirement_id))
@@ -3882,8 +4097,11 @@ async function fastFinalizeProjectionAudit(workspace, record, analyses, requirem
     addIssue("REQUIREMENTS_NOT_WRITTEN_BY_TASK", { count: requirementsNotWrittenByTask.length })
   }
 
+  const ownerPaths = uniqueStrings(requirements.flatMap((requirement) => coverage.ownersByRequirement.get(requirement.requirement_id) ?? []))
+  const auditedPaths = state.finalCompleted ? ownerPaths : provisionalPaths
+  const auditedPathSet = new Set(auditedPaths)
   const invalidPages = []
-  for (const pagePath of provisionalPaths) {
+  for (const pagePath of auditedPaths) {
     const pageRecord = latestByPath.get(pagePath)
     if (!pageRecord) {
       invalidPages.push({ path: pagePath, code: "MISSING_COMMIT_RECORD" })
@@ -3915,7 +4133,7 @@ async function fastFinalizeProjectionAudit(workspace, record, analyses, requirem
     const ownerPaths = [...new Set(coverage.ownersByRequirement.get(requirement.requirement_id) ?? [])]
     if (ownerPaths.length !== 1) continue
     const pageRecord = latestByPath.get(ownerPaths[0])
-    if (!pageRecord || !provisionalSet.has(ownerPaths[0])) continue
+    if (!pageRecord || !auditedPathSet.has(ownerPaths[0])) continue
     const committedSourceRefs = new Set((pageRecord.sourceRefs ?? []).map((sourceRef) => stableStringify(sourceRef)))
     const missing = (requirementById.get(requirement.requirement_id)?.source_refs ?? [])
       .filter((sourceRef) => !committedSourceRefs.has(stableStringify(sourceRef)))
@@ -3932,10 +4150,12 @@ async function fastFinalizeProjectionAudit(workspace, record, analyses, requirem
   }
 
   const requiredPathsOutsideTask = []
-  for (const requirement of requirements) {
-    const ownerPaths = [...new Set(coverage.ownersByRequirement.get(requirement.requirement_id) ?? [])]
-    if (ownerPaths.length === 1 && !provisionalSet.has(ownerPaths[0])) {
-      requiredPathsOutsideTask.push({ requirement_id: requirement.requirement_id, path: ownerPaths[0] })
+  if (!state.finalCompleted) {
+    for (const requirement of requirements) {
+      const ownerPaths = [...new Set(coverage.ownersByRequirement.get(requirement.requirement_id) ?? [])]
+      if (ownerPaths.length === 1 && !auditedPathSet.has(ownerPaths[0])) {
+        requiredPathsOutsideTask.push({ requirement_id: requirement.requirement_id, path: ownerPaths[0] })
+      }
     }
   }
   if (requiredPathsOutsideTask.length > 0) {
@@ -4009,6 +4229,66 @@ async function snapshotWikiGeneration(wikiRoot, generationWikiRoot) {
     })
   }
   return pages
+}
+
+async function annotateGenerationPages(workspace, pages) {
+  const pointer = await readJson(workspace.paths.currentGeneration, null)
+  const previousGenerationId = pointer?.generation_id
+  const previousManifest = typeof previousGenerationId === "string"
+    ? await readJson(path.join(workspace.paths.generations, previousGenerationId, "manifest.json"), null)
+    : null
+  const previousByPath = new Map((previousManifest?.pages ?? []).map((page) => [page.path, page]))
+  return pages.map((page) => {
+    const previous = previousByPath.get(page.path)
+    const disposition = !previous ? "created" : previous.sha256 === page.sha256 ? "unchanged" : "updated"
+    const origin = /^wiki\/sources\//.test(page.path) || /^wiki\/(index|overview|log)\.md$/.test(page.path)
+      ? "core-generated"
+      : "page-transaction"
+    return {
+      ...page,
+      origin,
+      disposition,
+      previous_sha256: previous?.sha256 ?? null,
+    }
+  })
+}
+
+async function publishedWikiSnapshot(workspace) {
+  const pointer = await readJson(workspace.paths.currentGeneration, null)
+  const generationId = pointer?.generation_id
+  if (typeof generationId !== "string" || !/^generation-[0-9a-f-]+$/i.test(generationId)) {
+    fail("PUBLISHED_GENERATION_NOT_FOUND", "No published Wiki generation is available.", {
+      retryable: true,
+      suggestedAction: "Finalize a completed task before using public Wiki query tools.",
+    })
+  }
+  const generationRoot = path.join(workspace.paths.generations, generationId)
+  const manifest = await readJson(path.join(generationRoot, "manifest.json"), null)
+  const wikiRoot = path.join(generationRoot, "wiki")
+  if (!manifest || manifest.generationId !== generationId || !(await pathExists(wikiRoot))) {
+    fail("PUBLISHED_GENERATION_CORRUPT", "The published Wiki generation is missing its manifest or page snapshot.", {
+      retryable: true,
+      details: { generation_id: generationId },
+    })
+  }
+  return { generationId, wikiRoot, wikiRevision: manifest.wikiRevision }
+}
+
+async function readPublishedWikiPage(workspace, wikiRoot, requestedPath) {
+  const relative = validatePagePath(requestedPath)
+  const wikiRelative = relative.replace(/^wiki\//, "")
+  const target = path.resolve(wikiRoot, wikiRelative)
+  const allowedPrefix = `${path.resolve(wikiRoot)}${path.sep}`
+  if (!target.startsWith(allowedPrefix) || !(await pathExists(target))) {
+    fail("WIKI_PAGE_NOT_FOUND", `Wiki page does not exist in the published generation: ${relative}`, {
+      retryable: true,
+      details: { path: relative },
+    })
+  }
+  const info = await lstat(target)
+  if (!info.isFile() || info.isSymbolicLink()) fail("INVALID_PAGE_PATH", `Published Wiki page is not a regular file: ${relative}`)
+  const content = await readFile(target, "utf8")
+  return { path: relative, target, content, fileHash: sha256(content), parsed: parseWikiPage(content) }
 }
 
 async function readManagedWikiPage(workspace, requestedPath) {
@@ -4164,19 +4444,47 @@ async function buildStableGenerationArtifacts(workspace, options) {
   })
 }
 
+function compactEmbeddingArtifact(index, vectorPath = "embedding.f32") {
+  const vectors = Array.isArray(index?.vectors) ? index.vectors : []
+  const dimensions = Number(index?.dimensions) || vectors[0]?.length || 0
+  if (vectors.some((vector) => (!Array.isArray(vector) && !ArrayBuffer.isView(vector)) || vector.length !== dimensions)) {
+    fail("EMBEDDING_INVALID_RESPONSE", "Embedding snapshot contains inconsistent vector dimensions.")
+  }
+  const buffer = Buffer.alloc(vectors.length * dimensions * 4)
+  for (let vectorIndex = 0; vectorIndex < vectors.length; vectorIndex += 1) {
+    for (let dimension = 0; dimension < dimensions; dimension += 1) {
+      buffer.writeFloatLE(Number(vectors[vectorIndex][dimension]) || 0, (vectorIndex * dimensions + dimension) * 4)
+    }
+  }
+  const { vectors: _vectors, ...metadata } = index
+  return {
+    metadata: {
+      ...metadata,
+      schemaVersion: 3,
+      dimensions,
+      storage: "contiguous-float32-le",
+      vector_path: vectorPath,
+      vector_count: vectors.length,
+    },
+    buffer,
+  }
+}
+
 async function buildGenerationArtifacts(workspace, { generationId, taskId, pageSourceRefs }) {
   const generationRoot = path.join(workspace.paths.generations, generationId)
   const wikiRevision = await hashDirectory(workspace.paths.wiki)
-  const pages = await snapshotWikiGeneration(workspace.paths.wiki, path.join(generationRoot, "wiki"))
+  const pages = await annotateGenerationPages(workspace, await snapshotWikiGeneration(workspace.paths.wiki, path.join(generationRoot, "wiki")))
   const pageSourceRefsArtifact = { schemaVersion: 1, pages: pageSourceRefs }
   const retrievalIndexes = await buildRetrievalIndexes(workspace, { wikiRoot: workspace.paths.wiki })
+  const compactEmbedding = compactEmbeddingArtifact(retrievalIndexes.embedding)
+  const compactFeatureHash = compactEmbeddingArtifact(retrievalIndexes.featureHash, "feature-hash.f32")
   const graph = await buildGraph(workspace.paths.wiki)
   const lint = await lintWiki(workspace)
   const values = {
     "page-source-refs.json": pageSourceRefsArtifact,
     "bm25.json": retrievalIndexes.bm25,
-    "vector.json": retrievalIndexes.vector,
-    "embedding.json": retrievalIndexes.embedding,
+    "feature-hash.json": compactFeatureHash.metadata,
+    "embedding.json": compactEmbedding.metadata,
     "graph.json": graph,
     "lint.json": lint,
   }
@@ -4186,6 +4494,12 @@ async function buildGenerationArtifacts(workspace, { generationId, taskId, pageS
     await writeJsonAtomic(artifactPath, value)
     artifacts[name] = { path: name, sha256: await sha256File(artifactPath) }
   }
+  const embeddingVectorPath = path.join(generationRoot, compactEmbedding.metadata.vector_path)
+  await writeBufferAtomic(embeddingVectorPath, compactEmbedding.buffer)
+  artifacts[compactEmbedding.metadata.vector_path] = { path: compactEmbedding.metadata.vector_path, sha256: await sha256File(embeddingVectorPath) }
+  const featureVectorPath = path.join(generationRoot, compactFeatureHash.metadata.vector_path)
+  await writeBufferAtomic(featureVectorPath, compactFeatureHash.buffer)
+  artifacts[compactFeatureHash.metadata.vector_path] = { path: compactFeatureHash.metadata.vector_path, sha256: await sha256File(featureVectorPath) }
   const manifestPath = path.join(generationRoot, "manifest.json")
   await writeJsonAtomic(manifestPath, {
     schemaVersion: 1,
@@ -4197,14 +4511,6 @@ async function buildGenerationArtifacts(workspace, { generationId, taskId, pageS
     artifacts,
   })
   const manifestSha256 = await sha256File(manifestPath)
-  // Preserve the V1.0.1 fixed-path projection for older readers. The
-  // generation pointer is published by the caller only after these writes.
-  await writeJsonAtomic(path.join(workspace.paths.indexes, "page-source-refs.json"), pageSourceRefsArtifact)
-  await writeJsonAtomic(path.join(workspace.paths.indexes, "bm25.json"), retrievalIndexes.bm25)
-  await writeJsonAtomic(path.join(workspace.paths.indexes, "vector.json"), retrievalIndexes.vector)
-  await writeJsonAtomic(path.join(workspace.paths.indexes, "embedding.json"), retrievalIndexes.embedding)
-  await writeJsonAtomic(path.join(workspace.paths.indexes, "graph.json"), graph)
-  await writeJsonAtomic(path.join(workspace.paths.state, "lint.json"), lint)
   return { generationRoot, wikiRevision, manifestSha256, retrievalIndexes, lint, artifacts }
 }
 
@@ -4325,14 +4631,19 @@ function derivePageRequirements(analyses, domainSchema = null, domainSchemaMetad
     const title = candidateTitle(candidate)
     if (!title) return null
     const normalizedTitle = canonicalPageSlug(title)
-    const requirementId = `page-${sha256(normalizedTitle).slice(0, 20)}`
+    const requirementKey = typeof candidate.requirementKey === "string" && candidate.requirementKey
+      ? `${normalizedTitle}:${candidate.requirementKey}`
+      : normalizedTitle
+    const requirementId = `page-${sha256(requirementKey).slice(0, 20)}`
     const normalizedKind = normalizePageKind(pageKind) ?? "topic"
     const previous = requirements.get(requirementId)
     const requirement = previous ?? {
       requirement_id: requirementId,
       title,
       page_kind: normalizedKind,
-      preferred_path: preferredPagePath(normalizedKind, title),
+      preferred_path: typeof candidate.preferredPath === "string" && candidate.preferredPath
+        ? candidate.preferredPath
+        : preferredPagePath(normalizedKind, title),
       recommended_sections: recommendedSections(normalizedKind),
       source_refs: [],
       collections: [],
@@ -4370,6 +4681,32 @@ function derivePageRequirements(analyses, domainSchema = null, domainSchemaMetad
     for (const concept of analysis.concepts ?? []) ensureRequirement(concept, "concept", "concepts", analysis.batchId)
     for (const candidate of analysis.candidatePages ?? []) {
       ensureRequirement(candidate, candidate.pageKind ?? candidate.page_kind ?? "topic", "candidatePages", analysis.batchId, true)
+    }
+    const semanticCollections = [
+      ["claims", analysis.claims ?? [], "Claim", "finding", "wiki/findings"],
+      ["relations", analysis.relations ?? [], "Relationship", "finding", "wiki/findings"],
+      ["contradictions", analysis.contradictions ?? [], "Contradiction", "finding", "wiki/findings"],
+      ["reviewItems", analysis.reviewItems ?? [], "Review Item", "finding", "wiki/findings"],
+      ["unresolvedQuestions", analysis.unresolvedQuestions ?? [], "Open Question", "query", "wiki/queries"],
+    ]
+    for (const [collection, items, label, pageKind, root] of semanticCollections) {
+      for (const [index, item] of items.entries()) {
+        const object = item && typeof item === "object" ? item : { content: String(item ?? "") }
+        const content = String(object.text ?? object.content ?? object.reason ?? object.question ?? stableStringify(object)).trim()
+        if (!content) continue
+        const semanticHash = sha256(`${analysis.batchId}:${collection}:${object.localId ?? object.local_id ?? index}:${content}`).slice(0, 20)
+        const concise = content.replace(/\s+/g, " ").slice(0, 96)
+        ensureRequirement({
+          ...object,
+          confidence: undefined,
+          title: `${label}: ${concise}`,
+          preferredPath: `${root}/${collection.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}-${semanticHash}.md`,
+          requirementKey: semanticHash,
+          sourceRefs: Array.isArray(object.sourceRefs) && object.sourceRefs.length > 0
+            ? object.sourceRefs
+            : analysis.sourceRefs ?? [],
+        }, pageKind, collection, analysis.batchId, true)
+      }
     }
   }
 
@@ -4415,7 +4752,11 @@ function pageRequirementsWithPatchScaffolds(requirements, existingPages) {
       patch_scaffold: {
         patchId: `patch-${requirement.requirement_id}`,
         path: existing?.path ?? requirement.preferred_path,
-        operation: existing ? "replace" : "create",
+        // Merge is the safe authoritative default for an existing page. A
+        // drafter may receive only a bounded excerpt, so replace would allow
+        // unseen grounded sections to be deleted. Section-specific rewrites
+        // continue to use updatePages with an expected full-page hash.
+        operation: existing ? "merge" : "create",
         ...(existing ? { expectedFileHash: existing.file_hash } : {}),
         title: requirement.title,
         pageKind: normalizePageKind(existing?.page_kind) ?? pageKindForPath(existing?.path) ?? requirement.page_kind,
@@ -4728,9 +5069,9 @@ function paginatePagePlanThroughCursor(context, requestedCursor, nextCursor) {
   }
 }
 
-function normalizePagePlanView(value, projectionRequested) {
-  if (value === undefined || value === null || value === "") return projectionRequested ? "plan" : "plan"
-  if (!["plan", "manifest", "draft-shard"].includes(value)) fail("INVALID_INPUT", "view must be plan, manifest, or draft-shard.")
+function normalizePagePlanView(value) {
+  if (value === undefined || value === null || value === "") return "internal-plan"
+  if (!["manifest", "draft-shard"].includes(value)) fail("INVALID_INPUT", "view must be manifest or draft-shard.")
   return value
 }
 
@@ -4976,13 +5317,36 @@ async function findEquivalentTask(workspace, buildKey) {
 }
 
 function statusResponse(task) {
+  if (["importing", "parsing"].includes(task.status)) {
+    const progress = task.importProgress ?? { accepted: 0, parsed: 0, bm25Indexed: 0, embeddingIndexed: 0, failed: 0, complete: false }
+    return {
+      task_id: task.taskId,
+      status: task.status,
+      completed_batches: 0,
+      total_batches: task.batchCount,
+      retrieval_readiness: {
+        state: task.status,
+        sources: {
+          accepted: progress.accepted,
+          parsed: progress.parsed,
+          bm25_indexed: progress.bm25Indexed,
+          embedding_indexed: progress.embeddingIndexed,
+          failed: progress.failed,
+          by_source: progress.sources ?? [],
+        },
+        complete: progress.complete === true,
+      },
+      parallel_extraction: { enabled: false, required: false, recommended_workers: 0, max_workers: task.options?.maxBackgroundAgents ?? 3 },
+      next_action: { tool: "llm_wiki_retrieve_context", arguments: { task_id: task.taskId, queries: ["current source question"] } },
+    }
+  }
   const wikiProjection = pageProjectionStatus(task)
   const remainingBatches = Math.max(0, task.batchCount - task.completedBatchIds.length)
   const extractionOverlaps = !wikiProjection.projection_complete
     && !wikiProjection.final_completed
     && (wikiProjection.in_progress || wikiProjection.ready)
     && remainingBatches > 0
-  const pipelineConcurrency = pipelineConcurrencyPlan({ remainingBatches, extractionOverlaps })
+  const pipelineConcurrency = pipelineConcurrencyPlan({ remainingBatches, extractionOverlaps, maxBackgroundAgents: task.options?.maxBackgroundAgents })
   const recommendedWorkers = pipelineConcurrency.recommended_extractors
   const workerLeases = Object.entries(validBatchLeases(task)).map(([batchId, lease]) => ({
     worker_id: lease.workerId,
@@ -4997,6 +5361,22 @@ function statusResponse(task) {
     total_batches: task.batchCount,
     leased_batches: workerLeases.length,
     leased_batches_semantics: "persisted-reservations-not-live-agents",
+    retrieval_readiness: {
+      state: task.status === "completed" ? "knowledge-base-complete" : "source-ready",
+      sources: {
+        accepted: task.sourceIds.length,
+        parsed: task.sourceIds.length,
+        bm25_indexed: task.sourceIds.length,
+        embedding_indexed_documents: Number(task.importProgress?.embeddingIndexed) || 0,
+        failed: Number(task.importProgress?.failed) || 0,
+        by_source: task.importProgress?.sources ?? task.sourceIds.map((sourceId) => ({ source_id: sourceId, state: "bm25-ready" })),
+      },
+      channels: {
+        bm25: { ready: true, complete: true },
+        embedding: { ready: (Number(task.importProgress?.embeddingIndexed) || 0) > 0, complete: false },
+        wiki: { ready: task.status === "completed", complete: task.status === "completed" },
+      },
+    },
     parallel_extraction: {
       enabled: remainingBatches > 0,
       required: remainingBatches > 0,
@@ -5004,7 +5384,7 @@ function statusResponse(task) {
       coordinator_direct_extraction: "fallback-only-after-worker-failure",
       single_batch_background: remainingBatches === 1,
       recommended_workers: recommendedWorkers,
-      max_workers: 4,
+      max_workers: pipelineConcurrency.max_background_agents_total,
       max_background_agents_total: pipelineConcurrency.max_background_agents_total,
       extraction_workers_during_drafting: pipelineConcurrency.recommended_extractors,
       worker_batch_quantum: recommendedWorkerBatchQuantum(remainingBatches, recommendedWorkers),
@@ -5079,7 +5459,7 @@ function projectionAction(task, wikiProjection = pageProjectionStatus(task)) {
       tool: "llm_wiki_commit_pages",
       action_owner: "writer",
       delegate_to: "llm-wiki-writer",
-      execution_mode: "legacy-plan-compatibility",
+      execution_mode: "bounded-plan-commit",
       arguments: {
         task_id: task.taskId,
         writer_id: lease.writerId,

@@ -55,7 +55,60 @@ export function taskPaths(workspacePaths, taskId) {
     domainSchemaRoot: path.join(root, "domain-schema"),
     pagePlan: path.join(root, "page-plan.json"),
     pageDrafts: path.join(root, "page-drafts"),
+    importRequest: path.join(root, "import-request.json"),
+    retrievalIndex: path.join(root, "retrieval-index.json"),
+    featureHashVectors: path.join(root, "feature-hash.f32"),
   }
+}
+
+export async function updateImportTask(workspace, taskId, sources, options = {}) {
+  const record = await loadTask(workspace.paths, taskId)
+  if (!record.task || !["importing", "parsing", "prepared"].includes(record.task.status)) {
+    fail("INVALID_TASK_STATE", "Only an importing task can accept progressive source updates.")
+  }
+  const maxChunkChars = Math.min(workspace.config.limits.maxChunkChars, MAX_AGENT_CHUNK_CHARS)
+  const totalSourceChars = sources.flatMap((source) => source.chunks)
+    .reduce((sum, chunk) => sum + (typeof chunk?.text === "string" ? chunk.text.length : 0), 0)
+  const adaptiveBatchChars = totalSourceChars >= LARGE_TASK_SOURCE_CHARS ? LARGE_AGENT_BATCH_CHARS : DEFAULT_AGENT_BATCH_CHARS
+  const requestedBatchChars = Number(options.maxBatchChars)
+  const maxBatchChars = Number.isFinite(requestedBatchChars)
+    ? Math.min(Math.max(requestedBatchChars, 1_000), workspace.config.limits.maxBatchChars, MAX_AGENT_BATCH_CHARS)
+    : Math.min(workspace.config.limits.maxBatchChars, adaptiveBatchChars)
+  const maxBatchPayloadBytes = batchPayloadLimit(maxBatchChars)
+  const allChunks = boundTaskChunks(
+    sources.flatMap((source) => source.chunks),
+    Math.min(maxChunkChars, maxBatchChars),
+    Math.min(MAX_TASK_CHUNK_PAYLOAD_BYTES, maxBatchPayloadBytes),
+  )
+  const batches = makeBatches(taskId, allChunks, maxBatchChars)
+  record.task.sourceIds = sources.map((source) => source.source_id)
+  record.task.sourceSnapshotHash = sha256(stableStringify(sources.map((source) => ({ sourceId: source.source_id, hash: source.content_hash }))))
+  record.task.batchCount = batches.length
+  record.task.batchBounds = batchBoundsRecord(maxChunkChars, maxBatchChars, maxBatchPayloadBytes)
+  record.task.options = { ...record.task.options, maxChunkChars, maxBatchChars }
+  record.task.importProgress = {
+    accepted: sources.length,
+    parsed: sources.length,
+    bm25Indexed: sources.length,
+    embeddingIndexed: Number(record.task.importProgress?.embeddingIndexed) || 0,
+    failed: Number(options.failed) || 0,
+    complete: options.complete === true,
+    updatedAt: nowIso(),
+    sources: (record.task.importProgress?.sources ?? []).map((state) => {
+      const parsed = sources.find((source) => source.display_name === state.display_name)
+      return parsed ? { display_name: state.display_name, source_id: parsed.source_id, state: "bm25-ready", chunk_count: parsed.chunks.length } : state
+    }),
+  }
+  record.task.status = options.complete === true ? "prepared" : "parsing"
+  if (options.complete === true) {
+    record.task.buildKey = taskBuildKey(record.task.sourceIds, record.task.domainSchema?.hash ?? null, record.task.options.targetLanguage)
+    record.task.importCompletedAt = nowIso()
+  }
+  record.batches = batches
+  await writeJsonAtomic(record.paths.batches, batches)
+  batchFileCache.delete(record.paths.batches)
+  await saveTask(record.paths, record.task)
+  return record
 }
 
 export async function createTask(workspace, sources, options = {}) {
@@ -135,6 +188,9 @@ export async function createTask(workspace, sources, options = {}) {
       enableBm25: true,
       enableVector: true,
       enableGraph: true,
+      maxTotalAgents: options.hostCapabilities?.maxTotalAgents ?? 4,
+      coordinatorSlots: options.hostCapabilities?.coordinatorSlots ?? 1,
+      maxBackgroundAgents: options.hostCapabilities?.maxBackgroundAgents ?? 3,
     },
   }
   if (options.domainSchema) {

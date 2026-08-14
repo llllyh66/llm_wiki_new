@@ -4,6 +4,7 @@ import { lstat, open, rename, rm } from "node:fs/promises"
 import path from "node:path"
 import { LlmWikiError, fail } from "./errors.js"
 import { parseManagedSource, SUPPORTED_SOURCE_TYPES } from "./parser.js"
+import { createOcrSession } from "./ocr.js"
 import {
   cleanDisplayName,
   ensureDir,
@@ -17,30 +18,37 @@ import {
   writeTextAtomic,
 } from "./utils.js"
 
-export async function importSources(workspace, files) {
+export async function importSources(workspace, files, options = {}) {
   if (!Array.isArray(files) || files.length === 0) {
     fail("INVALID_INPUT", "files must contain at least one local file path.")
   }
   const accepted = []
   const duplicates = []
   const rejected = []
-  for (const input of files) {
-    const displayName = cleanDisplayName(input?.display_name ?? input?.displayName, path.basename(String(input?.path ?? "source")))
-    try {
-      const result = await importOne(workspace, input, displayName)
-      if (result.disposition === "duplicate") duplicates.push(result)
-      else accepted.push(result)
-    } catch (error) {
-      const normalized = error instanceof LlmWikiError
-        ? error
-        : new LlmWikiError("SOURCE_IMPORT_FAILED", error instanceof Error ? error.message : String(error))
-      rejected.push({ display_name: displayName, ...normalized.toJSON() })
+  const ocrSession = createOcrSession()
+  try {
+    for (const input of files) {
+      const displayName = cleanDisplayName(input?.display_name ?? input?.displayName, path.basename(String(input?.path ?? "source")))
+      try {
+        options.signal?.throwIfAborted()
+        const result = await importOne(workspace, input, displayName, { ocrSession, signal: options.signal })
+        if (result.disposition === "duplicate") duplicates.push(result)
+        else accepted.push(result)
+        if (typeof options.onSource === "function") await options.onSource(result, { accepted, duplicates, rejected })
+      } catch (error) {
+        const normalized = error instanceof LlmWikiError
+          ? error
+          : new LlmWikiError("SOURCE_IMPORT_FAILED", error instanceof Error ? error.message : String(error))
+        rejected.push({ display_name: displayName, ...normalized.toJSON() })
+      }
     }
+  } finally {
+    await ocrSession.terminate()
   }
   return { accepted, duplicates, rejected, all: [...accepted, ...duplicates] }
 }
 
-async function importOne(workspace, input, displayName) {
+async function importOne(workspace, input, displayName, options = {}) {
   if (!input || typeof input.path !== "string" || !input.path.trim()) {
     fail("ATTACHMENT_NOT_MATERIALIZED", "The attachment does not have a readable local path.", {
       retryable: true,
@@ -70,6 +78,7 @@ async function importOne(workspace, input, displayName) {
   const mediaType = SUPPORTED_SOURCE_TYPES[extension]
   if (!mediaType) {
     if (extension === ".xls") fail("UNSUPPORTED_FILE_TYPE", "Legacy .xls workbooks are not supported; save the workbook as .xlsx and retry.")
+    if (extension === ".ppt") fail("UNSUPPORTED_FILE_TYPE", "Legacy .ppt presentations are not supported; save the presentation as .pptx and retry.")
     fail("UNSUPPORTED_FILE_TYPE", `Unsupported file type: ${extension || "unknown"}`)
   }
   if (linkInfo.size > workspace.config.limits.maxSourceBytes) {
@@ -137,7 +146,7 @@ async function importOne(workspace, input, displayName) {
         managedPath,
         sourceId,
         mediaType,
-        { maxChunkChars: workspace.config.limits.maxChunkChars },
+        { maxChunkChars: workspace.config.limits.maxChunkChars, ocrSession: options.ocrSession, signal: options.signal },
       )
       const documentPath = path.join(extractedDir, "document.json")
       const markdownPath = path.join(extractedDir, "document.md")
@@ -155,7 +164,7 @@ async function importOne(workspace, input, displayName) {
         sizeBytes,
         importedAt: nowIso(),
         originalLocationHint: stripPrivateLocation(sourcePath),
-        parserVersion: "headless-document-v3",
+        parserVersion: "headless-document-v4-ocr",
         extractedDocumentPath: relativePosix(workspace.paths.root, documentPath),
         chunksPath: relativePosix(workspace.paths.root, chunksPath),
         extractionHash: sha256(parsed.markdown),

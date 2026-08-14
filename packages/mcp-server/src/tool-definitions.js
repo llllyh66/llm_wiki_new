@@ -36,12 +36,13 @@ const commitAnalysisInputSchema = closedObject({
   task_id: taskId,
   batch_id: { type: "string" },
   worker_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
+  lease_token: { type: "string", minLength: 1, maxLength: 200 },
   analysis: {
     ...commitAnalysisContract.shape,
     description: "Copy get_batch.analysis_scaffold first, then fill semantic arrays. Keep numeric confidence values, sourceRefMode, the numeric top-level evidence catalog, and candidate evidence_index sourceRefs.",
   },
   idempotency_key: { type: "string", minLength: 8, maxLength: 200 },
-}, ["task_id", "batch_id", "analysis", "idempotency_key"])
+}, ["task_id", "batch_id", "worker_id", "lease_token", "analysis", "idempotency_key"])
 commitAnalysisInputSchema.$defs = commitAnalysisContract.definitions
 const stagedDraftReceipt = closedObject({
   shard_id: { type: "string", pattern: "^draft-[0-9]{4,}$" },
@@ -78,7 +79,7 @@ const domainPageFilters = closedObject({
 const toolDefinitions = [
   {
     name: "llm_wiki_import_files",
-    description: "Import Agent-visible supported documents, including XLSX workbooks, into the current workspace's managed source store, parse and batch them, and create or resume a build-equivalent task. Equivalent active source+Schema+language imports return reused_task=true instead of creating competing provisional publishers. Initializes the workspace automatically. The result requires background-agent-first extraction even when batch_count=1; the main Agent should coordinate and not call get_batch directly unless a worker creation or transport failure is recorded.",
+    description: "Import Agent-visible supported documents, including PDF, PowerPoint, images with OCR, and XLSX workbooks, into the current workspace's managed source store, parse and batch them, and create or resume a build-equivalent task. Equivalent active source+Schema+language imports return reused_task=true instead of creating competing provisional publishers. Initializes the workspace automatically. The result requires background-agent-first extraction even when batch_count=1; the main Agent should coordinate and not call get_batch directly unless a worker creation or transport failure is recorded.",
     inputSchema: closedObject({
       files: {
         type: "array", minItems: 1, maxItems: 100,
@@ -88,7 +89,12 @@ const toolDefinitions = [
         target_language: { type: "string" },
         force_reanalyze: { type: "boolean", description: "Create a new equivalent task only after any matching task is terminal. Active equivalent tasks must be resumed and cannot be duplicated." },
         max_batch_chars: { type: "number", minimum: 1000, maximum: 24000 },
+        progressive_import: { type: "boolean", description: "Return a durable task immediately, then parse and publish ready source chunks progressively. Use true for interactive imports." },
         domain_schema_path: { type: "string", description: "Agent-visible path to a progressive-directory-v2 Domain Schema directory. The validated directory is snapshotted into the task." },
+        host_capabilities: closedObject({
+          max_total_agents: { type: "integer", minimum: 1, maximum: 32 },
+          coordinator_slots: { type: "integer", minimum: 1, maximum: 32 },
+        }, ["max_total_agents", "coordinator_slots"]),
       }),
     }, ["files"]),
   },
@@ -113,13 +119,25 @@ const toolDefinitions = [
     }, ["task_id"]),
   },
   {
+    name: "llm_wiki_renew_lease",
+    description: "Renew one active extraction or projection lease. Extraction requires batch_id, worker_id, and lease_token; projection requires projection_id and writer_id. Total lease lifetime is bounded.",
+    inputSchema: closedObject({
+      task_id: taskId,
+      batch_id: { type: "string", minLength: 1, maxLength: 100 },
+      worker_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
+      lease_token: { type: "string", minLength: 1, maxLength: 200 },
+      projection_id: { type: "string", minLength: 1, maxLength: 100 },
+      writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
+    }, ["task_id"]),
+  },
+  {
     name: "llm_wiki_retrieve_context",
     description: "Search the llm_wiki knowledge base for evidence needed to answer a user's question. Call this before answering factual questions about imported documents or generated Wiki content, even when an answer appears in prior conversation context. Returns relevant source chunks, committed analysis, and stable Wiki sections with identifiers and locators. Omit batch_id for normal task-wide questions; supply it only to prioritize one extractor batch. Results use BM25 plus Embedding while building and add Wiki title, path, and link-graph recall after completion.",
     inputSchema: closedObject({
       task_id: taskId,
       batch_id: { type: "string" },
       queries: { type: "array", minItems: 1, maxItems: 20, items: { type: "string", minLength: 1, maxLength: 2000 } },
-      channels: { type: "array", items: { enum: ["bm25", "embedding", "wiki", "vector", "graph"] }, description: "Use bm25, embedding, and wiki. vector and graph are backward-compatible aliases." },
+      channels: { type: "array", items: { enum: ["bm25", "embedding", "wiki"] }, description: "Use exact channel names: bm25 and embedding while building; wiki becomes available from the published generation after completion." },
       limit: { type: "number", minimum: 1, maximum: 100 },
       max_chars: { type: "number", minimum: 1000, maximum: 120000 },
     }, ["task_id", "queries"]),
@@ -147,26 +165,16 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_page_plan_context",
-    description: "Coordinator-owned projection tool. For parallel drafting, the main coordinator calls view=manifest, then delegates each returned draft-shard action to one llm-wiki-page-drafter (up to four). Each Drafter fetches its own bounded context and stages a hash-bound receipt. In normal mode the stable Writer never calls manifest or draft-shard and is launched only after receipts exist; it is the sole committer and uses staged_draft_receipts with patches:[]. Serial Writer drafting is an explicit fallback only after Drafter creation fails. Legacy view=plan remains for compatibility.",
+    description: "Coordinator-owned projection tool. The coordinator calls view=manifest, delegates bounded path-disjoint draft-shard actions within reported host capacity, and starts the sole Writer only after hash-bound staged receipts exist.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
       projection_id: { type: "string", minLength: 1, maxLength: 100 },
-      view: { enum: ["plan", "manifest", "draft-shard"], description: "Use manifest first, then draft-shard with a returned shard_id. plan is the legacy whole-plan cursor protocol." },
+      view: { enum: ["manifest", "draft-shard"], description: "Use manifest first, then draft-shard with a returned shard_id." },
       shard_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^draft-[0-9]{4,}$" },
       cursor: { type: ["integer", "null"], minimum: 0 },
       max_chars: { type: "integer", minimum: 20000, maximum: 200000 },
-    }, ["task_id"]),
-  },
-  {
-    name: "llm_wiki_apply_projection",
-    description: "Coordinator-only compatibility entrypoint that acquires or resumes a projection and returns its compact server-side draft manifest. It never writes pages and its returned shard actions belong to coordinator-launched Drafters, not the Writer.",
-    inputSchema: closedObject({
-      task_id: taskId,
-      writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },
-      projection_id: { type: "string", minLength: 1, maxLength: 100, description: "Resume an existing projection lease. Omit to acquire the next ready projection." },
-      max_projections: { type: "integer", minimum: 1, maximum: 24, description: "Legacy coordinator hint retained for compatibility; the call returns one compact manifest and the coordinator follows its next_action." },
-    }, ["task_id"]),
+    }, ["task_id", "writer_id", "view"]),
   },
   {
     name: "llm_wiki_stage_page_drafts",
@@ -199,7 +207,6 @@ const toolDefinitions = [
       projection_id: { type: "string", minLength: 1, maxLength: 100 },
       projection_complete: { type: "boolean", description: "Set false when more bounded patch commits remain for this projection. Omit or true on the final commit, including an empty acknowledgement." },
       draft_shard_ids: { type: "array", minItems: 1, maxItems: 8, uniqueItems: true, items: { type: "string", pattern: "^draft-[0-9]{4,}$" }, description: "For projection_complete=false manifest waves, copy the shard IDs from the returned commit action." },
-      staged_draft_shard_ids: { type: "array", minItems: 1, maxItems: 8, uniqueItems: true, items: { type: "string", pattern: "^draft-[0-9]{4,}$" }, description: "Deprecated bare-ID compatibility form. Current Writers use staged_draft_receipts so the accepted draft hash is verified." },
       staged_draft_receipts: { type: "array", minItems: 1, maxItems: 8, items: stagedDraftReceipt, description: "Hash-bound server-side draft receipts returned by llm_wiki_get_staged_page_drafts. Current staged commits use this instead of bare shard IDs." },
       based_on_wiki_revision: { type: "string", pattern: "^[0-9a-f]{64}$" },
       patches: { type: "array", minItems: 0, maxItems: 50, items: { type: "object" } },

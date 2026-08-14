@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises"
+import { access, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
@@ -26,6 +26,15 @@ An Aggregate groups related Business Entities.
   await writeFile(source, content)
   const core = await LlmWikiCore.open(workspace)
   return { root, workspace, incoming, source, content, core }
+}
+
+async function publishTestWiki(workspace, suffix) {
+  const generationId = `generation-00000000-0000-4000-8000-${String(suffix).padStart(12, "0")}`
+  const generationRoot = path.join(workspace, ".llm-wiki", "generations", generationId)
+  await mkdir(generationRoot, { recursive: true })
+  await cp(path.join(workspace, "wiki"), path.join(generationRoot, "wiki"), { recursive: true })
+  await writeFile(path.join(generationRoot, "manifest.json"), JSON.stringify({ schemaVersion: 1, generationId, taskId: "task-test-published", wikiRevision: `wiki-${suffix}`, pages: [], artifacts: {} }))
+  await writeFile(path.join(workspace, ".llm-wiki", "current-generation.json"), JSON.stringify({ schema_version: 1, generation_id: generationId }))
 }
 
 function analysisFor(taskId, batch) {
@@ -343,11 +352,15 @@ test("real embedding recall is cached and endpoint failures degrade without fail
     }), { status: 200, headers: { "content-type": "application/json" } })
   }
   const endpoint = "http://embedding.test/v1/embeddings"
-  const imported = await f.core.importFiles({ files: [{ path: semanticSource }] })
+  await f.core.init()
   const configPath = path.join(f.workspace, ".llm-wiki", "config.json")
   const config = JSON.parse(await readFile(configPath, "utf8"))
   config.retrieval.embedding = { provider: "openai-compatible", model: "test-embedding", endpoint, batchSize: 8, maxDocuments: 100 }
   await writeFile(configPath, JSON.stringify(config))
+  const imported = await f.core.importFiles({ files: [{ path: semanticSource }] })
+  for (let attempt = 0; attempt < 50 && requests === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
   const batch = await f.core.getBatch({ task_id: imported.task_id })
 
   const first = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: batch.batch_id, queries: ["car"], channels: ["bm25", "embedding", "wiki"] })
@@ -361,26 +374,26 @@ test("real embedding recall is cached and endpoint failures degrade without fail
 
   endpointMalformed = "empty"
   const malformed = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: batch.batch_id, queries: ["car"], channels: ["embedding"] })
-  assert.equal(malformed.channel_status.embedding.mode, "feature-hash-fallback")
-  assert.equal(malformed.channel_status.embedding.reason, "EMBEDDING_INVALID_RESPONSE")
+  assert.equal(malformed.channel_status.feature_hash.mode, "feature-hash-fallback")
+  assert.equal(malformed.channel_status.feature_hash.reason, "EMBEDDING_INVALID_RESPONSE")
 
   endpointMalformed = "bad-index"
   const malformedIndex = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: batch.batch_id, queries: ["car"], channels: ["embedding"] })
-  assert.equal(malformedIndex.channel_status.embedding.mode, "feature-hash-fallback")
-  assert.equal(malformedIndex.channel_status.embedding.reason, "EMBEDDING_INVALID_RESPONSE")
+  assert.equal(malformedIndex.channel_status.feature_hash.mode, "feature-hash-fallback")
+  assert.equal(malformedIndex.channel_status.feature_hash.reason, "EMBEDDING_INVALID_RESPONSE")
 
   endpointMalformed = false
   endpointUnavailable = true
   const degraded = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: batch.batch_id, queries: ["car"], channels: ["embedding"] })
-  assert.equal(degraded.channel_status.embedding.mode, "feature-hash-fallback")
-  assert.equal(degraded.channel_status.embedding.degraded, true)
+  assert.equal(degraded.channel_status.feature_hash.mode, "feature-hash-fallback")
+  assert.equal(degraded.channel_status.feature_hash.degraded, true)
   assert.equal(Array.isArray(degraded.hits), true)
 
   endpointUnavailable = false
   endpointNonStreaming = true
   const nonStreaming = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: batch.batch_id, queries: ["car"], channels: ["embedding"] })
-  assert.equal(nonStreaming.channel_status.embedding.mode, "feature-hash-fallback")
-  assert.equal(nonStreaming.channel_status.embedding.reason, "EMBEDDING_INVALID_RESPONSE")
+  assert.equal(nonStreaming.channel_status.feature_hash.mode, "feature-hash-fallback")
+  assert.equal(nonStreaming.channel_status.feature_hash.reason, "EMBEDDING_INVALID_RESPONSE")
 })
 
 test("Wiki title and bidirectional link neighbors participate in RRF", async (t) => {
@@ -390,6 +403,7 @@ test("Wiki title and bidirectional link neighbors participate in RRF", async (t)
   await mkdir(topics, { recursive: true })
   await writeFile(path.join(topics, "alpha.md"), "# AlphaTerm\n\nSee [[topics/hidden-neighbor]].\n")
   await writeFile(path.join(topics, "hidden-neighbor.md"), "# Hidden Neighbor\n\nLinked background knowledge.\n")
+  await publishTestWiki(f.workspace, 2)
   const imported = await f.core.importFiles({ files: [{ path: f.source }] })
   const batch = await f.core.getBatch({ task_id: imported.task_id })
   const retrieval = await f.core.retrieveContext({
@@ -411,6 +425,7 @@ test("Wiki retrieval graph ignores links inside Markdown code examples", async (
   await mkdir(topics, { recursive: true })
   await writeFile(path.join(topics, "alpha.md"), "# AlphaCodeExample\n\n```markdown\n[[topics/hidden-neighbor]]\n```\n")
   await writeFile(path.join(topics, "hidden-neighbor.md"), "# Hidden Neighbor\n\nUnrelated background knowledge.\n")
+  await publishTestWiki(f.workspace, 3)
   const imported = await f.core.importFiles({ files: [{ path: f.source }] })
   const batch = await f.core.getBatch({ task_id: imported.task_id })
   const retrieval = await f.core.retrieveContext({
@@ -437,7 +452,7 @@ test("page planning resolves safe cross-batch local IDs into bidirectional Relat
   assert.equal(imported.batch_count >= 2, true)
 
   while (true) {
-    const batch = await f.core.getBatch({ task_id: imported.task_id })
+    const batch = await f.core.getBatch({ task_id: imported.task_id, worker_id: "cross-batch-worker" })
     if (batch.completed) break
     const alphaEvidence = batch.evidence_catalog.find((entry) => entry.quote.includes("Alpha service is defined"))
     const betaEvidence = batch.evidence_catalog.find((entry) => entry.quote.includes("Beta depends on Alpha service"))
@@ -458,6 +473,8 @@ test("page planning resolves safe cross-batch local IDs into bidirectional Relat
     const committed = await f.core.commitAnalysis({
       task_id: imported.task_id,
       batch_id: batch.batch_id,
+      worker_id: batch.worker_id,
+      lease_token: batch.lease_token,
       analysis,
       idempotency_key: `cross-batch-related-${batch.batch_id}`,
     })
@@ -490,18 +507,23 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
 
   const sourceRef = await analyzeAll(f.core, imported)
   const buildingRetrieval = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["Business Entity"] })
-  assert.equal(buildingRetrieval.retrieval_phase, "building")
-  assert.deepEqual(buildingRetrieval.available_channels, ["bm25", "embedding"])
-  const retrieval = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: "batch-0001", queries: ["Business Entity"], channels: ["bm25", "vector", "graph"] })
-  assert.deepEqual(retrieval.available_channels, ["bm25", "vector", "graph"])
-  assert.deepEqual(retrieval.pending_channels, [])
+  assert.equal(buildingRetrieval.retrieval_phase, "source-ready")
+  assert.deepEqual(buildingRetrieval.available_channels, ["bm25"])
+  assert.deepEqual(buildingRetrieval.fallback_channels, ["feature_hash"])
+  const retrieval = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: "batch-0001", queries: ["Business Entity"], channels: ["bm25", "embedding", "wiki"] })
+  assert.deepEqual(retrieval.available_channels, ["bm25"])
+  assert.deepEqual(retrieval.pending_channels, ["embedding", "wiki"])
+  assert.deepEqual(retrieval.fallback_channels, ["feature_hash"])
 
   const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
   assert.equal(plan.analysis_summary.claims.length, 1)
   assert.equal(plan.page_patch_schema.properties.path.type, "string")
-  assert.deepEqual(plan.page_requirements.map((requirement) => requirement.title).sort(), ["Aggregate", "Business Entity"])
+  assert.equal(plan.page_requirements.some((requirement) => requirement.title === "Aggregate"), true)
+  assert.equal(plan.page_requirements.some((requirement) => requirement.title === "Business Entity"), true)
+  assert.equal(plan.page_requirements.some((requirement) => requirement.title.startsWith("Claim: Business Entity is the canonical business object.")), true)
   const businessRequirement = plan.page_requirements.find((requirement) => requirement.title === "Business Entity")
   const aggregateRequirement = plan.page_requirements.find((requirement) => requirement.title === "Aggregate")
+  const claimRequirement = plan.page_requirements.find((requirement) => requirement.title.startsWith("Claim: Business Entity is the canonical business object."))
   assert.deepEqual(businessRequirement.patch_scaffold.sourceRefs, [businessRequirement.requirement_id])
   assert.deepEqual(businessRequirement.patch_scaffold.covers, [businessRequirement.requirement_id])
   const committed = await f.core.commitPages({
@@ -534,15 +556,20 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
       covers: [aggregateRequirement.requirement_id],
       sourceRefs: [aggregateRequirement.requirement_id],
       rationale: "The source explicitly defines Aggregate.",
+    }, {
+      ...claimRequirement.patch_scaffold,
+      content: `# ${claimRequirement.title}\n\nBusiness Entity is the canonical business object.`,
+      summary: "The source's canonical Business Entity claim.",
+      tags: ["claim"],
     }],
   })
   assert.equal(committed.accepted, true)
-  assert.equal(committed.normalized_page_requirement_source_refs, 2)
+  assert.equal(committed.normalized_page_requirement_source_refs, 3)
 
   const result = await f.core.finalize({ task_id: imported.task_id })
   assert.equal(result.status, "completed")
   assert.equal(result.indexing.bm25, "completed")
-  assert.equal(result.indexing.vector, "completed")
+  assert.equal(result.indexing.feature_hash, "completed")
   assert.match(result.generation_id, /^generation-/)
   const generationPointer = JSON.parse(await readFile(path.join(f.workspace, ".llm-wiki", "current-generation.json"), "utf8"))
   assert.equal(generationPointer.generation_id, result.generation_id)
@@ -550,8 +577,10 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
   const generationManifest = JSON.parse(await readFile(path.join(f.workspace, ".llm-wiki", "generations", result.generation_id, "manifest.json"), "utf8"))
   assert.equal(generationManifest.wikiRevision, result.wiki_revision)
   assert.equal(generationManifest.taskId, imported.task_id)
-  assert.deepEqual(Object.keys(generationManifest.artifacts).sort(), ["bm25.json", "embedding.json", "graph.json", "lint.json", "page-source-refs.json", "vector.json"])
-  assert.deepEqual(result.created_pages, ["wiki/concepts/business-entity.md", "wiki/concepts/aggregate.md"])
+  assert.deepEqual(Object.keys(generationManifest.artifacts).sort(), ["bm25.json", "embedding.f32", "embedding.json", "feature-hash.f32", "feature-hash.json", "graph.json", "lint.json", "page-source-refs.json"])
+  assert.equal(result.created_pages.includes("wiki/concepts/business-entity.md"), true)
+  assert.equal(result.created_pages.includes("wiki/concepts/aggregate.md"), true)
+  assert.equal(result.created_pages.includes(claimRequirement.patch_scaffold.path), true)
   assert.equal((await f.core.status({ task_id: imported.task_id })).status, "completed")
   assert.match(await readFile(path.join(f.workspace, "wiki", "index.md"), "utf8"), /Business Entity/)
   assert.match(await readFile(path.join(f.workspace, "wiki", "index.md"), "utf8"), /## Concepts/)
@@ -567,7 +596,8 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
   assert.equal((await readFile(path.join(f.workspace, imported.sources[0].managed_path), "utf8")).includes("Product Model"), true)
   const completedRetrieval = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["Business Entity"] })
   assert.equal(completedRetrieval.retrieval_phase, "knowledge-base-complete")
-  assert.deepEqual(completedRetrieval.available_channels, ["bm25", "embedding", "wiki"])
+  assert.deepEqual(completedRetrieval.available_channels, ["bm25", "wiki"])
+  assert.deepEqual(completedRetrieval.fallback_channels, ["feature_hash"])
   const again = await f.core.finalize({ task_id: imported.task_id })
   assert.deepEqual(again, result)
 })
@@ -709,7 +739,10 @@ test("parallel workers lease distinct batches and concurrent commits preserve ev
     await writeFile(file, `# Parallel ${index}\n\n${"Business Entity is the canonical business object. Context. ".repeat(60)}\n`)
     files.push({ path: file })
   }
-  const imported = await f.core.importFiles({ files, options: { max_batch_chars: 1_000 } })
+  const imported = await f.core.importFiles({
+    files,
+    options: { max_batch_chars: 1_000, host_capabilities: { max_total_agents: 5, coordinator_slots: 1 } },
+  })
   assert.equal(imported.batch_count > 1, true)
   assert.equal(imported.parallel_extraction.recommended_workers, Math.min(4, imported.batch_count))
   assert.equal(imported.parallel_extraction.worker_batch_quantum, Math.min(6, Math.ceil(imported.batch_count / imported.parallel_extraction.recommended_workers)))
@@ -740,6 +773,7 @@ test("parallel workers lease distinct batches and concurrent commits preserve ev
       task_id: imported.task_id,
       batch_id: batch.batch_id,
       worker_id: batch.worker_id,
+      lease_token: batch.lease_token,
       idempotency_key: `parallel-analysis-${index}`,
       analysis: {
         schemaVersion: 1,
@@ -854,6 +888,7 @@ test("a smaller get_batch request never repartitions another worker's live lease
     task_id: imported.task_id,
     batch_id: first.batch_id,
     worker_id: "extractor-live-1",
+    lease_token: first.lease_token,
     idempotency_key: "lease-stability-commit-v1",
     analysis: {
       ...first.analysis_scaffold,
@@ -866,6 +901,7 @@ test("a smaller get_batch request never repartitions another worker's live lease
     task_id: imported.task_id,
     batch_id: first.batch_id,
     worker_id: "extractor-live-1",
+    lease_token: first.lease_token,
     idempotency_key: "lease-stability-commit-v1",
     analysis: {
       ...first.analysis_scaffold,
@@ -879,6 +915,7 @@ test("a smaller get_batch request never repartitions another worker's live lease
       task_id: imported.task_id,
       batch_id: first.batch_id,
       worker_id: "extractor-live-1",
+      lease_token: first.lease_token,
       idempotency_key: "lease-stability-commit-v1",
       analysis: { ...first.analysis_scaffold, batchSummary: "Changed request." },
     }),
@@ -905,13 +942,13 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
     fallback_mode: "serial-writer-only",
     writer_launch_policy: "after-staged-drafter-receipt",
     writer_normal_mode: "staged-receipt-commit-only",
-    max_drafters: 4,
+    max_drafters: 3,
     max_paths_per_shard: 6,
     minimum_paths: 4,
-    pipeline_background_budget: 4,
-    max_background_agents_total: 4,
+    pipeline_background_budget: 3,
+    max_background_agents_total: 3,
     extraction_workers_during_drafting: 2,
-    max_drafters_when_extraction_overlaps: 2,
+    max_drafters_when_extraction_overlaps: 1,
     partition_key: "patch_scaffold.path",
     drafter_handoff: "server-side-temporary-draft-receipt",
     stage_tool: "llm_wiki_stage_page_drafts",
@@ -933,6 +970,7 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
       task_id: imported.task_id,
       batch_id: batch.batch_id,
       worker_id: batch.worker_id,
+      lease_token: batch.lease_token,
       idempotency_key: `projection-analysis-${index}`,
       analysis: {
         schemaVersion: 1,
@@ -968,10 +1006,10 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(ready.next_action.tool, "llm_wiki_get_page_plan_context")
   assert.equal(ready.next_action.arguments.writer_id, "wiki-writer-1")
   assert.deepEqual(ready.pipeline_concurrency, {
-    max_background_agents_total: 4,
+    max_background_agents_total: 3,
     recommended_extractors: 2,
-    max_drafters: 2,
-    recommended_drafters: 2,
+    max_drafters: 1,
+    recommended_drafters: 1,
   })
   assert.equal(ready.parallel_extraction.recommended_workers, 2)
   assert.equal(ready.parallel_extraction.restart_on_worker_completion, true)
@@ -1002,7 +1040,7 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
     tool: "llm_wiki_commit_pages",
     action_owner: "writer",
     delegate_to: "llm-wiki-writer",
-    execution_mode: "legacy-plan-compatibility",
+    execution_mode: "bounded-plan-commit",
     arguments: {
       task_id: imported.task_id,
       writer_id: "wiki-writer-1",
@@ -1173,16 +1211,18 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.deepEqual(stable.provisional_pages, [])
   assert.equal(stable.wiki_projection.final_completed, true)
   const finalized = await f.core.finalize({ task_id: imported.task_id })
-  assert.deepEqual(finalized.created_pages, ["wiki/topics/projected-entity.md"])
+  assert.equal(finalized.created_pages.includes("wiki/topics/projected-entity.md"), true)
+  assert.equal(finalized.created_pages.includes("wiki/index.md"), true)
   assert.deepEqual(finalized.updated_pages, [])
-  // replace is a complete final-body rewrite. Provisional-only content must
-  // be intentionally reintroduced by the final Writer if it remains valid.
+  // A final drafter receives bounded context, so an existing page defaults to
+  // merge and cannot silently delete unseen grounded provisional material.
   const completed = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["reconciled cross-batch summary"] })
   assert.equal(completed.retrieval_phase, "knowledge-base-complete")
-  assert.deepEqual(completed.available_channels, ["bm25", "embedding", "wiki"])
+  assert.deepEqual(completed.available_channels, ["bm25", "wiki"])
+  assert.deepEqual(completed.fallback_channels, ["feature_hash"])
   assert.equal(completed.hits.some((hit) => hit.path === "wiki/topics/projected-entity.md"), true)
   const provisionalAfterReplace = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["ProvisionalOnlyMarker"] })
-  assert.equal(provisionalAfterReplace.hits.some((hit) => hit.path === "wiki/topics/projected-entity.md"), false)
+  assert.equal(provisionalAfterReplace.hits.some((hit) => hit.path === "wiki/topics/projected-entity.md"), true)
 
   // Simulate a process exit after the generation pointer was durable but
   // before task/result completion. A fresh Core instance must repair only the
@@ -1281,6 +1321,7 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
       task_id: imported.task_id,
       batch_id: batch.batch_id,
       worker_id: batch.worker_id,
+      lease_token: batch.lease_token,
       analysis,
       idempotency_key: `writer-backlog-analysis-${index}`,
     })
@@ -1306,7 +1347,15 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
   }
   await writeFile(taskPath, JSON.stringify(persisted))
 
-  const first = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 40_000 })
+  const unfencedJoin = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 40_000 })
+  assert.equal(unfencedJoin.waiting, true)
+  assert.equal(unfencedJoin.projection.writer_busy, true)
+  const first = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: "projection-legacy-writer-backlog",
+    max_chars: 40_000,
+  })
   assert.equal(first.projection.mode, "incremental")
   assert.equal(first.projection.batch_ids.length, 8)
   assert.equal(first.projection.safely_repartitioned, true)
@@ -1367,7 +1416,7 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
   assert.equal(second.existing_page_catalog.some((page) => page.path === "wiki/concepts/unrelated-large.md"), true)
 })
 
-test("compatibility projection redirects to the semantic Writer and final commits remain idempotent", async (t) => {
+test("current manifest projection reaches semantic reconciliation and final commits remain idempotent", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
   const imported = await f.core.importFiles({ files: [{ path: f.source }] })
@@ -1390,6 +1439,7 @@ test("compatibility projection redirects to the semantic Writer and final commit
     task_id: imported.task_id,
     batch_id: batch.batch_id,
     worker_id: batch.worker_id,
+    lease_token: batch.lease_token,
     idempotency_key: "fast-projection-analysis-v1",
     analysis: {
       schemaVersion: 1,
@@ -1416,22 +1466,20 @@ test("compatibility projection redirects to the semantic Writer and final commit
 
   const before = await f.core.status({ task_id: imported.task_id })
   assert.equal(before.next_action.tool, "llm_wiki_get_page_plan_context")
-  const projectedManifest = await f.core.applyWikiProjection({
+  const projectedManifest = await f.core.getPagePlanContext({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
-    max_projections: 6,
+    view: "manifest",
   })
   const projected = await f.core.getPagePlanContext({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
     projection_id: projectedManifest.projection.projection_id,
-    view: "plan",
     cursor: 0,
     max_chars: 200_000,
   })
-  assert.equal(projectedManifest.accepted, true)
-  assert.equal(projectedManifest.automated, false)
-  assert.equal(projectedManifest.writer_mode, "legacy-semantic")
+  assert.equal(projectedManifest.view, "manifest")
+  assert.equal(projectedManifest.page_plan_complete, true)
   assert.equal(projectedManifest.parallel_drafting.partition_key, "page_requirement.patch_scaffold.path")
   assert.equal(projectedManifest.parallel_drafting.same_path_requirements_are_indivisible, true)
   assert.equal(projectedManifest.parallel_drafting.execution_mode, "coordinator-owned-parallel-drafters")
@@ -1484,7 +1532,7 @@ test("compatibility projection redirects to the semantic Writer and final commit
     writer_id: "wiki-writer-1",
     projection_id: projected.projection.projection_id,
     based_on_wiki_revision: projected.based_on_wiki_revision,
-    idempotency_key: "legacy-semantic-projection-v1",
+    idempotency_key: "manifest-semantic-projection-v1",
     patches: incrementalPatches,
   })
   assert.equal(incremental.wiki_projection.final_completed, false)
@@ -1495,7 +1543,7 @@ test("compatibility projection redirects to the semantic Writer and final commit
     writer_id: "wiki-writer-1",
     projection_id: finalPlan.projection.projection_id,
     based_on_wiki_revision: finalPlan.based_on_wiki_revision,
-    idempotency_key: "legacy-semantic-final-v1",
+    idempotency_key: "manifest-semantic-final-v1",
     patches: finalPlan.page_requirements.map((requirement) => ({
       ...requirement.patch_scaffold,
       content: `# ${requirement.title}\n\n## Overview\n\nSemantically reconciled page for ${requirement.title}.\n`,
@@ -1518,7 +1566,7 @@ test("compatibility projection redirects to the semantic Writer and final commit
   assert.match(aggregatePage, /business-entity/)
 })
 
-test("legacy semantic Writer keeps projections bounded to the original batch window", async (t) => {
+test("current manifest Writer keeps projections bounded to the batch window", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
   const files = []
@@ -1538,6 +1586,7 @@ test("legacy semantic Writer keeps projections bounded to the original batch win
       task_id: imported.task_id,
       batch_id: batch.batch_id,
       worker_id: batch.worker_id,
+      lease_token: batch.lease_token,
       idempotency_key: `fast-backlog-analysis-${batch.batch_id}`,
       analysis: {
         schemaVersion: 1,
@@ -1554,16 +1603,15 @@ test("legacy semantic Writer keeps projections bounded to the original batch win
   }
   assert.equal(analyzed > 8, true)
 
-  const projected = await f.core.applyWikiProjection({
+  const projected = await f.core.getPagePlanContext({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
-    max_projections: 1,
+    view: "manifest",
   })
-  assert.equal(projected.automated, false)
-  assert.equal(projected.writer_mode, "legacy-semantic")
+  assert.equal(projected.view, "manifest")
   assert.equal(projected.projection.mode, "incremental")
   assert.equal(projected.projection.batch_ids.length <= 8, true)
-  assert.equal(projected.pagination.returned_items > 0, true)
+  assert.equal(projected.draft_manifest.page_count > 0, true)
 })
 
 test("knowledge-base deletion requires confirmation, blocks active tasks, and preserves configuration by scope", async (t) => {
@@ -2226,8 +2274,8 @@ test("page drafters stage receipt-only shards and the Writer commits them server
     idempotency_key: "commit-staged-page-draft-v1",
   })
   assert.equal(committed.accepted, true)
-  assert.deepEqual(committed.committed_staged_draft_shard_ids, [shard.shard.shard_id])
-  assert.deepEqual(committed.committed_staged_draft_receipts, [{ shard_id: shard.shard.shard_id, draft_hash: staged.draft_hash }])
+  assert.deepEqual(committed.committed_draft_receipts, [{ shard_id: shard.shard.shard_id, draft_hash: staged.draft_hash }])
+  assert.deepEqual(committed.committed_draft_receipts, [{ shard_id: shard.shard.shard_id, draft_hash: staged.draft_hash }])
   assert.equal(committed.main_agent_payload, "receipt-only")
   assert.equal(committed.next_action.action_owner, committed.projection.pending_draft_shards > 0 ? "coordinator" : "writer")
   assert.equal(committed.writer_next_action, null)

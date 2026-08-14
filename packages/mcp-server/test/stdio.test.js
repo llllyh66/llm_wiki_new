@@ -272,7 +272,6 @@ test("built MCP server survives errors and completes the full workflow over one 
     { name: "llm_wiki_get_page_plan_context", arguments: { task_id: "invalid" } },
     { name: "llm_wiki_stage_page_drafts", arguments: { task_id: "invalid" } },
     { name: "llm_wiki_get_staged_page_drafts", arguments: { task_id: "invalid" } },
-    { name: "llm_wiki_apply_projection", arguments: { task_id: "invalid" } },
     { name: "llm_wiki_commit_pages", arguments: { task_id: "invalid", patches: [], based_on_wiki_revision: "0".repeat(64), idempotency_key: "invalid-pages-v1" } },
     { name: "llm_wiki_update_pages", arguments: { task_id: "invalid", action: "inspect", targets: [{ path: "wiki/concepts/example.md" }] } },
     { name: "llm_wiki_finalize", arguments: { task_id: "invalid" } },
@@ -316,8 +315,9 @@ test("built MCP server survives errors and completes the full workflow over one 
     arguments: { task_id: taskId, queries: ["Business Entity"] },
   })
   assert.equal(retrieval.isError, undefined)
-  assert.equal(retrieval.structuredContent.retrieval_phase, "building")
-  assert.deepEqual(retrieval.structuredContent.available_channels, ["bm25", "embedding"])
+  assert.equal(retrieval.structuredContent.retrieval_phase, "source-ready")
+  assert.deepEqual(retrieval.structuredContent.available_channels, ["bm25"])
+  assert.deepEqual(retrieval.structuredContent.fallback_channels, ["feature_hash"])
 
   // Reproduce the failure sequence seen in real Agent runs: a dense analysis
   // with many validation errors, a malformed retry, and a bad SourceRef. None
@@ -425,13 +425,12 @@ test("built MCP server survives errors and completes the full workflow over one 
   assert.equal(analyzed.structuredContent.normalized_source_ref_indexes, 3)
   assert.equal(analyzed.structuredContent.next_action.tool, "llm_wiki_get_page_plan_context")
   const projected = await client.callTool({
-    name: "llm_wiki_apply_projection",
-    arguments: { task_id: taskId, writer_id: "stdio-wiki-writer", max_projections: 6 },
+    name: "llm_wiki_get_page_plan_context",
+    arguments: { task_id: taskId, writer_id: "stdio-wiki-writer", view: "manifest" },
   })
   assert.equal(projected.isError, undefined)
-  assert.equal(projected.structuredContent.automated, false)
-  assert.equal(projected.structuredContent.writer_mode, "legacy-semantic")
-  assert.equal(projected.structuredContent.semantic_writer_required, true)
+  assert.equal(projected.structuredContent.view, "manifest")
+  assert.equal(projected.structuredContent.page_plan_complete, true)
   assert.equal(projected.structuredContent.next_action.tool, "llm_wiki_get_page_plan_context")
   assert.equal(projected.structuredContent.page_commit_limits.max_patches_per_call, 50)
   const shardCall = await client.callTool({

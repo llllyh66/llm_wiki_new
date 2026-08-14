@@ -137,10 +137,10 @@ chunk 验证。全部通过时直接清除 provisional 状态，不启动第二�
 2. 每个 page drafter 按自己的 `draft_action` 读取一个 `view="draft-shard"`，仅在分片内综合相关 batch 的实体、声明、关系、冲突和现有页面，然后调用 `llm_wiki_stage_page_drafts`；
 3. Writer 用 `llm_wiki_get_staged_page_drafts(draft_receipts)` 检查 `{shard_id, draft_hash}` receipt，并让 Core 通过 `staged_draft_receipts` 统一、原子提交；页面正文不经过主 Agent；
 4. 原始 chunk 只放在简洁的来源证据区；
-5. 每个小 wave 以 `projection_complete=false` 原子提交，并回传服务端给出的 `committed_staged_draft_receipts`；这些持久化的 ID + hash 证明 final Writer 确实处理了该 shard，不会因旧页已有 coverage 而跳过语义重写。成功后立即丢弃该分片上下文；所有 shard 处理后用空 patch 和 `projection_complete=true` 完成最终覆盖审计；
+5. 每个小 wave 以 `projection_complete=false` 原子提交，并回传服务端给出的 `committed_draft_receipts`；这些持久化的 ID + hash 证明 final Writer 确实处理了该 shard，不会因已有 coverage 而跳过语义重写。成功后立即丢弃该分片上下文；所有 shard 处理后用空 patch 和 `projection_complete=true` 完成最终覆盖审计；
 6. 最终 projection 完成后重新调用 Finalize，更新 `index.md` 和 `overview.md` 等全局汇总页。
 
-如果 Drafter 在 shard cursor 处中断，协调器使用同一 projection ID、shard ID 和准确 cursor 重启该 Drafter；如果 Writer 在 receipt 提交处中断，则重放相同 `{shard_id, draft_hash}` receipt 与幂等键。上下文压缩后直接按状态返回的未覆盖 shard 恢复，无需重放已接受页面。`llm_wiki_apply_projection` 只是兼容入口，会返回同一 compact manifest，不会自动渲染页面。
+如果 Drafter 在 shard cursor 处中断，协调器使用同一 projection ID、shard ID 和准确 cursor 重启该 Drafter；如果 Writer 在 receipt 提交处中断，则重放相同 `{shard_id, draft_hash}` receipt 与幂等键。上下文压缩后直接按状态返回的未覆盖 shard 恢复，无需重放已接受页面。
 
 ### 2.6 Related 关系生成
 
@@ -172,7 +172,6 @@ Related 不是在单一阶段一次性生成，而是分三步完成：
 - BM25：传统词法检索；
 - Embedding：语义向量检索；
 - Wiki：已生成页面、标题、路径和双向链接检索；
-- vector/graph：兼容旧调用的别名或扩展通道。
 
 知识库构建中，查询优先返回 BM25 和 Embedding 结果；Wiki 投影完成后，Wiki 通道自动加入召回。Embedding 不可用时会降级，不会导致 MCP 断开。
 
@@ -188,8 +187,7 @@ Embedding 配置位于 `.llm-wiki/config.json` 的 `retrieval.embedding`，包�
 | `llm_wiki_retrieve_context` | BM25 + Embedding + Wiki 多路召回 |
 | `llm_wiki_query_domain_pages` | 反查页面的 Domain Schema 分类，或按 Schema/Domain/ABE/BE 分页召回页面 |
 | `llm_wiki_commit_analysis` | 校验并持久化一个 batch 的结构化分析 |
-| `llm_wiki_get_page_plan_context` | 返回服务端 manifest 或有界 draft shard，传统 plan cursor 仅作兼容 |
-| `llm_wiki_apply_projection` | 兼容入口：获取 compact manifest，不自动写页面 |
+| `llm_wiki_get_page_plan_context` | 返回服务端 manifest 或有界 draft shard |
 | `llm_wiki_stage_page_drafts` | 将单个 drafter 的完整 shard 暂存在服务端，只返回 receipt |
 | `llm_wiki_get_staged_page_drafts` | 读取暂存 shard 的元数据，不返回页面正文 |
 | `llm_wiki_commit_pages` | 原子提交页面 patch，或通过 hash-bound `staged_draft_receipts` 提交服务端暂存 shard |

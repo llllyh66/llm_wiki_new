@@ -7,19 +7,20 @@ import test from "node:test"
 import { fileURLToPath } from "node:url"
 import JSZip from "jszip"
 
-test("CLI initializes and migrates a legacy source tree without semantic generation", async (t) => {
+test("CLI initializes and imports an explicit source without semantic generation", async (t) => {
   const workspace = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-cli-"))
   t.after(() => rm(workspace, { recursive: true, force: true }))
-  const legacy = path.join(workspace, "raw", "sources")
-  await mkdir(legacy, { recursive: true })
-  await writeFile(path.join(legacy, "legacy.md"), "# Legacy Source\n\nImported by the migration bridge.\n")
+  const incoming = path.join(workspace, "incoming")
+  await mkdir(incoming, { recursive: true })
+  const source = path.join(incoming, "source.md")
+  await writeFile(source, "# Source\n\nImported explicitly.\n")
   const cli = fileURLToPath(new URL("../src/index.js", import.meta.url))
   const initialized = run(cli, ["init", "--workspace", workspace])
   assert.equal(initialized.status, 0, initialized.stderr)
   assert.equal(JSON.parse(initialized.stdout).workspace_initialized, true)
-  const migrated = run(cli, ["migrate-legacy", "raw/sources", "--workspace", workspace])
-  assert.equal(migrated.status, 0, migrated.stderr)
-  const result = JSON.parse(migrated.stdout)
+  const imported = run(cli, ["import", source, "--workspace", workspace])
+  assert.equal(imported.status, 0, imported.stderr)
+  const result = JSON.parse(imported.stdout)
   assert.equal(result.accepted.length, 1)
   assert.equal(result.status, "prepared")
 })
@@ -33,18 +34,19 @@ test("CLI rejects missing option values before opening a workspace", () => {
   }
 })
 
-test("CLI legacy migration includes XLSX workbooks", async (t) => {
+test("CLI explicit import includes XLSX workbooks", async (t) => {
   const workspace = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-cli-xlsx-"))
   t.after(() => rm(workspace, { recursive: true, force: true }))
-  const legacy = path.join(workspace, "raw", "sources")
-  await mkdir(legacy, { recursive: true })
-  await writeFile(path.join(legacy, "legacy.xlsx"), await minimalXlsx())
+  const incoming = path.join(workspace, "incoming")
+  await mkdir(incoming, { recursive: true })
+  const source = path.join(incoming, "workbook.xlsx")
+  await writeFile(source, await minimalXlsx())
   const cli = fileURLToPath(new URL("../src/index.js", import.meta.url))
-  const migrated = run(cli, ["migrate-legacy", "raw/sources", "--workspace", workspace])
-  assert.equal(migrated.status, 0, migrated.stderr)
-  const result = JSON.parse(migrated.stdout)
+  const imported = run(cli, ["import", source, "--workspace", workspace])
+  assert.equal(imported.status, 0, imported.stderr)
+  const result = JSON.parse(imported.stdout)
   assert.equal(result.accepted.length, 1)
-  assert.equal(result.sources[0].display_name, "legacy.xlsx")
+  assert.equal(result.sources[0].display_name, "workbook.xlsx")
 })
 
 function run(cli, args) {

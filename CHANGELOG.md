@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+## [1.0.8] - 2026-08-14
+
+- Replace the mixed projection guidance with one capacity-aware manifest →
+  draft-shard → hash-bound receipt → single Writer → audited Finalize protocol.
+  Remove the projection redirect, retired channel aliases, runtime migration
+  command, and bare staged-shard compatibility field from current interfaces.
+- Add progressive import registration and per-source readiness. Each parsed
+  source publishes a task-scoped persisted BM25 index and compact feature store
+  before status reports it ready, so uploaded evidence is queryable while slow
+  Wiki construction continues.
+- Remove the 10,000-document and 1,000/2,000 embedding candidate cutoffs. Online
+  retrieval never bulk-embeds documents; background indexing fills real
+  Embedding caches and responses identify deterministic feature fallback
+  truthfully.
+- Publish real inverted BM25 postings, generation-scoped float32 Embedding and
+  feature stores, link-graph artifacts, and complete generation page diffs.
+  Public reads use only the active generation and validate artifact hashes.
+- Add host-capacity scheduling, explicit worker/writer identities, extraction
+  fencing tokens and epochs, bounded lease renewal, projection fencing,
+  orphaned-draft quarantine, and exact busy-operation replay actions.
+- Make semantic requirement coverage include independent claims, relations,
+  contradictions, review items, and unresolved questions. Existing bounded
+  page context defaults to `merge`, and Finalize always re-audits coverage and
+  source ownership before publication.
+- Add offline English/Simplified-Chinese OCR for standalone images, scanned PDF
+  pages, and embedded PowerPoint images. Add native `.pptx`/`.pptm` slide text
+  and table extraction with page/slide locator metadata and bounded archive,
+  render, image-header, cancellation, and OCR safety limits.
+
 ## [1.0.7] - 2026-08-12
 
 - Make Finalize the first final-reconciliation action after incremental catch-up.

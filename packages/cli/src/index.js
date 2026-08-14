@@ -1,7 +1,5 @@
 #!/usr/bin/env node
 import { LlmWikiCore, asLlmWikiError } from "@llm-wiki/core"
-import { readdir } from "node:fs/promises"
-import path from "node:path"
 
 const argv = process.argv.slice(2)
 
@@ -24,14 +22,8 @@ try {
     const confirmed = argv.includes("--confirm-delete-knowledge-base")
     result = await core.deleteKnowledgeBase({ scope, confirmation: confirmed ? "DELETE KNOWLEDGE BASE" : "" })
   }
-  else if (command === "migrate-legacy") {
-    const legacyRoot = path.resolve(core.workspaceRoot, argv[0] || "raw/sources")
-    const files = await collectSupportedFiles(legacyRoot)
-    if (files.length === 0) throw new Error(`No supported legacy sources found under ${legacyRoot}`)
-    result = await core.importFiles({ files: files.map((file) => ({ path: file })), options: { domain_schema_path: domainSchemaPath } })
-  }
   else {
-    process.stderr.write("Usage: llm-wiki <init|import|status|lint|abort|delete|migrate-legacy> [arguments] [--workspace DIR] [--domain-schema DIRECTORY]\n")
+    process.stderr.write("Usage: llm-wiki <init|import|status|lint|abort|delete> [arguments] [--workspace DIR] [--domain-schema DIRECTORY]\n")
     process.exitCode = 2
     process.exit()
   }
@@ -39,23 +31,6 @@ try {
 } catch (error) {
   process.stderr.write(`${JSON.stringify({ error: asLlmWikiError(error).toJSON() }, null, 2)}\n`)
   process.exitCode = 1
-}
-
-async function collectSupportedFiles(root) {
-  const supported = new Set([".md", ".markdown", ".txt", ".html", ".htm", ".docx", ".xlsx", ".pdf"])
-  const files = []
-  async function walk(current) {
-    const entries = await readdir(current, { withFileTypes: true })
-    entries.sort((left, right) => left.name.localeCompare(right.name))
-    for (const entry of entries) {
-      const absolute = path.join(current, entry.name)
-      if (entry.isSymbolicLink()) continue
-      if (entry.isDirectory()) await walk(absolute)
-      else if (entry.isFile() && supported.has(path.extname(entry.name).toLowerCase())) files.push(absolute)
-    }
-  }
-  await walk(root)
-  return files
 }
 
 function takeOption(args, name) {

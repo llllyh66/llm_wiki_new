@@ -1,4 +1,5 @@
 import { LlmWikiError, asLlmWikiError } from "@llm-wiki/core"
+import { createHash } from "node:crypto"
 import { TOOL_DEFINITIONS } from "./tool-definitions.js"
 
 const MAX_MCP_INPUT_BYTES = 12 * 1024 * 1024
@@ -130,11 +131,20 @@ function errorResult(error, context = {}) {
   const atomicPageRejection = ["llm_wiki_commit_pages", "llm_wiki_update_pages"].includes(context.tool) && ATOMIC_PAGE_REJECTION_CODES.has(normalized.code)
   const submittedItems = context.tool === "llm_wiki_update_pages" ? context.args?.updates : context.args?.patches
   const errorData = { ...normalized.toJSON(), retryable: normalized.retryable || analysisRetry }
+  const busy = normalized.code === "TASK_BUSY" || normalized.code === "MCP_BUSY"
   return {
     ok: false,
     accepted: false,
     rejected: true,
     error: errorData,
+    ...(busy ? {
+      retry_after_ms: BUSY_RETRY_AFTER_MS,
+      retry_action: {
+        tool: context.tool,
+        reuse_original_arguments: true,
+        request_fingerprint: createHash("sha256").update(JSON.stringify(context.args ?? {})).digest("hex"),
+      },
+    } : {}),
     ...(Array.isArray(normalized.details?.validation_errors)
       ? { validation_errors: normalized.details.validation_errors }
       : analysisRetry ? { validation_errors: [normalized.message] } : {}),
@@ -200,11 +210,9 @@ function recoveryAction(tool, args, error) {
     return { tool: "llm_wiki_status", arguments: { task_id: error.details.owner_task_id } }
   }
   if (error.code === "TASK_BUSY") {
-    return typeof args?.task_id === "string"
-      ? { tool: "llm_wiki_status", arguments: { task_id: args.task_id } }
-      : { tool: "llm_wiki_list_tasks", arguments: {} }
+    return { tool, reuse_original_arguments: true, retry_after_ms: BUSY_RETRY_AFTER_MS }
   }
-  if (error.code === "MCP_BUSY") return { tool: "llm_wiki_list_tasks", arguments: {} }
+  if (error.code === "MCP_BUSY") return { tool, reuse_original_arguments: true, retry_after_ms: BUSY_RETRY_AFTER_MS }
   if (tool === "llm_wiki_commit_analysis" && RECOVERABLE_ANALYSIS_CODES.has(error.code)) {
     return { tool, arguments: { task_id: args?.task_id, batch_id: args?.batch_id, worker_id: args?.worker_id } }
   }
@@ -304,7 +312,7 @@ function recoveryAction(tool, args, error) {
         projection_id: args?.projection_id,
         based_on_wiki_revision: args?.based_on_wiki_revision,
         projection_complete: args?.projection_complete !== false,
-        ...(Array.isArray(args?.staged_draft_shard_ids) ? { staged_draft_shard_ids: args.staged_draft_shard_ids } : {}),
+        ...(Array.isArray(args?.staged_draft_receipts) ? { staged_draft_receipts: args.staged_draft_receipts } : {}),
       },
     }
   }
@@ -358,6 +366,7 @@ export class HeadlessToolRouter {
     switch (name) {
       case "llm_wiki_import_files": return this.core.importFiles(args)
       case "llm_wiki_get_batch": return this.core.getBatch(args)
+      case "llm_wiki_renew_lease": return this.core.renewLease(args)
       case "llm_wiki_get_domain_schema": return this.core.getDomainSchema(args)
       case "llm_wiki_retrieve_context": return this.core.retrieveContext(args)
       case "llm_wiki_query_domain_pages": return this.core.queryDomainPages(args)
@@ -365,7 +374,6 @@ export class HeadlessToolRouter {
       case "llm_wiki_get_page_plan_context": return this.core.getPagePlanContext(args)
       case "llm_wiki_stage_page_drafts": return this.core.stagePageDrafts(args)
       case "llm_wiki_get_staged_page_drafts": return this.core.getStagedPageDrafts(args)
-      case "llm_wiki_apply_projection": return this.core.applyWikiProjection(args)
       case "llm_wiki_commit_pages": return this.core.commitPages(args)
       case "llm_wiki_update_pages": return this.core.updatePages(args)
       case "llm_wiki_finalize": return this.core.finalize(args)

@@ -1,389 +1,446 @@
-# llm_wiki V1.0.1 Bug 审计报告
+# llm_wiki 1.0.8 全量 Bug 审计与修复闭环报告
+
+> 审计日期：2026-08-14
+>
+> 审计基线：`main` / `cd0531a`；修复分支：`codex/fix-1.0.8`
+>
+> 版本：1.0.8
+>
+> 状态：二次审计通过（Release Ready）
+>
+> 后续方案：[BUG_FIX_PLAN.md](BUG_FIX_PLAN.md)
+
+## 1. 执行摘要
+
+本轮审计覆盖 Skill 提示词、新旧流程边界、多 Agent 协作、租约、解析和 Chunk、构建中召回、构建完成后召回、Embedding/BM25、投影、Finalize、generation 发布、OCR/PPTX 新改造及恢复协议。
+
+首轮审计共记录 35 项必须修复的问题；1.0.8 已完成生产代码、测试、
+Skill/Agent 合约和文档同步修复。二次审计结论为 35/35 闭环，无未解决的
+P0/P1 发布阻断项。下文 Bug 章节保留修复前根因和影响，用于追溯。
+
+| 级别 | 数量 | 定义 |
+|---|---:|---|
+| P0 | 3 | 可造成静默数据丢失或 Finalize 发布未物化的必要知识 |
+| P1 | 19 | 可造成明确漏召回、未发布数据暴露、任务阻断、资源失控或新流程无法在目标宿主执行 |
+| P2 | 12 | 规模、性能、恢复、索引一致性、可观测性或内容完整性问题 |
+| P3 | 1 | 版本和诊断元数据错误 |
+
+其中 `AUD-001`、`AUD-002`、`AUD-003`、`AUD-004` 和 `AUD-014` 由隔离最小复现确认；
+构建期快速召回另增加了“第二个文件仍在导入时，第一个 source 已可通过 BM25
+命中”和“超过 10,000 Chunk 的尾部词法目标仍可召回”回归测试。
+
+## 2. 1.0.8 二次审计闭环矩阵
+
+| Bug | 状态 | 1.0.8 修复证据 |
+|---|---|---|
+| AUD-001 | 已修复 | 截断页默认 `merge`，section 更新保留未读正文 |
+| AUD-002 | 已修复 | claim/relation/contradiction/review/unresolved 均生成独立 requirement |
+| AUD-003 | 已修复 | Finalize 每次重算 coverage，不再用 `finalCompleted` 跳过审计 |
+| AUD-004 | 已修复 | 移除 1,000/2,000 候选上限，真实 Embedding 尾部召回通过 |
+| AUD-005 | 已修复 | 移除 10,000 语料裁剪，>10K 尾部 Chunk 回归通过 |
+| AUD-006 | 已修复 | Domain Query 与公开召回统一读 active generation |
+| AUD-007 | 已修复 | 页面/索引/lint/manifest 在 staging generation 完成后原子切 pointer |
+| AUD-008 | 已修复 | host capability 返回 total/coordinator/background 容量并按可用槽位计算 |
+| AUD-009 | 已修复 | 新增 `.agents/agents` 通用 Extractor/Drafter/Writer 角色合约 |
+| AUD-010 | 已修复 | 新增有界 `llm_wiki_renew_lease`，覆盖 extraction/projection |
+| AUD-011 | 已修复 | extraction commit/renew 强制校验 opaque token + epoch |
+| AUD-012 | 已修复 | 并行协议要求显式 worker/writer ID，不共享默认身份 |
+| AUD-013 | 已修复 | Skill/MCP/Agent 仅保留 manifest→draft-shard→receipt→Writer→Finalize |
+| AUD-014 | 已修复 | 无标题页使用 relative basename 安全回退 |
+| AUD-015 | 已修复 | section-aware Chunk 加 12% overlap、parent 信息与 content-hash 去重 |
+| AUD-016 | 已修复 | schema 3 持久 BM25 postings/TF/DF 被查询路径实际消费 |
+| AUD-017 | 已修复 | generation-scoped JSON metadata + contiguous float32 向量产物及 hash 校验 |
+| AUD-018 | 已修复 | per-path cap 提高并按 section/content hash 去重，不再固定 2 条 |
+| AUD-019 | 已修复 | provisional owner/task 状态损坏时 fail-closed |
+| AUD-020 | 已修复 | 单次 import 共享 OCR session/worker，不按文件重建 |
+| AUD-021 | 已修复 | PDF 页数/OCR/时间/文本/像素预算与 AbortSignal 向下传递 |
+| AUD-022 | 已修复 | PNG/JPEG/WebP/BMP/TIFF 解码前头部尺寸校验与多帧拒绝 |
+| AUD-023 | 已修复 | 英文/简中语言包入依赖，无注入真实 OCR Worker 测试通过 |
+| AUD-024 | 已修复 | PPTX 按 presentation relationship 权威顺序解析并保留 slide locator |
+| AUD-025 | 已修复 | Chart/SmartArt/embedded workbook 抽取，不支持对象进 review metadata |
+| AUD-026 | 已修复 | 过期 projection plan/draft 移入 orphan quarantine，projection ID 作围栏 |
+| AUD-027 | 已修复 | busy 结果返回精确原操作重试 action |
+| AUD-028 | 已修复 | Root/Core/MCP/CLI/lock/protocol 版本统一为 1.0.8 |
+| AUD-029 | 已修复 | Finalize created/updated 由完整 generation diff 派生 |
+| AUD-030 | 已修复 | progressive import 立即返回 task，每 source 原子更新任务索引 |
+| AUD-031 | 已修复 | requested/active/effective/fallback 通道分开，feature_hash 不冒充 Embedding |
+| AUD-032 | 已修复 | 在线仅请求 query vector，文档向量后台预热 |
+| AUD-033 | 已修复 | 构建期 task source/analysis 优先，stable Wiki 不挤占新 source 配额 |
+| AUD-034 | 已修复 | importing/source-ready/degraded/knowledge-base-complete 由耐久就绪度派生 |
+| AUD-035 | 已修复 | import/status/retrieve 共享逐 source/逐 channel readiness 合约 |
+
+## 3. 审计方法与证据
+
+### 2.1 执行的验证
+
+- Core：72/72 通过。
+- MCP：23/23 通过。其中两项回环网络用例在沙箱中因 `EPERM` 失败，允许本机回环后通过。
+- CLI：3/3 通过。
+- `npm run build`：通过。
+- `git diff --check`：通过。
+- `npm audit --omit=dev --audit-level=high`：0 vulnerabilities。
+- Core/MCP/CLI 的 `npm pack --dry-run` 全部通过，新 OCR/PPTX 源文件与 MCP dist 已进入打包清单。
+- 完成长页面、空最终投影、无标题页面和 Embedding 上限四组隔离复现。
+- 真实 OCR Worker 在无注入模式下识别测试图片成功，且语言包已进生产依赖。
+
+### 2.2 证据等级
+
+- **CONFIRMED**：已有可重复最小复现、现有测试失败或确定的运行时证据。
+- **STATIC-CERTAIN**：控制流和数据流直接证明了结果，但本轮没有再做故障注入。
+- **STRESS-RISK**：需要超大输入、长时运行、多协调器或进程级故障才会触发，必须在修复时加压力/故障注入测试。
+
+## 4. 修复前召回和发布模型
+
+修复前默认路由如下：
+
+```text
+构建中：BM25 + Embedding -> RRF
+完成后：BM25 + Embedding + Wiki title/path/link graph -> RRF
+```
+
+路由标签本身正确，但修复前不等于全量可召回：总语料、Embedding 候选和实际向量化存在静默上限，最终生成的 BM25/vector 文件也没有被查询路径消费。
 
-## 1. 审计结论
+修复前 `retrieve_context` 通过 `current-generation.json` 读取已发布 Wiki，但 `queryDomainPages` 直接读工作树 Wiki，导致两条读路径对“已发布”定义不一致。
 
-审计基线为 main 分支、标签 V1.0.1，HEAD 为 4ed5c2c（feat: project domain schema types into wiki pages）。审计期间未修改任何生产源码、测试或构建配置；仅执行了构建、测试、静态检查、依赖审计和临时目录中的最小复现。
+### 3.1 构建期“上传后快速可召回”专项结论
 
-结论：V1.0.1 不建议在修复 P1 问题、处理依赖高危 advisory、并明确最终投影的页面保留语义前作为稳定发布版交付。当前没有确认的 P0；但 MCP 结果序列化存在可将服务进程打到 OOM 的 P1 DoS，锁定依赖中有 PDF.js 高危 advisory，Core 主测试套件仍为红色。
+设计方向正确，但当前实现只满足“`import_files` 完整返回后，所有 source chunk 可参与 BM25/Embedding 路由”，不满足“文件上传后很快可召回”。实际时间线是：
 
-审计发现：
+```text
+T0 调用 import_files
+  -> 持有 workspace 写锁
+  -> 所有文件串行复制、解析/OCR、切 Chunk、写 artifact
+T1 全部可导入文件处理结束
+  -> 此时才 createTask 并返回 task_id
+  -> source chunk 才能被 retrieve_context 搜索
+T2 Analysis 逐批提交
+  -> 已完成 analysis 渐进加入召回语料
+T3 task.status=completed
+  -> 默认标签从 BM25+Embedding 切到 BM25+Embedding+Wiki
+```
 
-- 6 项确认问题：5 项运行时/数据正确性或安全问题，1 项为确定的测试/契约失败；另有 3 个直接依赖 advisory。
-- 7 项高概率问题，集中在进程崩溃恢复、幂等记录、Finalize/index 原子性、缓存和持久化耐久性。
-- 多个未验证风险：外部路径读取边界、embedding SSRF、Windows 原子替换语义、恶意 PDF 可利用性和多进程故障恢复。
-- Core 47 项测试中 46 通过、1 失败；MCP 16/16 通过；CLI 1/1 通过。
+因此，纯文本小文件在 `import_files` 返回后确实能立即检索；但扫描 PDF、大 PPTX、多文件批量导入期间没有 task ID、没有增量可见 chunk，也没有可查询索引。构建期可用性还存在四个放大问题：默认 `embedding.provider=none`、feature-hash 被伪装成 Embedding、真实 Embedding 首查现场补算文档向量、旧 Wiki/analysis 可挤占新上传 source 的候选预算。
 
-建议发布门槛：
+现有垂直切片测试只在 `importFiles` 完成且 `analyzeAll` 之后断言 `retrieval_phase=building` 和两路标签；它没有验证 Analysis 前命中 source，更没有把后续文件/parser 阻塞住后验证首个 chunk 已可搜。格式测试则只断言 `corpus.truncated=true` 和 feature-hash fallback，等于确认降级存在，并未证明快速召回或召回完整性。
 
-1. 先修复 BUG-002、DEP-001 中的高危依赖和 HP-001/HP-002 的崩溃恢复路径。
-2. 明确 BUG-001 是“最终语义重写允许丢弃 provisional body”还是“必须保留旧事实”；在契约确定前不要简单修改断言。
-3. 增加进程级、跨进程、恶意输入和 Node 20/Windows 的测试，再进行真实 MCP 宿主验证。
+目标协议应改为：先持久登记 source/task 并立即返回 task ID；每个可验证 chunk 落盘后原子加入 task-local BM25；Embedding 后台异步追赶；查询绝不等待批量补向量，而是在响应中精确声明每个 source/channel 的可用覆盖率。Wiki 构建完成后，再以 generation manifest 原子发布全量 BM25、Embedding、Wiki/graph 多路索引。
 
-## 2. 范围、基线和方法
+## 5. 修复前 Bug 根因清单
 
-### 2.1 范围
+### AUD-001：长页面只提供头尾节选，却使用权威 `replace`
 
-覆盖 Core 任务状态机、批次/lease、Evidence/SourceRef、解析器、Domain Schema、PagePlan、PagePatch、事务、Finalize、检索和 embedding；MCP STDIO 生命周期、工具路由、并发背压、取消、错误恢复、结果大小限制、日志和构建产物；CLI、Skill、Claude Agents、MCP 配置、构建链和依赖；以及崩溃窗口、幂等性、路径安全、跨平台行为、DoS 和数据正确性。
-
-### 2.2 基线证据
-
-- Git：main...origin/main，工作区初始干净。
-- 版本：root/core/mcp/cli 均为 1.0.1；标签为 V1.0.1。
-- 本机：Node v24.18.0、npm 11.16.0、macOS。
-- 构建：npm run build 通过；Core 仅执行 node --check，MCP 构建是复制 src 到 dist 并生成 build-info，CLI 仅执行 node --check。
-- npm test 在 Core 阶段停止，47 项中 1 项失败；MCP 16/16 通过；CLI 1/1 通过；失败用例单独重复仍失败。
-- npm audit --omit=dev --audit-level=high 报告 3 项 advisory，2 high、1 moderate。
-- .github/workflows/ci.yml 声明 Node 20，矩阵为 Ubuntu/macOS/Windows；本次未实际获得远程 CI 运行结果。
-
-### 2.3 证据等级
-
-- CONFIRMED：已由可重复测试、最小复现或直接依赖审计确认。
-- HIGH-PROBABILITY：代码路径已证明存在故障窗口或资源问题，但本次未做进程 kill、断电、Windows 或多进程注入。
-- UNVERIFIED-RISK：风险成立的前提依赖宿主、部署或外部服务边界，不能仅凭当前仓库断言为产品 bug。
-
-## 3. 架构和状态模型
-
-    Agent/Skill
-      -> MCP STDIO / HeadlessToolRouter
-      -> LlmWikiCore
-      -> Source Store -> parser -> chunks -> bounded batches
-      -> worker lease -> AnalysisEnvelope + SourceRef
-      -> page plan/projection -> PagePatch or staged draft
-      -> write.lock + transaction journal -> wiki pages
-      -> Finalize -> source pages/aggregate pages/indexes/lint
-      -> retrieval: BM25 + embedding/fallback + Wiki graph
-
-Core 实例内通过 taskLocks 和 workspaceWriteTail 排队；进程间通过 task lock、sources.lock 和 write.lock 协调。PagePatch 事务有 expectedFileHash 和回滚逻辑，但 transaction journal、task commits、idempotency record 的提交顺序不是一个可恢复的统一 WAL。
-
-主要状态：
-
-    importing -> prepared/extracting -> planning -> committing -> finalizing -> completed
-                              -> failed/cancelled
-    incremental projection -> final projection -> Finalize
-
-同一任务的 lease、PagePlan cursor、PagePatch scaffold 和 SourceRef 有较完整校验；provisional 页面在任务未完成时会从检索结果中隐藏；MCP 正常错误、背压、取消和 STDIO idle heartbeat 的现有测试通过。
-
-## 4. Confirmed Bugs
-
-### BUG-001：最终投影测试确定失败，且暴露 provisional body 保留语义不一致
-
-- 分类：TEST/CONTRACT；模块：Core projection、Wiki writer、retrieval。
-- 严重度：P2（CI 阻断）；置信度：1.00。
-- 精确位置：
-  - packages/core/test/e2e.test.js:1468-1473：最终 patch 把页面 body 设置为 reconciled summary。
-  - packages/core/test/e2e.test.js:1490-1493：仍用 ProvisionalOnlyMarker 查询同一页面并断言命中。
-  - packages/core/src/wiki-page.js:90-95：body 取自 incoming patch，不从 existing body 合并。
-  - packages/core/src/transaction.js:63-65：对 replace patch 调用 prepareWikiPageContent。
-- 前置条件：运行用例 micro-batch Wiki projection uses one writer, hides provisional pages, and requires final reconciliation。
-- 最小复现：
-
-    node --test --test-name-pattern='micro-batch Wiki projection uses one writer' packages/core/test/e2e.test.js
-
-- 期望：用例成功，最终页面可被用测试查询召回；如果产品契约是保留 provisional-only facts，则旧事实应仍存在。
-- 实际：稳定失败于 e2e.test.js:1493，实际值为 false、期望值为 true。
-- 证据：最终 patch body 只有 Projected Entity 和 reconciled overview；prepareWikiPageContent 用 incoming body 替代 provisional body，因此 ProvisionalOnlyMarker 不再存在。
-- 根因：测试假设与最终语义重写实现不一致。当前证据不能证明这是必需保留旧正文的产品 bug，也不能证明丢弃旧正文就是正确契约。
-- 影响：root npm test 红色；若业务要求保留旧事实，则存在事实丢失；若最终 Writer 被允许完全重写，则测试断言错误。
-- 数据损失/重复/死锁：存在条件性内容丢失；未发现死锁。
-- 临时规避：最终测试改用最终 summary 查询，或由 Writer 将需要保留的事实显式写入 final patch。
-- 最小修复方向：先在文档和 PagePatch contract 中明确 replace 的保留规则；若 replace 是完整重写则改测试并新增“不隐式保留”的断言；若必须保留，则在最终 Writer 的 merge 语义中显式合并旧正文。
-- 回归测试：同时覆盖完整 replace、显式 merge、provisional marker 保留/丢弃三种契约。
-
-### BUG-002：MCP 超大结果的递归截断可把进程打到 OOM
-
-- 分类：MCP/DoS；模块：HeadlessToolRouter。
-- 严重度：P1；置信度：1.00。
-- 精确位置：packages/mcp-server/src/tools.js:57-91，尤其是 68-86。
-- 前置条件：结果 JSON 超过 MAX_MCP_OUTPUT_BYTES（450 KiB），且 data.next_action 本身含有大字符串或大对象。
-- 最小复现：
-
-    node --max-old-space-size=128 --input-type=module -e 'import { HeadlessToolRouter } from "./packages/mcp-server/src/tools.js"; const huge={next_action:{tool:"llm_wiki_list_tasks",arguments:{payload:"x".repeat(520000)}},ok:true}; const router=new HeadlessToolRouter({listTasks:async()=>huge}); await router.callMcp("llm_wiki_list_tasks",{});'
-
-  该子进程触发 V8 heap out of memory；使用普通默认 heap 也复现了进程 OOM，审计过程中未在主 Agent 进程中重复。
-- 期望：超限结果被一次性变成有界的 MCP_OUTPUT_TOO_LARGE，连接保持可用。
-- 实际：serializeResult 将 data.next_action 原样放回新的超限 wrapper，并再次递归调用 serializeResult；没有深度、字节或次数上限，最终因重复 JSON stringify 触发 OOM。
-- 根因：错误恢复动作没有独立的有界 schema，且超限 wrapper 继续携带原始 next_action。
-- 影响：Node MCP 进程退出，所有共享 STDIO 调用中断；比普通可恢复的 output-too-large 严重。
-- 数据损失/重复/死锁：当前调用结果丢失；长任务可能需要重新连接并依赖已持久化的 lease/idempotency。
-- 临时规避：调用端不要向未严格校验的参数字段传递大字符串；运营侧重启 MCP。该规避不应作为发布安全措施。
-- 最小修复方向：超限时仅保留固定长度的 tool 名、task_id 和允许字段；删除或摘要 next_action.arguments；使用一次性 fallback，不再递归 serializeResult。
-- 回归测试：在独立 child process 中注入 0.5 MiB next_action，断言进程正常退出、返回小于上限的结构化错误，并覆盖循环/嵌套 next_action。
-
-### BUG-003：源文件解析类型由可伪造的 display_name 决定
-
-- 分类：输入校验/内容安全；模块：Source Store、parser。
-- 严重度：P2；置信度：1.00。
-- 精确位置：
-  - packages/core/src/source-store.js:50-63 用 path.resolve(input.path) 读取实际文件，却用 displayName 的扩展名选择 parser。
-  - packages/core/src/parser.js:153-160 HTML parser 会移除 script/style；错误选择 Markdown 时不会走该清理。
-- 前置条件：实际文件扩展名和 display_name 扩展名不一致。
-- 最小复现：将内容 <script>alert(1)</script><h1>Title</h1><p>Body</p> 写入 real.html，再调用 core.importFiles({files:[{path: realHtml, display_name: "spoof.md"}]})。
-- 期望：按真实文件类型解析，或明确拒绝 extension mismatch。
-- 实际：manifest.mediaType 为 text/markdown，chunk 文本仍包含 script 标签；真实 Markdown 伪装为 .html 也会走 HTML 清洗。
-- 根因：path.extname(displayName) 优先级高于 path.extname(sourcePath)，display_name 同时承担展示名和 parser 类型。
-- 影响：HTML 清洗可被绕过；Markdown/HTML/XLSX/PDF 的解析、检索和后续 Wiki 写入可能错误；若 Wiki renderer 允许 HTML，存在内容注入面。
-- 数据损失/重复/死锁：可能造成解析内容丢失或未经预期清洗的内容进入知识库；无死锁证据。
-- 临时规避：调用方确保 display_name 扩展名与实际文件一致，并不要把用户可编辑 display_name 当作安全边界。
-- 最小修复方向：以实际路径扩展名为 parser 来源；display_name 只作为 label；如果宿主只能提供别名，至少校验两者一致并拒绝不一致。
-- 回归测试：真实 HTML 以 .md display_name 导入、真实 Markdown 以 .html display_name 导入、二进制/不支持扩展名 mismatch。
-
-### BUG-004：超长块分片的 SourceRef locator 全部指向整块
-
-- 分类：Evidence/可追溯性；模块：parser、SourceRef。
-- 严重度：P2；置信度：1.00。
-- 精确位置：packages/core/src/parser.js:387-395。每个 splitText(piece) 都写入同一 block.startOffset 和 block.endOffset。
-- 前置条件：一个 paragraph/code/table block 超过 maxChunkChars。
-- 最小复现：长度 10,000 的单段 Markdown、maxChunkChars=1000 调用 parseManagedSource。实际输出 17 chunks；除 H1 外的 16 个 chunk 都是 startOffset=8、endOffset=10008。
-- 期望：每个 chunk 的 locator 能映射到对应 piece 在原始文档中的准确区间；至少 start/end 不应全部相同。
-- 实际：所有分片的 locator 相同；parseBlocks 和 splitText 还会 trim/trimStart，使原始空白偏移进一步不可逆。
-- 根因：splitText 只返回文本，不返回原文相对偏移；chunkDocument 使用 block 级 pendingStart/pendingEnd。
-- 影响：Agent 只能得到整段证据范围；引用、回溯和 source UI 高亮可能指向错误位置；表格/长代码块尤其明显。
-- 数据损失/重复/死锁：不删除源文档，但降低证据精度并可能造成错误归因。
-- 临时规避：避免超过 chunk 上限的单段；将文档预先按段落/标题拆开。
-- 最小修复方向：splitText 返回 text/startOffset/endOffset，从未 trim 的规范化源文本计算边界；对 table/code 也保留片段到原文的映射。
-- 回归测试：property test 验证每个 chunk 的 source slice 包含其 quote，分片区间单调、不重叠或明确允许重叠，并覆盖 Unicode、CRLF、表格和代码块。
-
-### BUG-005：代码块中的链接被当作 Wiki 关系和图边
-
-- 分类：Projection/graph/lint correctness；模块：wiki-page、Core graph、lint。
-- 严重度：P2；置信度：1.00。
-- 精确位置：
-  - packages/core/src/wiki-page.js:267-284 的 extractWikiLinks/extractRelatedReferences 对整个正文使用正则，没有排除 fenced code block 或 blockquote。
-  - packages/core/src/core.js:3338-3344 在 Finalize 中用该结果建立双向关系。
-  - packages/core/src/core.js:3845-3853 buildGraph 直接对完整文件做 wikilink 正则。
-  - packages/core/src/lint.js:17 也复用该解析结果。
-- 最小复现：调用 extractRelatedReferences，输入为 fenced markdown 内容和 [[topics/in-code]]、[inside](wiki/entities/in-link.md)；实际返回 topics/in-code 和 entities/in-link。
-- 期望：代码示例、引用材料和非 Related 普通文本中的 link 不产生知识图边；只有明确的 canonical body link 或 Related 语法产生边。
-- 实际：Finalize 会把可解析的代码示例转成关系，graph.json 还可能产生不规范的 target 字符串，lint 可能报告错误 broken link/orphan。
-- 根因：关系解析器和 buildGraph 使用全局正则，没有共享 Markdown block tokenizer 和统一 canonicalization。
-- 影响：双向 Related 污染、图检索误召回、lint 噪声，且一次 Finalize 会改写页面关系。
-- 临时规避：不要在 Wiki 正文代码块中放 wikilink 或 Markdown Wiki path。
-- 最小修复方向：先剥离 fenced code、HTML code/pre 和 blockquote，再分别解析 canonical body links 与显式 Related section；buildGraph/lint/Finalize 必须共用一个解析器。
-- 回归测试：代码块、blockquote、inline code、正文真实 link、Related 中 legacy path、绝对 URL 和 traversal path。
-
-### DEP-001：V1.0.1 锁定依赖含高危 advisory
-
-- 分类：第三方依赖/安全供应链。
-- 严重度：P1（PDF 解析路径）；置信度：1.00（依赖漏洞确认），可利用性置信度需另测。
-- 审计命令：NPM_CONFIG_LOGS_DIR=/private/tmp npm audit --omit=dev --audit-level=high。
-- 实际结果：
-  - pdfjs-dist@5.7.284：high，GHSA-hq66-cqwq-w95j，恶意 PDF 打开时 arbitrary JavaScript execution advisory。
-  - fast-uri@3.1.4：high，GHSA-7p8r-x3mc-p8w7，host confusion via backslash authority introducer；由 MCP SDK 的 ajv 链路引入。
-  - hono@4.12.32：moderate，GHSA-8j4g-w8fx-2239，CORS middleware ReDoS；由 MCP SDK 的 node-server 链路引入。
-- 精确位置：
-  - packages/core/package.json:10-11 声明 pdfjs-dist 范围。
-  - package-lock.json:1144-1150 锁定 pdfjs-dist 5.7.284。
-  - packages/core/src/parser.js:184-209 对不可信 PDF 调用 PDF.js。
-  - package-lock.json:742、879 为 fast-uri/hono。
-- 现有缓解：PDF 调用设置 isEvalSupported=false、disableFontFace=true、useWorkerFetch=false，但不能把上游 advisory 自动等价为已修复。
-- 影响：恶意 PDF 的安全边界需要单独验证；MCP SDK transitive advisory 需要根据实际 STDIO/SDK 路径评估，但 release 仍不应带 high advisory。
-- 最小修复方向：升级到包含修复的版本并对 PDF parser 做回归/恶意样本测试；npm audit 提示 pdfjs-dist 需要可能的 breaking upgrade，不能直接盲目使用 --force。
-- 临时规避：关闭 PDF 导入，或只接收受信 PDF；MCP 部署保持 STDIO、不要将未使用的 HTTP 链路暴露为服务。
-
-## 5. High-Probability Bugs
-
-### HP-001：Page transaction 在 rename、journal、task state 之间没有崩溃恢复协议
-
-- 分类：持久化/分布式恢复；严重度：P1；置信度：0.95。
-- 精确位置：
-  - packages/core/src/transaction.js:69-83 先 rename 目标页，之后才生成 journal。
-  - packages/core/src/transaction.js:84-113 计算 revision 并写 transaction.json。
-  - packages/core/src/core.js:2085-2129 之后才把 transactionId 写入 commits、修改 task state、保存 task。
-  - packages/core/src/transaction.js:126-132 只在已有 transactionId 被引用时读取 journal；启动流程没有扫描未引用 journal 并恢复。
-- 故障窗口：进程在目标 rename 后、journal 写入前；journal 写入后、commits/task state 持久化前；或多页面 rename 中间被 kill。
-- 期望：重启后可识别 prepared/applied/committed transaction，自动完成或回滚，并保持 task/journal/wiki 一致。
-- 预计实际：页面已经存在但 task 没有 commit record；重试 create 可能变成 FILE_HASH_CONFLICT；Finalize 的 pageRecords 可能遗漏孤立页面。
-- 证据等级：代码明确存在窗口，本次没有注入 process kill，因此仍标为 HIGH-PROBABILITY。
-- 临时规避：保留 .llm-wiki/journal，人工检查 transaction.json、目标文件和 task commits 后再 rebase；不要直接删除 journal。
-- 最小修复方向：写入带状态的 intent/WAL 并 fsync；rename 前记录目标和备份，启动时扫描未完成 transaction；把 task commit ledger 和 transaction 状态设计为可恢复协议。
-- 回归测试：在每个关键点注入 SIGKILL，重启 Core，验证 pages、commits、result、retrieval indexes 和 idempotency 都能收敛。
-
-### HP-002：幂等记录在副作用之后写入，崩溃时 exact replay 不成立
-
-- 分类：幂等性/持久化；严重度：P1；置信度：0.95。
-- 精确位置：packages/core/src/task-store.js:393-411；operation() 在 406 行执行，idempotency shard 直到 410 行才写入。
-- 前置条件：任何带 idempotency_key 的 operation 在副作用完成后、record 写盘前进程退出。
-- 期望：同 key、同 request 在重启后返回原 response，不重复副作用。
-- 预计实际：副作用可能已经落地，但 shard 不存在；重试重新执行并遇到 hash conflict、重复写或另一个错误，而不是 exact replay。
-- 说明：同一 Core/同一 task 的锁降低并发竞态，但不能覆盖进程崩溃。
-- 最小修复方向：把 request intent、in-progress/committed 状态和 response 放入可恢复 journal；或让每个副作用以 idempotency key 为 durable transaction identity。
-- 回归测试：在 operation 成功后写 idempotency record 前 kill，重启后重复同 key，断言只产生一个 transaction/analysis/page commit。
-
-### HP-003：Finalize 和领域 metadata refresh 跨页面、索引、lint 的写入不是统一事务
-
-- 分类：Finalize/索引一致性；严重度：P2；置信度：0.90。
-- 精确位置：packages/core/src/core.js:2268-2293 依次写 source pages、relations、index、overview、log、page-source-refs、bm25/vector/embedding/graph/lint，再保存 completed task。
-- 风险：进程在任意中间步骤退出时，页面和 indexes 可能来自不同版本；任务状态在 finalizing，虽可再次 Finalize，但没有显式阶段 marker 或版本一致性校验。
-- 现有缓解：Finalize 重跑通常会重建部分内容；这降低了持久伤害，但没有替代 crash injection 证明。
-- 修复方向：将 Finalize 输出拆成可恢复阶段，每阶段带 generation/revision；或建立一次性的 derived-artifact manifest，所有 index 以同一 generation 发布。
-- 回归测试：每个 write 后 kill/restart，检查 wikiRevision、page-source-refs、graph、lint 和任务 result 的 generation 一致。
-
-### HP-004：embedding JSON cache 没有大小、TTL 或删除策略
-
-- 分类：资源耗尽/检索；严重度：P2；置信度：0.95。
-- 精确位置：packages/core/src/embedding.js:47-75 在 .llm-wiki/indexes/embeddings/<fingerprint> 下按 document hash 写文件，没有 eviction；:245-255 每个 vector 单独持久化。
-- 影响：重复导入、不同内容 hash、不同 endpoint/model fingerprint 会持续增长；大向量以 JSON 存储，磁盘可远超知识库本身。
-- 修复方向：按 workspace 配置设置最大 bytes/files，LRU/TTL，Finalize 或 delete 时回收不可达 hash；对 vector 做紧凑二进制格式或明确预算。
-- 回归测试：生成超过预算的文档版本，断言 cache 不超过上限并保留命中率可解释。
-
-### HP-005：embedding 非 streaming response 分支在限额前先完整读入内存
-
-- 分类：外部服务/DoS；严重度：P2；置信度：0.90。
-- 精确位置：packages/core/src/embedding.js:204-208。当 response.body 没有 getReader 时直接 await response.text()，之后才检查 Buffer.byteLength。
-- 影响：不可信或错误配置的 endpoint 可以在 16 MiB 检查前制造更大的字符串和 heap 峰值。
-- 修复方向：对所有 fetch Response 统一使用 byte-counting stream；无 body reader 时使用受控 reader/AbortController，不能以 response.text() 作为前置步骤。
-- 回归测试：mock 无 stream body 返回超大文本，断言在 bounded memory 下失败。
-
-### HP-006：journal backup/staging 生命周期可能造成长期磁盘增长
-
-- 分类：资源生命周期；严重度：P2；置信度：0.90。
-- 精确位置：packages/core/src/transaction.js:19-22 创建 transactionRoot/backupRoot；成功路径只在 120-123 删除 stagingRoot，没有清理 backupRoot 或已完成 transaction 目录。
-- 影响：每次 replace 都可能保留完整旧页面；多轮增量任务和大页面会造成磁盘增长。
-- 修复方向：保留可配置审计期限或压缩/配额；完成后将 journal 标记为 immutable record，备份按策略清理；删除前提供可审计 dry-run。
-- 回归测试：大量 replace 后检查 journal/backup bytes，验证 GC 规则和恢复期仍可用。
-
-### HP-007：领域 Schema matcher 是 substring 匹配，短别名可能误选类型
-
-- 分类：Domain Schema/语义正确性；严重度：P2；置信度：0.80。
-- 精确位置：packages/core/src/domain-schema.js:752-766 的 term 过滤及 :210-224 的多模式匹配。
-- 风险：非 CJK 只要求长度至少 3，匹配未按词边界；别名可能在更长单词中误命中，自动选择错误 entity/concept/relation constraints。
-- 说明：当前契约没有明确必须词边界匹配，因此不提升为 CONFIRMED。
-- 修复方向：对 Latin token 使用边界/词法匹配，对 CJK 设计 longest-match/优先级，并在 selection response 中返回匹配区间。
-- 回归测试：短别名作为长单词子串、CJK 重叠别名、类型/属性同名。
-
-## 6. Unverified Risks and Test Gaps
-
-### 6.1 路径和权限边界
-
-- packages/core/src/source-store.js:50-78 接受任意 path.resolve 后的本地文件，未限制在 workspace；domain-schema.js:16-31 对 domain_schema_path 也允许 workspace 外路径。
-- README/Tool schema 将其描述为 Agent-visible path，因此这可能是有意的宿主能力，不在当前证据上断言为漏洞。
-- 若 MCP 输入可被不可信 Agent 控制，则可能读取 /etc、用户目录或其他项目文件。应由宿主 attachment materialization 或 Core allowlist 明确边界。
-- 建议测试：workspace 内、workspace 外、符号链接、硬链接、路径竞态、敏感文件拒绝；明确文档 Agent-visible 是否等于任意本地路径。
-
-### 6.2 Embedding SSRF 和 secret/response 泄露
-
-- packages/core/src/embedding.js:16-43 允许 env/config 指定 endpoint，:120-150 直接 fetch，没有 host/protocol allowlist。
-- 对受信 operator 配置，风险可接受；若配置由项目/Agent 影响，则存在 loopback、cloud metadata、内网 SSRF。
-- 错误消息会截取外部响应 body 前 1,000 字符，需确认不会泄漏 token/内部返回。
-
-### 6.3 Windows 原子替换和目录耐久性
-
-- packages/core/src/utils.js:52-87 对 temp 文件执行 fsync 后直接 rename，没有目录 fsync；Windows 下目标存在时 rename/replace 语义需要真实 CI 证明。
-- CI 已声明 windows-latest，但本次只在 macOS/Node 24 执行；不能把配置当作运行结果。
-
-### 6.4 多进程和 kill/restart
-
-现有测试覆盖同进程锁、MCP backpressure 和协议错误，但未覆盖：
-
-- 两个 Node 进程同时 lease/commit/finalize/delete。
-- 锁持有进程 SIGKILL、PID reuse、损坏 lock 文件和 stale lock。
-- transaction rename/journal/task/idempotency 的每个崩溃点。
-- power-loss 风格的 fsync/rename durability。
-
-### 6.5 Parser/format fuzz
-
-已有 DOCX/XLSX/PDF/HTML 格式测试，但没有：
-
-- 恶意 PDF corpus 和当前 PDF.js advisory 的可利用性验证。
-- ZIP bomb、XML entity、超大 sharedStrings、异常 worksheet relationship 的 property/fuzz 组合。
-- UTF-16 surrogate、CJK、CRLF、长单行、代码块和表格 locator property tests。
-
-### 6.6 MCP/Skill/Agent contract
-
-现有 contract tests 已确认 16 个工具、Claude agent MCP 继承、错误通道和 STDIO 生命周期基本一致。仍缺：
-
-- 工具 JSON Schema 与 router/Core 实际运行时校验的一致性测试；当前 router 直接接收 args，不能假定所有 MCP host 都会先做 schema validation。
-- 超大 next_action、循环 next_action、超大错误字段的 child-process isolation test。
-- 真实 Claude Code/OpenCode/Codex host 的 handshake、idle、重启和 build-info 版本验证。
-
-### 6.7 Build artifact drift
-
-- 审计开始时本地 packages/mcp-server/dist/build-info.json 仍报告上一版本 commit 477bd87；源代码 HEAD 已是 4ed5c2c/V1.0.1。重新执行 npm run build 后才恢复一致。
-- dist/ 被 .gitignore 忽略，.mcp.json 和 opencode.json 都直接启动 dist/index.js；fresh checkout 在未先 build 时没有可运行的 dist。
-- README 已要求先 npm run build，因此这是发布/运维脆弱性而非当前源码逻辑的单独 CONFIRMED bug；仍建议把 build freshness 纳入启动检查或发布包检查。
-
-## 7. Bug Matrix
-
-| ID | 状态 | 严重度 | 置信度 | 主要影响 |
-|---|---|---:|---:|---|
-| BUG-001 | CONFIRMED test/contract | P2 | 1.00 | Core CI 红；最终 body 保留语义不明 |
-| BUG-002 | CONFIRMED | P1 | 1.00 | MCP 结果递归导致 Node OOM/STDIO 中断 |
-| BUG-003 | CONFIRMED | P2 | 1.00 | display_name 伪装改变 parser，可能绕过 HTML 清洗 |
-| BUG-004 | CONFIRMED | P2 | 1.00 | 长块分片 locator 错误，SourceRef 不精确 |
-| BUG-005 | CONFIRMED | P2 | 1.00 | 代码块 link 污染 Related/graph/lint |
-| DEP-001 | CONFIRMED dependency | P1 | 1.00 | pdfjs high；fast-uri high；hono moderate |
-| HP-001 | HIGH-PROBABILITY | P1 | 0.95 | kill 后孤立页面、journal 和 task ledger 分裂 |
-| HP-002 | HIGH-PROBABILITY | P1 | 0.95 | 副作用落地但 idempotency replay 丢失 |
-| HP-003 | HIGH-PROBABILITY | P2 | 0.90 | Finalize 多产物版本不一致 |
-| HP-004 | HIGH-PROBABILITY | P2 | 0.95 | embedding cache 长期磁盘耗尽 |
-| HP-005 | HIGH-PROBABILITY | P2 | 0.90 | 非 streaming embedding response heap 峰值 |
-| HP-006 | HIGH-PROBABILITY | P2 | 0.90 | journal backup 无界增长 |
-| HP-007 | HIGH-PROBABILITY | P2 | 0.80 | Schema 类型自动选择误命中 |
-
-## 8. 测试覆盖矩阵
-
-| 能力 | 现有覆盖 | 本次结果 | 缺口 |
-|---|---|---|---|
-| Core e2e/state/projection | e2e 37 项 | 36 pass / 1 fail | crash/restart、跨进程、最终 body 语义 |
-| Core formats | formats 6 项 | 通过 | fuzz、恶意 PDF、资源上限压力 |
-| Wiki page | wiki-page 4 项 | 通过 | fenced code/blockquote graph |
-| MCP contract | contract 13 项 | 13/13 | oversized recursive next_action |
-| MCP STDIO | stdio 3 项 | 3/3 | 真实宿主、异常进程 OOM |
-| CLI | cli 1 项 | 1/1 | 多平台、错误恢复 |
-| Build | node --check + dist copy | 通过 | typecheck/lint/package runtime matrix |
-| Dependencies | npm audit | 3 advisory | 修复后重新 audit |
-| OS/Node | CI 配置 Node20 + 3 OS | 本地 Node24/macOS | 实际 CI 结果未纳入本次证据 |
-
-## 9. 建议新增的 Top 10 回归测试
-
-1. MCP child-process output cap：注入大 next_action，验证只序列化一次且进程不退出。
-2. Transaction crash matrix：在 rename、journal、commits、task save、idempotency save 各点 SIGKILL 后重启恢复。
-3. Idempotency crash replay：副作用成功、record 尚未写入时重试同 key，只允许一个 durable commit。
-4. Source type mismatch：实际 HTML/Markdown/TXT 与 display_name 交叉组合，验证拒绝或按实际类型解析。
-5. Chunk locator property：长 paragraph/code/table 分片区间映射原文，覆盖 Unicode/CRLF/trim。
-6. Graph parser context：fence、blockquote、inline code、Related section 和 canonical body link 的边集合。
-7. PDF security regression：修复版本、恶意样本、isEvalSupported=false 配置和异常资源上限。
-8. Multi-process lock race：两个独立 Node 进程同时 lease、commit_pages、finalize、delete。
-9. Cross-platform atomic write：Node20 Windows/Ubuntu/macOS 上重复写现有 JSON/Markdown，含 kill/restart。
-10. Embedding budget/SSRF：超大非 streaming response、cache quota、endpoint allowlist 和 response redaction。
-
-## 10. 优先修复计划
-
-### P0：当前无确认项
-
-无需立即按 P0 阻断，但不要因此跳过 P1。
-
-### P1：发布前必须处理
-
-1. BUG-002：改为一次性有界的 MCP error serialization，加入 child-process OOM regression。
-2. DEP-001：升级/替换 PDF.js 和 transitive advisory 版本；重新跑 audit、PDF corpus 和全平台测试。
-3. HP-001/HP-002：建立可恢复 transaction/idempotency WAL，明确重启后的 reconciliation。
-4. 明确 BUG-001 的 replace/merge contract；在 contract 明确前保留红色测试作为 release blocker。
-5. 评估外部路径和 embedding endpoint 是否属于受信 operator-only 能力；若不是，增加 allowlist。
-
-### P2：随后处理
-
-1. BUG-003：parser 类型只由实际文件类型决定。
-2. BUG-004：为 split pieces 生成准确 locator。
-3. BUG-005：统一 Markdown link parser，排除代码块/引用，graph/lint/Finalize 共用。
-4. HP-003：Finalize/index generation 引入 generation manifest。
-5. HP-004/HP-006：embedding/journal 增加磁盘预算和回收。
-6. HP-005：所有 embedding response 走 bounded streaming。
-7. HP-007：领域类型选择使用词边界/最长匹配并暴露 match spans。
-
-## 11. 真实宿主验证建议
-
-本次未使用真实 Codex/Claude Code/OpenCode 宿主，也未调用真实模型；MCP STDIO 测试使用 Node test harness。修复 P1 后，建议在同一 main commit 上执行：
-
-- fresh checkout -> npm ci -> npm run build -> 启动 .mcp.json 和 opencode 配置，确认 build-info 的 packageVersion/gitCommit。
-- Claude Code/Codex/OpenCode 各完成一次单文件和多 batch 流程，覆盖 context compaction 后 recovery。
-- idle heartbeat、宿主断开、MCP 重启、丢失 tool response、重复 idempotency key。
-- Windows Node20 与 macOS/Linux Node20 的同一套测试和 package install。
-
-## 12. 审计限制
-
-- 未修改生产代码，未实现修复；报告中的最小修复是设计建议。
-- 本机只有 Node24/macOS 实测；Node20/Windows 仅检查了 CI 配置。
-- 未做真实 kill/restart、断电模拟、跨进程并发和恶意 PDF exploit 验证，因此相关条目标为 HIGH-PROBABILITY 或 UNVERIFIED-RISK。
-- 依赖 audit 已联网完成；advisory 的当前 parser 调用链是否可利用仍需针对修复版本和恶意样本验证。
-- npm run lint、npm run typecheck 未定义可执行脚本；本次不能把 node --check 视为 lint/typecheck。
+- **级别/证据**：P0 / CONFIRMED。
+- **位置**：`packages/core/src/core.js:4419`、`4825-4852`。
+- **复现**：41,485 字符现有页面仅向 Drafter 返回 24,065 字符，`content_truncated=true`，中间标记不可见，但 scaffold 仍为 `operation=replace`。
+- **根因**：上下文预算与页面写入语义分离；Core 知道全文被截断，但没有限制权威替换。
+- **影响**：增量或最终投影可静默删除页面中间的已根据事实。
+- **必修**：截断上下文不得生成 Agent 权威 `replace`；改用服务端 section patch/三方合并，或为当前目标提供完整可分页原文。
+
+### AUD-002：矛盾、复核项和独立 Claim 不会生成强制页面需求
+
+- **级别/证据**：P0 / CONFIRMED。
+- **位置**：`packages/core/src/core.js:4320-4397`。
+- **复现**：仅包含 `contradictions` 和 `reviewItems` 的已根据 Analysis 产生 0 requirement、0 shard，内容未出现在 Wiki。
+- **根因**：`derivePageRequirements` 仅处理 entities、concepts 和 candidatePages。
+- **影响**：关键冲突、风险和待复核信息可在最终知识库中完全消失。
+- **必修**：建立全语义类型 Requirement/Coverage Ledger，每个必要项要么被页面物化，要么被显式解决并保留可验证决议。
+
+### AUD-003：空最终投影可设置 `finalCompleted` 并绕过 Finalize 审计
+
+- **级别/证据**：P0 / CONFIRMED。
+- **位置**：`packages/core/src/core.js:2884-2916`及 projection completion 路径。
+- **复现**：第一次 Finalize 返回 `FINAL_PROJECTION_REQUIRED`；最终 manifest 仍为 0 shard；提交空 `projection_complete=true` 后 `finalCompleted=true`，第二次 Finalize 成功，但 review/矛盾文本未物化。
+- **根因**：Finalize 仅在 `!finalCompleted || lease || provisionalPaths` 时运行 fast audit；“已走过投影流程”被误当成“语义覆盖已完成”。
+- **影响**：Finalize 可发布明知不完整的知识库。
+- **必修**：Finalize 每次发布前都必须验证完整 Coverage Ledger；`finalCompleted` 只能是审计结果，不能是跳过审计的条件。
+
+### AUD-004：Embedding 候选 2,000/默认向量 1,000 上限导致确定性漏召回
+
+- **级别/证据**：P1 / CONFIRMED。
+- **位置**：`packages/core/src/retrieval.js:317-329`，`packages/core/src/embedding.js:36-87`。
+- **复现**：1,101 文档语料中，伪 Embedding 服务确认 query 与第 1,051 个文档语义等价；该文档在默认上限外时无法召回，移到第 51 个时立即命中。
+- **根因**：用 BM25/Wiki 前置粗筛代替全量语义索引，而无词法重叠的目标无法进入候选。
+- **影响**：语义改写、同义词和跨语言查询可静默漏结果；构建期未传 `batch_id` 的普通问答尤其可能让新上传 chunk 落在候选上限之外。
+- **必修**：构建时索引全量可召回文档，查询走持久向量索引/ANN；任何部分索引必须 fail-closed 或执行全量二次扫描。
+
+### AUD-005：召回语料硬上限 10,000 且无可继续分片
+
+- **级别/证据**：P1 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/retrieval.js:11`、`109-174`。
+- **根因**：`fairTake` 在单次内存语料构造中直接裁剪。
+- **影响**：超过上限的后续 Wiki/analysis/source chunk 永久不参与该次查询；`corpus.truncated` 仅是提示，不是召回保障，也不能保证刚上传的 source 获得优先配额。
+- **必修**：改为全量持久索引和分片查询；不能达到全量索引时明确阻断“知识库已可完整查询”状态。
+
+### AUD-006：`queryDomainPages` 绕过 generation 与 provisional 隔离
+
+- **级别/证据**：P1 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/core.js:726-759`。
+- **根因**：search 和 inspect 都从 `workspace.paths.wiki` 读当前工作树，而非 active generation，且没有跨任务 provisional 排除。
+- **影响**：未 Finalize 的领域页可被提前查询；与 `retrieve_context` 看到的发布版本不一致。
+- **必修**：所有用户可见读路径共用 `activeGenerationRoot`；构建期需读工作树时必须显式传 task ID 并应用一致的 provisional 过滤。
+
+### AUD-007：Finalize 在 lint/pointer gate 前改写工作 Wiki 和兼容索引
+
+- **级别/证据**：P1 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/core.js:2931-3010`。
+- **根因**：Finalize 先写 source/index/overview/log、构建 generation，再写 V1.0.1 固定路径索引，最后才根据 lint 决定是否发布 pointer。
+- **影响**：官方 generation pointer 仍可指向旧版，但工作树、Domain Query 和旧 reader 已看到失败版，形成双重真相。
+- **必修**：在独立 generation staging 目录完成页面、索引、lint 和 manifest，全部通过后仅原子更新 pointer；移除当前路径的兼容写入。
+
+### AUD-008：Skill/Server 的后台 Agent 容量模型与 Codex 宿主不兼容
+
+- **级别/证据**：P1 / STATIC-CERTAIN。
+- **位置**：`.agents/skills/llm-wiki-builder/SKILL.md:149-175`、`563-564`；`packages/core/src/core.js:430-490`。
+- **根因**：Skill 要求精确启动 `recommended_workers`，并计划 2 Extractor + 2 Drafter；当前 Codex 最多 4 个总并发槽，其中包含主协调器。
+- **影响**：服务端推荐 4 个工作 Agent 时无法完整启动；部分 spawn 成功后的 fallback 语义不清晰，可触发重复工作。
+- **必修**：引入 host capability handshake，返回 `max_total_agents`、`coordinator_slots`、`max_background_agents`；计算 `effective_workers=min(recommended, available)`，并定义部分启动失败时的确定恢复规则。
+
+### AUD-009：当前仓库没有 Codex 可用的命名项目 Agent 定义
+
+- **级别/证据**：P1 / STATIC-CERTAIN。
+- **位置**：`.claude/agents/*`、`.cac/agents/*`；无 `.agents/agents/*` 或可由当前 Codex 调用的对等定义。
+- **根因**：Skill 把 Claude/CAC 的 `subagent_type` 机制当成通用宿主协议。
+- **影响**：`llm-wiki-extractor`、`page-drafter`、`writer` 在 Codex 中不能被字面启动，Skill 指令不可执行。
+- **必修**：将角色合约与宿主 spawn API 解耦；为支持的宿主提供实际可调用的角色配置，其他宿主使用带签名 role contract 的通用 Agent，不再硬编码 Claude 参数。
+
+### AUD-010：Extraction/Projection 租约没有心跳或显式续租
+
+- **级别/证据**：P1 / STRESS-RISK。
+- **位置**：`packages/core/src/core.js:78-79`及 lease 校验路径。
+- **根因**：分析租约固定 30 分钟、投影租约固定 60 分钟，只在调用边界延长，模型思考/生成期间无心跳。
+- **影响**：长文档或慢宿主上，原 Agent 仍在工作时租约可过期，其他 Agent 重复处理。提交校验通常阻止覆盖，但会浪费成本并引入非确定性。
+- **必修**：实现带 fencing token 的 bounded renewal API，只允许当前 owner/epoch 在最长任务时间内续租。
+
+### AUD-011：相同 `worker_id` 缺少 coordinator epoch/fencing
+
+- **级别/证据**：P1 / STRESS-RISK。
+- **位置**：`packages/core/src/core.js:519-568`、`812-824`。
+- **根因**：身份只有稳定 worker ID，无协调器会话或 lease generation。
+- **影响**：两个协调器误用相同 ID 时可同时读取同一批次并做重复语义工作；首次提交通常获胜，但没有严格的旧持有者隔离。
+- **必修**：租约返回不透明 `lease_token`/`epoch`，commit 和 renew 必须携带；旧 token 在重新授权后永久失效。
+
+### AUD-012：`worker_id`/`writer_id` 在 Core 中可缺省为共享默认值
+
+- **级别/证据**：P2 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/core.js:3431-3437`及 tool schema。
+- **根因**：新流程要求稳定显式 ID，Core 却仍保留 `worker-default`。
+- **影响**：客户端漏传 ID 时多 Agent 会意外共享同一租约身份。
+- **必修**：当 `parallel_extraction.required` 或投影新流程启用时将 ID 改为必填；迁移客户端只能经显式的版本化桥接进入。
+
+### AUD-013：当前 Skill、MCP 和存储仍混合旧流程
+
+- **级别/证据**：P1 / STATIC-CERTAIN。
+- **位置**：Skill 中 old server/legacy SourceRef/locator/投影分支；`llm_wiki_apply_projection`；`view=plan`；裸 `staged_draft_shard_ids`；`vector/graph` alias；V1.0.1 固定路径索引；CLI `migrate-legacy`。
+- **根因**：迁移逻辑没有与当前运行时协议隔离。
+- **影响**：728 行核心 Skill 同时教导新旧分支，Agent 容易选错路径；服务端存在多个等价入口和双重索引真相。
+- **必修**：当前 Skill/MCP 仅保留一条 manifest → draft-shard → staged receipt → single writer → audited Finalize 流程；迁移放入独立一次性工具和版本化文档，不参与新任务提示词。
+
+### AUD-014：无标题 Wiki 页使 Page Plan 抛 `ReferenceError`
+
+- **级别/证据**：P1 / CONFIRMED。
+- **位置**：`packages/core/src/core.js:973-976`。
+- **复现**：Wiki 中存在无 frontmatter title 且无 H1 的 Markdown 时，`getPagePlanContext` 抛 `ReferenceError: file is not defined`。
+- **根因**：循环只解构 `{content, relative, parsed}`，回退标题却引用不在作用域的 `file`。
+- **影响**：一个手工或损坏页面可阻断整个任务投影。
+- **必修**：使用 `path.posix.basename(relative, ".md")` 或在 snapshot 中保留 file，并增加无标题/损坏 frontmatter 测试。
+
+### AUD-015：Source/Analysis/Wiki 分块无 overlap，跨边界事实可漏召回
+
+- **级别/证据**：P1 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/parser.js:544-578`，`packages/core/src/retrieval.js:9-10`及 `splitSections`。
+- **根因**：每个 cut 从下一位置继续，没有句子窗口或 parent-child 回溯。
+- **影响**：关系两端、否定词与结论、表头与跨页行可分居两个 chunk，BM25 无法共现，Embedding 也不能看到完整语义；构建期尚无 Wiki 聚合页补偿时影响更明显。
+- **必修**：句子/表行感知切分 + 10%–15% overlap，保留 parent ID 和精确 evidence offset，召回时按 parent/引用去重。
+
+### AUD-016：`bm25.json` 不是可查询 BM25 索引
+
+- **级别/证据**：P2 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/retrieval.js:28-30`、`506-515`。
+- **根因**：生成物只存 id/path/title/hash/token length，没有 term dictionary/postings/TF/DF；查询每次重新 tokenize 整个内存语料。
+- **影响**：Finalize 产物与运行时行为名不副实，大知识库查询成本随语料线性增长；构建期也没有“chunk 一落盘即可查询”的增量倒排索引。
+- **必修**：生成分词版本化的倒排索引并让查询实际读取；增量构建期对 source/analysis 使用同一索引格式。
+
+### AUD-017：`vector.json` 和真实 Embedding 缓存没有可查询向量存储协议
+
+- **级别/证据**：P2 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/retrieval.js:517-553`，`packages/core/src/embedding.js`。
+- **根因**：`vector.json` 是 256 维 feature-hash fallback 且查询不读取；真实向量以 content hash 零散 JSON 存储，没有 doc ID manifest、tombstone、generation 或 ANN。
+- **影响**：向量文件数量高、GC 和 generation 一致性难以证明，无法规模化近邻检索；Finalize 完成后也没有真正切换到持久多路向量查询。
+- **必修**：建立 generation-scoped vector manifest + 紧凑向量文件/SQLite-HNSW 等本地存储，使用 doc ID/hash 校验并实际参与查询。
+
+### AUD-018：每条 Wiki path 最多返回两个 section
+
+- **级别/证据**：P2 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/retrieval.js:69-91`。
+- **根因**：固定 `pathCount >= 2` 过滤，不考虑查询是否命中多个独立 section。
+- **影响**：长页面第三个相关 section 可被抑制。
+- **必修**：改为 MMR/相似度去重和可配置 per-path cap；若多个 section 提供不同证据，允许全部进入限额。
+
+### AUD-019：跨任务 provisional 状态读取失败时 fail-open
+
+- **级别/证据**：P2 / STRESS-RISK。
+- **位置**：`packages/core/src/retrieval.js:178-199`。
+- **根因**：某个 task record 损坏/替换时 catch 错误并把其页面当成普通稳定页排名。
+- **影响**：与发布隔离目标相反；在 active generation 回退到工作树或特殊读路径上可暴露未发布页。
+- **必修**：默认只读 active generation；必须读工作树时，任何 owner 状态不可验证都应 fail-closed 或排除受影响路径。
+
+### AUD-020：多文件导入为每个文件重新创建 OCR Worker
+
+- **级别/证据**：P1 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/source-store.js:20-40`，`packages/core/src/parser.js:31-40`、`92-94`。
+- **根因**：`importSources` 串行调用 `importOne`，未共享 parser 已支持的 `ocrSession`。
+- **影响**：批量图片/扫描 PDF 会重复准备语言包、创建和终止 Tesseract Worker，导入耗时和内存峰值明显增加。
+- **必修**：每个 import operation 创建一个受控 OCR session pool，传递给所有 parser，在整个操作结束时统一释放。
+
+### AUD-021：PDF OCR 没有页数、总耗时、总像素或取消预算
+
+- **级别/证据**：P1 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/parser.js:250-285`及 Core import cancellation 路径。
+- **根因**：对 `document.numPages` 全量循环，每个低文本页都可 OCR；AbortSignal 未传入 parser/OCR 循环。
+- **影响**：大扫描 PDF 可占用工作区写锁很长时间，宿主取消后后台工作仍继续。
+- **必修**：引入 max pages/max OCR pages/max rendered pixels/max OCR chars/wall-clock budget，每页和每次 recognize 前检查 AbortSignal。
+
+### AUD-022：PDF 像素上限计算失效，独立图片无解压后尺寸防护
+
+- **级别/证据**：P1 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/parser.js:307-316`、image OCR 路径。
+- **根因**：`Math.max(1, calculatedScale)` 阻止超大 PDF 页缩小到 scale < 1；图片只有文件字节上限，没有 width/height/pixel/frame 上限。
+- **影响**：巨型页面或解压炸弹图片可触发过量内存分配或进程崩溃。
+- **必修**：允许 scale < 1 并在 canvas 创建前硬校验实际像素；对图片先读 metadata，限制维度、总像素、帧数和解码后字节。
+
+### AUD-023：现有 OCR 测试未运行真实 Worker，当前安装无法完成真实 OCR
+
+- **级别/证据**：P1 / CONFIRMED（当前工作树）。
+- **位置**：`packages/core/test/formats.test.js`、`packages/core/src/ocr.js`、`packages/core/package.json`。
+- **证据**：格式测试注入 `ocrRecognize` 假函数；真实 smoke 因当前 `node_modules` 缺失 `@tesseract.js-data/eng`/`chi_sim` 失败。package.json/lock 已声明依赖，因此也是安装/发布门禁缺口。
+- **影响**：CI 可全绿但实际图片导入在用户机器上首次启动即失败。
+- **必修**：fresh `npm ci` 后运行一张中英文 fixture 的真实 OCR，验证离线语言包解析和打包产物。
+
+### AUD-024：PPTX 按 `slideN.xml` 文件名而非权威关系顺序解析
+
+- **级别/证据**：P2 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/pptx.js:14-32`。
+- **根因**：仅枚举 `ppt/slides/slide\d+.xml` 并按数字排序，未读 `presentation.xml` 与 rels 的 slide ID 顺序。
+- **影响**：重排、复制或从其他文稿合并的演示文稿可产生错误页序和错误 `locator.slide`。
+- **必修**：按 `p:sldIdLst` 顺序解析 relationship target，用展示顺序作为 locator，保留内部 part 名作诊断元数据。
+
+### AUD-025：PPTX 常见 Chart/SmartArt/内嵌工作簿内容不可召回
+
+- **级别/证据**：P2 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/pptx.js`的 slide XML/text/table/image 路径。
+- **根因**：仅提取原生段落、表格和关联图片 OCR，未遍历 chart data、diagram data 和 embedded workbook。
+- **影响**：数值型汇报的关键事实可被完全遗漏，却不一定有显式 review warning。
+- **必修**：提取受支持的 chart/SmartArt/workbook 数据；无法安全提取的 object 必须生成可见 review item，不得静默跳过。
+
+### AUD-026：投影租约过期只清内存状态，旧 plan/draft 文件可残留
+
+- **级别/证据**：P2 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/core.js:3561-3566`及 page-plan/page-drafts 清理路径。
+- **根因**：`pageProjectionStatus` 把过期 lease 设为 null，但不实时清理该 projection 的 plan 和 staged draft artifacts。
+- **影响**：长期中断/重试会累积磁盘垃圾并增加恢复诊断混淆。
+- **必修**：过期时原子地将 artifact 移入带 retention 的 orphan/quarantine，新 projection 不得读取旧 projection ID 的任何文件。
+
+### AUD-027：`MCP_BUSY/TASK_BUSY` 的最终恢复动作与 Skill “重试原操作”不一致
+
+- **级别/证据**：P2 / STATIC-CERTAIN。
+- **位置**：MCP router busy 处理、Skill backpressure 段落。
+- **根因**：路由器内部有限次重试原操作，耗尽后的 `next_action` 却可转向 status/list_tasks，丢失原请求标识。
+- **影响**：Agent 可在背压后停留于状态轮询，而不是使用相同幂等键重试原操作。
+- **必修**：busy 结果返回有界的 `retry_action`/opaque request token，与 Skill 统一为等待 `retry_after_ms` 后重试精确原操作。
+
+### AUD-028：MCP 协议服务版本仍为 `1.0.6-1`
+
+- **级别/证据**：P3 / STATIC-CERTAIN。
+- **位置**：`packages/mcp-server/src/protocol-server.js:28`。
+- **影响**：诊断、宿主缓存和问题报告会把 1.0.7 服务识别为旧版。
+- **必修**：从 package metadata/build-info 单一来源生成协议版本，增加一致性测试。
+
+### AUD-029：Finalize 结果的 created/updated pages 不包含确定性生成页
+
+- **级别/证据**：P2 / STATIC-CERTAIN。
+- **位置**：Finalize result 构建与 `#writeSourcePages`/index/overview/log 路径。
+- **根因**：结果计数主要基于 task page transaction records，Core 直接生成或更新的 source/index/overview/log 没有统一记录。
+- **影响**：用户报告、发布审计和增量变更清单不完整。
+- **必修**：generation manifest 对所有页面记录 origin、old/new hash 和 disposition，Finalize result 由 manifest diff 统一生成。
+
+### AUD-030：完整导入结束后才创建 task，上传期间无法提前召回
+
+- **级别/证据**：P1 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/core.js:377-432`，`packages/core/src/source-store.js:20-40`。
+- **根因**：`importFiles` 持有 workspace 写锁并同步等待 `importSources`；所有文件串行完成复制、解析/OCR、Chunk 和 artifact 写入后才调用 `createTask`。
+- **影响**：慢 PDF/OCR/PPTX 或批量文件处理期间没有 task ID 和 task-local 召回视图；“上传后很快可用”实际退化为“全部解析完才可用”。
+- **必修**：拆成 source 注册、task 创建、渐进解析/索引三阶段；先返回可恢复 task ID，每个完整校验的 chunk 批次以原子小 generation 发布给 task-local 检索，剩余文件继续后台构建。
+
+### AUD-031：feature-hash 降级被宣称为真实 Embedding 路由
+
+- **级别/证据**：P1 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/workspace.js:122-147`，`packages/core/src/retrieval.js:39-59`、`93-104`。
+- **根因**：默认 `embedding.provider=none`；Embedding 不可用时生成字符/token feature-hash 排名，但仍写入 `rankings.embedding`，因此 `available_channels` 继续返回 Embedding。
+- **影响**：默认所谓“两路召回”其实是两个高度相关的词法/字符特征路由，不具备语义改写保障；RRF 还会把相关性很强的两路当成独立证据重复加权。
+- **必修**：区分 requested/active/effective channel；真实模型不可用时返回独立 `feature_hash` degraded channel，不得标为 Embedding。若产品承诺始终两路，必须随包提供可工作的本地 Embedding 或在初始化时强制完成 provider 配置。
+
+### AUD-032：真实 Embedding 在首次查询现场补算，快速召回可阻塞数分钟
+
+- **级别/证据**：P1 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/retrieval.js:39-42`，`packages/core/src/embedding.js:12-13`、`61-100`。
+- **根因**：source/analysis 没有导入期主动向量构建；首次查询对缓存缺失候选发起批量外部 Embedding，请求默认总预算 600,000ms。
+- **影响**：启用真实模型后，用户第一次问答可能等待最多 1,000 个文档的向量化；完成后的 source/analysis 也可能继续发生相同首查成本。
+- **必修**：chunk 可见后后台增量 Embedding；查询只读取已发布向量快照并受严格在线延迟预算约束，绝不在请求路径批量补文档向量。Embedding 未追平时立即用 BM25 返回并显式报告覆盖率。
+
+### AUD-033：构建期语料混合使旧 Wiki 挤占新上传 source 的候选预算
+
+- **级别/证据**：P1 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/retrieval.js:32-40`、`109-174`、`317-329`。
+- **根因**：普通问答没有 `currentBatchId` 时，语料以 `wiki/analyses/sources` 公平轮转；请求 Embedding 还会无条件计算 Wiki ranking，并把 Wiki top-250 加入仅 2,000 个候选。
+- **影响**：构建期本应优先服务的新上传 source 可能被旧 stable Wiki、历史 analysis 和语料上限挤掉，导致“文件已导入但问不到”。
+- **必修**：建立阶段化检索域和配额：构建期先查 task-local source/analysis，source freshness 有保底；上一代 stable Wiki 作为显式 `stable_wiki` 辅助通道，单独打分、单独配额，不得暗中占用 source Embedding 预算。
+
+### AUD-034：召回阶段只看 `task.status`，不看真实索引/发布就绪状态
+
+- **级别/证据**：P1 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/retrieval.js:14-19`、`95-104`。
+- **根因**：`status === completed` 是两路/多路切换的唯一条件，没有读取 source 解析进度、BM25/向量 manifest 完整性或 active generation pointer。
+- **影响**：崩溃恢复、部分索引、Finalize/pointer 窗口中，响应可能宣称错误阶段或错误可用通道；也无法表达“部分 source 已可用、其余仍导入”。
+- **必修**：阶段由耐久 retrieval manifest 和 publication pointer 派生，至少区分 `importing`、`source-ready`、`analyzing`、`wiki-staging`、`published`；通道选择只依据实际 ready/complete 状态。
+
+### AUD-035：缺少逐 source/逐通道召回就绪度契约
+
+- **级别/证据**：P2 / STATIC-CERTAIN。
+- **位置**：`packages/core/src/retrieval.js:93-106`及 import/status 响应。
+- **根因**：响应只有粗粒度 phase、channel status 和 corpus truncation，没有 accepted/parsed/indexed/failed source 数、BM25/Embedding 覆盖率及本次答案的语料范围。
+- **影响**：用户和 Agent 无法判断刚上传的哪个文件已经可搜，也无法区分“没答案”和“目标文件尚未完成索引”。
+- **必修**：返回 task/source/channel readiness：`accepted/parsed/bm25_indexed/embedding_indexed/failed`、`indexed/total/complete/degraded`、`answer_scope` 和 manifest generation；状态变化必须可轮询且崩溃恢复后一致。
+
+## 5. 已验证为健康的部分
+
+以下能力没有在本轮发现覆盖或丢失型 bug，修复时必须保持：
+
+- 不同显式 worker ID 在有效租约期间不会获取同一 batch。
+- 同一 worker ID 可在断线后续取持久租约的批次。
+- Analysis commit 和 Page commit 有任务锁、证据校验、hash 约束和幂等记录。
+- 并行 Drafter 的 staged receipt 是 hash-bound，只有单 Writer 执行持久页面提交。
+- path-disjoint shard、分波提交、cursor replay、staged receipt 恢复的现有测试通过。
+- `retrieve_context` 已根据 task status 选择构建中两路与完成后三路的默认标签；该机制可保留为兼容显示，但必须由 AUD-031/AUD-034 的真实通道就绪状态取代其决策权。
+- generation pointer 的正常发布和两个已有崩溃恢复用例通过。
+- 长块 offset 精确分片、Unicode locator、oversized batch repair 的新测试通过。
+- PPTX 有 ZIP entry、声明展开字节、XML、slide 数、OCR image 数和 image 字节上限，且不跟随外部链接/不执行宏。
+- 当前 production dependency audit 为 0 个 high/critical。
+
+## 6. 旧版审计处置
+
+本文已取代原 V1.0.1 审计。旧报告中已修复的 MCP 输出 OOM、display name parser spoof、长块 locator、generation 基础发布等问题不再继续作为当前待修项。所有当前待修项均以 `AUD-001`–`AUD-035` 为唯一编号。
+
+## 8. 发布决策
+
+二次审计已确认以下发布条件：
+
+1. `AUD-001`–`AUD-035` 全部达到 [BUG_FIX_PLAN.md](BUG_FIX_PLAN.md) 的完成标准，无“暂缓”或“接受风险”项。
+2. 长页面、全语义 Coverage Ledger、空最终投影和召回上限的先失败测试在旧实现失败、新实现通过。
+3. 上传期间首个完整 chunk 可在全文件导入结束前通过 BM25 命中；超过 10,000 文档的 lexical-only、semantic-only、cross-boundary 和跨语言召回测试不得静默漏目标。
+4. 构建期和完成后所有用户可见读路径仅看到允许的 generation/task scope。
+5. Codex、Claude/CAC 各至少完成一次真实多 Agent 容量、租约续租、Agent 丢失恢复和单 Writer 压力测试。
+6. fresh install 后真实中英 OCR、扫描 PDF、重排 PPTX、chart/SmartArt fixture 的集成测试通过。
+7. Core/MCP/CLI 全套测试为 72/72、23/23、3/3，构建、Skill 官方校验与 `git diff --check` 通过。
+
+结论：代码与协议层面可发布 1.0.8。跨操作系统 CI 和远端注册表发布属后续发行
+环境任务，不影响本次 Git 分支与标签发布。

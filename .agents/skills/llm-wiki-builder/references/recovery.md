@@ -29,7 +29,7 @@ large for the host reader, resume that lease with the same worker and batch IDs
 after rebuilding the current server. `get_batch` enforces hard Agent-facing
 ceilings (3K text per chunk, 9K source text per batch, and 24 KiB serialized
 chunk payload per batch), budgets the complete response, compacts oversized structured table
-metadata, and repairs unfinished legacy batches without discarding the lease.
+metadata, and repairs unfinished bounded batches without discarding the lease.
 Do not wait for expiry or send another worker to repeat the same unreadable
 response.
 
@@ -86,8 +86,8 @@ same task. A `WIKI_REVISION_CONFLICT` from an unrelated-path change indicates
 an older Core process is still running; restart that process on the updated
 build, then resume the existing task and lease instead of creating a new task.
 
-`PAGE_PLAN_INCOMPLETE` is a legacy-plan recovery. Prefer restarting the same
-projection with `view: "manifest"`; Core persists the complete plan and returns
+`PAGE_PLAN_INCOMPLETE` requires restarting the same projection with
+`view: "manifest"`; Core persists the complete plan and returns
 bounded `draft-shard` actions, so the model never has to retain every cursor.
 Read `page_commit_limits` before drafting. Partition paths first, generate only
 one shard or bounded wave, and commit it with `projection_complete: false`.
@@ -111,10 +111,9 @@ launch the Writer until hash-bound staged receipts exist. If a Drafter stopped b
 staging, relaunch only that Drafter with the exact shard action. If the Writer
 stopped during a receipt commit, replay the same `{shard_id, draft_hash}` receipts and idempotency
 key. Paths written by an incomplete projection remain provisional and excluded
-from retrieval. After upgrading from an older server, resume that same
-projection from cursor zero;
-Core automatically shrinks an oversized legacy incremental lease to eight
-batches and reports `projection.safely_repartitioned: true`. Remaining batches
+from retrieval. After a configuration change, resume that same projection from
+cursor zero. Core shrinks an oversized incremental lease to the current bounded
+window and reports `projection.safely_repartitioned: true`; remaining batches
 stay queued and are not discarded.
 After each Writer receipt wave returns, follow its coordinator-owned next
 action, launch the next Drafter wave, and launch the Writer again only after new

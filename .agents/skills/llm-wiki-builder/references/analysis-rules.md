@@ -9,16 +9,12 @@
 - When `get_batch` returns `evidence_catalog`, copy its `analysis_scaffold`
   unchanged and cite `evidence_index` integers in candidate `sourceRefs`. The
   Core resolves them to exact complete SourceRefs and compacts the persisted
-  top-level catalog. Never retype the supplied quotes. On an older server
-  without this catalog, treat top-level `sourceRefs` as the catalog of unique
-  complete references and use checked zero-based indexes in nested candidates.
+  top-level catalog. Never retype the supplied quotes.
 - Write `reviewItems` as objects with non-empty `content` and indexed or
   complete `sourceRefs`; put unsourced questions in `unresolvedQuestions`.
 - Evidence-catalog quotes are already short, exact, and verbatim. Select their
-  indexes without reading the original source file. Only on a legacy server,
-  start each top-level SourceRef by copying one exact
-  `chunk.source_ref_templates` entry and add a contiguous batch quote; never
-  reconstruct or normalize locator fields yourself.
+  indexes without reading the original source file; never reconstruct or
+  normalize locator fields yourself.
 - A title-only quote does not support detailed facts from a table. Claims,
   relations, contradictions, and review items must cite quotes containing their
   identifying terms. Split table evidence by row or coherent topic; a single
@@ -50,9 +46,6 @@ standalone envelope):
   "reviewItems": [{ "content": "A sourced issue requiring review", "sourceRefs": [1] }]
 }
 ```
-
-Only a legacy server without `evidence_catalog` uses complete SourceRef objects
-in the top-level catalog.
 
 ## Page planning
 

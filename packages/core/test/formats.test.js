@@ -208,8 +208,8 @@ test("very large Markdown tables and code blocks produce complete payload-bounde
   assert.equal(batches.every((batch) => batch.payloadBytes <= 128 * 1024), true)
   assert.equal(batches.flatMap((batch) => batch.chunks).every((chunk) => chunk.text.length <= 8_000), true)
 
-  const smallHint = await fixture.core.getBatch({ task_id: imported.task_id, max_chars: 1_000 })
-  const normal = await fixture.core.getBatch({ task_id: imported.task_id })
+  const smallHint = await fixture.core.getBatch({ task_id: imported.task_id, worker_id: "large-structure-worker", max_chars: 1_000 })
+  const normal = await fixture.core.getBatch({ task_id: imported.task_id, worker_id: "large-structure-worker" })
   assert.equal(smallHint.batch_limits.complete, true)
   assert.equal(smallHint.batch_id, normal.batch_id)
   assert.deepEqual(smallHint.chunks, normal.chunks)
@@ -227,9 +227,9 @@ test("very large Markdown tables and code blocks produce complete payload-bounde
     max_chars: 10_000,
   })
   assert.equal(retrieval.fusion, "rrf")
-  assert.equal(retrieval.corpus.max_documents, 100)
-  assert.equal(retrieval.corpus.truncated, true)
-  assert.equal(retrieval.channel_status.embedding.mode, "feature-hash-fallback")
+  assert.equal(retrieval.corpus.indexed_documents > 100, true)
+  assert.equal(retrieval.corpus.truncated, false)
+  assert.equal(retrieval.channel_status.feature_hash.mode, "feature-hash-fallback")
   assert.equal(Buffer.byteLength(JSON.stringify(retrieval)) < 20_000, true)
 })
 
@@ -260,13 +260,13 @@ test("parser and task batching never split a supplementary Unicode character", a
   const parserPath = path.join(fixture.incoming, "unicode-parser.md")
   await writeFile(parserPath, parserSource)
   const parsed = await parseManagedSource(parserPath, "source-unicode-parser", "text/markdown", { maxChunkChars: 500 })
-  assert.equal(parsed.chunks.map((chunk) => chunk.text).join(""), parserSource)
+  assert.equal(reconstructCoveredSource(parsed.chunks, parserSource), parserSource)
   assert.equal(parsed.chunks.every((chunk) => !hasUnpairedSurrogate(chunk.text)), true)
 
   const tinyPath = path.join(fixture.incoming, "unicode-tiny.md")
   await writeFile(tinyPath, "😀a")
   const tiny = await parseManagedSource(tinyPath, "source-unicode-tiny", "text/markdown", { maxChunkChars: 1 })
-  assert.equal(tiny.chunks.map((chunk) => chunk.text).join(""), "😀a")
+  assert.equal(reconstructCoveredSource(tiny.chunks, "😀a"), "😀a")
   assert.equal(tiny.chunks.every((chunk) => !hasUnpairedSurrogate(chunk.text)), true)
 
   const taskSource = `${"x".repeat(1_799)}😀${"y".repeat(3_500)}`
@@ -276,7 +276,7 @@ test("parser and task batching never split a supplementary Unicode character", a
   const batches = JSON.parse(await readFile(path.join(fixture.workspace, ".llm-wiki", "tasks", imported.task_id, "batches.json"), "utf8"))
   const taskChunks = batches.flatMap((batch) => batch.chunks)
   assert.equal(taskChunks.every((chunk) => !hasUnpairedSurrogate(chunk.text)), true)
-  assert.equal(taskChunks.map((chunk) => chunk.text).join(""), taskSource)
+  assert.equal(reconstructCoveredSource(taskChunks, taskSource), taskSource)
 })
 
 test("PDF text is normalized page by page with traceable page numbers", async (t) => {
@@ -290,6 +290,109 @@ test("PDF text is normalized page by page with traceable page numbers", async (t
   assert.match(chunks[0].text, /Hello PDF Knowledge/)
 })
 
+test("PDF pages without a usable text layer fall back to OCR", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-pdf-ocr-"))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const source = path.join(root, "scan.pdf")
+  await writeFile(source, minimalPdf(""))
+  const parsed = await parseManagedSource(source, "source-pdf-ocr", "application/pdf", {
+    ocrRecognize: async (_image, context) => ({ text: `Scanned agreement page ${context.pageNumber}`, confidence: 93 }),
+  })
+  assert.match(parsed.markdown, /Scanned agreement page 1/)
+  assert.equal(parsed.document.metadata.ocrPages[0].pageNumber, 1)
+  assert.equal(parsed.document.metadata.ocrPages[0].confidence, 93)
+  assert.equal(parsed.chunks.some((chunk) => chunk.pageNumber === 1), true)
+})
+
+test("PowerPoint slides retain native text, tables, slide locators, and OCR embedded images", async (t) => {
+  const fixture = await formatFixture()
+  t.after(() => rm(fixture.root, { recursive: true, force: true }))
+  const nativeSource = path.join(fixture.incoming, "quarterly.pptx")
+  await writeFile(nativeSource, await powerpointFixture())
+  const imported = await fixture.core.importFiles({ files: [{ path: nativeSource }] })
+  assert.equal(imported.rejected.length, 0)
+  const document = await managedDocument(fixture.workspace, imported.sources[0].content_hash)
+  assert.equal(document.title, "quarterly")
+  assert.equal(document.mediaType, "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+  assert.equal(document.metadata.slideCount, 1)
+  assert.equal(document.metadata.macrosExecuted, false)
+  assert.equal(document.blocks.some((block) => block.kind === "paragraph" && block.text.includes("Revenue increased")), true)
+  const table = document.blocks.find((block) => block.kind === "table")
+  assert.deepEqual(table.headers, ["Region", "Revenue"])
+  assert.deepEqual(table.rows[0], ["North", "42"])
+  const chunks = await managedChunks(fixture.workspace, imported.sources[0].content_hash)
+  assert.equal(chunks.some((chunk) => chunk.slideNumber === 1), true)
+  const batch = await fixture.core.getBatch({ task_id: imported.task_id })
+  const slideChunk = batch.chunks.find((chunk) => chunk.slideNumber === 1)
+  assert.equal(slideChunk.source_ref_templates[0].locator.slide, 1)
+
+  const imageSource = path.join(fixture.incoming, "scanned-chart.pptx")
+  await writeFile(imageSource, await powerpointFixture({ embeddedImage: Buffer.from("mock image") }))
+  const parsed = await parseManagedSource(
+    imageSource,
+    "source-powerpoint-ocr",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    {
+      ocrRecognize: async (_image, context) => ({
+        text: `OCR chart for slide ${context.slideNumber}`,
+        confidence: 97,
+      }),
+    },
+  )
+  assert.match(parsed.markdown, /OCR chart for slide 1/)
+  assert.equal(parsed.document.metadata.ocrImageCount, 1)
+  assert.equal(parsed.document.metadata.slides[0].ocrImages[0].confidence, 97)
+})
+
+test("standalone images normalize injected OCR text and metadata", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-image-ocr-"))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const source = path.join(root, "receipt.png")
+  await writeFile(source, Buffer.from("mock image"))
+  const parsed = await parseManagedSource(source, "source-image-ocr", "image/png", {
+    ocrRecognize: async () => ({ text: "Invoice number 4827", confidence: 96.5 }),
+  })
+  assert.equal(parsed.document.title, "receipt")
+  assert.equal(parsed.document.metadata.extractionMethod, "ocr")
+  assert.equal(parsed.document.metadata.confidence, 96.5)
+  assert.equal(parsed.chunks.some((chunk) => /Invoice number 4827/.test(chunk.text)), true)
+})
+
+test("bundled OCR worker recognizes a real packaged image without injection", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-real-ocr-"))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const { createCanvas } = await import("@napi-rs/canvas")
+  const canvas = createCanvas(1_000, 260)
+  const context = canvas.getContext("2d")
+  context.fillStyle = "white"
+  context.fillRect(0, 0, 1_000, 260)
+  context.fillStyle = "black"
+  context.font = "bold 96px sans-serif"
+  context.fillText("INVOICE 4827", 50, 165)
+  const source = path.join(root, "invoice.png")
+  await writeFile(source, canvas.toBuffer("image/png"))
+  const parsed = await parseManagedSource(source, "source-real-ocr", "image/png")
+  assert.match(parsed.markdown, /4827/)
+  assert.equal(parsed.document.metadata.extractionMethod, "ocr")
+})
+
+test("image dimension bombs are rejected from headers before decoder allocation", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-image-bomb-"))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const source = path.join(root, "bomb.png")
+  const header = Buffer.alloc(33)
+  Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).copy(header, 0)
+  header.writeUInt32BE(13, 8)
+  header.write("IHDR", 12, "ascii")
+  header.writeUInt32BE(100_000, 16)
+  header.writeUInt32BE(100_000, 20)
+  await writeFile(source, header)
+  await assert.rejects(
+    () => parseManagedSource(source, "source-image-bomb", "image/png"),
+    (error) => error.code === "SOURCE_PARSE_FAILED" && /dimension|pixel/.test(error.message),
+  )
+})
+
 async function managedDocument(workspace, hash) {
   return JSON.parse(await readFile(path.join(workspace, ".llm-wiki", "sources", "objects", hash, "extracted", "document.json"), "utf8"))
 }
@@ -300,6 +403,20 @@ async function managedChunks(workspace, hash) {
 
 async function documentForManagedPath(workspace, managedPath) {
   return JSON.parse(await readFile(path.join(workspace, path.dirname(managedPath), "extracted", "document.json"), "utf8"))
+}
+
+function reconstructCoveredSource(chunks, source) {
+  const ordered = [...chunks].sort((left, right) => left.startOffset - right.startOffset || left.endOffset - right.endOffset)
+  let cursor = 0
+  let reconstructed = ""
+  for (const chunk of ordered) {
+    assert.equal(chunk.startOffset <= cursor, true, `gap before source offset ${chunk.startOffset}`)
+    if (chunk.endOffset <= cursor) continue
+    reconstructed += source.slice(cursor, chunk.endOffset)
+    cursor = chunk.endOffset
+  }
+  assert.equal(cursor, source.length)
+  return reconstructed
 }
 
 function hasUnpairedSurrogate(value) {
@@ -375,6 +492,29 @@ async function xlsxFixture(options = {}) {
     <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
       <row r="1"><c r="A1" t="inlineStr"><is><t>Internal note</t></is></c></row>
     </sheetData></worksheet>`)
+  return zip.generateAsync({ type: "nodebuffer" })
+}
+
+async function powerpointFixture(options = {}) {
+  const zip = new JSZip()
+  zip.file("ppt/slides/slide1.xml", `<?xml version="1.0" encoding="UTF-8"?>
+    <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+      <p:cSld><p:spTree>
+        <p:sp><p:txBody><a:p><a:r><a:t>Quarterly Plan</a:t></a:r></a:p><a:p><a:r><a:t>Revenue increased &amp; costs stayed flat.</a:t></a:r></a:p></p:txBody></p:sp>
+        <a:tbl>
+          <a:tr><a:tc><a:txBody><a:p><a:r><a:t>Region</a:t></a:r></a:p></a:txBody></a:tc><a:tc><a:txBody><a:p><a:r><a:t>Revenue</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+          <a:tr><a:tc><a:txBody><a:p><a:r><a:t>North</a:t></a:r></a:p></a:txBody></a:tc><a:tc><a:txBody><a:p><a:r><a:t>42</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+        </a:tbl>
+      </p:spTree></p:cSld>
+    </p:sld>`)
+  if (options.embeddedImage) {
+    zip.file("ppt/slides/_rels/slide1.xml.rels", `<?xml version="1.0" encoding="UTF-8"?>
+      <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+        <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+        <Relationship Id="external" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" TargetMode="External" Target="https://example.invalid/chart.png"/>
+      </Relationships>`)
+    zip.file("ppt/media/image1.png", options.embeddedImage)
+  }
   return zip.generateAsync({ type: "nodebuffer" })
 }
 
