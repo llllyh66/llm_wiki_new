@@ -179,7 +179,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_stage_page_drafts",
-    description: "Persist one fully retrieved, path-disjoint semantic PagePatch shard in task-scoped temporary staging without writing Wiki pages. The Drafter must submit the exact current draft_claim_token; expired or superseded invocations are fenced. Success requires accepted=true, staged=true, a non-empty draft_hash, and a positive patch_count. Core persists the hash-bound receipt so status can recover a lost Drafter response; only then is the stable Writer launched to commit it server-side.",
+    description: "Persist one fully retrieved, path-disjoint semantic PagePatch shard in task-scoped temporary staging without writing Wiki pages. Fully visible existing pages use complete replace content; truncated pages use sectionChanges and may upsert only new or fully visible editable headings without selecting overlapping parent/child sections. The Drafter must submit the exact current draft_claim_token; expired or superseded invocations are fenced. Success requires accepted=true, staged=true, a non-empty draft_hash, and a positive patch_count. Core persists the hash-bound receipt so status can recover a lost Drafter response; only then is the stable Writer launched to commit it server-side.",
     inputSchema: closedObject({
       task_id: taskId,
       writer_id: { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9._:-]+$" },

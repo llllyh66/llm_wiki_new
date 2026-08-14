@@ -28,6 +28,8 @@ const ATOMIC_PAGE_REJECTION_CODES = new Set([
   "INCOMPLETE_PAGE_COVERAGE",
   "PAGE_DRAFT_SHARDS_INCOMPLETE",
   "PAGE_DRAFT_SHARD_NOT_READY",
+  "PAGE_DRAFT_SECTION_NOT_FULLY_VISIBLE",
+  "PAGE_DRAFT_SCHEMA_UPGRADE_REQUIRED",
   "STAGED_DRAFT_NOT_FOUND",
   "STAGED_DRAFT_EXISTS",
   "STAGED_DRAFT_HASH_MISMATCH",
@@ -192,6 +194,8 @@ function pageCommitRetryScope(code) {
   if (code === "PAGE_PLAN_INCOMPLETE") return "prepare_server_manifest_then_process_one_bounded_shard"
   if (code === "PAGE_DRAFT_SHARDS_INCOMPLETE") return "process_next_uncommitted_server_shard"
   if (code === "PAGE_DRAFT_SHARD_NOT_READY") return "retrieve_all_cursors_for_the_reported_server_shard"
+  if (code === "PAGE_DRAFT_SECTION_NOT_FULLY_VISIBLE") return "redraft_entire_shard_using_only_new_or_fully_visible_sections"
+  if (code === "PAGE_DRAFT_SCHEMA_UPGRADE_REQUIRED") return "refresh_manifest_and_redraft_retired_merge_payloads"
   if (code === "STAGED_DRAFT_NOT_FOUND") return "restage_the_reported_shard_then_retry_server_commit"
   if (code === "STAGED_DRAFT_EXISTS") return "do_not_resubmit_an_accepted_shard"
   if (code === "PAGE_DRAFT_STAGING_UNAVAILABLE") return "resume_the_active_manifest_projection_before_server_commit"
@@ -207,6 +211,8 @@ function pageCommitRetryInstruction(code) {
   if (code === "PAGE_PLAN_INCOMPLETE") return "Return control to the coordinator. It requests view=manifest, launches a Drafter for one bounded shard, and starts the Writer only after a receipt exists."
   if (code === "PAGE_DRAFT_SHARDS_INCOMPLETE") return "Return the next shard to the coordinator, which launches its Drafter; accepted earlier shards are durable and must not be regenerated."
   if (code === "PAGE_DRAFT_SHARD_NOT_READY") return "The coordinator must relaunch the shard's Drafter to retrieve every cursor and stage a receipt before restarting the Writer."
+  if (code === "PAGE_DRAFT_SECTION_NOT_FULLY_VISIBLE") return "Redraft the entire rejected shard. Upsert only new headings or headings listed in editable_section_headings; leave protected sections unchanged."
+  if (code === "PAGE_DRAFT_SCHEMA_UPGRADE_REQUIRED") return "The retired staged merge payload was discarded safely. Refresh the manifest and redraft every returned shard with the current PagePatch schema."
   if (code === "STAGED_DRAFT_NOT_FOUND") return "Return control to the coordinator so it can relaunch the reported Drafter; retry the Writer only after a replacement receipt exists."
   if (code === "STAGED_DRAFT_EXISTS") return "Do not resubmit an accepted shard; continue with the next uncommitted manifest shard."
   if (code === "PAGE_DRAFT_STAGING_UNAVAILABLE") return "Return control to the coordinator so it can resume the active manifest and stage the shard before restarting the Writer."
@@ -258,7 +264,37 @@ function recoveryAction(tool, args, error) {
   if (tool === "llm_wiki_update_pages" && ["WIKI_UPDATE_PUBLISH_FAILED", "WORKSPACE_CHANGED_DURING_INDEXING"].includes(error.code)) {
     return { tool: "llm_wiki_finalize", arguments: { task_id: args?.task_id } }
   }
+  if (tool === "llm_wiki_stage_page_drafts" && ["INVALID_PAGE_PATCH", "INVALID_PAGE_PATH", "INVALID_SOURCE_REF", "INCOMPLETE_PAGE_COVERAGE", "DUPLICATE_PAGE_COVERAGE", "PAGE_COMMIT_TOO_LARGE", "PAGE_DRAFT_SECTION_NOT_FULLY_VISIBLE"].includes(error.code)) {
+    return {
+      tool,
+      action_owner: "drafter",
+      delegate_to: "llm-wiki-page-drafter",
+      arguments: {
+        task_id: args?.task_id,
+        writer_id: args?.writer_id,
+        projection_id: args?.projection_id,
+        shard_id: args?.shard_id,
+        draft_claim_token: args?.draft_claim_token,
+      },
+      required_generated_arguments: ["patches", "idempotency_key"],
+    }
+  }
   if (tool === "llm_wiki_commit_pages" && error.code === "PAGE_PLAN_INCOMPLETE") {
+    return {
+      tool: "llm_wiki_get_page_plan_context",
+      action_owner: "coordinator",
+      delegate_to: "llm-wiki-page-drafter",
+      arguments: {
+        task_id: args?.task_id,
+        writer_id: args?.writer_id,
+        projection_id: args?.projection_id,
+        view: "manifest",
+        cursor: 0,
+        max_chars: 40_000,
+      },
+    }
+  }
+  if (tool === "llm_wiki_commit_pages" && error.code === "PAGE_DRAFT_SCHEMA_UPGRADE_REQUIRED") {
     return {
       tool: "llm_wiki_get_page_plan_context",
       action_owner: "coordinator",

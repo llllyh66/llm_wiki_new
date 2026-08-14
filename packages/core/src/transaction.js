@@ -68,7 +68,27 @@ export async function commitPageTransaction(workspace, task, patches, basedOnWik
         }
       }
       const staged = path.join(stagingRoot, relative)
-      const preparedContent = prepareWikiPageContent(patch, currentContent)
+      let preparedContent
+      try {
+        preparedContent = prepareWikiPageContent(patch, currentContent)
+      } catch (error) {
+        fail(typeof error?.code === "string" ? error.code : "INVALID_PAGE_PATCH", String(error?.message ?? error), {
+          retryable: true,
+          details: { path: relative, patch_id: patch.patchId },
+        })
+      }
+      if (preparedContent.length > workspace.config.limits.maxPageChars) {
+        fail("PAGE_COMMIT_TOO_LARGE", `Prepared page exceeds the ${workspace.config.limits.maxPageChars}-character workspace limit: ${relative}.`, {
+          retryable: true,
+          details: {
+            path: relative,
+            patch_id: patch.patchId,
+            prepared_content_chars: preparedContent.length,
+            max_page_chars: workspace.config.limits.maxPageChars,
+          },
+          suggestedAction: "Reduce the rewritten page or section changes before retrying the rejected atomic commit.",
+        })
+      }
       await writeTextAtomic(staged, preparedContent)
       targets.push({
         patch,

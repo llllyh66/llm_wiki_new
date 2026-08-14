@@ -2,7 +2,9 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import {
   applyWikiPageSectionChanges,
+  createWikiPageDraftExcerpt,
   extractRelatedReferences,
+  findOverlappingWikiPageSections,
   listWikiPageSections,
   parseWikiPage,
   prepareWikiPageContent,
@@ -79,23 +81,85 @@ test("Chinese pages receive localized Core-owned navigation and classification s
   assert.doesNotMatch(prepared, /^## Domain Classification$/m)
 })
 
-test("replace drops stale body facts while merge explicitly retains them", () => {
+test("replace rewrites a complete page while merge upserts sections without appending a second body", () => {
   const existing = `# SGSNInitiatedDetach
 
+Legacy introduction.
+
+## Details
+
 Legacy grounded fact.
+
+## History
+
+Preserved history.
 `
   const replacePatch = {
-    ...pagePatch("# SGSNInitiatedDetach\n\nReconciled grounded fact.\n"),
+    ...pagePatch("# SGSNInitiatedDetach\n\nReconciled introduction.\n"),
     operation: "replace",
   }
   const replaced = prepareWikiPageContent(replacePatch, existing, "2026-08-06")
-  assert.match(replaced, /Reconciled grounded fact/)
+  assert.match(replaced, /Reconciled introduction/)
   assert.doesNotMatch(replaced, /Legacy grounded fact/)
 
-  const mergePatch = { ...replacePatch, operation: "merge" }
+  const { content, ...mergeBase } = replacePatch
+  const mergePatch = {
+    ...mergeBase,
+    operation: "merge",
+    sectionChanges: [
+      { operation: "upsert_section", heading: "Details", level: 2, content: "Reconciled grounded fact." },
+      { operation: "upsert_section", heading: "Operations", level: 2, content: "New operational guidance." },
+    ],
+  }
   const merged = prepareWikiPageContent(mergePatch, existing, "2026-08-06")
-  assert.match(merged, /Legacy grounded fact/)
+  assert.doesNotMatch(merged, /Legacy grounded fact/)
   assert.match(merged, /Reconciled grounded fact/)
+  assert.match(merged, /Preserved history/)
+  assert.match(merged, /New operational guidance/)
+  assert.equal((merged.match(/^# SGSNInitiatedDetach$/gm) ?? []).length, 1)
+  assert.equal((merged.match(/^## Details$/gm) ?? []).length, 1)
+})
+
+test("draft excerpts distinguish fully visible editable sections from protected partial sections", () => {
+  const content = `# Large Page
+
+## Head
+
+Short complete head section.
+
+## Middle
+
+${"Hidden middle content. ".repeat(500)}
+
+## Tail
+
+Short complete tail section.
+`
+  const excerpt = createWikiPageDraftExcerpt(content, 1_000)
+  assert.equal(excerpt.content_truncated, true)
+  assert.deepEqual(excerpt.editable_section_headings, ["Head", "Tail"])
+  assert.equal(excerpt.protected_section_headings.includes("Middle"), true)
+})
+
+test("nested section selections are detected before a merge can apply conflicting upserts", () => {
+  const content = `# Page
+
+## Parent
+
+Parent content.
+
+### Child
+
+Child content.
+
+## Sibling
+
+Sibling content.
+`
+  assert.deepEqual(findOverlappingWikiPageSections(content, ["Parent", "Child", "Sibling"]), [
+    { ancestor: "Parent", descendant: "Child" },
+  ])
+  assert.deepEqual(findOverlappingWikiPageSections(content, ["Child", "Sibling"]), [])
 })
 
 test("relationship prose and incidental source paths do not become graph edges", () => {

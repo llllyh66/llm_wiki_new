@@ -119,20 +119,37 @@ export const analysisSchema = Object.freeze({
 })
 
 export const pagePatchSchema = Object.freeze({
-  $id: "https://llm-wiki.local/schemas/page-patch-v1.json",
+  $id: "https://llm-wiki.local/schemas/page-patch-v2.json",
   type: "object",
-  required: ["patchId", "path", "operation", "title", "pageKind", "content", "sourceRefs", "rationale"],
+  required: ["patchId", "path", "operation", "title", "pageKind", "sourceRefs", "rationale"],
   properties: {
     patchId: { type: "string", minLength: 1, maxLength: 200 },
     path: { type: "string", pattern: "^wiki/(sources|entities|concepts|topics|comparisons|queries|synthesis|findings|methodology|thesis|meetings|decisions|projects|stakeholders|goals|habits|reflections|chapters|characters|themes|plot-threads|journal)/.+\\.md$" },
     operation: {
       enum: ["create", "replace", "merge"],
-      description: "create requires an absent path; replace is a complete incoming body rewrite; merge explicitly retains existing grounded body content.",
+      description: "create writes a new complete page; replace rewrites a complete existing page that was fully visible to the Drafter; merge applies bounded sectionChanges to a truncated existing page without appending a second body.",
     },
     expectedFileHash: { type: "string", pattern: "^[0-9a-f]{64}$", description: "Required for replace and merge when the path already exists; copy the exact current file hash." },
     title: { type: "string", minLength: 1, maxLength: 500 },
     pageKind: { type: "string", minLength: 1, maxLength: 100 },
-    content: { type: "string", minLength: 1 },
+    content: { type: "string", minLength: 1, description: "Required only for create and replace. It is the complete desired page body." },
+    sectionChanges: {
+      type: "array",
+      minItems: 1,
+      maxItems: 20,
+      description: "Required only for merge. Upsert complete, fully visible sections or add a new section; Core preserves every other section server-side. Do not select both a parent section and one of its nested child sections in the same patch.",
+      items: {
+        type: "object",
+        required: ["operation", "heading", "content"],
+        properties: {
+          operation: { const: "upsert_section" },
+          heading: { type: "string", minLength: 1, maxLength: 300 },
+          level: { type: "integer", minimum: 2, maximum: 6 },
+          content: { type: "string", minLength: 1 },
+        },
+        additionalProperties: false,
+      },
+    },
     summary: { type: "string", maxLength: 500 },
     domainSchemaId: { type: "string", minLength: 1, maxLength: 200 },
     domainSchemaVersion: { type: "string", minLength: 1, maxLength: 200 },
@@ -181,6 +198,16 @@ export const pagePatchSchema = Object.freeze({
     },
     rationale: { type: "string", minLength: 1, maxLength: 10000 },
   },
+  allOf: [
+    {
+      if: { properties: { operation: { enum: ["create", "replace"] } }, required: ["operation"] },
+      then: { required: ["content"], not: { required: ["sectionChanges"] } },
+    },
+    {
+      if: { properties: { operation: { const: "merge" } }, required: ["operation"] },
+      then: { required: ["sectionChanges"], not: { required: ["content"] } },
+    },
+  ],
   additionalProperties: false,
 })
 

@@ -450,6 +450,79 @@ test("page validation rejection reports atomic whole-subset retry semantics", as
   assert.equal(response.structuredContent.mcp_connection_usable, true)
 })
 
+test("a protected-section draft rejection returns the shard to the same Drafter", async () => {
+  const router = new HeadlessToolRouter({
+    stagePageDrafts: async () => {
+      throw new LlmWikiError("PAGE_DRAFT_SECTION_NOT_FULLY_VISIBLE", "The section was truncated.", {
+        retryable: true,
+        details: { heading: "Legacy Details", editable_section_headings: ["Recent Evidence"] },
+      })
+    },
+  })
+  const response = await router.callMcp("llm_wiki_stage_page_drafts", {
+    task_id: "task-example",
+    writer_id: "wiki-writer-1",
+    projection_id: "projection-example",
+    shard_id: "draft-0001",
+    draft_claim_token: "claim-example",
+    patches: [{ patchId: "patch-example" }],
+    idempotency_key: "protected-section-v1",
+  })
+  assert.equal(response.isError, undefined)
+  assert.equal(response.structuredContent.error.code, "PAGE_DRAFT_SECTION_NOT_FULLY_VISIBLE")
+  assert.equal(response.structuredContent.atomic_commit_applied, false)
+  assert.equal(response.structuredContent.page_commit_recovery.retry_scope, "redraft_entire_shard_using_only_new_or_fully_visible_sections")
+  assert.deepEqual(response.structuredContent.next_action, {
+    tool: "llm_wiki_stage_page_drafts",
+    action_owner: "drafter",
+    delegate_to: "llm-wiki-page-drafter",
+    arguments: {
+      task_id: "task-example",
+      writer_id: "wiki-writer-1",
+      projection_id: "projection-example",
+      shard_id: "draft-0001",
+      draft_claim_token: "claim-example",
+    },
+    required_generated_arguments: ["patches", "idempotency_key"],
+  })
+})
+
+test("a retired staged merge schema routes the coordinator to a fresh manifest", async () => {
+  const router = new HeadlessToolRouter({
+    commitPages: async () => {
+      throw new LlmWikiError("PAGE_DRAFT_SCHEMA_UPGRADE_REQUIRED", "The staged merge schema is retired.", {
+        retryable: true,
+        details: { projection_plan_invalidated: true, resume_view: "manifest" },
+      })
+    },
+  })
+  const response = await router.callMcp("llm_wiki_commit_pages", {
+    task_id: "task-example",
+    writer_id: "wiki-writer-1",
+    projection_id: "projection-example",
+    based_on_wiki_revision: "d".repeat(64),
+    staged_draft_receipts: [{ shard_id: "draft-0001", draft_hash: "e".repeat(64) }],
+    patches: [],
+    idempotency_key: "schema-upgrade-v1",
+  })
+  assert.equal(response.isError, undefined)
+  assert.equal(response.structuredContent.error.code, "PAGE_DRAFT_SCHEMA_UPGRADE_REQUIRED")
+  assert.equal(response.structuredContent.page_commit_recovery.retry_scope, "refresh_manifest_and_redraft_retired_merge_payloads")
+  assert.deepEqual(response.structuredContent.next_action, {
+    tool: "llm_wiki_get_page_plan_context",
+    action_owner: "coordinator",
+    delegate_to: "llm-wiki-page-drafter",
+    arguments: {
+      task_id: "task-example",
+      writer_id: "wiki-writer-1",
+      projection_id: "projection-example",
+      view: "manifest",
+      cursor: 0,
+      max_chars: 40_000,
+    },
+  })
+})
+
 test("unfinished server-side page shards recover without restarting or disconnecting", async () => {
   const nextShard = { shard_id: "draft-0007", paths: ["wiki/entities/example.md"], requirement_ids: ["page-example"] }
   const router = new HeadlessToolRouter({

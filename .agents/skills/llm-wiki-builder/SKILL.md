@@ -181,12 +181,20 @@ For each manifest `draft_action`, launch at most the returned capacity. Each Dra
 2. Follows every returned cursor until `draft_shard_complete=true`.
 3. Creates exactly one PagePatch per assigned canonical path.
 4. Copies each requirement’s `patch_scaffold`; unions `covers`, `sourceRefs`, classifications, and related paths when several requirements share a path.
-5. Adds grounded semantic content in the original language of the directly
-   supporting evidence without changing path, operation, expected hash, or
-   requirement identifiers. It does not translate pages to make the Wiki
+5. Preserves the returned `draft_mode`, path, operation, expected hash, and
+   requirement identifiers. For `new-page` and `complete-page-rewrite`, it
+   supplies one complete `content` body. For `section-upsert`, it fills
+   `sectionChanges` with `upsert_section` entries only for new headings or
+   headings listed in the matching existing page's
+   `editable_section_headings`; it never edits `protected_section_headings` or
+   appends a second page body. One merge patch never upserts both a parent
+   section and its nested child; the parent upsert contains the complete
+   desired nested content.
+6. Keeps grounded semantic content in the original language of the directly
+   supporting evidence. It does not translate pages to make the Wiki
    monolingual.
-6. Calls `llm_wiki_stage_page_drafts` with the exact projection/shard identity and a new idempotency key.
-7. Returns only the accepted `{shard_id, draft_hash}` receipt.
+7. Calls `llm_wiki_stage_page_drafts` with the exact projection/shard identity and a new idempotency key.
+8. Returns only the accepted `{shard_id, draft_hash}` receipt.
 
 Every manifest `draft_action` includes a TTL-bound `draft_claim_token`. Copy it
 unchanged through every shard cursor and the staging call. The token fences an
@@ -201,7 +209,12 @@ Drafter; refresh the manifest and relaunch it immediately when its live handle
 is absent. After any Drafter notification, refill all available Drafter slots
 before waiting.
 
-For an existing page, preserve server scaffold operation `merge`. Never change it to authoritative replacement. Core keeps unseen grounded sections server-side.
+For an existing page, preserve the server-selected operation. `replace` means
+the complete old page is present and the Drafter must return one coherent,
+fully rebased page. `merge` means the old page was truncated: submit only
+bounded `upsert_section` changes for new or fully visible editable headings.
+Core keeps every other section server-side and rejects changes to a partially
+visible protected section.
 
 ### 3.3 Commit with one Writer
 

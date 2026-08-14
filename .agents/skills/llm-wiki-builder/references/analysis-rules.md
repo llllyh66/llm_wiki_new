@@ -92,8 +92,11 @@ standalone envelope):
   endpoints should link to each other, and pages derived from the same source
   should link to the canonical source page when relevant. Finalize mirrors
   resolvable links into both pages' Related navigation.
-- Submit complete rebased content for `merge`; the Core does not perform a model
-  merge.
+- Submit complete rebased `content` for `replace` only when the server marks the
+  existing page as fully visible. For `merge`, submit bounded `sectionChanges`
+  using `upsert_section`; never repeat the old body or edit a protected,
+  partially visible section. Do not upsert both a parent section and one of its
+  nested children in the same patch.
 - Build page patches from each returned `page_requirement.patch_scaffold`.
   Requirement-ID `sourceRefs` are server handles that Core resolves to exact
   quotes and locators; do not copy complete SourceRef objects into a patch.

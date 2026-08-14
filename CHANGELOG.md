@@ -48,9 +48,13 @@
   fencing tokens and epochs, bounded lease renewal, projection fencing,
   orphaned-draft quarantine, and exact busy-operation replay actions.
 - Make semantic requirement coverage include independent claims, relations,
-  contradictions, review items, and unresolved questions. Existing bounded
-  page context defaults to `merge`, and Finalize always re-audits coverage and
-  source ownership before publication.
+  contradictions, review items, and unresolved questions. Existing pages that
+  fit the Drafter context use coherent full-page `replace`; truncated pages use
+  bounded, visibility-fenced section upserts instead of body concatenation.
+  Core rejects overlapping parent/child upserts, enforces the final prepared
+  page-size limit, and safely invalidates staged drafts from the retired merge
+  schema so upgrades recover through a fresh manifest.
+  Finalize always re-audits coverage and source ownership before publication.
 - Add offline English/Simplified-Chinese OCR for standalone images, scanned PDF
   pages, and embedded PowerPoint images. Add native `.pptx`/`.pptm` slide text
   and table extraction with page/slide locator metadata and bounded archive,

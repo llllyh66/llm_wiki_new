@@ -47,7 +47,9 @@ import { ensureWorkspace, resolveWorkspaceRoot, workspacePaths } from "./workspa
 import {
   applyWikiPageSectionChanges,
   canonicalPageSlug,
+  createWikiPageDraftExcerpt,
   extractRelatedReferences,
+  findOverlappingWikiPageSections,
   listWikiPageSections,
   normalizePageKind,
   normalizeRelatedSlug,
@@ -1258,7 +1260,10 @@ export class LlmWikiCore {
       }
     }
     const plannedRequirements = pageRequirementsWithPatchScaffolds(requirements, existingPages)
-    const effectiveRequirements = plannedRequirements
+    const draftManifest = buildPageDraftManifest(plannedRequirements)
+    const effectiveRequirements = projection
+      ? applyDraftShardPatchModes(plannedRequirements, existingPages, draftManifest)
+      : plannedRequirements
     const revision = workspace.revision
     // Freeze the projection's initial workspace revision for diagnostics, but
     // do not invalidate paginated context when another task changes unrelated
@@ -1281,7 +1286,6 @@ export class LlmWikiCore {
       conflicts: analyses.flatMap((analysis) => analysis.contradictions),
       required_pages: effectiveRequirements,
     }
-    const draftManifest = buildPageDraftManifest(effectiveRequirements)
     const finalizationHint = semanticFinalizationHint(record.task, projection, requirements, existingPages, analyses)
     const context = fullContext
     if (projection) {
@@ -1335,7 +1339,7 @@ export class LlmWikiCore {
         page_commit_limits: pageCommitLimits(workspace.config.limits, projection),
         page_patch_scaffold_contract: {
           ready_to_fill: true,
-          instruction: "Copy page_requirement.patch_scaffold, add content in the original language of its directly supporting source evidence, and submit it. Do not translate source-authored knowledge into the workspace target language. Keep path, operation, expectedFileHash, covers, and requirement-ID sourceRefs unchanged unless intentionally merging requirements.",
+          instruction: "Copy page_requirement.patch_scaffold and preserve its draft_mode. For create or replace, add complete content. For merge, fill sectionChanges with upsert_section entries only for new headings or headings listed as fully editable in existing_pages; never select both a parent section and its nested child. Never append a second page body. Keep the language of directly supporting source evidence and preserve path, operation, expectedFileHash, covers, and requirement-ID sourceRefs.",
           source_ref_mode: "page-requirement-id",
           exact_source_refs_resolved_by_core: true,
         },
@@ -1489,7 +1493,7 @@ export class LlmWikiCore {
       page_patch_schema: pagePatchSchema,
       page_patch_scaffold_contract: {
         ready_to_fill: true,
-        instruction: "Copy each shard requirement's patch_scaffold and add content in the original language of its directly supporting source evidence. Do not translate source-authored knowledge to target_language. Never reconstruct exact SourceRefs.",
+        instruction: "Copy each shard requirement's patch_scaffold and preserve draft_mode. For create or replace, add one complete content body. For merge, remove no sections and fill sectionChanges with upsert_section entries only for new headings or existing_pages.editable_section_headings; protected sections remain server-side, and parent/child sections cannot be selected together. Keep knowledge in the original language of its directly supporting evidence. Never append a second body, translate source-authored knowledge to target_language, or reconstruct exact SourceRefs.",
         source_ref_mode: "page-requirement-id",
         exact_source_refs_resolved_by_core: true,
       },
@@ -1720,7 +1724,7 @@ export class LlmWikiCore {
         writer_guidance: {
           mode: "concise-incremental-draft",
           recommended_body_chars: { min: 300, max: 1_200 },
-          instruction: "Write only grounded facts required by this shard, in the original language of their directly supporting source evidence, and merge relevant existing content without translating it to target_language.",
+          instruction: "Write only grounded facts required by this shard in the original language of their directly supporting source evidence. Rewrite the complete page only when draft_mode=complete-page-rewrite. When draft_mode=section-upsert, emit bounded upsert_section changes for new or fully editable headings and leave protected sections untouched.",
         },
       } : {}),
       ...(projection.mode === "final" && snapshot.finalizationHint ? { finalization_hint: snapshot.finalizationHint } : {}),
@@ -1932,8 +1936,9 @@ export class LlmWikiCore {
       requirements,
       record,
       workspace,
+      snapshot?.context?.existing_pages ?? [],
     )
-    const contentChars = normalizedPatches.reduce((sum, patch) => sum + patch.content.length, 0)
+    const contentChars = normalizedPatches.reduce((sum, patch) => sum + pagePatchSemanticChars(patch), 0)
     const draftHash = sha256(stableStringify(normalizedPatches))
     const draftPath = pageDraftPath(record.paths, projection.projectionId, shardId)
     const idempotent = await withIdempotency(
@@ -2093,7 +2098,7 @@ export class LlmWikiCore {
     }
   }
 
-  #validateAndNormalizeStagedDrafts(rawPatches, shard, requirements, record, workspace) {
+  #validateAndNormalizeStagedDrafts(rawPatches, shard, requirements, record, workspace, existingPages = []) {
     if (!Array.isArray(rawPatches) || rawPatches.length === 0) {
       fail("INVALID_PAGE_PATCH", "A staged draft shard must contain at least one PagePatch.", {
         retryable: true,
@@ -2121,6 +2126,7 @@ export class LlmWikiCore {
       }
       const submittedPatch = normalizePagePatchDomainClassifications(rawPatch, requirements).patch
       validatePagePatchShape(submittedPatch, workspace.config.limits)
+      validateDraftMergeSectionVisibility(submittedPatch, shard, existingPages, record.task.taskId)
       if (!shardPaths.has(submittedPatch.path)) {
         fail("INVALID_PAGE_PATCH", `Patch path is outside its assigned draft shard: ${submittedPatch.path}`, {
           retryable: true,
@@ -2169,7 +2175,7 @@ export class LlmWikiCore {
               expected_file_hash: scaffold?.expectedFileHash ?? null,
               submitted_file_hash: submittedPatch.expectedFileHash ?? null,
             },
-            suggestedAction: "Copy the requirement's patch_scaffold exactly and only add semantic content.",
+            suggestedAction: "Copy the requirement's patch_scaffold exactly. Add complete content for create/replace, or fill sectionChanges for merge.",
           })
         }
         const requiredRelated = Array.isArray(scaffold?.related) ? scaffold.related : []
@@ -2213,7 +2219,7 @@ export class LlmWikiCore {
         details: { shard_id: shard.shard_id, expected_paths: shard.paths, received_paths: [...patchPaths] },
       })
     }
-    const contentChars = normalizedPatches.reduce((sum, patch) => sum + patch.content.length, 0)
+    const contentChars = normalizedPatches.reduce((sum, patch) => sum + pagePatchSemanticChars(patch), 0)
     if (contentChars > workspace.config.limits.maxCommitChars) {
       fail("PAGE_COMMIT_TOO_LARGE", "The staged draft shard exceeds the bounded content budget.", {
         retryable: true,
@@ -2613,6 +2619,26 @@ export class LlmWikiCore {
         }
         submittedPatches.push(...staged.patches)
       }
+      const legacyMergePatch = submittedPatches.find((patch) => (
+        patch?.operation === "merge"
+        && typeof patch?.content === "string"
+        && !Array.isArray(patch?.sectionChanges)
+      ))
+      if (legacyMergePatch) {
+        await this.#invalidatePendingProjectionPlan(record, commitProjection, "PAGE_PATCH_SCHEMA_UPGRADE")
+        fail("PAGE_DRAFT_SCHEMA_UPGRADE_REQUIRED", "A staged merge draft uses the retired body-concatenation schema and must be redrafted safely.", {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: {
+            path: legacyMergePatch.path ?? null,
+            patch_id: legacyMergePatch.patchId ?? null,
+            atomic_commit_applied: false,
+            projection_plan_invalidated: true,
+            resume_view: "manifest",
+          },
+          suggestedAction: "Refresh view=manifest for the same task and Writer. Redraft the returned shards with complete replace content or visibility-fenced sectionChanges.",
+        })
+      }
     }
     if (submittedPatches.length > workspace.config.limits.maxPatchesPerCommit) {
       fail("PAGE_COMMIT_TOO_LARGE", `A page commit accepts at most ${workspace.config.limits.maxPatchesPerCommit} patches; received ${submittedPatches.length}.`, {
@@ -2626,7 +2652,7 @@ export class LlmWikiCore {
         suggestedAction: `Partition canonical paths before drafting and submit a bounded wave of at most ${workspace.config.limits.maxPatchesPerCommit} patches with projection_complete=false. Do not regenerate already accepted waves.`,
       })
     }
-    const commitChars = submittedPatches.reduce((sum, patch) => sum + (typeof patch?.content === "string" ? patch.content.length : 0), 0)
+    const commitChars = submittedPatches.reduce((sum, patch) => sum + pagePatchSemanticChars(patch), 0)
     if (commitChars > workspace.config.limits.maxCommitChars) {
       fail("PAGE_COMMIT_TOO_LARGE", `Page content exceeds the ${workspace.config.limits.maxCommitChars}-character commit limit. Submit smaller commits.`)
     }
@@ -2733,7 +2759,14 @@ export class LlmWikiCore {
           : pageRequirementsWithPatchScaffolds(commitRequirements, [])
         for (const shard of selectedShards) {
           const shardPatches = submittedPatches.filter((patch) => shard.paths.includes(patch?.path))
-          this.#validateAndNormalizeStagedDrafts(shardPatches, shard, projectionRequirements, record, workspace)
+          this.#validateAndNormalizeStagedDrafts(
+            shardPatches,
+            shard,
+            projectionRequirements,
+            record,
+            workspace,
+            snapshot?.context?.existing_pages ?? [],
+          )
         }
       }
     }
@@ -4927,14 +4960,16 @@ function pageRequirementsWithPatchScaffolds(requirements, existingPages) {
       .map((pagePath) => pagePath.replace(/^wiki\//, "").replace(/\.md$/i, ""))
     return {
       ...requirement,
+      draft_mode: existing ? "complete-page-rewrite" : "new-page",
+      existing_page_content_complete: true,
       patch_scaffold: {
         patchId: `patch-${requirement.requirement_id}`,
         path: existing?.path ?? requirement.preferred_path,
-        // Merge is the safe authoritative default for an existing page. A
-        // drafter may receive only a bounded excerpt, so replace would allow
-        // unseen grounded sections to be deleted. Section-specific rewrites
-        // continue to use updatePages with an expected full-page hash.
-        operation: existing ? "merge" : "create",
+        // The projection manifest refines an existing page to merge when its
+        // shard must truncate that page. Non-projection callers receive the
+        // complete existing-page record and therefore use an authoritative
+        // full-page rewrite.
+        operation: existing ? "replace" : "create",
         ...(existing ? { expectedFileHash: existing.file_hash } : {}),
         title: requirement.title,
         pageKind: normalizePageKind(existing?.page_kind) ?? pageKindForPath(existing?.path) ?? requirement.page_kind,
@@ -4960,6 +4995,38 @@ function pageRequirementsWithPatchScaffolds(requirements, existingPages) {
         } : {}),
         ...(related.length > 0 ? { related } : {}),
         rationale: `Materialize page requirement ${requirement.requirement_id}.`,
+      },
+    }
+  })
+}
+
+function applyDraftShardPatchModes(requirements, existingPages, manifest) {
+  const existingByPath = new Map((existingPages ?? []).map((page) => [page.path, page]))
+  const shardByPath = new Map((manifest ?? []).flatMap((shard) => shard.paths.map((pagePath) => [pagePath, shard])))
+  return (requirements ?? []).map((requirement) => {
+    const scaffold = requirement?.patch_scaffold
+    const existing = existingByPath.get(scaffold?.path)
+    if (!existing || !scaffold) return requirement
+    const shard = shardByPath.get(scaffold.path)
+    const maxBodyChars = maxExistingPageCharsForDraftShard(shard)
+    const complete = typeof existing.content === "string" && existing.content.length <= maxBodyChars
+    if (complete) {
+      const { sectionChanges, ...completeScaffold } = scaffold
+      return {
+        ...requirement,
+        draft_mode: "complete-page-rewrite",
+        existing_page_content_complete: true,
+        patch_scaffold: { ...completeScaffold, operation: "replace" },
+      }
+    }
+    return {
+      ...requirement,
+      draft_mode: "section-upsert",
+      existing_page_content_complete: false,
+      patch_scaffold: {
+        ...scaffold,
+        operation: "merge",
+        sectionChanges: [],
       },
     }
   })
@@ -5341,22 +5408,19 @@ function pageDraftShardContext(context, shard) {
 }
 
 function boundDraftShardContext(context, shard) {
-  const pathCount = Math.max(1, Array.isArray(shard?.paths) ? shard.paths.length : 1)
   // Existing pages can legitimately be large (the workspace page limit is
   // 200K). A six-page shard must not place six full bodies in a drafter's
-  // context. Keep a deterministic head/tail excerpt while preserving the
-  // server hash and all requirement/source metadata used for safe commits.
-  const maxBodyChars = Math.max(4_000, Math.floor(24_000 / pathCount))
+  // context. Keep a deterministic head/tail excerpt and disclose exactly
+  // which complete sections may be upserted. Core rejects attempts to replace
+  // a section that was only partially visible to the Drafter.
+  const maxBodyChars = maxExistingPageCharsForDraftShard(shard)
   const existingPages = (context.existing_pages ?? []).map((page) => {
-    if (typeof page?.content !== "string" || page.content.length <= maxBodyChars) return page
-    const headChars = Math.floor(maxBodyChars * 0.65)
-    const tailChars = Math.max(1, maxBodyChars - headChars)
+    if (typeof page?.content !== "string") return page
+    const excerpt = createWikiPageDraftExcerpt(page.content, maxBodyChars)
     return {
       ...page,
-      content: `${page.content.slice(0, headChars)}\n\n<!-- draft context excerpt; full page remains server-side -->\n\n${page.content.slice(-tailChars)}`,
-      content_truncated: true,
-      original_content_chars: page.content.length,
-      context_excerpt_chars: maxBodyChars,
+      ...excerpt,
+      section_patch_required: excerpt.content_truncated,
     }
   })
   return {
@@ -5367,6 +5431,62 @@ function boundDraftShardContext(context, shard) {
       max_existing_page_excerpt_chars: maxBodyChars,
       full_existing_pages_remain_server_side: true,
     },
+  }
+}
+
+function maxExistingPageCharsForDraftShard(shard) {
+  const pathCount = Math.max(1, Array.isArray(shard?.paths) ? shard.paths.length : 1)
+  return Math.max(4_000, Math.floor(24_000 / pathCount))
+}
+
+function pagePatchSemanticChars(patch) {
+  if (typeof patch?.content === "string") return patch.content.length
+  if (!Array.isArray(patch?.sectionChanges)) return 0
+  return patch.sectionChanges.reduce((sum, change) => sum + (typeof change?.content === "string" ? change.content.length : 0), 0)
+}
+
+function validateDraftMergeSectionVisibility(patch, shard, existingPages, taskId) {
+  if (patch?.operation !== "merge") return
+  const existing = (existingPages ?? []).find((page) => page?.path === patch.path)
+  if (!existing || typeof existing.content !== "string") {
+    fail("INVALID_PAGE_PATCH", `Merge patch has no authoritative existing page context: ${patch.path}.`, {
+      retryable: true,
+      taskId,
+    })
+  }
+  const excerpt = createWikiPageDraftExcerpt(existing.content, maxExistingPageCharsForDraftShard(shard))
+  const normalized = (value) => String(value ?? "").normalize("NFKC").trim().replace(/\s+/g, " ").toLowerCase()
+  const existingHeadings = new Set(listWikiPageSections(existing.content).map((section) => normalized(section.heading)))
+  const editableHeadings = new Set((excerpt.editable_section_headings ?? []).map(normalized))
+  const overlappingSections = findOverlappingWikiPageSections(existing.content, (patch.sectionChanges ?? []).map((change) => change?.heading))
+  if (overlappingSections.length > 0) {
+    fail("INVALID_PAGE_PATCH", "One merge patch cannot upsert both a parent section and its nested child section.", {
+      retryable: true,
+      taskId,
+      details: {
+        path: patch.path,
+        overlapping_sections: overlappingSections,
+        atomic_commit_applied: false,
+      },
+      suggestedAction: "Keep only the parent section upsert and include the complete desired nested content inside it, or update non-overlapping sections.",
+    })
+  }
+  for (const change of patch.sectionChanges ?? []) {
+    const heading = normalized(change?.heading)
+    if (existingHeadings.has(heading) && !editableHeadings.has(heading)) {
+      fail("PAGE_DRAFT_SECTION_NOT_FULLY_VISIBLE", `Merge patch cannot replace a section that was only partially visible: ${change.heading}.`, {
+        retryable: true,
+        taskId,
+        details: {
+          path: patch.path,
+          heading: change.heading,
+          editable_section_headings: excerpt.editable_section_headings ?? [],
+          protected_section_headings: excerpt.protected_section_headings ?? [],
+          atomic_commit_applied: false,
+        },
+        suggestedAction: "Upsert a complete section listed in editable_section_headings, or add a new descriptive section and leave protected sections unchanged.",
+      })
+    }
   }
 }
 

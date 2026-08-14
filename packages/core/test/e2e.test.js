@@ -4,6 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import test from "node:test"
 import { LlmWikiCore, LlmWikiError } from "../src/index.js"
+import { sha256, stableStringify } from "../src/utils.js"
 
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-core-"))
@@ -1526,12 +1527,20 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
       existing.sourceRefs = [...new Set([...existing.sourceRefs, requirement.requirement_id])]
       continue
     }
-    finalPatchesByPath.set(requirement.patch_scaffold.path, {
-      ...requirement.patch_scaffold,
-      content: `# ${requirement.title}\n\n## Overview\n\nA reconciled cross-batch summary for ${requirement.title}.\n`,
-      summary: `A reconciled cross-batch summary for ${requirement.title}.`,
-      tags: [requirement.page_kind],
-    })
+    const semanticContent = `A reconciled cross-batch summary for ${requirement.title}.`
+    finalPatchesByPath.set(requirement.patch_scaffold.path, requirement.patch_scaffold.operation === "merge"
+      ? {
+          ...requirement.patch_scaffold,
+          sectionChanges: [{ operation: "upsert_section", heading: "Overview", level: 2, content: semanticContent }],
+          summary: semanticContent,
+          tags: [requirement.page_kind],
+        }
+      : {
+          ...requirement.patch_scaffold,
+          content: `# ${requirement.title}\n\n## Overview\n\n${semanticContent}\n`,
+          summary: semanticContent,
+          tags: [requirement.page_kind],
+        })
   }
   const finalPatches = [...finalPatchesByPath.values()]
   const stable = await f.core.commitPages({
@@ -1553,8 +1562,8 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(completedStatus.completion_gate.task_complete, true)
   assert.equal(completedStatus.completion_gate.may_report_completion, true)
   assert.equal(completedStatus.completion_gate.automatic_continuation_required, false)
-  // A final drafter receives bounded context, so an existing page defaults to
-  // merge and cannot silently delete unseen grounded provisional material.
+  // A final drafter receives bounded context, so a truncated existing page
+  // gets section-upsert merge and cannot delete unseen provisional material.
   const completed = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["reconciled cross-batch summary"] })
   assert.equal(completed.retrieval_phase, "knowledge-base-complete")
   assert.deepEqual(completed.available_channels, ["bm25", "wiki"])
@@ -2760,6 +2769,211 @@ test("draft-shard cursor replay preserves the original max_chars boundary", asyn
   const persisted = JSON.parse(await readFile(taskPath, "utf8"))
   const reads = persisted.pageProjection.lease.draftShardCursorReads[manifest.draft_manifest.shards[0].shard_id]
   assert.equal(reads["0"].max_chars, 1_000)
+})
+
+test("projection rewrites fully visible pages and section-upserts truncated pages without body duplication", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  await analyzeAll(f.core, imported)
+  const concepts = path.join(f.workspace, "wiki", "concepts")
+  await mkdir(concepts, { recursive: true })
+  await writeFile(path.join(concepts, "business-entity.md"), `# Business Entity
+
+## Details
+
+Old short-page fact.
+`)
+  await writeFile(path.join(concepts, "aggregate.md"), `# Aggregate
+
+## Legacy Details
+
+${"Preserved hidden aggregate fact. ".repeat(1_000)}
+
+## Recent Evidence
+
+Old visible tail fact.
+
+### Evidence Details
+
+Old visible nested detail.
+`)
+
+  const manifest = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "dual-mode-writer",
+    view: "manifest",
+    cursor: 0,
+    max_chars: 40_000,
+  })
+  const action = manifest.draft_manifest.draft_actions[0].arguments
+  const requirements = []
+  const existingPages = []
+  let cursor = 0
+  let finalShard
+  do {
+    const shard = await f.core.getPagePlanContext({ ...action, cursor })
+    requirements.push(...shard.page_requirements)
+    existingPages.push(...shard.existing_pages)
+    cursor = shard.next_cursor
+    finalShard = shard
+  } while (cursor !== null)
+
+  const shortRequirement = requirements.find((item) => item.patch_scaffold.path === "wiki/concepts/business-entity.md")
+  const largeRequirement = requirements.find((item) => item.patch_scaffold.path === "wiki/concepts/aggregate.md")
+  assert.equal(shortRequirement.draft_mode, "complete-page-rewrite")
+  assert.equal(shortRequirement.patch_scaffold.operation, "replace")
+  assert.equal(largeRequirement.draft_mode, "section-upsert")
+  assert.equal(largeRequirement.patch_scaffold.operation, "merge")
+  assert.deepEqual(largeRequirement.patch_scaffold.sectionChanges, [])
+  const largeContext = existingPages.find((page) => page.path === "wiki/concepts/aggregate.md")
+  assert.equal(largeContext.content_truncated, true)
+  assert.equal(largeContext.editable_section_headings.includes("Recent Evidence"), true)
+  assert.equal(largeContext.protected_section_headings.includes("Legacy Details"), true)
+
+  const patches = requirements.map((requirement) => {
+    if (requirement.patch_scaffold.operation === "merge") {
+      return {
+        ...requirement.patch_scaffold,
+        sectionChanges: [{
+          operation: "upsert_section",
+          heading: "Recent Evidence",
+          level: 2,
+          content: "Reconciled visible tail fact.",
+        }],
+      }
+    }
+    return {
+      ...requirement.patch_scaffold,
+      content: `# ${requirement.title}\n\n## Details\n\nRewritten complete-page fact.\n`,
+    }
+  })
+  const unsafePatches = patches.map((patch) => patch.operation === "merge"
+    ? { ...patch, sectionChanges: [{ operation: "upsert_section", heading: "Legacy Details", level: 2, content: "Unsafe partial rewrite." }] }
+    : patch)
+  await assert.rejects(
+    () => f.core.stagePageDrafts({
+      ...finalShard.next_action.arguments,
+      patches: unsafePatches,
+      idempotency_key: "dual-mode-unsafe-stage-v1",
+    }),
+    (error) => error instanceof LlmWikiError && error.code === "PAGE_DRAFT_SECTION_NOT_FULLY_VISIBLE",
+  )
+  const overlappingPatches = patches.map((patch) => patch.operation === "merge"
+    ? {
+        ...patch,
+        sectionChanges: [
+          { operation: "upsert_section", heading: "Recent Evidence", level: 2, content: "Rewritten parent." },
+          { operation: "upsert_section", heading: "Evidence Details", level: 3, content: "Conflicting child rewrite." },
+        ],
+      }
+    : patch)
+  await assert.rejects(
+    () => f.core.stagePageDrafts({
+      ...finalShard.next_action.arguments,
+      patches: overlappingPatches,
+      idempotency_key: "dual-mode-overlapping-stage-v1",
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "INVALID_PAGE_PATCH"
+      && error.details.overlapping_sections[0].ancestor === "Recent Evidence",
+  )
+
+  const staged = await f.core.stagePageDrafts({
+    ...finalShard.next_action.arguments,
+    patches,
+    idempotency_key: "dual-mode-safe-stage-v1",
+  })
+  const ready = await f.core.getStagedPageDrafts(staged.next_action.arguments)
+  const committed = await f.core.commitPages({
+    ...ready.next_action.arguments,
+    idempotency_key: "dual-mode-safe-commit-v1",
+  })
+  assert.equal(committed.accepted, true)
+  const shortPage = await readFile(path.join(concepts, "business-entity.md"), "utf8")
+  const largePage = await readFile(path.join(concepts, "aggregate.md"), "utf8")
+  assert.doesNotMatch(shortPage, /Old short-page fact/)
+  assert.match(shortPage, /Rewritten complete-page fact/)
+  assert.match(largePage, /Preserved hidden aggregate fact/)
+  assert.doesNotMatch(largePage, /Old visible tail fact/)
+  assert.match(largePage, /Reconciled visible tail fact/)
+  assert.equal((largePage.match(/^# Aggregate$/gm) ?? []).length, 1)
+  assert.equal((largePage.match(/^## Recent Evidence$/gm) ?? []).length, 1)
+})
+
+test("legacy staged merge bodies invalidate the pending plan and recover through a fresh manifest", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  await analyzeAll(f.core, imported)
+  const concepts = path.join(f.workspace, "wiki", "concepts")
+  await mkdir(concepts, { recursive: true })
+  await writeFile(path.join(concepts, "aggregate.md"), `# Aggregate\n\n## Existing\n\n${"Legacy grounded content. ".repeat(1_500)}\n`)
+
+  const manifest = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "schema-upgrade-writer",
+    view: "manifest",
+  })
+  const action = manifest.draft_manifest.draft_actions[0].arguments
+  const requirements = []
+  let cursor = 0
+  let finalShard
+  do {
+    const shard = await f.core.getPagePlanContext({ ...action, cursor })
+    requirements.push(...shard.page_requirements)
+    cursor = shard.next_cursor
+    finalShard = shard
+  } while (cursor !== null)
+  const patches = requirements.map((requirement) => requirement.patch_scaffold.operation === "merge"
+    ? {
+        ...requirement.patch_scaffold,
+        sectionChanges: [{ operation: "upsert_section", heading: "New Evidence", level: 2, content: "Current schema content." }],
+      }
+    : {
+        ...requirement.patch_scaffold,
+        content: `# ${requirement.title}\n\nCurrent schema content.\n`,
+      })
+  const staged = await f.core.stagePageDrafts({
+    ...finalShard.next_action.arguments,
+    patches,
+    idempotency_key: "schema-upgrade-stage-v1",
+  })
+  const draftDir = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "page-drafts")
+  const draftPath = path.join(draftDir, (await readdir(draftDir))[0])
+  const persistedDraft = JSON.parse(await readFile(draftPath, "utf8"))
+  persistedDraft.patches = persistedDraft.patches.map((patch) => {
+    if (patch.operation !== "merge") return patch
+    const { sectionChanges: _sectionChanges, ...legacyPatch } = patch
+    return { ...legacyPatch, content: `# ${patch.title}\n\nLegacy staged merge body.\n` }
+  })
+  persistedDraft.draft_hash = sha256(stableStringify(persistedDraft.patches))
+  await writeFile(draftPath, JSON.stringify(persistedDraft))
+  const taskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
+  const task = JSON.parse(await readFile(taskPath, "utf8"))
+  task.pageProjection.lease.stagedDraftReceipts[staged.shard_id].draft_hash = persistedDraft.draft_hash
+  await writeFile(taskPath, JSON.stringify(task))
+
+  await assert.rejects(
+    () => f.core.commitPages({
+      task_id: imported.task_id,
+      writer_id: "schema-upgrade-writer",
+      projection_id: manifest.projection.projection_id,
+      based_on_wiki_revision: manifest.based_on_wiki_revision,
+      projection_complete: false,
+      staged_draft_receipts: [{ shard_id: staged.shard_id, draft_hash: persistedDraft.draft_hash }],
+      patches: [],
+      idempotency_key: "schema-upgrade-commit-v1",
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "PAGE_DRAFT_SCHEMA_UPGRADE_REQUIRED"
+      && error.details.projection_plan_invalidated === true,
+  )
+  const recovered = await f.core.status({ task_id: imported.task_id })
+  assert.equal(recovered.wiki_projection.staged_uncommitted_draft_shards, 0)
+  assert.equal(recovered.next_action.tool, "llm_wiki_get_page_plan_context")
+  assert.equal(recovered.next_action.arguments.view, "manifest")
+  await assert.rejects(() => access(draftPath))
 })
 
 test("aborting a task removes uncommitted server-side page drafts", async (t) => {

@@ -9,6 +9,12 @@ It writes each page in the language of its directly supporting source evidence,
 uses the predominant evidence language consistently for multilingual support,
 and never translates source-authored knowledge merely to match
 `target_language`.
+It preserves each requirement's server-selected `draft_mode`. It supplies one
+complete `content` body for `new-page` or `complete-page-rewrite`. For
+`section-upsert`, it fills `sectionChanges` only for new headings or matching
+`editable_section_headings`; it never edits protected sections or appends a
+second page body. It never upserts both a parent section and its nested child
+in one patch.
 Every return ends this invocation and frees its host slot. If staging did not
 succeed, report the exact shard identity as incomplete; pending or retrieved
 shard state is not proof that this Drafter remains alive.

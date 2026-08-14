@@ -5,9 +5,9 @@ import os from "node:os"
 import path from "node:path"
 import test from "node:test"
 import { taskPaths, withIdempotency } from "../src/task-store.js"
-import { sha256, stableStringify, writeJsonAtomic, readJson, nowIso } from "../src/utils.js"
+import { hashDirectory, sha256, stableStringify, writeJsonAtomic, readJson, nowIso } from "../src/utils.js"
 import { ensureWorkspace } from "../src/workspace.js"
-import { cleanupTransactionArtifacts, recoverPendingPageTransactions } from "../src/transaction.js"
+import { cleanupTransactionArtifacts, commitPageTransaction, recoverPendingPageTransactions } from "../src/transaction.js"
 
 async function idempotencyFixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-recovery-"))
@@ -164,4 +164,37 @@ test("terminal transaction backups are evicted immediately when the byte budget 
   assert.equal(cleaned.overBudget, false)
   assert.equal(cleaned.retainedBytes <= 1_024, true)
   assert.equal(cleaned.budgetEvictedTransactions, 1)
+})
+
+test("page transactions reject a section merge whose prepared file exceeds maxPageChars", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-page-limit-"))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const workspace = await ensureWorkspace(root)
+  workspace.config.limits.maxPageChars = 800
+  const pagePath = path.join(workspace.paths.wiki, "topics", "large.md")
+  await mkdir(path.dirname(pagePath), { recursive: true })
+  const existing = `# Large\n\n## Existing\n\n${"Grounded existing content. ".repeat(20)}\n`
+  await writeFile(pagePath, existing)
+  const basedOnWikiRevision = await hashDirectory(workspace.paths.wiki)
+  await assert.rejects(
+    () => commitPageTransaction(workspace, { taskId: "task-page-limit", status: "completed" }, [{
+      patchId: "patch-page-limit",
+      path: "wiki/topics/large.md",
+      operation: "merge",
+      expectedFileHash: sha256(existing),
+      title: "Large",
+      pageKind: "topic",
+      sectionChanges: [{
+        operation: "upsert_section",
+        heading: "New Evidence",
+        level: 2,
+        content: "New grounded content. ".repeat(20),
+      }],
+      sourceRefs: [{ sourceId: "source-page-limit" }],
+      rationale: "Exercise the prepared page limit.",
+    }], basedOnWikiRevision),
+    (error) => error.code === "PAGE_COMMIT_TOO_LARGE"
+      && error.details.prepared_content_chars > error.details.max_page_chars,
+  )
+  assert.equal(await readFile(pagePath, "utf8"), existing)
 })
