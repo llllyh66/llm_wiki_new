@@ -33,7 +33,7 @@ export const analysisSchema = Object.freeze({
     claims: { type: "array", items: { $ref: "#/$defs/groundedCandidate" }, maxItems: 1000 },
     relations: {
       type: "array",
-      description: "Source-grounded relationships between extracted candidates.",
+      description: "Source-grounded relationships between extracted candidates. Keep the evidence-facing statement in content and put normalized structure in sourceEntityLocalId, predicate, and targetEntityLocalId.",
       items: { $ref: "#/$defs/groundedCandidate" },
       maxItems: 1000,
     },
@@ -51,7 +51,7 @@ export const analysisSchema = Object.freeze({
       properties: {
         sourceId: { type: "string" },
         chunkId: { type: "string" },
-        quote: { type: "string", maxLength: 1000, description: "Short verbatim evidence. Claims, relations, contradictions, and review items require a quote that lexically supports their content." },
+        quote: { type: "string", maxLength: 1000, description: "Short verbatim evidence. Core validates exact source provenance separately from field-aware claim and relation support." },
         locator: { type: "object" },
       },
       additionalProperties: false,
@@ -78,9 +78,13 @@ export const analysisSchema = Object.freeze({
         title: { type: "string" },
         text: { type: "string" },
         content: { type: "string" },
+        supportType: { enum: ["direct", "normalized", "inferred"], description: "direct preserves a source-supported statement; normalized uses deterministic lexical or predicate normalization; inferred items must be moved to reviewItems or unresolvedQuestions before commit." },
         confidence: { type: "number", minimum: 0, maximum: 1 },
         sourceEntityLocalId: { type: "string", description: "localId of the source entity in a relation." },
+        predicate: { type: "string", description: "Canonical relation predicate. Core validates it independently so endpoint overlap cannot hide an unsupported predicate." },
         targetEntityLocalId: { type: "string", description: "localId of the target entity in a relation." },
+        subject: { type: "string", description: "Optional evidence-facing source endpoint name for legacy or cross-batch relations." },
+        object: { type: "string", description: "Optional evidence-facing target endpoint name for legacy or cross-batch relations." },
         properties: { type: "object", description: "Source-grounded structured properties when useful." },
         schemaClassification: {
           type: "object",

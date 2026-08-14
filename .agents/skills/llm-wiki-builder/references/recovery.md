@@ -53,11 +53,14 @@ new idempotency key for a changed payload, and resubmit before continuing.
 Treat `accepted: false` as a normal validation result, not an MCP failure; do
 not restart or create another task for it.
 Submit `analysis` as an object rather than a serialized JSON string or Markdown
-code block. When many entries fail validation, rebuild a minimal envelope from
-the schema and include complete SourceRef objects on every grounded entry
-or valid zero-based indexes into the top-level catalog. Check every index
-against the catalog length instead of incrementally mutating the rejected
-payload.
+code block. For grounding failures, read each `grounding_diagnostics` entry and
+repair only the reported field: preserve every non-failing candidate and its
+evidence indexes. An unsupported predicate must be changed to the source-backed
+predicate, supported by a different evidence entry, or moved to review material;
+do not erase normalized structure or contract the rest of the envelope. Keep the
+same worker and lease for this application-level repair. When the envelope shape
+itself is invalid, rebuild it from the schema while preserving valid candidates,
+and check every evidence index against the catalog length.
 For a spreadsheet locator rejection, copy the SourceRef again from the leased
 chunk's `source_ref_templates`; `allowed_sheet_names` and
 `allowed_cell_ranges` in the error are diagnostic values, not text to guess or

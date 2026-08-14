@@ -857,6 +857,25 @@ export interface AnalysisEnvelope {
 }
 ```
 
+新抽取器应把关系的原文陈述与规范化结构分开：
+
+```ts
+export interface RelationCandidate {
+  localId: string;
+  sourceEntityLocalId?: string;
+  predicate?: string;
+  targetEntityLocalId?: string;
+  content: string;
+  supportType?: "direct" | "normalized" | "inferred";
+  confidence?: number;
+  sourceRefs: SourceRef[] | number[];
+}
+```
+
+`content` 是 evidence-facing statement；`predicate` 是规范化关系类型。
+`inferred` 不能作为 grounded fact 提交，应转入 review item 或 unresolved
+question。
+
 `AnalysisEnvelope.sourceRefs` 是本批次使用的完整 `SourceRef` 对象目录。各
 Candidate 的 `sourceRefs` 在线路输入中优先使用指向该目录的零起始整数索引；
 Core 在校验前将其确定性解析为完整 `SourceRef[]`，并仅持久化规范化对象。
@@ -864,10 +883,13 @@ Core 在校验前将其确定性解析为完整 `SourceRef[]`，并仅持久化�
 `content` 和可解析的 `sourceRefs`。无法引用原文的问题放入
 `unresolvedQuestions`。
 
-Core 在结构校验之后执行确定性的 Grounding Quality Gate：详细 claim、关系、
-矛盾和 review item 的短 quote 必须与候选内容存在关键术语覆盖；文档标题不能
-作为整张表的通用证据。大型表格应按行或连贯主题拆分引用，单个 SourceRef
-最多支撑 8 个候选条目。门禁失败属于可恢复的业务拒绝，不是 MCP 传输错误。
+Core 在结构校验之后执行确定性的 Grounding Quality Gate v2：SourceRef 的
+quote 来源真实性继续硬校验；claim、关系、矛盾和 review item 再按字段检查
+内容、强标识符与否定极性。关系的主语、谓词和宾语分别验证，主客体重合不能
+掩盖不受支持的谓词。camelCase、单复数和显式谓词别名可确定性归一化；推断
+必须进入 review item 或 unresolved question。单个 SourceRef 的高复用只产生
+warning，每个候选仍独立校验。门禁失败返回结构化 `grounding_diagnostics`，
+属于可恢复的业务拒绝，不是 MCP 传输错误。
 
 ## 9.6 Page Patch
 

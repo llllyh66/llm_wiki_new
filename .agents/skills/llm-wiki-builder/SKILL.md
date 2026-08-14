@@ -86,7 +86,8 @@ Never submit after `LEASE_FENCED`. Reacquire work and discard the superseded res
 
 - Every entity, concept, claim, relation, contradiction, and review item needs grounded `sourceRefs`.
 - Put unsupported uncertainty in `unresolvedQuestions`; do not invent evidence.
-- Keep relation text directly supported by its cited quote.
+- Keep the evidence-facing relation statement in `content`; put normalized structure in `sourceEntityLocalId`, `predicate`, and `targetEntityLocalId`. Use `supportType=normalized` only for deterministic normalization.
+- Put inference in `reviewItems` or `unresolvedQuestions`; never shrink or rewrite unrelated valid candidates merely to repair one grounding diagnostic.
 - Preserve conflicting claims. Do not silently choose a winner.
 - Use numeric confidence values.
 

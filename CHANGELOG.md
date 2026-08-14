@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+- Replace aggregate lexical-overlap grounding with Grounding Quality Gate v2.
+  Source provenance remains exact, while relation endpoints and predicates,
+  strong identifiers, numeric/unit anchors, and polarity are validated
+  independently. Deterministic camelCase and inflection normalization is
+  accepted without letting endpoint overlap hide an unsupported predicate.
+- Return structured grounding diagnostics, keep validation repair in the same
+  worker lease, preserve non-failing candidates, and report high SourceRef
+  reuse as a warning instead of an unconditional whole-envelope rejection.
+
 ## [1.0.8] - 2026-08-14
 
 - Replace the mixed projection guidance with one capacity-aware manifest →

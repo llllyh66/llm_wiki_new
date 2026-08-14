@@ -282,9 +282,9 @@ test("grounding quality gate rejects a title-only SourceRef reused for many unre
     }),
     (error) => error instanceof LlmWikiError
       && error.code === "INVALID_ANALYSIS"
-      && error.details.quality_gate === "source-ref-grounding-v1"
-      && error.details.validation_errors.some((message) => message.includes("does not lexically support"))
-      && error.details.validation_errors.some((message) => message.includes("reused by 12 grounded candidates")),
+      && error.details.quality_gate === "source-ref-grounding-v2"
+      && error.details.grounding_diagnostics.some((diagnostic) => ["INSUFFICIENT_LEXICAL_SUPPORT", "UNSUPPORTED_STRONG_ANCHOR"].includes(diagnostic.reason_code))
+      && error.details.grounding_warnings.some((warning) => warning.reason_code === "HIGH_SOURCE_REF_REUSE"),
   )
   assert.equal((await f.core.status({ task_id: imported.task_id })).status, "prepared")
 })

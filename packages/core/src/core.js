@@ -861,10 +861,11 @@ export class LlmWikiCore {
         source_ref_templates: "Use the prefilled batch-evidence indexes; do not generate complete SourceRef objects or reconstruct sheetName and cellRange on the current hot path.",
         nested_source_refs: "In batch-evidence-index mode, use evidence_catalog.evidence_index values directly in candidate sourceRefs and leave the scaffold catalog unchanged.",
         evidence: "Do not retype quotes or read the source file. The server generated every evidence_catalog quote as an exact contiguous batch substring.",
-        relation_grounding: "Put the directly supported relationship statement in relation.content and cite the evidence entry containing it.",
+        relation_grounding: "Put the directly supported source-facing statement in relation.content. Put normalized structure in sourceEntityLocalId, predicate, and targetEntityLocalId; the Core validates the predicate independently so endpoint overlap cannot hide an unsupported relation.",
+        support_type: "Use supportType=direct for source wording and supportType=normalized only for deterministic identifier, inflection, or declared predicate normalization. Put inference in reviewItems or unresolvedQuestions, never in grounded facts.",
         review_items: "Use {content, sourceRefs} objects only when a batch quote directly supports the concern; otherwise use unresolvedQuestions.",
         unresolved_questions: "Use plain strings only. Common legacy {question|reason|content|message|text} objects are normalized, but current workers must emit strings.",
-        candidate_shape: "Use candidate objects such as {localId, name|title|content, confidence: 0.9, sourceRefs: [evidence_index]}; confidence is a JSON number, never a quoted string.",
+        candidate_shape: "Use candidate objects such as {localId, name|title|content, supportType: 'direct', confidence: 0.9, sourceRefs: [evidence_index]}; relations should also use sourceEntityLocalId, predicate, and targetEntityLocalId. Confidence is a JSON number, never a quoted string.",
         domain_classification: domainSchema
           ? "Every entity and concept must include schemaClassification copied from the selected ABE classification_scaffold, including snapshotHash; replace its be placeholders from one be_pointer_hints entry and keep confidence numeric."
           : "schemaClassification is not required because this task has no Domain Schema.",
@@ -1052,7 +1053,7 @@ export class LlmWikiCore {
     const domainSchema = await this.#taskDomainSchema(record)
     const domainApplied = applyDomainSchema(normalized.analysis, domainSchema)
     validateSourceRefs(collectSourceRefs(domainApplied.analysis), record.task, record.batches, workspace.config.limits, chunkIndex)
-    validateGroundingQuality(domainApplied.analysis)
+    const groundingValidation = validateGroundingQuality(domainApplied.analysis)
     const idempotent = await withIdempotency(record.paths, input?.idempotency_key, { operation: "commit_analysis", batchId: batch.batchId, analysis: normalized.analysis }, async ({ persistResponse }) => {
       if (record.task.completedBatchIds.includes(batch.batchId)) fail("BATCH_ALREADY_COMPLETED", `Batch is already completed: ${batch.batchId}`)
       assertTaskStatus(record.task, ["prepared", "extracting"])
@@ -1085,6 +1086,7 @@ export class LlmWikiCore {
         normalized_unresolved_questions: normalized.normalizedUnresolvedQuestions,
         normalized_numeric_confidences: normalized.normalizedNumericConfidences,
         inferred_batch_evidence_mode: normalized.inferredBatchEvidenceMode,
+        grounding_validation: groundingValidation,
         domain_validation: domainApplied.report,
         wiki_projection: wikiProjection,
         next_action: projectionNextAction ?? extractionNextAction,

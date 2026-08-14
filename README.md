@@ -286,6 +286,12 @@ sheet names and cell ranges. Core resolves the indexes and persists only the
 complete SourceRefs actually used. Legacy complete SourceRefs remain compatible,
 and minor Markdown/Unicode quote differences are canonicalized only when they
 match one unique source span.
+Grounding Quality Gate v2 keeps that exact quote-provenance check separate from
+field-aware semantic checks. Relation `content` carries the source-facing
+statement while `sourceEntityLocalId`, `predicate`, and `targetEntityLocalId`
+carry normalized structure. Endpoints cannot mask an unsupported predicate;
+identifier, numeric, unit, and polarity changes are rejected. High SourceRef
+reuse is reported as a warning while each candidate is validated independently.
 For large Schemas, `get_batch` now performs deterministic batch-text matching
 against canonical type IDs, names, aliases, and property labels and embeds the
 bounded complete definitions directly. Most batches therefore need no separate

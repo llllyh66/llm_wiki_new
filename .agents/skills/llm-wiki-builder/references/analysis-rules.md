@@ -17,10 +17,16 @@
   normalize locator fields yourself.
 - A title-only quote does not support detailed facts from a table. Claims,
   relations, contradictions, and review items must cite quotes containing their
-  identifying terms. Split table evidence by row or coherent topic; a single
-  SourceRef may ground at most eight candidates.
-- Put the directly supported relation statement in `content` and cite the
-  evidence index containing that statement.
+  identifying terms. Split table evidence by row or coherent topic. High reuse
+  of one SourceRef is reported as a warning; every candidate is still validated
+  independently against that evidence.
+- Put the directly supported source-facing relation statement in `content` and
+  cite the evidence index containing that statement. Put normalized structure
+  in `sourceEntityLocalId`, `predicate`, and `targetEntityLocalId`; the predicate
+  is validated independently from the endpoints.
+- Use `supportType=direct` for source wording and `supportType=normalized` only
+  for deterministic identifier, inflection, or declared predicate
+  normalization. Put inference in `reviewItems` or `unresolvedQuestions`.
 - Use conservative confidence values between 0 and 1.
 - Put uncertainty in `unresolvedQuestions` instead of guessing.
 - Keep sourced facts separate from inference.
@@ -43,6 +49,7 @@ standalone envelope):
   "sourceRefMode": "batch-evidence-index",
   "sourceRefs": [0, 1],
   "entities": [{ "localId": "entity-1", "name": "Example", "sourceRefs": [0] }],
+  "relations": [{ "localId": "relation-1", "sourceEntityLocalId": "entity-1", "predicate": "dependsOn", "targetEntityLocalId": "entity-2", "content": "Example depends on Entity 2.", "supportType": "normalized", "sourceRefs": [1] }],
   "reviewItems": [{ "content": "A sourced issue requiring review", "sourceRefs": [1] }]
 }
 ```

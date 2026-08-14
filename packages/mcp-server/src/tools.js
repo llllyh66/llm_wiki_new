@@ -148,13 +148,20 @@ function errorResult(error, context = {}) {
     ...(Array.isArray(normalized.details?.validation_errors)
       ? { validation_errors: normalized.details.validation_errors }
       : analysisRetry ? { validation_errors: [normalized.message] } : {}),
+    ...(Array.isArray(normalized.details?.grounding_diagnostics)
+      ? { grounding_diagnostics: normalized.details.grounding_diagnostics }
+      : {}),
+    ...(Array.isArray(normalized.details?.grounding_warnings)
+      ? { grounding_warnings: normalized.details.grounding_warnings }
+      : {}),
     ...(analysisRetry ? {
       worker_restart: {
-        required: true,
-        strategy: "restart-same-worker-id-immediately",
+        required: false,
+        strategy: "repair-in-place-same-worker-and-lease",
         worker_id: context.args?.worker_id,
         batch_id: context.args?.batch_id,
         delay_ms: 0,
+        preserve_non_failing_candidates: true,
       },
     } : {}),
     ...(atomicPageRejection ? {

@@ -193,6 +193,8 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
   assert.equal(analysisInput.properties.sourceRefs.items.type, "integer")
   assert.equal(analysisInput.properties.entities.items.$ref, "#/$defs/analysis_groundedCandidate")
   assert.equal(analysisCommit.inputSchema.$defs.analysis_groundedCandidate.properties.confidence.type, "number")
+  assert.deepEqual(analysisCommit.inputSchema.$defs.analysis_groundedCandidate.properties.supportType.enum, ["direct", "normalized", "inferred"])
+  assert.equal(analysisCommit.inputSchema.$defs.analysis_groundedCandidate.properties.predicate.type, "string")
   assert.equal(analysisCommit.inputSchema.$defs.analysis_sourceRefList.items.type, "integer")
   assert.equal(analysisCommit.inputSchema.$defs.analysis_groundedCandidate.properties.schemaClassification.properties.snapshotHash.type, "string")
   const schemaText = JSON.stringify(analysisCommit.inputSchema)
@@ -271,13 +273,46 @@ test("commit_analysis validation failures are recoverable business results, not 
     assert.equal(response.structuredContent.next_action.tool, "llm_wiki_commit_analysis")
     assert.equal(response.structuredContent.next_action.arguments.worker_id, "extractor-4")
     assert.deepEqual(response.structuredContent.worker_restart, {
-      required: true,
-      strategy: "restart-same-worker-id-immediately",
+      required: false,
+      strategy: "repair-in-place-same-worker-and-lease",
       worker_id: "extractor-4",
       batch_id: "batch-0001",
       delay_ms: 0,
+      preserve_non_failing_candidates: true,
     })
   }
+})
+
+test("grounding diagnostics survive MCP serialization and keep the worker in place", async () => {
+  const diagnostic = {
+    path: "relations[0]",
+    reason_code: "UNSUPPORTED_RELATION_PREDICATE",
+    field: "predicate",
+    predicate: "responsibleFor",
+  }
+  const router = new HeadlessToolRouter({
+    commitAnalysis: async () => {
+      throw new LlmWikiError("INVALID_ANALYSIS", "Grounding failed.", {
+        details: {
+          validation_errors: ["relations[0] predicate is unsupported"],
+          grounding_diagnostics: [diagnostic],
+          grounding_warnings: [{ reason_code: "HIGH_SOURCE_REF_REUSE", count: 9 }],
+        },
+      })
+    },
+  })
+  const response = await router.callMcp("llm_wiki_commit_analysis", {
+    task_id: "task-example",
+    batch_id: "batch-0001",
+    worker_id: "extractor-4",
+    analysis: {},
+    idempotency_key: "grounding-diagnostic-v2",
+  })
+
+  assert.deepEqual(response.structuredContent.grounding_diagnostics, [diagnostic])
+  assert.equal(response.structuredContent.grounding_warnings[0].reason_code, "HIGH_SOURCE_REF_REUSE")
+  assert.equal(response.structuredContent.worker_restart.required, false)
+  assert.equal(response.structuredContent.worker_restart.preserve_non_failing_candidates, true)
 })
 
 test("an expired or missing extraction lease recovers through get_batch without disconnecting MCP", async () => {

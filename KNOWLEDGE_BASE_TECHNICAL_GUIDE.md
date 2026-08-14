@@ -87,7 +87,7 @@ Core 将同样的信息写入正文的“领域分类”章节。分类路径来
 - 对超大单行或旧 batch 尝试安全重分区；
 - 保留原始 batch ID、worker 租约和恢复信息。
 
-每个 extractor 使用稳定的 `worker_id`。Agent invocation 一结束，只要仍有抽取工作且未超过当前 pipeline 并发上限，协调器会零延迟以同一 worker ID 补位：有租约则立即续做原 batch，否则领取下一 batch；验证失败也不等待租约过期。
+每个 extractor 使用稳定的 `worker_id`。Agent invocation 一结束，只要仍有抽取工作且未超过当前 pipeline 并发上限，协调器会零延迟以同一 worker ID 补位：有租约则立即续做原 batch，否则领取下一 batch。普通 validation rejection 在当前 worker/lease 内按结构化诊断就地修复，不要求重启；只有 invocation 已结束时才以同一 worker ID 续做。
 
 ### 2.3 Schema-first 分析
 
@@ -98,7 +98,7 @@ Agent 根据 batch 和 Schema 生成 `AnalysisEnvelope`，然后调用 `llm_wiki
 1. 校验 envelope、task、batch 和 schemaVersion；
 2. 解析 `sourceRefs` 索引；
 3. 校验 sourceRef 是否指向真实 chunk；
-4. 校验 quote、locator 和证据质量；
+4. 精确校验 quote 与 locator 的来源真实性，再由 Grounding Quality Gate v2 分别校验 relation 端点、谓词、强标识符、数值/单位和否定极性；
 5. 规范化并校验实体和概念的 Domain → ABE → BE 文件链与 JSON Pointer，从目标 Schema 节点补齐 BE key/name；
 6. 校验 reviewItems、claims、relations 等集合结构；
 7. 通过后将分析结果写入 Analysis Store，并标记 batch 完成。
