@@ -140,16 +140,24 @@ Never submit after `LEASE_FENCED`. Reacquire work and discard the superseded res
 ### Analysis quality
 
 - Every entity, concept, claim, relation, contradiction, and review item needs grounded `sourceRefs`.
-- Exact quote copying is not required. A concise paraphrase is valid when its
-  meaningful terms are supported, every identifier/number/date/unit occurs in
-  the selected evidence, and positive/negative polarity is preserved.
+- Judge candidates by evidence support, not wording identity. Preserve useful
+  semantic normalization and entity canonicalization. Low surface-word overlap
+  is a review warning; zero meaningful overlap, unsupported strong anchors, or
+  changed polarity remain hard errors.
 - Put source-grounded concerns in `reviewItems`. Put unsupported uncertainty or
   inference in `unresolvedQuestions`; do not invent evidence.
-- Keep the evidence-facing relation statement in `content`; put normalized structure in `sourceEntityLocalId`, `predicate`, and `targetEntityLocalId`. Use `supportType=normalized` only for deterministic normalization.
+- Create a relation only when the evidence supports its endpoints, direction,
+  and predicate. A risk, failure consequence, or counterfactual does not by
+  itself establish `dependsOn`: preserve the supported consequence as a Claim
+  and put only the uncertain stronger interpretation in `unresolvedQuestions`.
+  Core safely downgrades a source-facing Relation with unsupported structure to
+  a Claim instead of deleting it. Use `supportType=normalized` for supported
+  semantic normalization.
 - On `INVALID_ANALYSIS`, repair only the exact `grounding_diagnostics[].path`
   and `.field`, preserve every non-failing candidate and evidence index, keep
   the same worker and lease, and use a new idempotency key for the changed
-  payload. Never rebuild the whole envelope merely to make it more verbatim.
+  payload. Do not replace supported normalization with source-sentence
+  transcription.
 - Preserve conflicting claims. Do not silently choose a winner.
 - Use numeric confidence values.
 

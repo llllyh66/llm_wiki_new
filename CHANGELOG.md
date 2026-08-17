@@ -4,6 +4,11 @@
 
 ## [1.0.8] - 2026-08-14
 
+- Keep grounding validation evidence-semantic instead of transcription-driven:
+  low lexical overlap is now a warning, while zero evidence overlap, strong
+  anchor changes, polarity errors, and invalid relation structure remain hard
+  failures. Core returns every diagnostic for a candidate in one response and
+  safely downgrades source-facing unsupported Relations to Claims.
 - Make Grounding Quality Gate polarity checks sentence-local so unrelated
   negation elsewhere in a cited passage does not reject a supported fact.
   Extractors now receive an explicit diagnostic-local repair contract: concise

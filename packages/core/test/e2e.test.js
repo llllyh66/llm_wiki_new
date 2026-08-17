@@ -284,7 +284,7 @@ test("grounding quality gate rejects a title-only SourceRef reused for many unre
     (error) => error instanceof LlmWikiError
       && error.code === "INVALID_ANALYSIS"
       && error.details.quality_gate === "source-ref-grounding-v2"
-      && error.details.grounding_diagnostics.some((diagnostic) => ["INSUFFICIENT_LEXICAL_SUPPORT", "UNSUPPORTED_STRONG_ANCHOR"].includes(diagnostic.reason_code))
+      && error.details.grounding_diagnostics.some((diagnostic) => ["NO_EVIDENCE_TERM_SUPPORT", "UNSUPPORTED_STRONG_ANCHOR"].includes(diagnostic.reason_code))
       && error.details.grounding_warnings.some((warning) => warning.reason_code === "HIGH_SOURCE_REF_REUSE"),
   )
   assert.equal((await f.core.status({ task_id: imported.task_id })).status, "prepared")
@@ -325,6 +325,42 @@ test("grounding accepts exact relation content from server evidence without labe
     },
   })
   assert.equal(committed.accepted, true)
+})
+
+test("commit safely downgrades a source-facing relation with unsupported structure to a claim", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  await writeFile(f.source, "# Campaigns\n\nThe MarketingManager manages MarketingCampaigns.\n")
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  const evidence = batch.evidence_catalog.find((entry) => entry.quote.includes("MarketingManager manages MarketingCampaigns"))
+  assert.ok(evidence)
+
+  const committed = await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    idempotency_key: "relation-claim-downgrade-v1",
+    analysis: {
+      ...batch.analysis_scaffold,
+      entities: [
+        { localId: "marketing-manager", name: "MarketingManager", sourceRefs: [evidence.evidence_index] },
+        { localId: "marketing-campaign", name: "MarketingCampaigns", sourceRefs: [evidence.evidence_index] },
+      ],
+      relations: [{
+        localId: "manager-responsible-for-campaign",
+        sourceEntityLocalId: "marketing-manager",
+        predicate: "responsibleFor",
+        targetEntityLocalId: "marketing-campaign",
+        content: "The MarketingManager manages MarketingCampaigns.",
+        supportType: "normalized",
+        sourceRefs: [evidence.evidence_index],
+      }],
+    },
+  })
+
+  assert.equal(committed.accepted, true)
+  assert.equal(committed.normalized_relation_claims, 1)
+  assert.deepEqual(committed.relation_claim_downgrades[0].reason_codes, ["UNSUPPORTED_RELATION_PREDICATE"])
 })
 
 

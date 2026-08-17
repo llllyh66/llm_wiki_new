@@ -395,7 +395,7 @@ test("built MCP server survives errors and completes the full workflow over one 
     }
     if (index === 3) {
       assert.equal(invalid.structuredContent.error.details.quality_gate, "source-ref-grounding-v2")
-      assert.equal(invalid.structuredContent.error.details.validation_error_count, 47)
+      assert.equal(invalid.structuredContent.error.details.validation_error_count, 94)
       assert.equal(invalid.structuredContent.grounding_warnings[0].reason_code, "HIGH_SOURCE_REF_REUSE")
     }
     assert.equal((await client.listTools()).tools.length, 18)

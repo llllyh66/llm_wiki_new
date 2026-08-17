@@ -8,7 +8,18 @@ const ANALYSIS_ARRAYS = ["sourceRefs", "entities", "concepts", "claims", "relati
 const GROUNDED_ANALYSIS_COLLECTIONS = new Set(["entities", "concepts", "claims", "relations", "contradictions", "candidatePages", "reviewItems"])
 const MAX_ANALYSIS_VALIDATION_ERRORS = 50
 const MAX_SOURCE_REF_REUSE = 8
+const MAX_ANALYSIS_CLAIMS = 1_000
 const GROUNDING_QUALITY_COLLECTIONS = new Set(["claims", "relations", "contradictions", "reviewItems"])
+const RELATION_STRUCTURE_DIAGNOSTIC_CODES = new Set([
+  "UNSUPPORTED_RELATION_ENDPOINT",
+  "RELATION_DIRECTION_MISMATCH",
+  "UNSUPPORTED_RELATION_PREDICATE",
+])
+const RELATION_STRUCTURE_FIELDS = new Set([
+  "sourceEntityLocalId", "targetEntityLocalId", "predicate", "relationType", "relation_type",
+  "subject", "object", "source", "target", "from", "to", "sourceName", "targetName",
+  "sourceEntityName", "targetEntityName", "name", "title",
+])
 const GENERIC_GROUNDING_TERMS = new Set(["content", "data", "document", "item", "内容", "数据", "文档", "指标", "体系", "关系", "概述", "包含", "包括"])
 const GROUNDING_STOP_WORDS = new Set([
   "the", "is", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
@@ -306,11 +317,13 @@ export function validateGroundingQuality(analysis) {
         errors.push(diagnostic.message)
         continue
       }
-      const diagnostic = candidateGroundingDiagnostic(collection, path, item, evidenceText, candidateNames)
-      if (diagnostic) {
+      const candidateWarnings = []
+      const candidateDiagnostics = candidateGroundingDiagnostics(collection, path, item, evidenceText, candidateNames, candidateWarnings)
+      for (const diagnostic of candidateDiagnostics) {
         diagnostics.push(diagnostic)
         errors.push(diagnostic.message)
       }
+      warnings.push(...candidateWarnings)
     }
   }
   for (const { count, paths } of refUses.values()) {
@@ -341,78 +354,150 @@ export function validateGroundingQuality(analysis) {
   }
 }
 
-function candidateGroundingDiagnostic(collection, path, item, evidenceText, candidateNames) {
+export function downgradeUnsupportedRelationsToClaims(analysis) {
+  if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) {
+    return { analysis, downgraded: 0, entries: [] }
+  }
+  const relations = Array.isArray(analysis.relations) ? analysis.relations : []
+  const claims = Array.isArray(analysis.claims) ? [...analysis.claims] : []
+  if (relations.length === 0 || claims.length >= MAX_ANALYSIS_CLAIMS) {
+    return { analysis, downgraded: 0, entries: [] }
+  }
+  const candidateNames = analysisCandidateNames(analysis)
+  const keptRelations = []
+  const entries = []
+  for (const [itemIndex, item] of relations.entries()) {
+    if (!item || typeof item !== "object" || Array.isArray(item) || !Array.isArray(item.sourceRefs)) {
+      keptRelations.push(item)
+      continue
+    }
+    const evidenceText = item.sourceRefs
+      .filter(isSourceRefObject)
+      .map((ref) => typeof ref.quote === "string" ? ref.quote.trim() : "")
+      .filter(Boolean)
+      .join("\n")
+    const assertion = candidateAssertionText(item)
+    const diagnostics = evidenceText
+      ? candidateGroundingDiagnostics("relations", `relations[${itemIndex}]`, item, evidenceText, candidateNames)
+      : []
+    const structuralDiagnostics = diagnostics.filter((diagnostic) => RELATION_STRUCTURE_DIAGNOSTIC_CODES.has(diagnostic.reason_code))
+    const nonStructuralDiagnostics = diagnostics.filter((diagnostic) => !RELATION_STRUCTURE_DIAGNOSTIC_CODES.has(diagnostic.reason_code))
+    const sourceFacingContent = Boolean(assertion
+      && normalizeGroundingText(evidenceText).includes(normalizeGroundingText(assertion)))
+    if (structuralDiagnostics.length === 0 || nonStructuralDiagnostics.length > 0
+      || claims.length >= MAX_ANALYSIS_CLAIMS) {
+      keptRelations.push(item)
+      continue
+    }
+    const claimContent = sourceFacingContent
+      ? assertion
+      : bestSupportedEvidenceSegment(assertion, evidenceText)
+    if (!claimContent) {
+      keptRelations.push(item)
+      continue
+    }
+    const claim = { ...item, content: claimContent, supportType: "direct" }
+    for (const field of RELATION_STRUCTURE_FIELDS) delete claim[field]
+    claims.push(claim)
+    entries.push({
+      relation_path: `relations[${itemIndex}]`,
+      claim_index: claims.length - 1,
+      reason_codes: [...new Set(structuralDiagnostics.map((diagnostic) => diagnostic.reason_code))],
+      used_evidence_wording: !sourceFacingContent,
+    })
+  }
+  if (entries.length === 0) return { analysis, downgraded: 0, entries: [] }
+  return {
+    analysis: { ...analysis, claims, relations: keptRelations },
+    downgraded: entries.length,
+    entries,
+  }
+}
+
+function candidateGroundingDiagnostics(collection, path, item, evidenceText, candidateNames, warnings = []) {
+  const diagnostics = []
   const supportType = item.supportType ?? item.support_type
   if (supportType === "inferred") {
-    return groundingDiagnostic(
+    diagnostics.push(groundingDiagnostic(
       path,
       "INFERRED_FACT_NOT_PUBLISHABLE",
       "supportType",
-      `${path} is marked inferred and cannot be committed as a grounded fact; move it to reviewItems or unresolvedQuestions`,
-    )
+      `${path} is marked inferred and cannot be committed as a grounded fact; rewrite it as a source-supported candidate or move the unsupported inference to unresolvedQuestions`,
+    ))
   }
   const assertion = candidateAssertionText(item)
-  if (!assertion) return null
+  if (!assertion) return diagnostics
 
   const unsupportedAnchors = groundingAnchors(assertion).filter((anchor) => !groundingAnchors(evidenceText).includes(anchor))
   if (unsupportedAnchors.length > 0) {
-    return groundingDiagnostic(
+    diagnostics.push(groundingDiagnostic(
       path,
       "UNSUPPORTED_STRONG_ANCHOR",
       "content",
-      `${path} introduces identifiers, numbers, dates, or units that do not occur in its SourceRef quote`,
+      `${path} introduces identifiers, numbers, dates, or units that do not occur in its selected evidence`,
       { unsupported_anchors: unsupportedAnchors },
-    )
+    ))
   }
 
   if (groundingPolarityMismatch(assertion, evidenceText)) {
-    return groundingDiagnostic(
+    diagnostics.push(groundingDiagnostic(
       path,
       "POLARITY_MISMATCH",
       "content",
-      `${path} changes the positive or negative polarity of its SourceRef quote`,
-    )
+      `${path} changes the positive or negative polarity of its selected evidence`,
+    ))
   }
 
   if (collection === "relations") {
-    const endpointDiagnostic = relationEndpointDiagnostic(path, item, evidenceText, candidateNames)
-    if (endpointDiagnostic) return endpointDiagnostic
+    diagnostics.push(...relationEndpointDiagnostics(path, item, evidenceText, candidateNames))
     const directionDiagnostic = relationDirectionDiagnostic(path, item, assertion, candidateNames)
-    if (directionDiagnostic) return directionDiagnostic
+    if (directionDiagnostic) diagnostics.push(directionDiagnostic)
     const predicateDiagnostic = relationPredicateDiagnostic(path, item, evidenceText)
-    if (predicateDiagnostic) return predicateDiagnostic
+    if (predicateDiagnostic) diagnostics.push(predicateDiagnostic)
   }
 
   const support = groundingTextSupport(assertion, evidenceText)
   if (!support.supported) {
-    return groundingDiagnostic(
-      path,
-      "INSUFFICIENT_LEXICAL_SUPPORT",
-      typeof item.content === "string" ? "content" : typeof item.text === "string" ? "text" : "candidate",
-      `${path} SourceRef quote does not lexically support the candidate content; preserve a directly supported statement and keep normalized structure in dedicated fields`,
-      { matched_terms: support.matchedTerms, unsupported_terms: support.unsupportedTerms },
-    )
+    const field = typeof item.content === "string" ? "content" : typeof item.text === "string" ? "text" : "candidate"
+    if (support.matchedTerms.length === 0) {
+      diagnostics.push(groundingDiagnostic(
+        path,
+        "NO_EVIDENCE_TERM_SUPPORT",
+        field,
+        `${path} shares no meaningful term with its selected evidence`,
+        { matched_terms: support.matchedTerms, unsupported_terms: support.unsupportedTerms },
+      ))
+    } else {
+      warnings.push(groundingDiagnostic(
+        path,
+        "LOW_LEXICAL_SUPPORT",
+        field,
+        `${path} has low surface-word overlap with its selected evidence; retain semantic normalization but review the mapping`,
+        { matched_terms: support.matchedTerms, unsupported_terms: support.unsupportedTerms },
+      ))
+    }
   }
-  return null
+  return diagnostics
 }
 
-function relationEndpointDiagnostic(path, item, evidenceText, candidateNames) {
+function relationEndpointDiagnostics(path, item, evidenceText, candidateNames) {
+  const diagnostics = []
   const endpoints = relationEndpoints(item, candidateNames)
   for (const endpoint of endpoints) {
     // Stable local IDs may intentionally point to a candidate from another
     // batch. Validate the endpoint surface when it is available here and let
     // page planning perform cross-batch ID resolution later.
     if (endpoint.value && !groundingPhraseSupported(endpoint.value, evidenceText)) {
-      return groundingDiagnostic(
+      diagnostics.push(groundingDiagnostic(
         path,
         "UNSUPPORTED_RELATION_ENDPOINT",
         endpoint.field,
-        `${path} ${endpoint.role} endpoint is not supported by its SourceRef quote`,
+        `${path} ${endpoint.role} endpoint is not supported by its selected evidence`,
         { endpoint_role: endpoint.role, endpoint: endpoint.value },
-      )
+      ))
     }
   }
-  return null
+  return diagnostics
 }
 
 function relationEndpoints(item, candidateNames) {
@@ -541,6 +626,20 @@ function groundingSegmentScore(assertion, evidenceSegment) {
   const evidenceTerms = new Set(groundingTerms(evidenceSegment))
   const matched = assertionTerms.filter((term) => evidenceTerms.has(term)).length
   return matched === 0 ? 0 : (matched * 100) + (matched / assertionTerms.length)
+}
+
+function bestSupportedEvidenceSegment(assertion, evidenceText) {
+  const segments = groundingEvidenceSegments(evidenceText)
+  let bestSegment = ""
+  let bestScore = 0
+  for (const segment of segments) {
+    const score = groundingSegmentScore(assertion, segment)
+    if (score > bestScore) {
+      bestScore = score
+      bestSegment = segment
+    }
+  }
+  return bestSegment
 }
 
 function candidateAssertionText(item) {

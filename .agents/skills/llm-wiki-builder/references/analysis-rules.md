@@ -18,22 +18,24 @@
   top-level catalog. Never retype the supplied quotes.
 - Write `reviewItems` as objects with non-empty `content` and indexed or
   complete `sourceRefs`; put unsourced questions in `unresolvedQuestions`.
-- Evidence-catalog quotes are already short, exact, and verbatim. Select their
-  indexes without reading the original source file; never reconstruct or
-  normalize locator fields yourself.
-- Candidate content need not copy an evidence quote verbatim. A concise
-  paraphrase is acceptable when meaningful terms remain supported, all strong
-  anchors such as identifiers, numbers, dates, and units occur in the selected
-  evidence, and polarity is unchanged.
+- Evidence-catalog passages are server-generated contiguous source evidence.
+  Select their indexes without reading the original source file; never
+  reconstruct or normalize locator fields yourself.
+- Judge candidate content by evidence support, not wording identity. Preserve
+  useful semantic normalization and entity canonicalization. Low surface-word
+  overlap is a review warning; zero meaningful overlap, unsupported strong
+  anchors, and changed polarity remain hard errors.
 - A title-only quote does not support detailed facts from a table. Claims,
   relations, contradictions, and review items must cite quotes containing their
   identifying terms. Split table evidence by row or coherent topic. High reuse
   of one SourceRef is reported as a warning; every candidate is still validated
   independently against that evidence.
-- Put the directly supported source-facing relation statement in `content` and
-  cite the evidence index containing that statement. Put normalized structure
-  in `sourceEntityLocalId`, `predicate`, and `targetEntityLocalId`; the predicate
-  is validated independently from the endpoints.
+- Create a relation only when the selected evidence supports its endpoints,
+  direction, and predicate. A risk, failure consequence, or counterfactual does
+  not by itself establish a dependency. Preserve the supported consequence as
+  a Claim and put only the uncertain stronger interpretation in
+  `unresolvedQuestions`. Core safely downgrades a source-facing Relation with
+  unsupported structure to a Claim instead of deleting it.
 - Use `supportType=direct` for source wording and `supportType=normalized` only
   for deterministic identifier, inflection, or declared predicate
   normalization. Put source-grounded concerns in `reviewItems` and unsupported

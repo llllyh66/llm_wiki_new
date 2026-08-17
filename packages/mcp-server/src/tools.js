@@ -173,7 +173,10 @@ function errorResult(error, context = {}) {
     } : {}),
     ...(analysisRetry && Array.isArray(normalized.details?.grounding_diagnostics) ? {
       grounding_repair: {
-        exact_quote_copy_required: false,
+        candidate_wording_policy: "evidence-supported-semantic-normalization-not-verbatim-identity",
+        low_lexical_overlap_is_warning: true,
+        zero_meaningful_term_overlap_is_rejected: true,
+        all_candidate_diagnostics_returned_together: true,
         repair_scope: "reported-diagnostic-paths-and-fields-only",
         preserve_non_failing_candidates: true,
         preserve_evidence_indexes: true,
@@ -182,6 +185,7 @@ function errorResult(error, context = {}) {
         strong_anchors_must_occur_in_selected_evidence: true,
         preserve_polarity: true,
         relation_fields_validated_independently: ["endpoints", "direction", "predicate"],
+        safe_source_facing_relation_auto_downgraded_to_claim: true,
         source_grounded_concerns_destination: "reviewItems",
         unsupported_inference_destination: "unresolvedQuestions",
       },

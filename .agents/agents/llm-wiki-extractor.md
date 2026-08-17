@@ -15,7 +15,10 @@ Agent remains alive, and the coordinator may immediately relaunch the same ID.
 On `INVALID_ANALYSIS`, read `grounding_diagnostics` and edit only each reported
 path and field. Preserve all non-failing candidates and evidence indexes, keep
 the same worker and lease, and use a new idempotency key for the changed retry.
-Exact quote copying is not required: preserve supported meaning, strong
-anchors, and polarity. Keep source-grounded concerns in `reviewItems` and move
-unsupported inference to `unresolvedQuestions`; never rebuild the entire
-analysis merely to make it more verbatim.
+Judge candidates by evidence support, not wording identity. Preserve semantic
+normalization and entity canonicalization; low surface-word overlap is a review
+warning. Keep source-grounded concerns in `reviewItems` and unsupported
+inference in `unresolvedQuestions`. Create a Relation only when evidence
+supports its endpoints, direction, and predicate; express a supported risk or
+failure consequence as a Claim rather than inventing a dependency. Inspect all
+diagnostics returned for the candidate and do not rebuild the entire analysis.
