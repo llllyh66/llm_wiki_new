@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
@@ -65,12 +65,6 @@ test("Domain page query inspects classifications and searches them with stable p
     },
     "schema-resource-v1",
   ))
-  const generationId = "generation-00000000-0000-4000-8000-000000000001"
-  const generationRoot = path.join(root, ".llm-wiki", "generations", generationId)
-  await mkdir(generationRoot, { recursive: true })
-  await cp(path.join(root, "wiki"), path.join(generationRoot, "wiki"), { recursive: true })
-  await writeFile(path.join(generationRoot, "manifest.json"), JSON.stringify({ schemaVersion: 1, generationId, taskId: "task-domain-query", wikiRevision: "published-domain-query", pages: [], artifacts: {} }))
-  await writeFile(path.join(root, ".llm-wiki", "current-generation.json"), JSON.stringify({ schema_version: 1, generation_id: generationId }))
 
   const inspected = await core.queryDomainPages({ action: "inspect", paths: ["wiki/entities/n26.md"] })
   assert.equal(inspected.pages[0].classified, true)
@@ -108,3 +102,4 @@ test("Domain page query inspects classifications and searches them with stable p
   assert.equal(resource.total_matches, 1)
   assert.equal(resource.pages[0].domain_schema.id, "schema-resource-v1")
 })
+

@@ -55,60 +55,7 @@ export function taskPaths(workspacePaths, taskId) {
     domainSchemaRoot: path.join(root, "domain-schema"),
     pagePlan: path.join(root, "page-plan.json"),
     pageDrafts: path.join(root, "page-drafts"),
-    importRequest: path.join(root, "import-request.json"),
-    retrievalIndex: path.join(root, "retrieval-index.json"),
-    featureHashVectors: path.join(root, "feature-hash.f32"),
   }
-}
-
-export async function updateImportTask(workspace, taskId, sources, options = {}) {
-  const record = await loadTask(workspace.paths, taskId)
-  if (!record.task || !["importing", "parsing", "prepared"].includes(record.task.status)) {
-    fail("INVALID_TASK_STATE", "Only an importing task can accept progressive source updates.")
-  }
-  const maxChunkChars = Math.min(workspace.config.limits.maxChunkChars, MAX_AGENT_CHUNK_CHARS)
-  const totalSourceChars = sources.flatMap((source) => source.chunks)
-    .reduce((sum, chunk) => sum + (typeof chunk?.text === "string" ? chunk.text.length : 0), 0)
-  const adaptiveBatchChars = totalSourceChars >= LARGE_TASK_SOURCE_CHARS ? LARGE_AGENT_BATCH_CHARS : DEFAULT_AGENT_BATCH_CHARS
-  const requestedBatchChars = Number(options.maxBatchChars)
-  const maxBatchChars = Number.isFinite(requestedBatchChars)
-    ? Math.min(Math.max(requestedBatchChars, 1_000), workspace.config.limits.maxBatchChars, MAX_AGENT_BATCH_CHARS)
-    : Math.min(workspace.config.limits.maxBatchChars, adaptiveBatchChars)
-  const maxBatchPayloadBytes = batchPayloadLimit(maxBatchChars)
-  const allChunks = boundTaskChunks(
-    sources.flatMap((source) => source.chunks),
-    Math.min(maxChunkChars, maxBatchChars),
-    Math.min(MAX_TASK_CHUNK_PAYLOAD_BYTES, maxBatchPayloadBytes),
-  )
-  const batches = makeBatches(taskId, allChunks, maxBatchChars)
-  record.task.sourceIds = sources.map((source) => source.source_id)
-  record.task.sourceSnapshotHash = sha256(stableStringify(sources.map((source) => ({ sourceId: source.source_id, hash: source.content_hash }))))
-  record.task.batchCount = batches.length
-  record.task.batchBounds = batchBoundsRecord(maxChunkChars, maxBatchChars, maxBatchPayloadBytes)
-  record.task.options = { ...record.task.options, maxChunkChars, maxBatchChars }
-  record.task.importProgress = {
-    accepted: sources.length,
-    parsed: sources.length,
-    bm25Indexed: sources.length,
-    embeddingIndexed: Number(record.task.importProgress?.embeddingIndexed) || 0,
-    failed: Number(options.failed) || 0,
-    complete: options.complete === true,
-    updatedAt: nowIso(),
-    sources: (record.task.importProgress?.sources ?? []).map((state) => {
-      const parsed = sources.find((source) => source.display_name === state.display_name)
-      return parsed ? { display_name: state.display_name, source_id: parsed.source_id, state: "bm25-ready", chunk_count: parsed.chunks.length } : state
-    }),
-  }
-  record.task.status = options.complete === true ? "prepared" : "parsing"
-  if (options.complete === true) {
-    record.task.buildKey = taskBuildKey(record.task.sourceIds, record.task.domainSchema?.hash ?? null, record.task.options.targetLanguage)
-    record.task.importCompletedAt = nowIso()
-  }
-  record.batches = batches
-  await writeJsonAtomic(record.paths.batches, batches)
-  batchFileCache.delete(record.paths.batches)
-  await saveTask(record.paths, record.task)
-  return record
 }
 
 export async function createTask(workspace, sources, options = {}) {
@@ -177,11 +124,6 @@ export async function createTask(workspace, sources, options = {}) {
       completedProjectionLeases: [],
     },
     analysisRevision: 0,
-    analysisValidation: {
-      schemaVersion: 1,
-      batches: {},
-      maxSemanticRepairs: 2,
-    },
     pagePlanRevision: 0,
     commitRevision: 0,
     retryCount: 0,
@@ -193,9 +135,6 @@ export async function createTask(workspace, sources, options = {}) {
       enableBm25: true,
       enableVector: true,
       enableGraph: true,
-      maxTotalAgents: options.hostCapabilities?.maxTotalAgents ?? 4,
-      coordinatorSlots: options.hostCapabilities?.coordinatorSlots ?? 1,
-      maxBackgroundAgents: options.hostCapabilities?.maxBackgroundAgents ?? 3,
     },
   }
   if (options.domainSchema) {
@@ -328,9 +267,7 @@ function boundTaskChunks(chunks, maxChars, maxPayloadBytes = MAX_TASK_CHUNK_PAYL
     if (text.length <= maxChars
       && payloadBytes <= maxPayloadBytes
       && nestedStringChars <= MAX_AGENT_NESTED_STRING_CHARS) return [compactedChunk]
-    const pieces = Array.isArray(compactedChunk?.blockKinds) && compactedChunk.blockKinds.includes("table")
-      ? splitTaskTableText(text, maxChars)
-      : splitChunkText(text, maxChars)
+    const pieces = splitChunkText(text, maxChars)
     return pieces.map((piece, index) => {
       const { structuredData: _structuredData, ...base } = compactedChunk
       const pieceText = piece.text
@@ -356,9 +293,6 @@ function compactTaskChunk(chunk) {
   return {
     ...chunk,
     taskPayloadVersion: TASK_CHUNK_PAYLOAD_VERSION,
-    ...(chunk.tableContext && typeof chunk.tableContext === "object"
-      ? { tableContext: compactTableContext(chunk.tableContext) }
-      : {}),
     ...(Array.isArray(chunk.structuredData) ? { structuredData: compactStructuredData(chunk.structuredData) } : {}),
   }
 }
@@ -396,24 +330,11 @@ function compactStructuredData(values) {
   return values.slice(0, 20).map((value) => ({
     kind: "table",
     compacted: true,
-    ...(Array.isArray(value?.headers) && value.headers.length > 0
-      ? { headers: value.headers.slice(0, 100).map((header) => String(header).slice(0, 500)), column_names: value.headers.slice(0, 100).map((header) => String(header).slice(0, 500)) }
-      : {}),
     ...(typeof value?.sheetName === "string" ? { sheetName: value.sheetName.slice(0, 500) } : {}),
     ...(typeof value?.cellRange === "string" ? { cellRange: value.cellRange.slice(0, 100) } : {}),
     ...(typeof value?.sheetState === "string" ? { sheetState: value.sheetState.slice(0, 100) } : {}),
     ...(value?.fragmented === true ? { fragmented: true } : {}),
   }))
-}
-
-function compactTableContext(value) {
-  const headers = Array.isArray(value?.headers)
-    ? value.headers.slice(0, 100).map((header) => String(header).slice(0, 500))
-    : []
-  return {
-    ...(headers.length > 0 ? { headers, column_names: headers } : {}),
-    ...(Number.isInteger(value?.table_count) ? { table_count: value.table_count } : {}),
-  }
 }
 
 function batchBoundsRecord(maxChunkChars, maxBatchChars, maxPayloadBytes) {
@@ -456,44 +377,6 @@ function splitChunkText(text, maxChars) {
   while (end > start && /\s/u.test(text[end - 1])) end -= 1
   if (start < end || pieces.length === 0) pieces.push({ text: text.slice(start, end), start, end })
   return pieces
-}
-
-function splitTaskTableText(text, maxChars) {
-  const lines = []
-  let cursor = 0
-  for (const line of text.split("\n")) {
-    lines.push({ text: line, start: cursor, end: cursor + line.length })
-    cursor += line.length + 1
-  }
-  if (lines.length < 3 || !/^\s*\|/u.test(lines[0].text) || !isTaskTableDelimiter(lines[1].text)) {
-    return splitChunkText(text, maxChars)
-  }
-  const prefix = `${lines[0].text}\n${lines[1].text}`
-  if (prefix.length + 2 >= maxChars) return splitChunkText(text, maxChars)
-  const pieces = []
-  let rows = []
-  const emit = () => {
-    if (rows.length === 0) return
-    pieces.push({
-      text: `${prefix}\n${rows.map((row) => row.text).join("\n")}`,
-      start: rows[0].start,
-      end: rows.at(-1).end,
-    })
-    rows = []
-  }
-  for (const row of lines.slice(2)) {
-    const currentRowsLength = rows.reduce((sum, item) => sum + item.text.length + 1, 0)
-    if (rows.length > 0 && prefix.length + 1 + currentRowsLength + row.text.length > maxChars) emit()
-    if (prefix.length + 1 + row.text.length > maxChars) return splitChunkText(text, maxChars)
-    rows.push(row)
-  }
-  emit()
-  return pieces.length > 0 ? pieces : splitChunkText(text, maxChars)
-}
-
-function isTaskTableDelimiter(value) {
-  const cells = value.trim().slice(1, -1).split("|").map((cell) => cell.trim())
-  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/u.test(cell))
 }
 
 export async function loadTask(workspacePaths, taskId) {

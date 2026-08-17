@@ -2,9 +2,7 @@ import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import JSZip from "jszip"
-import { LlmWikiError, fail } from "./errors.js"
-import { createOcrSession } from "./ocr.js"
-import { pptxToMarkdown } from "./pptx.js"
+import { fail } from "./errors.js"
 import { safeTextCut, sha256 } from "./utils.js"
 import { xlsxToMarkdown } from "./xlsx.js"
 
@@ -17,28 +15,12 @@ export const SUPPORTED_SOURCE_TYPES = Object.freeze({
   ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   ".pdf": "application/pdf",
-  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-  ".pptm": "application/vnd.ms-powerpoint.presentation.macroEnabled.12",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".webp": "image/webp",
-  ".bmp": "image/bmp",
-  ".tif": "image/tiff",
-  ".tiff": "image/tiff",
 })
 
 export async function parseManagedSource(filePath, sourceId, mediaType, options = {}) {
-  options.signal?.throwIfAborted()
   let content
   let tableMetadata = []
   let documentMetadata = {}
-  let media = []
-  const ownsOcrSession = !options.ocrSession
-  const ocrSession = options.ocrSession ?? createOcrSession({
-    languages: options.ocrLanguages,
-    recognize: options.ocrRecognize,
-  })
   try {
     if (mediaType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
       const parsed = await docxToMarkdown(await readFile(filePath))
@@ -53,50 +35,15 @@ export async function parseManagedSource(filePath, sourceId, mediaType, options 
       tableMetadata = parsed.tables
       documentMetadata = parsed.metadata
     } else if (mediaType === "application/pdf") {
-      const parsed = await pdfToMarkdown(await readFile(filePath), { ocrSession, signal: options.signal })
-      content = parsed.markdown
-      documentMetadata = parsed.metadata
-    } else if (mediaType === "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-      || mediaType === "application/vnd.ms-powerpoint.presentation.macroEnabled.12") {
-      const parsed = await pptxToMarkdown(await readFile(filePath), {
-        fileName: path.basename(filePath),
-        ocrSession,
-        maxOcrImages: options.maxOcrImages,
-        signal: options.signal,
-      })
-      content = parsed.markdown
-      documentMetadata = parsed.metadata
-    } else if (mediaType.startsWith("image/")) {
-      const imageBuffer = await readFile(filePath)
-      if (!options.ocrRecognize) await assertSafeImageDimensions(imageBuffer)
-      options.signal?.throwIfAborted()
-      const recognized = await ocrSession.recognize(imageBuffer, {
-        kind: "source-image",
-        imageName: path.basename(filePath),
-        signal: options.signal,
-      })
-      if (!recognized.text) fail("SOURCE_PARSE_FAILED", "OCR found no usable text in the source image.")
-      const imageTitle = path.basename(filePath, path.extname(filePath)) || "Image"
-      content = `# ${imageTitle}\n\n## OCR text\n\n${recognized.text}`
-      documentMetadata = {
-        imageType: mediaType,
-        extractionMethod: "ocr",
-        ocrLanguages: ocrSession.languages,
-        textCharacters: recognized.text.length,
-        ...(recognized.confidence !== undefined ? { confidence: recognized.confidence } : {}),
-      }
-      media = [{ kind: "image", mediaType, extractionMethod: "ocr" }]
+      content = await pdfToMarkdown(await readFile(filePath))
     } else {
       content = await readFile(filePath, "utf8")
       if (mediaType === "text/html") content = htmlToMarkdown(content)
     }
   } catch (error) {
-    if (error instanceof LlmWikiError) throw error
-    fail("SOURCE_PARSE_FAILED", `Could not safely parse ${path.basename(filePath)}.`, {
+    fail("SOURCE_PARSE_FAILED", `Could not decode ${path.basename(filePath)} as UTF-8 text.`, {
       details: { reason: error instanceof Error ? error.message : String(error) },
     })
-  } finally {
-    if (ownsOcrSession) await ocrSession.terminate()
   }
   if (content.includes("\0")) {
     fail("SOURCE_PARSE_FAILED", "The source appears to be binary rather than Markdown or text.")
@@ -119,7 +66,7 @@ export async function parseManagedSource(filePath, sourceId, mediaType, options 
     mediaType,
     metadata: documentMetadata,
     blocks,
-    media,
+    media: [],
   }
   const chunks = chunkDocument(document, {
     maxChars: options.maxChunkChars ?? 8_000,
@@ -127,8 +74,6 @@ export async function parseManagedSource(filePath, sourceId, mediaType, options 
   for (const chunk of chunks) {
     const pageHeading = [...chunk.headingPath].reverse().find((heading) => /^Page \d+$/i.test(heading))
     if (pageHeading) chunk.pageNumber = Number(pageHeading.match(/\d+/)?.[0])
-    const slideHeading = [...chunk.headingPath].reverse().find((heading) => /^Slide \d+$/i.test(heading))
-    if (slideHeading) chunk.slideNumber = Number(slideHeading.match(/\d+/)?.[0])
   }
   return { document, markdown: normalized, chunks }
 }
@@ -236,12 +181,11 @@ function decodeXml(value = "") {
   })
 }
 
-async function pdfToMarkdown(buffer, options) {
-  let loadingTask
+async function pdfToMarkdown(buffer) {
   try {
     const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs")
     const standardFontDataUrl = fileURLToPath(new URL("./standard_fonts/", import.meta.resolve("pdfjs-dist/package.json")))
-    loadingTask = pdfjs.getDocument({
+    const loadingTask = pdfjs.getDocument({
       data: new Uint8Array(buffer),
       useWorkerFetch: false,
       // PDF imports are text extraction only. Never execute document-level
@@ -253,18 +197,7 @@ async function pdfToMarkdown(buffer, options) {
     })
     const document = await loadingTask.promise
     const pages = []
-    const ocrPages = []
-    const textPages = []
-    let usableTextCharacters = 0
-    const maxPages = 2_000
-    const maxOcrPages = 500
-    const maxOcrCharacters = 5_000_000
-    const deadline = Date.now() + 30 * 60 * 1_000
-    if (document.numPages > maxPages) fail("SOURCE_PARSE_FAILED", `The PDF exceeds the ${maxPages}-page safety limit.`)
-    let ocrCharacters = 0
     for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
-      options.signal?.throwIfAborted()
-      if (Date.now() > deadline) fail("SOURCE_PARSE_FAILED", "PDF parsing exceeded the 30-minute safety budget.")
       const page = await document.getPage(pageNumber)
       const text = await page.getTextContent()
       let line = ""
@@ -278,175 +211,16 @@ async function pdfToMarkdown(buffer, options) {
         } else line += " "
       }
       if (line.trim()) lines.push(line.trim())
-      let pageText = lines.join("\n").trim()
-      if (searchableCharacterCount(pageText) < 8) {
-        if (ocrPages.length >= maxOcrPages) fail("SOURCE_PARSE_FAILED", `The PDF exceeds the ${maxOcrPages}-page OCR safety limit.`)
-        const image = await renderPdfPage(page)
-        options.signal?.throwIfAborted()
-        const recognized = await options.ocrSession.recognize(image, { kind: "pdf-page", pageNumber, signal: options.signal })
-        if (recognized.text) {
-          ocrCharacters += recognized.text.length
-          if (ocrCharacters > maxOcrCharacters) fail("SOURCE_PARSE_FAILED", "PDF OCR text exceeds the safety limit.")
-          pageText = pageText && !recognized.text.includes(pageText)
-            ? `${pageText}\n${recognized.text}`
-            : recognized.text
-          ocrPages.push({
-            pageNumber,
-            textCharacters: recognized.text.length,
-            ...(recognized.confidence !== undefined ? { confidence: recognized.confidence } : {}),
-          })
-        } else if (pageText) textPages.push(pageNumber)
-      } else textPages.push(pageNumber)
-      usableTextCharacters += pageText.length
-      pages.push(`# Page ${pageNumber}\n\n${pageText || "_No readable text detected._"}`)
+      pages.push(`# Page ${pageNumber}\n\n${lines.join("\n")}`)
     }
-    if (usableTextCharacters === 0) fail("SOURCE_PARSE_FAILED", "The PDF contains no usable native or OCR text.")
-    return {
-      markdown: pages.join("\n\n"),
-      metadata: {
-        pdfPageCount: document.numPages,
-        textPages,
-        ocrPages,
-        ocrLanguages: options.ocrSession.languages,
-        scriptingEnabled: false,
-      },
-    }
-  } catch (error) {
-    if (error instanceof LlmWikiError) throw error
-    fail("SOURCE_PARSE_FAILED", "The PDF could not be safely parsed.", { details: { reason: error instanceof Error ? error.message : String(error) } })
-  } finally {
     // PDF.js 6 moved destruction to the LoadingTask. Keeping lifecycle
     // ownership here prevents a successful extraction from being converted
     // into SOURCE_PARSE_FAILED by a version-specific cleanup call.
-    await loadingTask?.destroy().catch(() => {})
+    await loadingTask.destroy()
+    return pages.join("\n\n")
+  } catch (error) {
+    fail("SOURCE_PARSE_FAILED", "The PDF could not be safely parsed.", { details: { reason: error instanceof Error ? error.message : String(error) } })
   }
-}
-
-async function renderPdfPage(page) {
-  const { createCanvas } = await import("@napi-rs/canvas")
-  const base = page.getViewport({ scale: 1 })
-  const maxPixels = 16_000_000
-  const scale = Math.min(2, Math.sqrt(maxPixels / Math.max(1, base.width * base.height)))
-  const viewport = page.getViewport({ scale })
-  const width = Math.max(1, Math.ceil(viewport.width))
-  const height = Math.max(1, Math.ceil(viewport.height))
-  if (width * height > maxPixels) fail("SOURCE_PARSE_FAILED", "Rendered PDF page exceeds the pixel safety limit.")
-  const canvas = createCanvas(width, height)
-  const canvasContext = canvas.getContext("2d")
-  await page.render({ canvas, canvasContext, viewport, intent: "display" }).promise
-  return canvas.toBuffer("image/png")
-}
-
-async function assertSafeImageDimensions(buffer) {
-  const header = imageHeaderDimensions(buffer)
-  validateDecodedImageBounds(header.width, header.height, header.frames)
-  const { loadImage } = await import("@napi-rs/canvas")
-  let image
-  try {
-    image = await loadImage(buffer)
-  } catch {
-    fail("SOURCE_PARSE_FAILED", "The image could not be safely decoded.")
-  }
-  const width = Number(image.width)
-  const height = Number(image.height)
-  if (width !== header.width || height !== header.height) fail("SOURCE_PARSE_FAILED", "The decoded image dimensions do not match its header.")
-  validateDecodedImageBounds(width, height, header.frames)
-}
-
-function validateDecodedImageBounds(width, height, frames = 1) {
-  const maxDimension = 20_000
-  const maxPixels = 40_000_000
-  const maxDecodedBytes = 160_000_000
-  if (!Number.isFinite(width) || !Number.isFinite(height) || width < 1 || height < 1
-    || !Number.isSafeInteger(width * height) || width > maxDimension || height > maxDimension
-    || width * height > maxPixels || width * height * 4 > maxDecodedBytes || frames !== 1) {
-    fail("SOURCE_PARSE_FAILED", "The image exceeds the dimension or decoded-pixel safety limit.")
-  }
-}
-
-function imageHeaderDimensions(buffer) {
-  if (!Buffer.isBuffer(buffer) || buffer.length < 12) fail("SOURCE_PARSE_FAILED", "The image header is incomplete.")
-  if (buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))) {
-    if (buffer.length < 24 || buffer.toString("ascii", 12, 16) !== "IHDR") fail("SOURCE_PARSE_FAILED", "The PNG header is invalid.")
-    const animationOffset = buffer.indexOf(Buffer.from("acTL"))
-    const frames = animationOffset >= 4 && animationOffset + 8 <= buffer.length ? buffer.readUInt32BE(animationOffset + 4) : 1
-    return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20), frames }
-  }
-  if (buffer[0] === 0xFF && buffer[1] === 0xD8) return jpegHeaderDimensions(buffer)
-  if (buffer.toString("ascii", 0, 2) === "BM" && buffer.length >= 26) {
-    return { width: Math.abs(buffer.readInt32LE(18)), height: Math.abs(buffer.readInt32LE(22)), frames: 1 }
-  }
-  if (buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP") return webpHeaderDimensions(buffer)
-  if (["II", "MM"].includes(buffer.toString("ascii", 0, 2))) return tiffHeaderDimensions(buffer)
-  fail("SOURCE_PARSE_FAILED", "The image format header is unsupported or corrupt.")
-}
-
-function jpegHeaderDimensions(buffer) {
-  let offset = 2
-  while (offset + 9 < buffer.length) {
-    if (buffer[offset] !== 0xFF) { offset += 1; continue }
-    const marker = buffer[offset + 1]
-    offset += 2
-    if (marker === 0xD8 || marker === 0xD9) continue
-    if (offset + 2 > buffer.length) break
-    const length = buffer.readUInt16BE(offset)
-    if (length < 2 || offset + length > buffer.length) break
-    if ([0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF].includes(marker)) {
-      return { width: buffer.readUInt16BE(offset + 5), height: buffer.readUInt16BE(offset + 3), frames: 1 }
-    }
-    offset += length
-  }
-  fail("SOURCE_PARSE_FAILED", "The JPEG dimensions are missing or corrupt.")
-}
-
-function webpHeaderDimensions(buffer) {
-  const kind = buffer.toString("ascii", 12, 16)
-  if (kind === "VP8X" && buffer.length >= 30) {
-    return {
-      width: 1 + buffer.readUIntLE(24, 3),
-      height: 1 + buffer.readUIntLE(27, 3),
-      frames: (buffer[20] & 0x02) === 0 ? 1 : 2,
-    }
-  }
-  if (kind === "VP8 " && buffer.length >= 30 && buffer[23] === 0x9D && buffer[24] === 0x01 && buffer[25] === 0x2A) {
-    return { width: buffer.readUInt16LE(26) & 0x3FFF, height: buffer.readUInt16LE(28) & 0x3FFF, frames: 1 }
-  }
-  if (kind === "VP8L" && buffer.length >= 25 && buffer[20] === 0x2F) {
-    const bits = buffer.readUInt32LE(21)
-    return { width: 1 + (bits & 0x3FFF), height: 1 + ((bits >>> 14) & 0x3FFF), frames: 1 }
-  }
-  fail("SOURCE_PARSE_FAILED", "The WebP dimensions are missing or corrupt.")
-}
-
-function tiffHeaderDimensions(buffer) {
-  const littleEndian = buffer.toString("ascii", 0, 2) === "II"
-  const read16 = (offset) => littleEndian ? buffer.readUInt16LE(offset) : buffer.readUInt16BE(offset)
-  const read32 = (offset) => littleEndian ? buffer.readUInt32LE(offset) : buffer.readUInt32BE(offset)
-  if (buffer.length < 8 || read16(2) !== 42) fail("SOURCE_PARSE_FAILED", "The TIFF header is invalid.")
-  const ifdOffset = read32(4)
-  if (ifdOffset < 8 || ifdOffset + 2 > buffer.length) fail("SOURCE_PARSE_FAILED", "The TIFF directory is invalid.")
-  const count = read16(ifdOffset)
-  if (count > 4_096 || ifdOffset + 2 + count * 12 + 4 > buffer.length) fail("SOURCE_PARSE_FAILED", "The TIFF directory exceeds safety limits.")
-  let width
-  let height
-  for (let index = 0; index < count; index += 1) {
-    const entry = ifdOffset + 2 + index * 12
-    const tag = read16(entry)
-    if (tag !== 256 && tag !== 257) continue
-    const type = read16(entry + 2)
-    const itemCount = read32(entry + 4)
-    if (itemCount !== 1 || ![3, 4].includes(type)) fail("SOURCE_PARSE_FAILED", "The TIFF dimension entry is invalid.")
-    const value = type === 3 ? read16(entry + 8) : read32(entry + 8)
-    if (tag === 256) width = value
-    else height = value
-  }
-  const nextIfd = read32(ifdOffset + 2 + count * 12)
-  if (!width || !height) fail("SOURCE_PARSE_FAILED", "The TIFF dimensions are missing.")
-  return { width, height, frames: nextIfd === 0 ? 1 : 2 }
-}
-
-function searchableCharacterCount(value) {
-  return (String(value).match(/[\p{L}\p{N}]/gu) ?? []).length
 }
 
 function inferTitle(content, fallback) {
@@ -608,16 +382,6 @@ function chunkDocument(document, options) {
     const cellRanges = [...new Set(structured.map((table) => table.cellRange).filter(Boolean))]
     if (sheetNames.length === 1) chunks.at(-1).sheetName = sheetNames[0]
     if (cellRanges.length === 1) chunks.at(-1).cellRange = cellRanges[0]
-    const tableHeaders = structured
-      .flatMap((table) => Array.isArray(table?.headers) ? [table.headers] : [])
-      .filter((headers) => headers.length > 0)
-    if (tableHeaders.length > 0) {
-      chunks.at(-1).tableContext = {
-        headers: tableHeaders[0],
-        column_names: tableHeaders[0],
-        table_count: tableHeaders.length,
-      }
-    }
     pending = []
     pendingKinds = []
     pendingStructured = []
@@ -643,9 +407,7 @@ function chunkDocument(document, options) {
     const text = block.text || block.markdown || ""
     if (pending.length > 0 && pending.join("\n\n").length + text.length + 2 > maxChars) emit()
     if (text.length > maxChars) {
-      const pieces = block.kind === "table"
-        ? splitTableWithOffsets(block, maxChars)
-        : splitTextWithOffsets(text, maxChars)
+      const pieces = splitTextWithOffsets(text, maxChars)
       for (const piece of pieces) {
         pending = [piece.text]
         pendingKinds = [block.kind]
@@ -666,58 +428,12 @@ function chunkDocument(document, options) {
   return chunks
 }
 
-function splitTableWithOffsets(block, maxChars) {
-  const text = block.text || block.markdown || ""
-  const lines = []
-  let cursor = 0
-  for (const line of text.split("\n")) {
-    lines.push({ text: line, start: cursor, end: cursor + line.length })
-    cursor += line.length + 1
-  }
-  if (lines.length < 3 || !isMarkdownTableDelimiter(lines[1].text)) {
-    return splitTextWithOffsets(text, maxChars)
-  }
-  const prefix = `${lines[0].text}\n${lines[1].text}`
-  if (prefix.length + 2 >= maxChars) return splitTextWithOffsets(text, maxChars)
-  const pieces = []
-  let rows = []
-  const emit = () => {
-    if (rows.length === 0) return
-    pieces.push({
-      text: `${prefix}\n${rows.map((row) => row.text).join("\n")}`,
-      relativeStart: rows[0].start,
-      relativeEnd: rows.at(-1).end,
-    })
-    rows = []
-  }
-  for (const row of lines.slice(2)) {
-    const nextLength = prefix.length + 1 + rows.reduce((sum, item) => sum + item.text.length + 1, 0) + row.text.length
-    if (rows.length > 0 && nextLength > maxChars) emit()
-    if (prefix.length + 1 + row.text.length > maxChars) {
-      emit()
-      return splitTextWithOffsets(text, maxChars)
-    }
-    rows.push(row)
-  }
-  emit()
-  return pieces.length > 0 ? pieces : splitTextWithOffsets(text, maxChars)
-}
-
-function isMarkdownTableDelimiter(value) {
-  const cells = value.trim().slice(1, -1).split("|").map((cell) => cell.trim())
-  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/u.test(cell))
-}
-
 function tableFragment(block, markdown) {
-  const headers = Array.isArray(block?.headers) && block.headers.length > 0
-    ? block.headers
-    : parseMarkdownTableRow(markdown.split("\n")[0] ?? "")
   return {
     kind: "table",
     markdown,
     text: markdown,
     fragmented: true,
-    ...(headers.length > 0 ? { headers, column_names: headers } : {}),
     ...(block.sheetName ? { sheetName: block.sheetName } : {}),
     ...(block.cellRange ? { cellRange: block.cellRange } : {}),
     ...(block.sheetState ? { sheetState: block.sheetState } : {}),
@@ -731,7 +447,6 @@ function splitText(text, maxChars) {
 function splitTextWithOffsets(text, maxChars) {
   const result = []
   let cursor = 0
-  const overlapChars = Math.max(1, Math.floor(maxChars * 0.12))
   while (text.length - cursor > maxChars) {
     const window = text.slice(cursor, cursor + maxChars + 1)
     const candidates = [window.lastIndexOf("\n\n"), window.lastIndexOf("\n"), window.lastIndexOf("。"), window.lastIndexOf(". "), window.lastIndexOf(" ")]
@@ -748,10 +463,8 @@ function splitTextWithOffsets(text, maxChars) {
         relativeEnd: rawEnd - trailing,
       })
     }
-    const nextStart = Math.max(cursor + 1, rawEnd - overlapChars)
-    const safeStart = safeTextCut(text, nextStart, cursor)
-    const remainder = text.slice(safeStart)
-    cursor = safeStart + (remainder.length - remainder.trimStart().length)
+    const remainder = text.slice(rawEnd)
+    cursor = rawEnd + (remainder.length - remainder.trimStart().length)
   }
   const rawRemainder = text.slice(cursor)
   const remainder = rawRemainder.trim()

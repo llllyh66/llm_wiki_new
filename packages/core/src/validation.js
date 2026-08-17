@@ -1,32 +1,14 @@
 import { lstat } from "node:fs/promises"
 import path from "node:path"
 import { fail } from "./errors.js"
-import { sha256, stableStringify, tokenize } from "./utils.js"
+import { stableStringify, tokenize } from "./utils.js"
 import { AGENT_PAGE_ROOTS, normalizePageKind, pageKindForPath } from "./wiki-page.js"
 
 const ANALYSIS_ARRAYS = ["sourceRefs", "entities", "concepts", "claims", "relations", "contradictions", "candidatePages", "reviewItems", "unresolvedQuestions"]
 const GROUNDED_ANALYSIS_COLLECTIONS = new Set(["entities", "concepts", "claims", "relations", "contradictions", "candidatePages", "reviewItems"])
-const MAX_ANALYSIS_VALIDATION_ERRORS = 2_000
-const SOURCE_REF_REUSE_WARNING_THRESHOLD = 8
-const GROUNDING_QUALITY_COLLECTIONS = new Set(["entities", "concepts", "claims", "relations", "contradictions", "candidatePages", "reviewItems"])
-const FACT_ASSERTION_COLLECTIONS = new Set(["entities", "concepts", "claims", "relations", "contradictions", "reviewItems"])
-const FACT_KINDS = new Set(["entity", "concept", "claim", "relation", "metric_definition", "parameter_definition", "contradiction", "summary", "review_item"])
-const SUPPORT_MODES = new Set(["explicit_text", "structured_entailment", "derived", "summary"])
-const NATURAL_LANGUAGE_CERTAINTY_KINDS = new Set(["claim", "relation", "contradiction", "review_item"])
-const COLLECTION_FACT_KINDS = Object.freeze({
-  entities: new Set(["entity"]),
-  concepts: new Set(["concept"]),
-  claims: new Set(["claim", "metric_definition", "parameter_definition"]),
-  relations: new Set(["relation"]),
-  contradictions: new Set(["contradiction"]),
-  candidatePages: new Set(["summary"]),
-  reviewItems: new Set(["review_item"]),
-})
-const STRUCTURED_FACT_FIELDS = new Set([
-  "metric", "formula", "condition", "sourceTable", "source_table", "unit",
-  "parameterId", "parameter_id", "defaultValue", "default_value",
-  "recommendedValue", "recommended_value",
-])
+const MAX_ANALYSIS_VALIDATION_ERRORS = 50
+const MAX_SOURCE_REF_REUSE = 8
+const GROUNDING_QUALITY_COLLECTIONS = new Set(["claims", "relations", "contradictions", "reviewItems"])
 const GENERIC_GROUNDING_TERMS = new Set(["content", "data", "document", "item", "内容", "数据", "文档", "指标", "体系", "关系", "概述", "包含", "包括"])
 const ALLOWED_PAGE_ROOTS = new Set(AGENT_PAGE_ROOTS)
 const SYSTEM_PAGES = new Set(["wiki/index.md", "wiki/overview.md", "wiki/log.md"])
@@ -35,8 +17,7 @@ const ANALYSIS_TOP_LEVEL_FIELDS = new Set([
   "claims", "relations", "contradictions", "candidatePages", "reviewItems", "batchSummary", "unresolvedQuestions",
 ])
 const ANALYSIS_ARRAY_LIMITS = Object.freeze({ sourceRefs: 500, entities: 500, concepts: 500, claims: 1_000, relations: 1_000, contradictions: 500, candidatePages: 500, reviewItems: 500, unresolvedQuestions: 200 })
-const PAGE_PATCH_FIELDS = new Set(["patchId", "path", "operation", "expectedFileHash", "title", "pageKind", "content", "sectionChanges", "summary", "domainSchemaId", "domainSchemaVersion", "domainClassifications", "tags", "related", "covers", "sourceRefs", "rationale"])
-const CORE_OWNED_SECTION_HEADINGS = new Set(["related", "related pages", "相关页面", "关联页面", "domain classification", "领域分类", "领域类型"])
+const PAGE_PATCH_FIELDS = new Set(["patchId", "path", "operation", "expectedFileHash", "title", "pageKind", "content", "summary", "domainSchemaId", "domainSchemaVersion", "domainClassifications", "tags", "related", "covers", "sourceRefs", "rationale"])
 
 export function normalizeAnalysisEnvelope(analysis, options = {}) {
   if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) {
@@ -141,14 +122,13 @@ function normalizeBatchEvidenceEnvelope(analysis, evidenceCatalog) {
     return ref
   }
   const resolveEvidenceIndex = (ref, field) => {
-    if (typeof ref !== "number") return [isSourceRefObject(ref) ? addUsed(ref) : ref]
+    if (typeof ref !== "number") return isSourceRefObject(ref) ? addUsed(ref) : ref
     if (!Number.isInteger(ref) || ref < 0 || ref >= available.length) {
       errors.push(`${field} evidence index ${ref} is out of range for evidence_catalog length ${available.length}`)
-      return [ref]
+      return ref
     }
     resolvedSourceRefIndexes += 1
-    const selected = Array.isArray(available[ref]) ? available[ref] : [available[ref]]
-    return selected.map((item) => isSourceRefObject(item) ? addUsed(item) : item)
+    return addUsed(available[ref])
   }
   if (!Array.isArray(analysis.sourceRefs)) {
     errors.push("sourceRefs must be the numeric catalog copied from analysis_scaffold")
@@ -170,7 +150,7 @@ function normalizeBatchEvidenceEnvelope(analysis, evidenceCatalog) {
       if (!item || typeof item !== "object" || Array.isArray(item) || !Array.isArray(item.sourceRefs)) return item
       return {
         ...item,
-        sourceRefs: item.sourceRefs.flatMap((ref, refIndex) => resolveEvidenceIndex(
+        sourceRefs: item.sourceRefs.map((ref, refIndex) => resolveEvidenceIndex(
           ref,
           `${collection}[${itemIndex}].sourceRefs[${refIndex}]`,
         )),
@@ -178,7 +158,8 @@ function normalizeBatchEvidenceEnvelope(analysis, evidenceCatalog) {
     })
   }
   if (used.length === 0 && Array.isArray(analysis.sourceRefs) && analysis.sourceRefs.length > 0) {
-    resolveEvidenceIndex(analysis.sourceRefs[0], "sourceRefs[0]")
+    const fallback = resolveEvidenceIndex(analysis.sourceRefs[0], "sourceRefs[0]")
+    if (isSourceRefObject(fallback)) addUsed(fallback)
   }
   normalized.sourceRefs = used
   if (errors.length > 0) {
@@ -253,26 +234,6 @@ export function validateAnalysisShape(analysis, taskId, batchId) {
         if (confidence !== undefined && (typeof confidence !== "number" || confidence < 0 || confidence > 1)) {
           addError(`${collection}[${itemIndex}].confidence must be between 0 and 1`)
         }
-        if (item.factKind !== undefined && !FACT_KINDS.has(item.factKind)) {
-          addError(`${collection}[${itemIndex}].factKind must be one of ${[...FACT_KINDS].join(", ")}`)
-        } else if (item.factKind !== undefined && !COLLECTION_FACT_KINDS[collection]?.has(item.factKind)) {
-          addError(`${collection}[${itemIndex}].factKind ${item.factKind} is not valid in the ${collection} collection`)
-        }
-        if (item.supportMode !== undefined && !SUPPORT_MODES.has(item.supportMode)) {
-          addError(`${collection}[${itemIndex}].supportMode must be one of ${[...SUPPORT_MODES].join(", ")}`)
-        }
-        if (item.supportMode === "derived" && !hasDerivationDeclaration(item.derivation)) {
-          addError(`${collection}[${itemIndex}].derivation is required when supportMode is derived`)
-        }
-        if (item.factKind === "summary" && item.supportMode !== undefined && item.supportMode !== "summary") {
-          addError(`${collection}[${itemIndex}].supportMode must be summary when factKind is summary`)
-        }
-        if (item.supportMode === "summary" && item.factKind !== undefined && item.factKind !== "summary") {
-          addError(`${collection}[${itemIndex}].factKind must be summary when supportMode is summary`)
-        }
-        if (item.predicate !== undefined && (typeof item.predicate !== "string" || !item.predicate.trim())) {
-          addError(`${collection}[${itemIndex}].predicate must be a non-empty string`)
-        }
         if (collection === "reviewItems" && (typeof item.content !== "string" || !item.content.trim())) {
           addError(`reviewItems[${itemIndex}].content must be a non-empty string`)
         } else if (collection === "reviewItems" && item.content.length > 10_000) {
@@ -296,260 +257,73 @@ export function validateAnalysisShape(analysis, taskId, batchId) {
   if (errors.length > 0) fail("INVALID_ANALYSIS", "Analysis envelope validation failed.", { details: { validation_errors: errors, validation_error_count: errorCount } })
 }
 
-function hasDerivationDeclaration(value) {
-  if (typeof value === "string") return Boolean(value.trim())
-  return Boolean(value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length > 0)
-}
-
-/**
- * Validate semantic grounding without requiring Wiki prose to be copied from
- * the source. SourceRef authenticity is handled by validateSourceRefs; this
- * gate hard-fails on altered typed facts, invalid relation contracts, missing
- * derivation declarations, or clear certainty/polarity contradictions.
- * Ordinary lexical mismatch is returned as a warning.
- */
-export function validateGroundingQuality(analysis, options = {}) {
-  const hardErrors = []
-  const warnings = []
-  let hardErrorCount = 0
-  let warningCount = 0
+export function validateGroundingQuality(analysis) {
+  const errors = []
   const refUses = new Map()
-  const knownCandidateLocalIds = new Set([
-    ...(Array.isArray(options.knownCandidateLocalIds) ? options.knownCandidateLocalIds : []),
-    ...analysisCandidateLocalIds(analysis),
-  ])
-  const maxDiagnostics = Number.isInteger(options.maxDiagnostics) && options.maxDiagnostics > 0
-    ? options.maxDiagnostics
-    : MAX_ANALYSIS_VALIDATION_ERRORS
-
-  const addDiagnostic = ({ collection, itemIndex, field, reasonCode, severity, observed, expected, sourceRefs, message }) => {
-    const refs = (Array.isArray(sourceRefs) ? sourceRefs : []).filter(isSourceRefObject)
-    const diagnostic = {
-      path: `${collection}[${itemIndex}]${field ? `.${field}` : ""}`,
-      field: field ?? null,
-      reason_code: reasonCode,
-      observed: boundDiagnosticValue(observed),
-      expected: boundDiagnosticValue(expected),
-      sourceRefs: refs.map(sourceRefDiagnostic),
-      roles: refs.map((ref) => sourceRefRole(ref)),
-      message: message ?? `${reasonCode} at ${collection}[${itemIndex}]`,
-    }
-    const target = severity === "warning" ? warnings : hardErrors
-    if (severity === "warning") warningCount += 1
-    else hardErrorCount += 1
-    if (target.length < maxDiagnostics) target.push(diagnostic)
-    return diagnostic
-  }
-
   for (const collection of GROUNDED_ANALYSIS_COLLECTIONS) {
     for (const [itemIndex, item] of (Array.isArray(analysis?.[collection]) ? analysis[collection] : []).entries()) {
       if (!item || typeof item !== "object" || !Array.isArray(item.sourceRefs)) continue
-      const refs = item.sourceRefs.filter(isSourceRefObject)
-      const primaryRefs = refs.filter((ref) => sourceRefRole(ref) !== "context")
-      if (collection === "relations") {
-        validateRelationContract({ item, itemIndex, refs, knownCandidateLocalIds, addDiagnostic })
-      }
-      for (const ref of primaryRefs) {
-        const key = stableStringify({
-          sourceId: ref.sourceId,
-          chunkId: ref.chunkId,
-          quote: ref.quote ?? null,
-          locator: ref.locator ?? null,
-          collection,
-          context_group: sourceRefContextGroup(ref),
-        })
-        const current = refUses.get(key) ?? { count: 0, paths: [], ref }
+      for (const ref of item.sourceRefs) {
+        if (!isSourceRefObject(ref)) continue
+        const signature = stableStringify(ref)
+        const current = refUses.get(signature) ?? { count: 0, paths: [] }
         current.count += 1
-        if (current.paths.length < 5) current.paths.push(`${collection}[${itemIndex}]`)
-        refUses.set(key, current)
+        if (current.paths.length < 3) current.paths.push(`${collection}[${itemIndex}]`)
+        refUses.set(signature, current)
       }
       if (!GROUNDING_QUALITY_COLLECTIONS.has(collection)) continue
-      const semanticText = candidateSemanticText(item, collection)
-      const evidenceText = refs
+      const semanticText = candidateSemanticText(item)
+      if (!semanticText) continue
+      const evidenceText = item.sourceRefs
+        .filter(isSourceRefObject)
         .map((ref) => typeof ref.quote === "string" ? ref.quote.trim() : "")
         .filter(Boolean)
         .join("\n")
-      const primaryEvidenceText = primaryRefs
-        .map((ref) => typeof ref.quote === "string" ? ref.quote.trim() : "")
-        .filter(Boolean)
-        .join("\n")
-      // Legacy entity/concept envelopes sometimes cite a source_ref_template
-      // without copying its quote. Keep those metadata-only candidates
-      // compatible; claims, relations, contradictions, and review items still
-      // require an auditable quote.
-      if (!evidenceText && FACT_ASSERTION_COLLECTIONS.has(collection) && !["entities", "concepts"].includes(collection)) {
-        addDiagnostic({
-          collection,
-          itemIndex,
-          field: factFieldFor(collection, item),
-          reasonCode: "MISSING_EVIDENCE_QUOTE",
-          severity: "hard",
-          observed: semanticText,
-          expected: "a SourceRef with a non-empty quote",
-          sourceRefs: refs,
-          message: `${collection}[${itemIndex}] requires a non-empty SourceRef quote for its factual assertion`,
-        })
-        continue
-      }
-      if (!evidenceText) continue
-
-      const assertionTexts = candidateAssertionTexts(item, collection)
-      for (const assertion of assertionTexts) {
-        const scopedEvidence = evidenceScopeForAssertion(assertion, refs)
-        const anchorReport = compareFactAnchors(assertion, scopedEvidence.combinedText || evidenceText)
-        for (const mismatch of anchorReport.mismatches) {
-          addDiagnostic({
-            collection,
-            itemIndex,
-            field: factFieldFor(collection, item),
-            reasonCode: mismatch.reason_code,
-            severity: "hard",
-            observed: mismatch.observed,
-            expected: mismatch.expected,
-            sourceRefs: refs,
-            message: `${collection}[${itemIndex}] ${mismatch.message}`,
-          })
-        }
-        const certainty = shouldValidateNaturalLanguageCertainty(item, collection, refs)
-          ? compareCertainty(assertion, scopedEvidence.primaryText || primaryEvidenceText || evidenceText)
-          : []
-        for (const mismatch of certainty) {
-          addDiagnostic({
-            collection,
-            itemIndex,
-            field: factFieldFor(collection, item),
-            reasonCode: mismatch.reason_code,
-            severity: "hard",
-            observed: mismatch.observed,
-            expected: mismatch.expected,
-            sourceRefs: refs,
-            message: `${collection}[${itemIndex}] ${mismatch.message}`,
-          })
-        }
-      }
-      for (const mismatch of compareStructuredFactFields(item, refs)) {
-        addDiagnostic({
-          collection,
-          itemIndex,
-          field: mismatch.field,
-          reasonCode: mismatch.reason_code,
-          severity: "hard",
-          observed: mismatch.observed,
-          expected: mismatch.expected,
-          sourceRefs: refs,
-          message: `${collection}[${itemIndex}] ${mismatch.message}`,
-        })
-      }
-      if (semanticText && !evidenceSupportsCandidate(semanticText, evidenceText, item, collection)) {
-        addDiagnostic({
-          collection,
-          itemIndex,
-          field: factFieldFor(collection, item),
-          reasonCode: "LEXICAL_MISMATCH",
-          severity: "warning",
-          observed: semanticText,
-          expected: "semantically related evidence; wording may be paraphrased",
-          sourceRefs: refs,
-          message: `${collection}[${itemIndex}] wording differs from the evidence; typed anchors remain the hard check`,
-        })
-      }
-      if (["entities", "concepts"].includes(collection)) {
-        const evidenceNormalized = normalizeGroundingText(evidenceText)
-        const matchedAliases = [...new Set(candidateAliasValues(item)
-          .filter((alias) => normalizeGroundingText(alias).length >= 2)
-          .filter((alias) => evidenceNormalized.includes(normalizeGroundingText(alias))))]
-        if (matchedAliases.length > 1) {
-          addDiagnostic({
-            collection,
-            itemIndex,
-            field: "aliases",
-            reasonCode: "ENTITY_ALIAS_AMBIGUITY",
-            severity: "warning",
-            observed: matchedAliases,
-            expected: "one canonical alias or explicit review",
-            sourceRefs: refs,
-            message: `${collection}[${itemIndex}] has multiple aliases supported by the same evidence; review canonicalization`,
-          })
-        }
+      if (!evidenceText) {
+        errors.push(`${collection}[${itemIndex}] requires a non-empty SourceRef quote that supports its content`)
+      } else if (!evidenceSupportsCandidate(semanticText, evidenceText, item)) {
+        errors.push(`${collection}[${itemIndex}] SourceRef quote does not lexically support the candidate content; cite the relevant row or passage`)
       }
     }
   }
-
-  // Reuse is diagnostic only. Context references (for example one table
-  // header shared by many rows) are deliberately excluded from this count.
-  for (const { count, paths, ref } of refUses.values()) {
-    if (count <= SOURCE_REF_REUSE_WARNING_THRESHOLD) continue
-    addDiagnostic({
-      collection: "sourceRefs",
-      itemIndex: 0,
-      field: null,
-      reasonCode: "SOURCE_REF_REUSE",
-      severity: "warning",
-      observed: count,
-      expected: `reuse is grouped by ${sourceRefContextGroup(ref)} and candidate type; no hard global limit`,
-      sourceRefs: [ref],
-      message: `A primary SourceRef is reused by ${count} candidates (${paths.join(", ")}); reuse is allowed but review the evidence granularity`,
+  for (const { count, paths } of refUses.values()) {
+    if (count > MAX_SOURCE_REF_REUSE) {
+      errors.push(`one SourceRef is reused by ${count} grounded candidates (${paths.join(", ")}, ...); split evidence by row or topic (maximum ${MAX_SOURCE_REF_REUSE} uses per reference)`)
+    }
+  }
+  if (errors.length > 0) {
+    fail("INVALID_ANALYSIS", "Analysis grounding quality validation failed.", {
+      details: {
+        validation_errors: errors.slice(0, MAX_ANALYSIS_VALIDATION_ERRORS),
+        validation_error_count: errors.length,
+        quality_gate: "source-ref-grounding-v1",
+      },
     })
   }
-
-  const allDiagnostics = [...hardErrors, ...warnings]
-  const validationFingerprint = sha256(stableStringify({
-    count: hardErrorCount,
-    errors: hardErrors.map(({ path, field, reason_code, observed, expected, sourceRefs }) => ({ path, field, reason_code, observed, expected, sourceRefs })),
-  })).slice(0, 32)
-  const report = {
-    quality_gate: "source-ref-grounding-v3",
-    validation_error_count: hardErrorCount,
-    validation_errors: hardErrors,
-    validation_error_messages: hardErrors.map((diagnostic) => diagnostic.message),
-    grounding_warnings: warnings,
-    validation_diagnostics: allDiagnostics,
-    validation_fingerprint: validationFingerprint,
-    warning_count: warningCount,
-    diagnostics_truncated: hardErrorCount > maxDiagnostics || warningCount > maxDiagnostics,
-    knowledge_coverage: groundingKnowledgeCoverage(analysis, hardErrors, warnings),
-    repair_guidance: {
-      preserve_supported_candidates: true,
-      remove_only_when_unsupported: true,
-      preferred_actions: ["narrow-evidence-scope", "correct-typed-anchor", "change-fact-kind-or-support-mode", "move-unsupported-inference-to-unresolvedQuestions"],
-    },
-  }
-  if (hardErrorCount > 0) {
-    fail("INVALID_ANALYSIS", "Analysis grounding quality validation failed for typed facts or certainty.", {
-      details: report,
-    })
-  }
-  return report
 }
 
-function candidateSemanticText(item, collection = "claims") {
-  return [...candidateAssertionTexts(item, collection), ...candidateAliasValues(item)].join(" ")
+function candidateSemanticText(item) {
+  return [item.name, item.title, item.text, item.content, item.subject, item.predicate, item.object]
+    .filter((value) => typeof value === "string" && value.trim())
+    .join(" ")
 }
 
-function factFieldFor(collection, item) {
-  if (collection === "reviewItems") return "content"
-  if (collection === "relations" && (item.content || item.text)) return item.content ? "content" : "text"
-  if (item.content) return "content"
-  if (item.text) return "text"
-  if (collection === "relations" && (item.subject || item.object)) return "subject/object"
-  return "assertion"
-}
-
-function evidenceSupportsCandidate(semanticText, evidenceText, item, collection) {
+function evidenceSupportsCandidate(semanticText, evidenceText, item) {
   const normalizedEvidence = normalizeGroundingText(evidenceText)
   const evidenceTerms = new Set(groundingTerms(evidenceText))
-  // Schema relation names, titles, aliases, and page labels are metadata. They
-  // may be normalized without being copied verbatim into source prose.
-  for (const assertion of candidateAssertionTexts(item, collection)) {
+  // Schema relation names can be long canonical identifiers which are not
+  // expected to occur verbatim in source prose. Judge the actual assertion
+  // independently first so a directly quoted fact cannot be diluted by its
+  // classification label (for example, a billing-account relation type).
+  for (const assertion of candidateAssertionTexts(item)) {
     const normalizedAssertion = normalizeGroundingText(assertion)
     if (normalizedAssertion.length >= 3 && normalizedEvidence.includes(normalizedAssertion)) return true
     if (groundingTermsSupported(assertion, evidenceTerms)) return true
   }
-  for (const label of candidateAliasValues(item)) {
+  for (const label of [item.name, item.title, item.text]) {
+    if (typeof label !== "string") continue
     const normalizedLabel = normalizeGroundingText(label)
-    if (normalizedLabel.length >= 2 && normalizedEvidence.includes(normalizedLabel)) return true
-    const labelAnchors = parseFactAnchors(label)
-    if (labelAnchors.some((anchor) => anchorCovered(anchor, parseFactAnchors(evidenceText)))) return true
+    if (normalizedLabel.length >= 3 && normalizedEvidence.includes(normalizedLabel)) return true
   }
   const semanticTerms = groundingTerms(semanticText)
   if (semanticTerms.length === 0 || evidenceTerms.size === 0) return false
@@ -557,474 +331,13 @@ function evidenceSupportsCandidate(semanticText, evidenceText, item, collection)
   return overlap >= 2 && overlap / semanticTerms.length >= 0.5
 }
 
-function candidateAssertionTexts(item, collection = "claims") {
-  const values = []
-  if (typeof item?.content === "string" && item.content.trim()) values.push(item.content)
-  if (typeof item?.text === "string" && item.text.trim()) values.push(item.text)
-  if (collection === "relations") {
-    const relationTuple = [item.subject, item.object]
-      .filter((value) => typeof value === "string" && value.trim())
-      .join(" ")
-    if (relationTuple) values.push(relationTuple)
-  }
-  // Names, titles, local IDs, and internal relation predicates are metadata,
-  // not factual assertion text. Entity aliases are handled as a semantic
-  // warning/review path below rather than being treated as body assertions.
-  return [...new Set(values)]
-}
-
-function candidateAliasValues(item) {
-  const values = [item?.name, item?.title]
-  if (Array.isArray(item?.aliases)) values.push(...item.aliases)
-  if (Array.isArray(item?.properties?.aliases)) values.push(...item.properties.aliases)
-  return values.filter((value) => typeof value === "string" && value.trim())
-}
-
-function analysisCandidateLocalIds(analysis) {
-  const ids = []
-  for (const collection of ["entities", "concepts"]) {
-    for (const item of (Array.isArray(analysis?.[collection]) ? analysis[collection] : [])) {
-      const localId = item?.localId ?? item?.local_id
-      if (typeof localId === "string" && localId.trim()) ids.push(localId)
-    }
-  }
-  return ids
-}
-
-function validateRelationContract({ item, itemIndex, refs, knownCandidateLocalIds, addDiagnostic }) {
-  const sourceId = item.sourceEntityLocalId ?? item.source_entity_local_id ?? item.sourceLocalId
-  const targetId = item.targetEntityLocalId ?? item.target_entity_local_id ?? item.targetLocalId
-  const namedSource = item.source ?? item.from ?? item.subject ?? item.sourceName ?? item.sourceEntityName
-  const namedTarget = item.target ?? item.to ?? item.object ?? item.targetName ?? item.targetEntityName
-  const hasSource = typeof sourceId === "string" && sourceId.trim()
-    || typeof namedSource === "string" && namedSource.trim()
-  const hasTarget = typeof targetId === "string" && targetId.trim()
-    || typeof namedTarget === "string" && namedTarget.trim()
-
-  if (!hasSource && !hasTarget) {
-    addDiagnostic({
-      collection: "relations",
-      itemIndex,
-      field: "source/target",
-      reasonCode: "RELATION_ENDPOINT_MISSING",
-      severity: "warning",
-      observed: null,
-      expected: "source and target endpoint references",
-      sourceRefs: refs,
-      message: `relations[${itemIndex}] has relationship prose but no graph endpoints; it will remain a finding instead of a graph edge`,
-    })
-  } else if (!hasSource || !hasTarget) {
-    addDiagnostic({
-      collection: "relations",
-      itemIndex,
-      field: "source/target",
-      reasonCode: "RELATION_ENDPOINT_INCOMPLETE",
-      severity: "hard",
-      observed: { source: sourceId ?? namedSource ?? null, target: targetId ?? namedTarget ?? null },
-      expected: "both source and target endpoints",
-      sourceRefs: refs,
-      message: `relations[${itemIndex}] must provide both relationship endpoints`,
-    })
-  }
-
-  for (const [field, localId] of [["sourceEntityLocalId", sourceId], ["targetEntityLocalId", targetId]]) {
-    if (typeof localId !== "string" || !localId.trim() || knownCandidateLocalIds.has(localId)) continue
-    addDiagnostic({
-      collection: "relations",
-      itemIndex,
-      field,
-      reasonCode: "RELATION_ENDPOINT_UNRESOLVED",
-      severity: "hard",
-      observed: localId,
-      expected: "a localId declared by an entity or concept in this task",
-      sourceRefs: refs,
-      message: `relations[${itemIndex}] references unknown endpoint ${localId}; extract the endpoint candidate or use a resolvable named endpoint`,
-    })
-  }
-
-  if (typeof item.predicate !== "string" || !item.predicate.trim()) {
-    addDiagnostic({
-      collection: "relations",
-      itemIndex,
-      field: "predicate",
-      reasonCode: "RELATION_PREDICATE_MISSING",
-      severity: "warning",
-      observed: item.predicate ?? null,
-      expected: "a normalized relationship predicate",
-      sourceRefs: refs,
-      message: `relations[${itemIndex}] has no predicate; add one so prose normalization does not define graph semantics`,
-    })
-  }
-}
-
-function candidateFactKind(item, collection) {
-  if (FACT_KINDS.has(item?.factKind)) return item.factKind
-  if (collection === "entities") return "entity"
-  if (collection === "concepts") return "concept"
-  if (collection === "relations") return "relation"
-  if (collection === "contradictions") return "contradiction"
-  if (collection === "candidatePages") return "summary"
-  if (collection === "reviewItems") return "review_item"
-  return "claim"
-}
-
-function candidateSupportMode(item, collection, refs) {
-  if (SUPPORT_MODES.has(item?.supportMode)) return item.supportMode
-  if (collection === "candidatePages") return "summary"
-  const primaryQuotes = refs
-    .filter((ref) => sourceRefRole(ref) !== "context")
-    .map((ref) => String(ref.quote ?? ""))
-  if (primaryQuotes.some(isStructuredEvidenceText)) return "structured_entailment"
-  return "explicit_text"
-}
-
-function shouldValidateNaturalLanguageCertainty(item, collection, refs) {
-  const kind = candidateFactKind(item, collection)
-  const supportMode = candidateSupportMode(item, collection, refs)
-  return NATURAL_LANGUAGE_CERTAINTY_KINDS.has(kind)
-    && ["explicit_text", "structured_entailment"].includes(supportMode)
-}
-
-function isStructuredEvidenceText(value) {
-  const text = String(value ?? "")
-  return /^\s*\|.*\|\s*$/mu.test(text)
-    || /\b(?:IF|THEN|ELSE|END|SELECT|FROM|WHERE|CASE)\b/iu.test(text)
-    || /(?:^|\n)\s*[\w.-]+\s*[:=]\s*[^\n]+/u.test(text)
-}
-
-function evidenceScopeForAssertion(assertion, refs) {
-  const primaryText = refs
-    .filter((ref) => sourceRefRole(ref) !== "context")
-    .map((ref) => scopePrimaryQuoteToAssertion(ref.quote, assertion))
-    .filter(Boolean)
-    .join("\n")
-  const contextText = refs
-    .filter((ref) => sourceRefRole(ref) === "context")
-    .map((ref) => typeof ref.quote === "string" ? ref.quote.trim() : "")
-    .filter(Boolean)
-    .join("\n")
-  return {
-    primaryText,
-    contextText,
-    combinedText: [primaryText, contextText].filter(Boolean).join("\n"),
-  }
-}
-
-function scopePrimaryQuoteToAssertion(value, assertion) {
-  const quote = typeof value === "string" ? value.trim() : ""
-  if (!quote) return ""
-  const tableRows = quote.split(/\r?\n/u)
-    .map((line) => line.trim())
-    .filter((line) => /^\|.*\|$/u.test(line) && !isMarkdownTableDelimiter(line))
-  if (tableRows.length <= 1) return quote
-
-  const normalizedAssertion = normalizeStructuralText(assertion)
-  const namedRows = tableRows.filter((row) => {
-    const firstCell = tableCells(row)[0]
-    const normalizedCell = normalizeStructuralText(firstCell)
-    return normalizedCell.length >= 3 && normalizedAssertion.includes(normalizedCell)
-  })
-  if (namedRows.length > 0) return namedRows.join("\n")
-
-  const assertionTerms = new Set(groundingTerms(assertion))
-  const scored = tableRows.map((row) => ({
-    row,
-    score: groundingTerms(row).filter((term) => assertionTerms.has(term)).length,
-  }))
-  const bestScore = Math.max(0, ...scored.map(({ score }) => score))
-  if (bestScore === 0) return quote
-  return scored.filter(({ score }) => score === bestScore).map(({ row }) => row).join("\n")
-}
-
-function tableCells(row) {
-  return /^\|.*\|$/u.test(row)
-    ? row.slice(1, -1).split("|").map((cell) => cell.trim())
-    : []
-}
-
-function isMarkdownTableDelimiter(row) {
-  const cells = tableCells(row)
-  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/u.test(cell))
-}
-
-function normalizeStructuralText(value) {
-  return String(value ?? "").normalize("NFKC").toLowerCase().replace(/[\s*`~]/gu, "")
-}
-
-function structuredFactFieldEntries(item) {
-  const entries = []
-  for (const [key, value] of Object.entries(item ?? {})) {
-    if (STRUCTURED_FACT_FIELDS.has(key) && ["string", "number", "boolean"].includes(typeof value)) entries.push([key, value])
-  }
-  if (item?.properties && typeof item.properties === "object" && !Array.isArray(item.properties)) {
-    for (const [key, value] of Object.entries(item.properties)) {
-      if (STRUCTURED_FACT_FIELDS.has(key) && ["string", "number", "boolean"].includes(typeof value)) entries.push([`properties.${key}`, value])
-    }
-  }
-  return entries
-}
-
-function compareStructuredFactFields(item, refs) {
-  const mismatches = []
-  for (const [field, value] of structuredFactFieldEntries(item)) {
-    const scoped = evidenceScopeForAssertion(String(value), refs)
-    const evidence = normalizeStructuralText(scoped.combinedText)
-    const observed = normalizeStructuralText(value)
-    if (observed && evidence.includes(observed)) continue
-    mismatches.push({
-      field,
-      reason_code: "STRUCTURAL_FIELD_MISMATCH",
-      observed: value,
-      expected: "the same structured field value in the selected primary row or its explicit context",
-      message: `structured field ${field} is not bound to the selected evidence scope`,
-    })
-  }
-  return mismatches
-}
-
-function groundingKnowledgeCoverage(analysis, hardErrors, warnings) {
-  const byCollection = {}
-  const primarySpans = new Set()
-  let candidateCount = 0
-  let groundedCandidateCount = 0
-  for (const collection of GROUNDED_ANALYSIS_COLLECTIONS) {
-    const items = Array.isArray(analysis?.[collection]) ? analysis[collection] : []
-    byCollection[collection] = items.length
-    candidateCount += items.length
-    for (const item of items) {
-      const refs = Array.isArray(item?.sourceRefs) ? item.sourceRefs.filter(isSourceRefObject) : []
-      if (refs.length > 0) groundedCandidateCount += 1
-      for (const ref of refs.filter((entry) => sourceRefRole(entry) !== "context")) {
-        primarySpans.add(stableStringify({ sourceId: ref.sourceId, chunkId: ref.chunkId, quote: ref.quote ?? null, locator: ref.locator ?? null }))
-      }
-    }
-  }
-  return {
-    candidate_count: candidateCount,
-    grounded_candidate_count: groundedCandidateCount,
-    primary_evidence_span_count: primarySpans.size,
-    by_collection: byCollection,
-    hard_error_candidate_count: new Set(hardErrors.map((item) => item.path.replace(/\.[^.]+$/u, ""))).size,
-    warning_candidate_count: new Set(warnings.map((item) => item.path.replace(/\.[^.]+$/u, ""))).size,
-  }
-}
-
-const UNIT_ALIASES = new Map([
-  ["ms", "ms"], ["msec", "ms"], ["millisecond", "ms"], ["milliseconds", "ms"], ["毫秒", "ms"],
-  ["s", "s"], ["sec", "s"], ["second", "s"], ["seconds", "s"], ["秒", "s"],
-  ["min", "min"], ["minute", "min"], ["minutes", "min"], ["分钟", "min"],
-  ["h", "h"], ["hr", "h"], ["hour", "h"], ["hours", "h"], ["小时", "h"],
-  ["d", "d"], ["day", "d"], ["days", "d"], ["天", "d"],
-  ["%", "%"], ["percent", "%"], ["percentage", "%"], ["百分比", "%"],
-])
-
-/**
- * Extract deterministic anchors from a factual assertion. This intentionally
- * does not attempt general NLP; unknown wording is handled as a warning.
- */
-export function parseFactAnchors(value) {
-  const text = typeof value === "string" ? value.normalize("NFKC") : ""
-  if (!text) return []
-  const anchors = []
-  const occupied = []
-  const add = (anchor, start, end) => {
-    if (occupied.some((range) => start < range.end && end > range.start)) return
-    occupied.push({ start, end })
-    anchors.push({ ...anchor, raw: text.slice(start, end), _start: start })
-  }
-  const numberSource = "[-+]?(?:\\d{1,3}(?:,\\d{3})+|\\d+)(?:\\.\\d+)?"
-  const numberValue = (raw) => Number(String(raw).replace(/,/g, ""))
-  const parseNumber = (raw) => numberValue(raw)
-
-  // Dates must be occupied before range parsing, otherwise 2024-01-02 would
-  // be mistaken for the numeric range 2024-01.
-  for (const match of text.matchAll(/(?<![\p{L}\p{N}_])(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?(?![\p{L}\p{N}_])/gu)) {
-    add({ kind: "date", granularity: "day", year: Number(match[1]), month: Number(match[2]), day: Number(match[3]) }, match.index, match.index + match[0].length)
-  }
-  for (const match of text.matchAll(/(?<![\p{L}\p{N}_])(\d{4})年(\d{1,2})月(\d{1,2})日?(?![\p{L}\p{N}_])/gu)) {
-    add({ kind: "date", granularity: "day", year: Number(match[1]), month: Number(match[2]), day: Number(match[3]) }, match.index, match.index + match[0].length)
-  }
-
-  for (const match of text.matchAll(new RegExp(`百分之\\s*(${numberSource})`, "gu"))) {
-    add({ kind: "percentage", value: parseNumber(match[1]), unit: "%" }, match.index, match.index + match[0].length)
-  }
-  for (const match of text.matchAll(new RegExp(`(${numberSource})\\s*%`, "gu"))) {
-    add({ kind: "percentage", value: parseNumber(match[1]), unit: "%" }, match.index, match.index + match[0].length)
-  }
-  for (const match of text.matchAll(new RegExp(`(${numberSource})\\s*/\\s*(${numberSource})`, "gu"))) {
-    add({ kind: "ratio", numerator: parseNumber(match[1]), denominator: parseNumber(match[2]) }, match.index, match.index + match[0].length)
-  }
-  for (const match of text.matchAll(new RegExp(`(${numberSource})\\s*(?:-|–|—|~|至|到)\\s*(${numberSource})`, "gu"))) {
-    add({ kind: "range", min: parseNumber(match[1]), max: parseNumber(match[2]) }, match.index, match.index + match[0].length)
-  }
-  const unitPattern = `(${numberSource})\\s*([A-Za-zµμ]+|毫秒|秒|分钟|小时|天|%)`
-  for (const match of text.matchAll(new RegExp(unitPattern, "gu"))) {
-    const unit = normalizeUnit(match[2])
-    if (!unit) continue
-    add({ kind: unit === "%" ? "percentage" : "measurement", value: parseNumber(match[1]), unit }, match.index, match.index + match[0].length)
-  }
-  // Years are distinct from complete dates. A leading separator that is part
-  // of an identifier (A-2001) does not start a standalone year anchor.
-  for (const match of text.matchAll(/(?<![\p{L}\p{N}_-])(\d{4})(?![-/年\d])/gu)) {
-    add({ kind: "date", granularity: "year", year: Number(match[1]) }, match.index, match.index + match[0].length)
-  }
-  // IDs are normalized for case and deterministic separators, but never
-  // interpreted as ordinary numbers. This covers A2001/A-2001/A_2001 and
-  // CamelCase identifiers containing a numeric suffix.
-  for (const match of text.matchAll(/(?<![\p{L}\p{N}_])(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z][A-Za-z0-9_-]*\d[A-Za-z0-9_-]*(?![\p{L}\p{N}_])/gu)) {
-    add({ kind: "identifier", value: normalizeIdentifier(match[0]) }, match.index, match.index + match[0].length)
-  }
-  for (const match of text.matchAll(new RegExp(`(?<![\\p{L}\\p{N}_])(${numberSource})(?![\\p{L}\\p{N}_])`, "gu"))) {
-    add({ kind: "number", value: parseNumber(match[1]) }, match.index, match.index + match[0].length)
-  }
-  return anchors
-    .sort((left, right) => left._start - right._start)
-    .map(({ _start: _ignored, ...anchor }) => anchor)
-}
-
-function normalizeUnit(value) {
-  const normalized = String(value ?? "").normalize("NFKC").trim().toLowerCase()
-  return UNIT_ALIASES.get(normalized) ?? null
-}
-
-function normalizeIdentifier(value) {
-  return String(value ?? "").normalize("NFKC").toLowerCase().replace(/[-_]/g, "")
-}
-
-function anchorCovered(anchor, evidenceAnchors) {
-  return evidenceAnchors.some((candidate) => {
-    if (anchor.kind === "date" && candidate.kind === "date") {
-      if (anchor.granularity === "year") return anchor.year === candidate.year
-      return candidate.granularity === "day"
-        && anchor.year === candidate.year && anchor.month === candidate.month && anchor.day === candidate.day
-    }
-    if (anchor.kind === "identifier" && candidate.kind === "identifier") return anchor.value === candidate.value
-    if (anchor.kind === "percentage" && candidate.kind === "percentage") return anchor.value === candidate.value && anchor.unit === candidate.unit
-    if (anchor.kind === "ratio" && candidate.kind === "ratio") return anchor.numerator === candidate.numerator && anchor.denominator === candidate.denominator
-    if (anchor.kind === "range" && candidate.kind === "range") return anchor.min === candidate.min && anchor.max === candidate.max
-    if (anchor.kind === "measurement" && candidate.kind === "measurement") return anchor.value === candidate.value && anchor.unit === candidate.unit
-    if (anchor.kind === "number" && candidate.kind === "number") return anchor.value === candidate.value
-    if (anchor.kind === "number" && ["measurement", "percentage", "ratio", "range"].includes(candidate.kind)) {
-      return candidate.kind === "measurement" && anchor.value === candidate.value && !candidate.unit
-    }
-    return false
-  })
-}
-
-export function compareFactAnchors(assertion, evidence) {
-  const assertionAnchors = parseFactAnchors(assertion)
-  const evidenceAnchors = parseFactAnchors(evidence)
-  const mismatches = []
-  for (const anchor of assertionAnchors) {
-    if (anchorCovered(anchor, evidenceAnchors)) continue
-    const matchingKind = evidenceAnchors.find((candidate) => candidate.kind === anchor.kind)
-    const message = anchor.kind === "date" && anchor.granularity === "day" && matchingKind?.granularity === "year"
-      ? `完整日期 ${anchor.raw} 不能由仅有年份的证据 ${matchingKind.raw} 支持`
-      : anchor.kind === "measurement" && matchingKind?.kind === "measurement"
-        ? `单位或数值 ${anchor.raw} 与证据中的 ${matchingKind.raw} 不等价`
-        : `事实锚点 ${anchor.raw} 未在所选证据中保持等价`
-    mismatches.push({
-      reason_code: anchor.kind === "identifier" ? "IDENTIFIER_MISMATCH"
-        : anchor.kind === "date" ? "DATE_MISMATCH"
-          : anchor.kind === "measurement" || anchor.kind === "percentage" ? "UNIT_OR_PERCENTAGE_MISMATCH"
-            : "NUMERIC_ANCHOR_MISMATCH",
-      observed: anchor.raw,
-      expected: matchingKind?.raw ?? evidenceAnchors.map((item) => item.raw).slice(0, 20),
-      message,
-    })
-  }
-  // An explicit unit in evidence must not silently disappear from a numeric
-  // assertion; this catches “50” rewritten from “50 ms”.
-  for (const candidate of evidenceAnchors.filter((item) => item.kind === "measurement")) {
-    const plain = assertionAnchors.find((item) => item.kind === "number" && item.value === candidate.value)
-    const explicit = assertionAnchors.find((item) => item.kind === "measurement" && item.value === candidate.value)
-    if (plain && !explicit) {
-      mismatches.push({
-        reason_code: "UNIT_MISSING",
-        observed: plain.raw,
-        expected: candidate.raw,
-        message: `证据中的单位 ${candidate.unit} 不能在事实改写中被省略`,
-      })
-    }
-  }
-  return { assertionAnchors, evidenceAnchors, mismatches: uniqueAnchorMismatches(mismatches) }
-}
-
-function uniqueAnchorMismatches(mismatches) {
-  const seen = new Set()
-  return mismatches.filter((mismatch) => {
-    const key = `${mismatch.reason_code}:${mismatch.observed}:${mismatch.expected}`
-    if (seen.has(key)) return false
-    seen.add(key)
-    return true
-  })
-}
-
-function compareCertainty(assertion, evidence) {
-  const candidate = certaintySignals(assertion)
-  const source = certaintySignals(evidence)
-  const mismatches = []
-  if (source.hedged && !candidate.hedged && !candidate.question) {
-    mismatches.push({
-      reason_code: "CERTAINTY_STRENGTHENED",
-      observed: assertion,
-      expected: "preserve the source's uncertainty",
-      message: "候选把证据中的可能性/不确定性改写成了确定陈述",
-    })
-  }
-  if (source.negated !== candidate.negated && (source.negated || candidate.negated)) {
-    mismatches.push({
-      reason_code: "POLARITY_MISMATCH",
-      observed: assertion,
-      expected: evidence,
-      message: "候选与证据的否定/肯定极性不一致",
-    })
-  }
-  return mismatches
-}
-
-function certaintySignals(value) {
-  const text = String(value ?? "").normalize("NFKC").toLowerCase()
-  return {
-    hedged: /(可能|或许|也许|预计|大约|约为|不确定|maybe|may|might|could|possibly|likely|approximately|approx\.?)/iu.test(text),
-    // Keep negation detection conservative: a bare `非` also matches words
-    // such as `非常`, which would incorrectly turn an ordinary Wiki sentence
-    // into a polarity hard error. Prefer explicit negative compounds.
-    negated: /(\b(?:not|no|never|disabled|inactive|failed|without)\b|没有|不能|禁用|失败|否定|不(?:是|能|会|可|存在|支持|同意|启用|活动|正确)|未(?:知|能|使用|启用|完成)|无(?:法|需|效))/iu.test(text),
-    question: /[?？]|是否|whether|unknown|未知/iu.test(text),
-  }
-}
-
-function sourceRefRole(ref) {
-  return ref?.role === "context" || ref?.evidence_role === "context" ? "context" : "primary"
-}
-
-function sourceRefContextGroup(ref) {
-  const locator = ref?.locator ?? {}
-  if (locator.cellRange || locator.sheetName) return `table:${locator.sheetName ?? ""}:${locator.cellRange ?? ""}`
-  if (Array.isArray(locator.headingPath) && locator.headingPath.length > 0) return `section:${locator.headingPath.join("/")}`
-  return "chunk"
-}
-
-function sourceRefDiagnostic(ref) {
-  return {
-    sourceId: ref.sourceId,
-    chunkId: ref.chunkId,
-    role: sourceRefRole(ref),
-    quoteHash: typeof ref.quote === "string" && ref.quote
-      ? sha256(ref.quote.normalize("NFKC")).slice(0, 16)
-      : null,
-    locator: ref.locator ?? null,
-    evidenceScope: sourceRefContextGroup(ref),
-  }
-}
-
-function boundDiagnosticValue(value) {
-  if (Array.isArray(value)) return value.slice(0, 50).map(boundDiagnosticValue)
-  if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).slice(0, 50).map(([key, item]) => [key, boundDiagnosticValue(item)]))
-  }
-  return typeof value === "string" ? value.slice(0, 2_000) : value
+function candidateAssertionTexts(item) {
+  const values = [item.content, item.text]
+  const relationTuple = [item.subject, item.predicate, item.object]
+    .filter((value) => typeof value === "string" && value.trim())
+    .join(" ")
+  if (relationTuple) values.push(relationTuple)
+  return [...new Set(values.filter((value) => typeof value === "string" && value.trim()))]
 }
 
 function groundingTerms(value) {
@@ -1166,9 +479,6 @@ export function validateSourceRefs(refs, task, batches, limits, chunkIndex) {
     if (!sourceIds.has(ref.sourceId)) fail("INVALID_SOURCE_REF", `Source ${ref.sourceId} is not part of this task.`)
     const chunk = chunks.get(ref.chunkId)
     if (!chunk || chunk.sourceId !== ref.sourceId) fail("INVALID_SOURCE_REF", `Chunk ${ref.chunkId} does not belong to source ${ref.sourceId}.`)
-    if (ref.role !== undefined && !["primary", "context"].includes(ref.role)) {
-      fail("INVALID_SOURCE_REF", "SourceRef role must be primary or context.")
-    }
     if (ref.quote !== undefined) {
       if (typeof ref.quote !== "string" || ref.quote.length > limits.maxQuoteChars) fail("INVALID_SOURCE_REF", "SourceRef quote is invalid or too long.")
       const quote = normalizeQuote(ref.quote)
@@ -1186,11 +496,10 @@ export function validateSourceRefs(refs, task, batches, limits, chunkIndex) {
     }
     if (ref.locator !== undefined) {
       if (!ref.locator || typeof ref.locator !== "object" || Array.isArray(ref.locator)) fail("INVALID_SOURCE_REF", "SourceRef locator must be an object.")
-      const { startOffset, endOffset, page, slide, headingPath, sheetName, cellRange } = ref.locator
+      const { startOffset, endOffset, page, headingPath, sheetName, cellRange } = ref.locator
       if (startOffset !== undefined && (!Number.isInteger(startOffset) || startOffset < 0)) fail("INVALID_SOURCE_REF", "locator.startOffset must be a non-negative integer.")
       if (endOffset !== undefined && (!Number.isInteger(endOffset) || endOffset < 0 || (startOffset !== undefined && endOffset < startOffset))) fail("INVALID_SOURCE_REF", "locator.endOffset is invalid.")
       if (page !== undefined && (!Number.isInteger(page) || page < 1)) fail("INVALID_SOURCE_REF", "locator.page must be a positive integer.")
-      if (slide !== undefined && (!Number.isInteger(slide) || slide < 1)) fail("INVALID_SOURCE_REF", "locator.slide must be a positive integer.")
       if (headingPath !== undefined && (!Array.isArray(headingPath) || headingPath.some((part) => typeof part !== "string"))) fail("INVALID_SOURCE_REF", "locator.headingPath must be a string array.")
       if (sheetName !== undefined && (typeof sheetName !== "string" || !sheetName.trim() || sheetName.length > 500)) fail("INVALID_SOURCE_REF", "locator.sheetName must be a non-empty bounded string.")
       if (cellRange !== undefined && (typeof cellRange !== "string" || !/^[A-Z]{1,3}[1-9]\d*:[A-Z]{1,3}[1-9]\d*$/i.test(cellRange))) fail("INVALID_SOURCE_REF", "locator.cellRange must be an A1-style range.")
@@ -1210,12 +519,6 @@ export function validateSourceRefs(refs, task, batches, limits, chunkIndex) {
         fail("INVALID_SOURCE_REF", `locator.page does not match chunk ${ref.chunkId}; copy an exact source_ref_templates value.`, {
           retryable: true,
           details: { expected_page: chunk.pageNumber },
-        })
-      }
-      if (slide !== undefined && Number.isInteger(chunk.slideNumber) && slide !== chunk.slideNumber) {
-        fail("INVALID_SOURCE_REF", `locator.slide does not match chunk ${ref.chunkId}; copy an exact source_ref_templates value.`, {
-          retryable: true,
-          details: { expected_slide: chunk.slideNumber },
         })
       }
       if (headingPath !== undefined && Array.isArray(chunk.headingPath)
@@ -1251,17 +554,10 @@ function normalizeQuote(value) {
 export function validatePagePatchShape(patch, limits) {
   if (!patch || typeof patch !== "object" || Array.isArray(patch)) fail("INVALID_PAGE_PATCH", "Each patch must be an object.")
   for (const key of Object.keys(patch)) if (!PAGE_PATCH_FIELDS.has(key)) fail("INVALID_PAGE_PATCH", `Patch contains unsupported field: ${key}`)
-  for (const key of ["patchId", "path", "operation", "title", "pageKind", "rationale"]) {
+  for (const key of ["patchId", "path", "operation", "title", "pageKind", "content", "rationale"]) {
     if (typeof patch[key] !== "string" || !patch[key].trim()) fail("INVALID_PAGE_PATCH", `Patch ${key} is required.`)
   }
   if (!new Set(["create", "replace", "merge"]).has(patch.operation)) fail("INVALID_PAGE_PATCH", `Unsupported page operation: ${patch.operation}`)
-  if (patch.operation === "merge") {
-    if (patch.content !== undefined) fail("INVALID_PAGE_PATCH", "Merge patches use sectionChanges, not a complete content body.")
-    validateMergeSectionChanges(patch.sectionChanges, limits)
-  } else {
-    if (typeof patch.content !== "string" || !patch.content.trim()) fail("INVALID_PAGE_PATCH", `Patch content is required for ${patch.operation}.`)
-    if (patch.sectionChanges !== undefined) fail("INVALID_PAGE_PATCH", `${patch.operation} patches use complete content, not sectionChanges.`)
-  }
   if (!Array.isArray(patch.sourceRefs) || patch.sourceRefs.length === 0) fail("INVALID_PAGE_PATCH", "Every page patch requires at least one SourceRef.")
   if (patch.sourceRefs.length > 500) fail("INVALID_PAGE_PATCH", "Patch sourceRefs exceeds 500 items.")
   if (patch.patchId.length > 200) fail("INVALID_PAGE_PATCH", "Patch patchId exceeds 200 characters.")
@@ -1327,35 +623,8 @@ export function validatePagePatchShape(patch, limits) {
   const normalizedKind = normalizePageKind(patch.pageKind)
   const pathKind = pageKindForPath(patch.path)
   if (!normalizedKind || !pathKind || normalizedKind !== pathKind) fail("INVALID_PAGE_PATCH", "pageKind must match the Wiki collection in path.")
-  if (typeof patch.content === "string" && patch.content.length > limits.maxPageChars) fail("INVALID_PAGE_PATCH", "Page content exceeds the workspace limit.")
+  if (patch.content.length > limits.maxPageChars) fail("INVALID_PAGE_PATCH", "Page content exceeds the workspace limit.")
   if (patch.expectedFileHash !== undefined && !/^[0-9a-f]{64}$/i.test(patch.expectedFileHash)) fail("INVALID_PAGE_PATCH", "expectedFileHash must be a SHA256 value.")
-}
-
-function validateMergeSectionChanges(value, limits) {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 20) {
-    fail("INVALID_PAGE_PATCH", "Merge patch sectionChanges must contain 1 to 20 section upserts.")
-  }
-  const headings = new Set()
-  let totalChars = 0
-  for (const [index, change] of value.entries()) {
-    if (!change || typeof change !== "object" || Array.isArray(change)) fail("INVALID_PAGE_PATCH", `sectionChanges[${index}] must be an object.`)
-    for (const key of Object.keys(change)) {
-      if (!["operation", "heading", "level", "content"].includes(key)) fail("INVALID_PAGE_PATCH", `sectionChanges[${index}] contains unsupported field: ${key}`)
-    }
-    if (change.operation !== "upsert_section") fail("INVALID_PAGE_PATCH", `sectionChanges[${index}].operation must be upsert_section.`)
-    const heading = String(change.heading ?? "").normalize("NFKC").trim()
-    const normalizedHeading = heading.replace(/\s+/g, " ").toLowerCase()
-    const level = change.level === undefined ? 2 : Number(change.level)
-    const content = String(change.content ?? "").replace(/\r\n?/g, "\n").trim()
-    if (!heading || heading.length > 300 || /[\r\n]/.test(heading)) fail("INVALID_PAGE_PATCH", `Invalid sectionChanges[${index}].heading.`)
-    if (CORE_OWNED_SECTION_HEADINGS.has(normalizedHeading)) fail("INVALID_PAGE_PATCH", `Section ${heading} is maintained by Core and cannot be edited directly.`)
-    if (headings.has(normalizedHeading)) fail("INVALID_PAGE_PATCH", `Duplicate section change in one merge patch: ${heading}`)
-    headings.add(normalizedHeading)
-    if (!Number.isInteger(level) || level < 2 || level > 6) fail("INVALID_PAGE_PATCH", `Section level must be an integer from 2 to 6 for ${heading}.`)
-    if (!content || content.length > limits.maxPageChars) fail("INVALID_PAGE_PATCH", `Section content for ${heading} must contain 1 to ${limits.maxPageChars} characters.`)
-    totalChars += content.length
-  }
-  if (totalChars > limits.maxPageChars) fail("INVALID_PAGE_PATCH", "Merge patch section content exceeds the workspace page limit.")
 }
 
 // Domain classifications are derived from the server-side page requirements.

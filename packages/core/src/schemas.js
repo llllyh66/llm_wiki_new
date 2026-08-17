@@ -12,7 +12,7 @@ export const analysisSchema = Object.freeze({
     batchId: { type: "string" },
     sourceRefs: {
       type: "array",
-      description: "Catalog of every unique complete SourceRef used by this envelope. With sourceRefMode=batch-evidence-index, copy the numeric scaffold catalog and use evidence_catalog indexes in nested candidates; Core persists resolved complete references. Primary and context references are both explicit.",
+      description: "Catalog of every unique complete SourceRef used by this envelope. With sourceRefMode=batch-evidence-index, copy the numeric scaffold catalog and use evidence_catalog indexes in nested candidates; Core persists resolved complete references.",
       items: {
         oneOf: [
           { type: "integer", minimum: 0 },
@@ -33,7 +33,7 @@ export const analysisSchema = Object.freeze({
     claims: { type: "array", items: { $ref: "#/$defs/groundedCandidate" }, maxItems: 1000 },
     relations: {
       type: "array",
-      description: "Source-grounded relationships between extracted candidates. New relations should declare predicate plus resolvable source and target endpoints; legacy prose-only relations remain accepted with diagnostics.",
+      description: "Source-grounded relationships between extracted candidates.",
       items: { $ref: "#/$defs/groundedCandidate" },
       maxItems: 1000,
     },
@@ -51,8 +51,7 @@ export const analysisSchema = Object.freeze({
       properties: {
         sourceId: { type: "string" },
         chunkId: { type: "string" },
-        quote: { type: "string", maxLength: 1000, description: "Short verbatim evidence. Wiki candidates may paraphrase it, but typed facts and certainty must remain equivalent." },
-        role: { enum: ["primary", "context"], description: "primary is the row/passage cited by the candidate; context carries table headers, columns, or headings." },
+        quote: { type: "string", maxLength: 1000, description: "Short verbatim evidence. Claims, relations, contradictions, and review items require a quote that lexically supports their content." },
         locator: { type: "object" },
       },
       additionalProperties: false,
@@ -80,29 +79,8 @@ export const analysisSchema = Object.freeze({
         text: { type: "string" },
         content: { type: "string" },
         confidence: { type: "number", minimum: 0, maximum: 1 },
-        factKind: {
-          enum: ["entity", "concept", "claim", "relation", "metric_definition", "parameter_definition", "contradiction", "summary", "review_item"],
-          description: "Semantic knowledge kind. Orthogonal to supportMode so, for example, a relation can be explicit or structurally entailed.",
-        },
-        supportMode: {
-          enum: ["explicit_text", "structured_entailment", "derived", "summary"],
-          description: "How the selected evidence supports this candidate. Omitted values are inferred for backward compatibility.",
-        },
-        derivation: {
-          oneOf: [{ type: "string", minLength: 1 }, { type: "object", minProperties: 1 }],
-          description: "Required rule or method declaration when supportMode is derived.",
-        },
-        predicate: { type: "string", minLength: 1, description: "Normalized relationship predicate for relation candidates." },
         sourceEntityLocalId: { type: "string", description: "localId of the source entity in a relation." },
         targetEntityLocalId: { type: "string", description: "localId of the target entity in a relation." },
-        metric: { type: "string", description: "Metric name for a structured metric definition." },
-        formula: { type: "string", description: "Source-preserving formula for a structured metric definition." },
-        condition: { type: "string", description: "Source-preserving condition for a structured fact." },
-        sourceTable: { type: "string", description: "Source table named by structured evidence." },
-        unit: { type: "string", description: "Unit named by structured evidence." },
-        parameterId: { oneOf: [{ type: "string" }, { type: "number" }], description: "Parameter identifier named by structured evidence." },
-        defaultValue: { description: "Default value named by structured evidence." },
-        recommendedValue: { description: "Recommended value named by structured evidence." },
         properties: { type: "object", description: "Source-grounded structured properties when useful." },
         schemaClassification: {
           type: "object",
@@ -137,37 +115,20 @@ export const analysisSchema = Object.freeze({
 })
 
 export const pagePatchSchema = Object.freeze({
-  $id: "https://llm-wiki.local/schemas/page-patch-v2.json",
+  $id: "https://llm-wiki.local/schemas/page-patch-v1.json",
   type: "object",
-  required: ["patchId", "path", "operation", "title", "pageKind", "sourceRefs", "rationale"],
+  required: ["patchId", "path", "operation", "title", "pageKind", "content", "sourceRefs", "rationale"],
   properties: {
     patchId: { type: "string", minLength: 1, maxLength: 200 },
     path: { type: "string", pattern: "^wiki/(sources|entities|concepts|topics|comparisons|queries|synthesis|findings|methodology|thesis|meetings|decisions|projects|stakeholders|goals|habits|reflections|chapters|characters|themes|plot-threads|journal)/.+\\.md$" },
     operation: {
       enum: ["create", "replace", "merge"],
-      description: "create writes a new complete page; replace rewrites a complete existing page that was fully visible to the Drafter; merge applies bounded sectionChanges to a truncated existing page without appending a second body.",
+      description: "create requires an absent path; replace is a complete incoming body rewrite; merge explicitly retains existing grounded body content.",
     },
     expectedFileHash: { type: "string", pattern: "^[0-9a-f]{64}$", description: "Required for replace and merge when the path already exists; copy the exact current file hash." },
     title: { type: "string", minLength: 1, maxLength: 500 },
     pageKind: { type: "string", minLength: 1, maxLength: 100 },
-    content: { type: "string", minLength: 1, description: "Required only for create and replace. It is the complete desired page body." },
-    sectionChanges: {
-      type: "array",
-      minItems: 1,
-      maxItems: 20,
-      description: "Required only for merge. Upsert complete, fully visible sections or add a new section; Core preserves every other section server-side. Do not select both a parent section and one of its nested child sections in the same patch.",
-      items: {
-        type: "object",
-        required: ["operation", "heading", "content"],
-        properties: {
-          operation: { const: "upsert_section" },
-          heading: { type: "string", minLength: 1, maxLength: 300 },
-          level: { type: "integer", minimum: 2, maximum: 6 },
-          content: { type: "string", minLength: 1 },
-        },
-        additionalProperties: false,
-      },
-    },
+    content: { type: "string", minLength: 1 },
     summary: { type: "string", maxLength: 500 },
     domainSchemaId: { type: "string", minLength: 1, maxLength: 200 },
     domainSchemaVersion: { type: "string", minLength: 1, maxLength: 200 },
@@ -216,16 +177,6 @@ export const pagePatchSchema = Object.freeze({
     },
     rationale: { type: "string", minLength: 1, maxLength: 10000 },
   },
-  allOf: [
-    {
-      if: { properties: { operation: { enum: ["create", "replace"] } }, required: ["operation"] },
-      then: { required: ["content"], not: { required: ["sectionChanges"] } },
-    },
-    {
-      if: { properties: { operation: { const: "merge" } }, required: ["operation"] },
-      then: { required: ["sectionChanges"], not: { required: ["content"] } },
-    },
-  ],
   additionalProperties: false,
 })
 

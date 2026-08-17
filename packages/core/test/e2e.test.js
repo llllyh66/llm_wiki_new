@@ -1,10 +1,9 @@
 import assert from "node:assert/strict"
-import { access, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises"
+import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
 import { LlmWikiCore, LlmWikiError } from "../src/index.js"
-import { sha256, stableStringify } from "../src/utils.js"
 
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-core-"))
@@ -27,15 +26,6 @@ An Aggregate groups related Business Entities.
   await writeFile(source, content)
   const core = await LlmWikiCore.open(workspace)
   return { root, workspace, incoming, source, content, core }
-}
-
-async function publishTestWiki(workspace, suffix) {
-  const generationId = `generation-00000000-0000-4000-8000-${String(suffix).padStart(12, "0")}`
-  const generationRoot = path.join(workspace, ".llm-wiki", "generations", generationId)
-  await mkdir(generationRoot, { recursive: true })
-  await cp(path.join(workspace, "wiki"), path.join(generationRoot, "wiki"), { recursive: true })
-  await writeFile(path.join(generationRoot, "manifest.json"), JSON.stringify({ schemaVersion: 1, generationId, taskId: "task-test-published", wikiRevision: `wiki-${suffix}`, pages: [], artifacts: {} }))
-  await writeFile(path.join(workspace, ".llm-wiki", "current-generation.json"), JSON.stringify({ schema_version: 1, generation_id: generationId }))
 }
 
 function analysisFor(taskId, batch) {
@@ -283,127 +273,11 @@ test("grounding quality gate rejects a title-only SourceRef reused for many unre
     }),
     (error) => error instanceof LlmWikiError
       && error.code === "INVALID_ANALYSIS"
-      && error.details.quality_gate === "source-ref-grounding-v3"
-      && error.details.validation_errors.some((diagnostic) => ["NUMERIC_ANCHOR_MISMATCH", "LEXICAL_MISMATCH"].includes(diagnostic.reason_code)),
+      && error.details.quality_gate === "source-ref-grounding-v1"
+      && error.details.validation_errors.some((message) => message.includes("does not lexically support"))
+      && error.details.validation_errors.some((message) => message.includes("reused by 12 grounded candidates")),
   )
   assert.equal((await f.core.status({ task_id: imported.task_id })).status, "prepared")
-})
-
-test("repeated semantic grounding failures stop the batch after two repairs", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
-  const batch = await f.core.getBatch({ task_id: imported.task_id })
-  const invalid = analysisFor(imported.task_id, batch).analysis
-  invalid.claims[0].text = "Business Entity has identifier A-2001."
-  invalid.claims.push({
-    localId: "claim-preserved-during-repair",
-    text: "Business Entity is the canonical business object.",
-    confidence: 0.9,
-    sourceRefs: invalid.claims[0].sourceRefs,
-  })
-
-  await assert.rejects(
-    () => f.core.commitAnalysis({
-      task_id: imported.task_id,
-      batch_id: batch.batch_id,
-      analysis: invalid,
-      idempotency_key: "semantic-repair-attempt-1",
-    }),
-    (error) => error instanceof LlmWikiError
-      && error.code === "INVALID_ANALYSIS"
-      && error.details.validation_attempt === 1
-      && error.details.repair_required === false
-      && error.details.knowledge_coverage.candidate_count === 5
-      && error.details.knowledge_preservation.current.candidate_count === 5
-      && typeof error.details.validation_fingerprint === "string",
-  )
-
-  await assert.rejects(
-    () => f.core.commitAnalysis({
-      task_id: imported.task_id,
-      batch_id: batch.batch_id,
-      analysis: invalid,
-      idempotency_key: "semantic-repair-attempt-2",
-    }),
-    (error) => error instanceof LlmWikiError
-      && error.code === "INVALID_ANALYSIS"
-      && error.details.validation_attempt === 2
-      && error.details.repair_required === true,
-  )
-
-  await assert.rejects(
-    () => f.core.commitAnalysis({
-      task_id: imported.task_id,
-      batch_id: batch.batch_id,
-      analysis: invalid,
-      idempotency_key: "semantic-repair-attempt-3",
-    }),
-    (error) => error instanceof LlmWikiError
-      && error.code === "ANALYSIS_REPAIR_REQUIRED"
-      && error.details.repair_required === true
-      && error.retryable === false,
-  )
-
-  const status = await f.core.status({ task_id: imported.task_id })
-  assert.equal(status.analysis_validation.batches[batch.batch_id].repair_required, true)
-  assert.equal(status.subagent_recovery.roles.extractor.desired_live_invocations, 0)
-  assert.equal(status.next_action, null)
-
-  const repaired = await f.core.commitAnalysis({
-    task_id: imported.task_id,
-    batch_id: batch.batch_id,
-    analysis: analysisFor(imported.task_id, batch).analysis,
-    idempotency_key: "semantic-repair-explicit-v1",
-  })
-  assert.equal(repaired.accepted, true)
-  assert.equal(repaired.repair_coverage.candidate_delta, -1)
-  assert.equal(repaired.repair_coverage.knowledge_loss_warning, true)
-  const recovered = await f.core.status({ task_id: imported.task_id })
-  assert.equal(recovered.analysis_validation.batches[batch.batch_id], undefined)
-  assert.equal(recovered.last_error, undefined)
-})
-
-test("a repair-required batch does not stop extraction of other batches", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  const largeSource = path.join(f.incoming, "repair-parallel.md")
-  const lines = Array.from({ length: 900 }, (_, index) => `Parallel evidence row ${String(index).padStart(4, "0")} remains independently schedulable.`)
-  await writeFile(largeSource, `# Repair parallelism\n\n${lines.join("\n")}\n`)
-  const imported = await f.core.importFiles({ files: [{ path: largeSource }], options: { max_batch_chars: 9_000 } })
-  assert.equal(imported.batch_count > 2, true)
-  const first = await f.core.getBatch({ task_id: imported.task_id, worker_id: "repair-worker" })
-  const invalid = {
-    ...first.analysis_scaffold,
-    claims: [{ localId: "bad-anchor", content: "This claim has identifier A-2001.", sourceRefs: [0] }],
-    batchSummary: "Invalid semantic repair fixture.",
-  }
-
-  for (const idempotency_key of ["parallel-repair-1", "parallel-repair-2"]) {
-    await assert.rejects(
-      () => f.core.commitAnalysis({
-        task_id: imported.task_id,
-        batch_id: first.batch_id,
-        worker_id: first.worker_id,
-        lease_token: first.lease_token,
-        analysis: invalid,
-        idempotency_key,
-      }),
-      (error) => error instanceof LlmWikiError && error.code === "INVALID_ANALYSIS",
-    )
-  }
-
-  const status = await f.core.status({ task_id: imported.task_id })
-  assert.equal(status.analysis_validation.batches[first.batch_id].repair_required, true)
-  assert.equal(status.subagent_recovery.roles.extractor.desired_live_invocations > 0, true)
-  assert.equal(status.next_action.tool, "llm_wiki_get_batch")
-
-  const other = await f.core.getBatch({ task_id: imported.task_id, worker_id: "other-worker" })
-  assert.notEqual(other.batch_id, first.batch_id)
-  await assert.rejects(
-    () => f.core.getBatch({ task_id: imported.task_id, batch_id: first.batch_id, worker_id: "new-worker" }),
-    (error) => error instanceof LlmWikiError && error.code === "ANALYSIS_REPAIR_REQUIRED",
-  )
 })
 
 test("grounding accepts exact relation content from server evidence without label dilution", async (t) => {
@@ -443,37 +317,6 @@ test("grounding accepts exact relation content from server evidence without labe
   assert.equal(committed.accepted, true)
 })
 
-test("table-row evidence automatically carries its exact header context", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  await writeFile(f.source, "# Parameters\n\n| 参数名 | 参数值 |\n| --- | --- |\n| timeout | 50 |\n| capacity | 500 |\n")
-  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
-  const batch = await f.core.getBatch({ task_id: imported.task_id })
-  const rowEvidence = batch.evidence_catalog.find((entry) => entry.quote.includes("timeout") && entry.quote.includes("50"))
-  assert.ok(rowEvidence)
-  assert.equal(rowEvidence.primary_quote, rowEvidence.quote)
-  assert.equal(rowEvidence.context_quotes.includes("| 参数名 | 参数值 |"), true)
-  assert.deepEqual(rowEvidence.context.table_headers, ["参数名", "参数值"])
-  assert.equal(batch.evidence_catalog_contract.table_context_auto_resolved, true)
-  assert.equal(batch.evidence_catalog.some((entry) => entry.quote === "| 参数名 | 参数值 |"), true)
-
-  const committed = await f.core.commitAnalysis({
-    task_id: imported.task_id,
-    batch_id: batch.batch_id,
-    idempotency_key: "table-header-context-v1",
-    analysis: {
-      ...batch.analysis_scaffold,
-      claims: [{
-        localId: "timeout-parameter",
-        content: "timeout 参数值 50",
-        sourceRefs: [rowEvidence.evidence_index],
-      }],
-    },
-  })
-
-  assert.equal(committed.accepted, true)
-  assert.equal(committed.normalized_source_ref_indexes, 1)
-})
 
 test("real embedding recall is cached and endpoint failures degrade without failing retrieval", async (t) => {
   const f = await fixture()
@@ -500,15 +343,11 @@ test("real embedding recall is cached and endpoint failures degrade without fail
     }), { status: 200, headers: { "content-type": "application/json" } })
   }
   const endpoint = "http://embedding.test/v1/embeddings"
-  await f.core.init()
+  const imported = await f.core.importFiles({ files: [{ path: semanticSource }] })
   const configPath = path.join(f.workspace, ".llm-wiki", "config.json")
   const config = JSON.parse(await readFile(configPath, "utf8"))
   config.retrieval.embedding = { provider: "openai-compatible", model: "test-embedding", endpoint, batchSize: 8, maxDocuments: 100 }
   await writeFile(configPath, JSON.stringify(config))
-  const imported = await f.core.importFiles({ files: [{ path: semanticSource }] })
-  for (let attempt = 0; attempt < 50 && requests === 0; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 10))
-  }
   const batch = await f.core.getBatch({ task_id: imported.task_id })
 
   const first = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: batch.batch_id, queries: ["car"], channels: ["bm25", "embedding", "wiki"] })
@@ -522,26 +361,26 @@ test("real embedding recall is cached and endpoint failures degrade without fail
 
   endpointMalformed = "empty"
   const malformed = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: batch.batch_id, queries: ["car"], channels: ["embedding"] })
-  assert.equal(malformed.channel_status.feature_hash.mode, "feature-hash-fallback")
-  assert.equal(malformed.channel_status.feature_hash.reason, "EMBEDDING_INVALID_RESPONSE")
+  assert.equal(malformed.channel_status.embedding.mode, "feature-hash-fallback")
+  assert.equal(malformed.channel_status.embedding.reason, "EMBEDDING_INVALID_RESPONSE")
 
   endpointMalformed = "bad-index"
   const malformedIndex = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: batch.batch_id, queries: ["car"], channels: ["embedding"] })
-  assert.equal(malformedIndex.channel_status.feature_hash.mode, "feature-hash-fallback")
-  assert.equal(malformedIndex.channel_status.feature_hash.reason, "EMBEDDING_INVALID_RESPONSE")
+  assert.equal(malformedIndex.channel_status.embedding.mode, "feature-hash-fallback")
+  assert.equal(malformedIndex.channel_status.embedding.reason, "EMBEDDING_INVALID_RESPONSE")
 
   endpointMalformed = false
   endpointUnavailable = true
   const degraded = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: batch.batch_id, queries: ["car"], channels: ["embedding"] })
-  assert.equal(degraded.channel_status.feature_hash.mode, "feature-hash-fallback")
-  assert.equal(degraded.channel_status.feature_hash.degraded, true)
+  assert.equal(degraded.channel_status.embedding.mode, "feature-hash-fallback")
+  assert.equal(degraded.channel_status.embedding.degraded, true)
   assert.equal(Array.isArray(degraded.hits), true)
 
   endpointUnavailable = false
   endpointNonStreaming = true
   const nonStreaming = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: batch.batch_id, queries: ["car"], channels: ["embedding"] })
-  assert.equal(nonStreaming.channel_status.feature_hash.mode, "feature-hash-fallback")
-  assert.equal(nonStreaming.channel_status.feature_hash.reason, "EMBEDDING_INVALID_RESPONSE")
+  assert.equal(nonStreaming.channel_status.embedding.mode, "feature-hash-fallback")
+  assert.equal(nonStreaming.channel_status.embedding.reason, "EMBEDDING_INVALID_RESPONSE")
 })
 
 test("Wiki title and bidirectional link neighbors participate in RRF", async (t) => {
@@ -551,7 +390,6 @@ test("Wiki title and bidirectional link neighbors participate in RRF", async (t)
   await mkdir(topics, { recursive: true })
   await writeFile(path.join(topics, "alpha.md"), "# AlphaTerm\n\nSee [[topics/hidden-neighbor]].\n")
   await writeFile(path.join(topics, "hidden-neighbor.md"), "# Hidden Neighbor\n\nLinked background knowledge.\n")
-  await publishTestWiki(f.workspace, 2)
   const imported = await f.core.importFiles({ files: [{ path: f.source }] })
   const batch = await f.core.getBatch({ task_id: imported.task_id })
   const retrieval = await f.core.retrieveContext({
@@ -573,7 +411,6 @@ test("Wiki retrieval graph ignores links inside Markdown code examples", async (
   await mkdir(topics, { recursive: true })
   await writeFile(path.join(topics, "alpha.md"), "# AlphaCodeExample\n\n```markdown\n[[topics/hidden-neighbor]]\n```\n")
   await writeFile(path.join(topics, "hidden-neighbor.md"), "# Hidden Neighbor\n\nUnrelated background knowledge.\n")
-  await publishTestWiki(f.workspace, 3)
   const imported = await f.core.importFiles({ files: [{ path: f.source }] })
   const batch = await f.core.getBatch({ task_id: imported.task_id })
   const retrieval = await f.core.retrieveContext({
@@ -600,7 +437,7 @@ test("page planning resolves safe cross-batch local IDs into bidirectional Relat
   assert.equal(imported.batch_count >= 2, true)
 
   while (true) {
-    const batch = await f.core.getBatch({ task_id: imported.task_id, worker_id: "cross-batch-worker" })
+    const batch = await f.core.getBatch({ task_id: imported.task_id })
     if (batch.completed) break
     const alphaEvidence = batch.evidence_catalog.find((entry) => entry.quote.includes("Alpha service is defined"))
     const betaEvidence = batch.evidence_catalog.find((entry) => entry.quote.includes("Beta depends on Alpha service"))
@@ -621,8 +458,6 @@ test("page planning resolves safe cross-batch local IDs into bidirectional Relat
     const committed = await f.core.commitAnalysis({
       task_id: imported.task_id,
       batch_id: batch.batch_id,
-      worker_id: batch.worker_id,
-      lease_token: batch.lease_token,
       analysis,
       idempotency_key: `cross-batch-related-${batch.batch_id}`,
     })
@@ -655,23 +490,18 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
 
   const sourceRef = await analyzeAll(f.core, imported)
   const buildingRetrieval = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["Business Entity"] })
-  assert.equal(buildingRetrieval.retrieval_phase, "source-ready")
-  assert.deepEqual(buildingRetrieval.available_channels, ["bm25"])
-  assert.deepEqual(buildingRetrieval.fallback_channels, ["feature_hash"])
-  const retrieval = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: "batch-0001", queries: ["Business Entity"], channels: ["bm25", "embedding", "wiki"] })
-  assert.deepEqual(retrieval.available_channels, ["bm25"])
-  assert.deepEqual(retrieval.pending_channels, ["embedding", "wiki"])
-  assert.deepEqual(retrieval.fallback_channels, ["feature_hash"])
+  assert.equal(buildingRetrieval.retrieval_phase, "building")
+  assert.deepEqual(buildingRetrieval.available_channels, ["bm25", "embedding"])
+  const retrieval = await f.core.retrieveContext({ task_id: imported.task_id, batch_id: "batch-0001", queries: ["Business Entity"], channels: ["bm25", "vector", "graph"] })
+  assert.deepEqual(retrieval.available_channels, ["bm25", "vector", "graph"])
+  assert.deepEqual(retrieval.pending_channels, [])
 
   const plan = await f.core.getPagePlanContext({ task_id: imported.task_id })
   assert.equal(plan.analysis_summary.claims.length, 1)
   assert.equal(plan.page_patch_schema.properties.path.type, "string")
-  assert.equal(plan.page_requirements.some((requirement) => requirement.title === "Aggregate"), true)
-  assert.equal(plan.page_requirements.some((requirement) => requirement.title === "Business Entity"), true)
-  assert.equal(plan.page_requirements.some((requirement) => requirement.title.startsWith("Claim: Business Entity is the canonical business object.")), true)
+  assert.deepEqual(plan.page_requirements.map((requirement) => requirement.title).sort(), ["Aggregate", "Business Entity"])
   const businessRequirement = plan.page_requirements.find((requirement) => requirement.title === "Business Entity")
   const aggregateRequirement = plan.page_requirements.find((requirement) => requirement.title === "Aggregate")
-  const claimRequirement = plan.page_requirements.find((requirement) => requirement.title.startsWith("Claim: Business Entity is the canonical business object."))
   assert.deepEqual(businessRequirement.patch_scaffold.sourceRefs, [businessRequirement.requirement_id])
   assert.deepEqual(businessRequirement.patch_scaffold.covers, [businessRequirement.requirement_id])
   const committed = await f.core.commitPages({
@@ -704,20 +534,15 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
       covers: [aggregateRequirement.requirement_id],
       sourceRefs: [aggregateRequirement.requirement_id],
       rationale: "The source explicitly defines Aggregate.",
-    }, {
-      ...claimRequirement.patch_scaffold,
-      content: `# ${claimRequirement.title}\n\nBusiness Entity is the canonical business object.`,
-      summary: "The source's canonical Business Entity claim.",
-      tags: ["claim"],
     }],
   })
   assert.equal(committed.accepted, true)
-  assert.equal(committed.normalized_page_requirement_source_refs, 3)
+  assert.equal(committed.normalized_page_requirement_source_refs, 2)
 
   const result = await f.core.finalize({ task_id: imported.task_id })
   assert.equal(result.status, "completed")
   assert.equal(result.indexing.bm25, "completed")
-  assert.equal(result.indexing.feature_hash, "completed")
+  assert.equal(result.indexing.vector, "completed")
   assert.match(result.generation_id, /^generation-/)
   const generationPointer = JSON.parse(await readFile(path.join(f.workspace, ".llm-wiki", "current-generation.json"), "utf8"))
   assert.equal(generationPointer.generation_id, result.generation_id)
@@ -725,10 +550,8 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
   const generationManifest = JSON.parse(await readFile(path.join(f.workspace, ".llm-wiki", "generations", result.generation_id, "manifest.json"), "utf8"))
   assert.equal(generationManifest.wikiRevision, result.wiki_revision)
   assert.equal(generationManifest.taskId, imported.task_id)
-  assert.deepEqual(Object.keys(generationManifest.artifacts).sort(), ["bm25.json", "embedding.f32", "embedding.json", "feature-hash.f32", "feature-hash.json", "graph.json", "lint.json", "page-source-refs.json"])
-  assert.equal(result.created_pages.includes("wiki/concepts/business-entity.md"), true)
-  assert.equal(result.created_pages.includes("wiki/concepts/aggregate.md"), true)
-  assert.equal(result.created_pages.includes(claimRequirement.patch_scaffold.path), true)
+  assert.deepEqual(Object.keys(generationManifest.artifacts).sort(), ["bm25.json", "embedding.json", "graph.json", "lint.json", "page-source-refs.json", "vector.json"])
+  assert.deepEqual(result.created_pages, ["wiki/concepts/business-entity.md", "wiki/concepts/aggregate.md"])
   assert.equal((await f.core.status({ task_id: imported.task_id })).status, "completed")
   assert.match(await readFile(path.join(f.workspace, "wiki", "index.md"), "utf8"), /Business Entity/)
   assert.match(await readFile(path.join(f.workspace, "wiki", "index.md"), "utf8"), /## Concepts/)
@@ -744,8 +567,7 @@ test("Markdown attachment completes the model-free vertical slice", async (t) =>
   assert.equal((await readFile(path.join(f.workspace, imported.sources[0].managed_path), "utf8")).includes("Product Model"), true)
   const completedRetrieval = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["Business Entity"] })
   assert.equal(completedRetrieval.retrieval_phase, "knowledge-base-complete")
-  assert.deepEqual(completedRetrieval.available_channels, ["bm25", "wiki"])
-  assert.deepEqual(completedRetrieval.fallback_channels, ["feature_hash"])
+  assert.deepEqual(completedRetrieval.available_channels, ["bm25", "embedding", "wiki"])
   const again = await f.core.finalize({ task_id: imported.task_id })
   assert.deepEqual(again, result)
 })
@@ -860,13 +682,6 @@ test("page commits repair legacy quote formatting and prefer requirement-ID Sour
   })
   assert.equal(committed.accepted, true)
   assert.equal(committed.normalized_page_source_ref_quotes, 1)
-  const finalized = await f.core.finalize({ task_id: imported.task_id })
-  assert.equal(finalized.status, "completed")
-  const sourcePage = await readFile(path.join(f.workspace, "wiki", "sources", `${imported.sources[0].source_id}.md`), "utf8")
-  assert.match(sourcePage, /^## 摘要$/m)
-  assert.match(sourcePage, /^## 关键实体与概念$/m)
-  assert.match(sourcePage, /^## 来源信息$/m)
-  assert.doesNotMatch(sourcePage, /^## Summary$/m)
 })
 
 test("single-batch tasks still require a background extractor", async (t) => {
@@ -879,98 +694,10 @@ test("single-batch tasks still require a background extractor", async (t) => {
   assert.equal(imported.parallel_extraction.mode, "background-agent-first")
   assert.equal(imported.parallel_extraction.single_batch_background, true)
   assert.equal(imported.parallel_extraction.recommended_workers, 1)
-  assert.equal(imported.subagent_recovery.process_liveness_known, false)
-  assert.equal(imported.subagent_recovery.roles.extractor.desired_live_invocations, 1)
-  assert.equal(imported.subagent_recovery.roles.drafter.desired_live_invocations, 0)
-  assert.equal(imported.subagent_recovery.roles.writer.desired_live_invocations, 0)
   const status = await f.core.status({ task_id: imported.task_id })
   assert.equal(status.parallel_extraction.enabled, true)
   assert.equal(status.parallel_extraction.required, true)
   assert.equal(status.parallel_extraction.single_batch_background, true)
-})
-
-test("Finalize before extraction starts routes to exact automatic catch-up", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
-  await assert.rejects(
-    () => f.core.finalize({ task_id: imported.task_id }),
-    (error) => error instanceof LlmWikiError
-      && error.code === "FINALIZE_CATCHUP_REQUIRED"
-      && error.details.remaining_extraction_batches === 1
-      && error.details.next_action.tool === "llm_wiki_get_batch"
-      && error.details.completion_gate.automatic_continuation_required === true
-      && error.details.completion_gate.user_confirmation_required === false,
-  )
-})
-
-test("failed tasks with unfinished extraction do not loop Finalize or relaunch Extractors", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
-  const taskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
-  const task = JSON.parse(await readFile(taskPath, "utf8"))
-  task.status = "failed"
-  task.lastError = { code: "SYNTHETIC_IMPORT_FAILURE", message: "Synthetic partial progressive import failure." }
-  await writeFile(taskPath, JSON.stringify(task))
-
-  const status = await f.core.status({ task_id: imported.task_id })
-  assert.equal(status.parallel_extraction.enabled, false)
-  assert.equal(status.worker_recovery.resumable, false)
-  assert.equal(status.subagent_recovery.roles.extractor.work_remaining, false)
-  assert.equal(status.subagent_recovery.roles.extractor.desired_live_invocations, 0)
-  assert.equal(status.next_action, null)
-  assert.equal(status.completion_gate.automatic_continuation_required, false)
-  assert.equal(status.completion_gate.finalize_ready, false)
-  await assert.rejects(
-    () => f.core.finalize({ task_id: imported.task_id }),
-    (error) => error instanceof LlmWikiError
-      && error.code === "FINALIZE_CATCHUP_REQUIRED"
-      && error.details.next_action === null
-      && error.details.completion_gate.automatic_continuation_required === false,
-  )
-})
-
-test("one background slot is shared by extraction and projection roles", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  const files = []
-  for (let index = 0; index < 8; index += 1) {
-    const file = path.join(f.incoming, `single-slot-${index}.md`)
-    await writeFile(file, `# Business Entity ${index}\n\n${"Business Entity is the canonical business object. ".repeat(18)}`)
-    files.push({ path: file })
-  }
-  const imported = await f.core.importFiles({
-    files,
-    options: { max_batch_chars: 1_000, host_capabilities: { max_total_agents: 2, coordinator_slots: 1 } },
-  })
-  for (let index = 0; index < 4; index += 1) {
-    const batch = await f.core.getBatch({ task_id: imported.task_id, worker_id: `single-slot-worker-${index}` })
-    const evidence = batch.evidence_catalog.find((entry) => entry.quote.includes("Business Entity"))
-    await f.core.commitAnalysis({
-      task_id: imported.task_id,
-      batch_id: batch.batch_id,
-      worker_id: batch.worker_id,
-      lease_token: batch.lease_token,
-      idempotency_key: `single-slot-analysis-${index}`,
-      analysis: {
-        ...batch.analysis_scaffold,
-        entities: [{ localId: `single-slot-entity-${index}`, name: "Business Entity", confidence: 0.9, sourceRefs: [evidence.evidence_index] }],
-        batchSummary: "Defines Business Entity.",
-      },
-    })
-  }
-  const manifest = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "single-slot-writer", view: "manifest" })
-  assert.equal(manifest.draft_manifest.pending_shard_count > 0, true)
-  const status = await f.core.status({ task_id: imported.task_id })
-  const roles = status.subagent_recovery.roles
-  const desired = roles.extractor.desired_live_invocations
-    + roles.drafter.desired_live_invocations
-    + roles.writer.desired_live_invocations
-  assert.equal(status.pipeline_concurrency.max_background_agents_total, 1)
-  assert.equal(roles.extractor.desired_live_invocations, 0)
-  assert.equal(roles.drafter.desired_live_invocations, 1)
-  assert.equal(desired, 1)
 })
 
 test("parallel workers lease distinct batches and concurrent commits preserve every result", async (t) => {
@@ -982,10 +709,7 @@ test("parallel workers lease distinct batches and concurrent commits preserve ev
     await writeFile(file, `# Parallel ${index}\n\n${"Business Entity is the canonical business object. Context. ".repeat(60)}\n`)
     files.push({ path: file })
   }
-  const imported = await f.core.importFiles({
-    files,
-    options: { max_batch_chars: 1_000, host_capabilities: { max_total_agents: 5, coordinator_slots: 1 } },
-  })
+  const imported = await f.core.importFiles({ files, options: { max_batch_chars: 1_000 } })
   assert.equal(imported.batch_count > 1, true)
   assert.equal(imported.parallel_extraction.recommended_workers, Math.min(4, imported.batch_count))
   assert.equal(imported.parallel_extraction.worker_batch_quantum, Math.min(6, Math.ceil(imported.batch_count / imported.parallel_extraction.recommended_workers)))
@@ -1016,7 +740,6 @@ test("parallel workers lease distinct batches and concurrent commits preserve ev
       task_id: imported.task_id,
       batch_id: batch.batch_id,
       worker_id: batch.worker_id,
-      lease_token: batch.lease_token,
       idempotency_key: `parallel-analysis-${index}`,
       analysis: {
         schemaVersion: 1,
@@ -1034,8 +757,8 @@ test("parallel workers lease distinct batches and concurrent commits preserve ev
   assert.equal(status.completed_batches, workerCount)
   assert.equal(status.leased_batches, 0)
   assert.equal(status.leased_batches_semantics, "persisted-reservations-not-live-agents")
-  assert.equal(status.worker_recovery.resumable, false)
-  assert.equal(status.worker_recovery.strategy, "none")
+  assert.equal(status.worker_recovery.resumable, true)
+  assert.equal(status.worker_recovery.strategy, "restart-same-worker-id")
   assert.equal(status.worker_recovery.process_liveness_known, false)
   assert.equal(status.worker_recovery.leases_are_live_agents, false)
   assert.equal(status.status, "planning")
@@ -1059,9 +782,6 @@ test("large tasks use compact 9K batches, cached bounds, and longer worker quant
   const persisted = JSON.parse(await readFile(batchesPath, "utf8"))
   assert.equal(persisted.every((batch) => batch.charCount <= 9_000 && batch.payloadBytes <= 24 * 1024), true)
   assert.equal(persisted.flatMap((batch) => batch.chunks).every((chunk) => chunk.taskPayloadVersion === 3), true)
-  const tableChunks = persisted.flatMap((batch) => batch.chunks).filter((chunk) => chunk.blockKinds?.includes("table"))
-  assert.equal(tableChunks.length > 1, true)
-  assert.equal(tableChunks.every((chunk) => chunk.text.includes("| Customer | Account | Product |\n| --- | --- | --- |")), true)
   assert.equal(persisted.flatMap((batch) => batch.chunks).flatMap((chunk) => chunk.structuredData ?? [])
     .every((table) => table.compacted === true && table.markdown === undefined && table.rows === undefined), true)
 
@@ -1090,27 +810,6 @@ test("a worker invocation can resume its leased batch by stable worker ID after 
   const imported = await f.core.importFiles({ files: [{ path: f.source }] })
   const leased = await f.core.getBatch({ task_id: imported.task_id, worker_id: "extractor-resume-1" })
   const status = await f.core.status({ task_id: imported.task_id })
-  assert.equal(status.subagent_recovery.process_liveness_known, false)
-  assert.equal(status.subagent_recovery.reconcile_before_waiting, true)
-  assert.deepEqual(status.subagent_recovery.coordinator_live_sets, [
-    "running_worker_ids",
-    "running_draft_shard_ids",
-    "running_writer_projection_ids",
-  ])
-  assert.equal(status.subagent_recovery.roles.extractor.work_remaining, true)
-  assert.equal(status.subagent_recovery.roles.extractor.desired_live_invocations, 1)
-  assert.equal(status.subagent_recovery.roles.extractor.persisted_reservations, 1)
-  assert.equal(status.subagent_recovery.roles.extractor.reservations_are_live_invocations, false)
-  assert.deepEqual(status.subagent_recovery.roles.extractor.resume_actions, [{
-    tool: "llm_wiki_get_batch",
-    action_owner: "extractor",
-    delegate_to: "llm-wiki-extractor",
-    arguments: {
-      task_id: imported.task_id,
-      worker_id: "extractor-resume-1",
-      batch_id: leased.batch_id,
-    },
-  }])
   assert.equal(status.worker_recovery.leases_are_live_agents, false)
   assert.deepEqual(status.worker_recovery.leases.map(({ worker_id, batch_id }) => ({ worker_id, batch_id })), [{
     worker_id: "extractor-resume-1",
@@ -1155,7 +854,6 @@ test("a smaller get_batch request never repartitions another worker's live lease
     task_id: imported.task_id,
     batch_id: first.batch_id,
     worker_id: "extractor-live-1",
-    lease_token: first.lease_token,
     idempotency_key: "lease-stability-commit-v1",
     analysis: {
       ...first.analysis_scaffold,
@@ -1168,7 +866,6 @@ test("a smaller get_batch request never repartitions another worker's live lease
     task_id: imported.task_id,
     batch_id: first.batch_id,
     worker_id: "extractor-live-1",
-    lease_token: first.lease_token,
     idempotency_key: "lease-stability-commit-v1",
     analysis: {
       ...first.analysis_scaffold,
@@ -1182,210 +879,11 @@ test("a smaller get_batch request never repartitions another worker's live lease
       task_id: imported.task_id,
       batch_id: first.batch_id,
       worker_id: "extractor-live-1",
-      lease_token: first.lease_token,
       idempotency_key: "lease-stability-commit-v1",
       analysis: { ...first.analysis_scaffold, batchSummary: "Changed request." },
     }),
     (error) => error instanceof LlmWikiError && error.code === "IDEMPOTENCY_CONFLICT",
   )
-})
-
-test("one completed batch can start source-language-preserving Projection while Extractors remain", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  const files = []
-  for (let index = 0; index < 4; index += 1) {
-    const file = path.join(f.incoming, `overlap-${index}.md`)
-    await writeFile(file, `# 并行抽取 ${index}\n\n业务实体是标准业务对象。${"中文语境。".repeat(130)}\n`)
-    files.push({ path: file })
-  }
-  const imported = await f.core.importFiles({
-    files,
-    options: {
-      max_batch_chars: 1_000,
-      target_language: "en-US",
-      host_capabilities: { max_total_agents: 4, coordinator_slots: 1 },
-    },
-  })
-  assert.equal(imported.batch_count, 4)
-  const batch = await f.core.getBatch({ task_id: imported.task_id, worker_id: "overlap-extractor-a" })
-  assert.equal(batch.workspace_context.target_language, "en-US")
-  assert.equal(batch.workspace_context.content_language_policy.mode, "preserve-source-language-per-page")
-  assert.equal(batch.workspace_context.content_language_policy.translate_source_authored_knowledge, false)
-  assert.match(batch.analysis_preflight.source_language, /Do not translate source-authored knowledge/)
-  const evidence = batch.evidence_catalog.find((item) => item.quote.includes("业务实体是标准业务对象")) ?? batch.evidence_catalog[0]
-  await f.core.commitAnalysis({
-    task_id: imported.task_id,
-    batch_id: batch.batch_id,
-    worker_id: batch.worker_id,
-    lease_token: batch.lease_token,
-    idempotency_key: "overlap-source-language-analysis-v1",
-    analysis: {
-      ...batch.analysis_scaffold,
-      entities: [{ localId: "entity-business-zh", name: "业务实体", content: "业务实体是标准业务对象。", sourceRefs: [evidence.evidence_index] }],
-      batchSummary: "该批次定义了业务实体。",
-    },
-  })
-
-  const early = await f.core.getPagePlanContext({
-    task_id: imported.task_id,
-    writer_id: "overlap-writer",
-    view: "manifest",
-  })
-  assert.equal(early.waiting, true)
-  assert.equal(early.waiting_reason, "projection_not_ready")
-  assert.equal(early.wait_for_all_extractors, false)
-  assert.equal(early.projection_can_overlap_extraction, true)
-  assert.equal(early.coordinator_action_required, false)
-
-  const taskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
-  const persistedTask = JSON.parse(await readFile(taskPath, "utf8"))
-  persistedTask.batchCompletedAt[persistedTask.completedBatchIds[0]] = new Date(Date.now() - 31_000).toISOString()
-  await writeFile(taskPath, JSON.stringify(persistedTask))
-
-  const ready = await f.core.status({ task_id: imported.task_id })
-  assert.equal(ready.status, "extracting")
-  assert.equal(ready.completed_batches, 1)
-  assert.equal(ready.total_batches, 4)
-  assert.equal(ready.wiki_projection.ready, true)
-  assert.equal(ready.next_action.tool, "llm_wiki_get_page_plan_context")
-  assert.deepEqual(ready.pipeline_concurrency, {
-    max_background_agents_total: 3,
-    recommended_extractors: 2,
-    max_drafters: 1,
-    recommended_projection_agents: 1,
-    recommended_drafters: 1,
-    recommended_writers: 0,
-  })
-
-  const manifest = await f.core.getPagePlanContext({
-    task_id: imported.task_id,
-    writer_id: "overlap-writer",
-    view: "manifest",
-  })
-  assert.equal(manifest.waiting, undefined)
-  assert.equal(manifest.projection.mode, "incremental")
-  assert.deepEqual(manifest.projection.batch_ids, [batch.batch_id])
-  assert.equal(manifest.content_language_policy.mode, "preserve-source-language-per-page")
-  assert.equal(manifest.content_language_policy.fallback_target_language, "en-US")
-  assert.match(manifest.page_patch_scaffold_contract.instruction, /original language/)
-
-  const competing = await f.core.getPagePlanContext({
-    task_id: imported.task_id,
-    writer_id: "other-writer",
-    view: "manifest",
-  })
-  assert.equal(competing.waiting, true)
-  assert.equal(competing.waiting_reason, "projection_lease_held")
-  assert.equal(competing.wait_for_all_extractors, false)
-  assert.equal(competing.automatic_recovery_required, true)
-  assert.equal(competing.next_action.arguments.projection_id, manifest.projection.projection_id)
-
-  const overlapping = await f.core.status({ task_id: imported.task_id })
-  assert.equal(overlapping.subagent_recovery.roles.extractor.desired_live_invocations, 2)
-  assert.equal(overlapping.subagent_recovery.roles.drafter.desired_live_invocations, 1)
-  assert.equal(overlapping.subagent_recovery.wait_policy.includes("launch or relaunch the missing role immediately"), true)
-  const shard = await f.core.getPagePlanContext(manifest.draft_manifest.draft_actions[0].arguments)
-  assert.equal(shard.content_language_policy.translate_source_authored_knowledge, false)
-  assert.match(shard.writer_guidance.instruction, /original language/)
-})
-
-test("overlap scheduling scales to multiple Drafters when host capacity and shard demand allow it", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  const statements = Array.from({ length: 13 }, (_, index) => `Entity ${index + 1} is a supported business object.`)
-  const files = []
-  for (let index = 0; index < 8; index += 1) {
-    const file = path.join(f.incoming, `scaled-overlap-${index}.md`)
-    const content = index === 0
-      ? `# Scaled overlap\n\n${statements.join("\n")}\n${"Context. ".repeat(30)}`
-      : `# Remaining extraction ${index}\n\n${"Pending extraction context. ".repeat(30)}`
-    await writeFile(file, content)
-    files.push({ path: file })
-  }
-  const imported = await f.core.importFiles({
-    files,
-    options: {
-      max_batch_chars: 1_000,
-      host_capabilities: { max_total_agents: 7, coordinator_slots: 1 },
-    },
-  })
-  assert.equal(imported.batch_count, 8)
-  assert.equal(imported.wiki_projection.parallel_page_drafting.extraction_workers_during_drafting, 3)
-  assert.equal(imported.wiki_projection.parallel_page_drafting.recommended_drafters_when_extraction_overlaps, 3)
-
-  const batch = await f.core.getBatch({ task_id: imported.task_id, worker_id: "scaled-overlap-extractor" })
-  const evidenceByStatement = statements.map((statement) => batch.evidence_catalog.find((entry) => entry.quote.includes(statement)))
-  assert.equal(evidenceByStatement.every(Boolean), true)
-  await f.core.commitAnalysis({
-    task_id: imported.task_id,
-    batch_id: batch.batch_id,
-    worker_id: batch.worker_id,
-    lease_token: batch.lease_token,
-    idempotency_key: "scaled-overlap-analysis-v1",
-    analysis: {
-      ...batch.analysis_scaffold,
-      entities: statements.map((content, index) => ({
-        localId: `scaled-entity-${index + 1}`,
-        name: `Entity ${index + 1}`,
-        content,
-        sourceRefs: [evidenceByStatement[index].evidence_index],
-      })),
-      batchSummary: "Thirteen supported business entities.",
-    },
-  })
-  const taskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
-  const persistedTask = JSON.parse(await readFile(taskPath, "utf8"))
-  persistedTask.batchCompletedAt[persistedTask.completedBatchIds[0]] = new Date(Date.now() - 31_000).toISOString()
-  await writeFile(taskPath, JSON.stringify(persistedTask))
-
-  const ready = await f.core.status({ task_id: imported.task_id })
-  assert.deepEqual(ready.pipeline_concurrency, {
-    max_background_agents_total: 6,
-    recommended_extractors: 3,
-    max_drafters: 3,
-    recommended_projection_agents: 3,
-    recommended_drafters: 3,
-    recommended_writers: 0,
-  })
-  const manifest = await f.core.getPagePlanContext({
-    task_id: imported.task_id,
-    writer_id: "scaled-overlap-writer",
-    view: "manifest",
-  })
-  assert.equal(manifest.draft_manifest.returned_shard_count, 3)
-  assert.equal(manifest.parallel_drafting.concurrent_extractors, 3)
-  assert.equal(manifest.parallel_drafting.recommended_drafters, 3)
-  const overlapping = await f.core.status({ task_id: imported.task_id })
-  assert.equal(overlapping.subagent_recovery.roles.extractor.desired_live_invocations, 3)
-  assert.equal(overlapping.subagent_recovery.roles.drafter.desired_live_invocations, 3)
-  const firstShardAction = manifest.draft_manifest.draft_actions[0].arguments
-  const firstShard = await f.core.getPagePlanContext(firstShardAction)
-  assert.equal(firstShard.draft_shard_complete, true)
-  await f.core.stagePageDrafts({
-    task_id: imported.task_id,
-    writer_id: firstShardAction.writer_id,
-    projection_id: firstShardAction.projection_id,
-    shard_id: firstShardAction.shard_id,
-    draft_claim_token: firstShardAction.draft_claim_token,
-    idempotency_key: "scaled-overlap-first-shard-v1",
-    patches: firstShard.page_requirements.map((requirement) => ({
-      ...requirement.patch_scaffold,
-      content: `# ${requirement.title}\n\n${requirement.title} is supported by the source.`,
-    })),
-  })
-  const writerWave = await f.core.status({ task_id: imported.task_id })
-  assert.deepEqual(writerWave.pipeline_concurrency, {
-    max_background_agents_total: 6,
-    recommended_extractors: 5,
-    max_drafters: 3,
-    recommended_projection_agents: 1,
-    recommended_drafters: 0,
-    recommended_writers: 1,
-  })
-  assert.equal(writerWave.subagent_recovery.roles.extractor.desired_live_invocations, 5)
-  assert.equal(writerWave.subagent_recovery.roles.drafter.desired_live_invocations, 0)
-  assert.equal(writerWave.subagent_recovery.roles.writer.desired_live_invocations, 1)
 })
 
 test("micro-batch Wiki projection uses one writer, hides provisional pages, and falls back after a failed final audit", async (t) => {
@@ -1407,14 +905,13 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
     fallback_mode: "serial-writer-only",
     writer_launch_policy: "after-staged-drafter-receipt",
     writer_normal_mode: "staged-receipt-commit-only",
-    max_drafters: 3,
+    max_drafters: 4,
     max_paths_per_shard: 6,
     minimum_paths: 4,
-    pipeline_background_budget: 3,
-    max_background_agents_total: 3,
+    pipeline_background_budget: 4,
+    max_background_agents_total: 4,
     extraction_workers_during_drafting: 2,
-    max_drafters_when_extraction_overlaps: 1,
-    recommended_drafters_when_extraction_overlaps: 1,
+    max_drafters_when_extraction_overlaps: 2,
     partition_key: "patch_scaffold.path",
     drafter_handoff: "server-side-temporary-draft-receipt",
     stage_tool: "llm_wiki_stage_page_drafts",
@@ -1436,7 +933,6 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
       task_id: imported.task_id,
       batch_id: batch.batch_id,
       worker_id: batch.worker_id,
-      lease_token: batch.lease_token,
       idempotency_key: `projection-analysis-${index}`,
       analysis: {
         schemaVersion: 1,
@@ -1472,12 +968,10 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(ready.next_action.tool, "llm_wiki_get_page_plan_context")
   assert.equal(ready.next_action.arguments.writer_id, "wiki-writer-1")
   assert.deepEqual(ready.pipeline_concurrency, {
-    max_background_agents_total: 3,
+    max_background_agents_total: 4,
     recommended_extractors: 2,
-    max_drafters: 1,
-    recommended_projection_agents: 1,
-    recommended_drafters: 1,
-    recommended_writers: 0,
+    max_drafters: 2,
+    recommended_drafters: 2,
   })
   assert.equal(ready.parallel_extraction.recommended_workers, 2)
   assert.equal(ready.parallel_extraction.restart_on_worker_completion, true)
@@ -1500,9 +994,6 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(incrementalPlan.commit_ready, true)
   const competingWriter = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-2" })
   assert.equal(competingWriter.waiting, true)
-  assert.equal(competingWriter.waiting_reason, "projection_lease_held")
-  assert.equal(competingWriter.wait_for_all_extractors, false)
-  assert.equal(competingWriter.automatic_recovery_required, true)
   assert.equal(competingWriter.projection.writer_busy, true)
   const leasedStatus = await f.core.status({ task_id: imported.task_id })
   assert.equal(leasedStatus.wiki_projection.page_plan_complete, true)
@@ -1511,7 +1002,7 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
     tool: "llm_wiki_commit_pages",
     action_owner: "writer",
     delegate_to: "llm-wiki-writer",
-    execution_mode: "bounded-plan-commit",
+    execution_mode: "legacy-plan-compatibility",
     arguments: {
       task_id: imported.task_id,
       writer_id: "wiki-writer-1",
@@ -1615,20 +1106,9 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(catchupReady.status, "planning")
   assert.equal(catchupReady.wiki_projection.ready, true)
   assert.equal(catchupReady.wiki_projection.mode, "incremental")
-  assert.equal(catchupReady.completion_gate.task_complete, false)
-  assert.equal(catchupReady.completion_gate.may_report_completion, false)
-  assert.equal(catchupReady.completion_gate.user_confirmation_required, false)
-  assert.equal(catchupReady.completion_gate.automatic_continuation_required, true)
-  assert.equal(catchupReady.completion_gate.finalize_ready, false)
-  assert.equal(catchupReady.completion_gate.outstanding.unprojected_batches, 2)
-  assert.equal(catchupReady.completion_gate.next_action.tool, "llm_wiki_get_page_plan_context")
   await assert.rejects(
     () => f.core.finalize({ task_id: imported.task_id }),
-    (error) => error instanceof LlmWikiError
-      && error.code === "FINALIZE_CATCHUP_REQUIRED"
-      && error.details.unprojected_batch_count === 2
-      && error.details.next_action.tool === "llm_wiki_get_page_plan_context"
-      && error.details.completion_gate.user_confirmation_required === false,
+    (error) => error instanceof LlmWikiError && error.code === "FINAL_PROJECTION_REQUIRED",
   )
 
   const catchupPlan = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 100_000 })
@@ -1646,16 +1126,12 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.equal(caughtUp.wiki_projection.mode, "final")
   assert.equal(caughtUp.wiki_projection.ready, true)
   assert.equal(caughtUp.next_action.tool, "llm_wiki_finalize")
-  assert.equal(caughtUp.completion_gate.finalize_ready, true)
-  assert.equal(caughtUp.completion_gate.automatic_continuation_required, true)
   await assert.rejects(
     () => f.core.finalize({ task_id: imported.task_id }),
     (error) => error instanceof LlmWikiError
       && error.code === "FINAL_PROJECTION_REQUIRED"
       && error.details.fast_finalization_audit.issues.some((issue) => issue.code === "MISSING_REQUIREMENT_SOURCE_REFS")
-      && error.details.next_action.tool === "llm_wiki_get_page_plan_context"
-      && error.details.completion_gate.automatic_continuation_required === true
-      && error.details.completion_gate.user_confirmation_required === false,
+      && error.details.next_action.tool === "llm_wiki_get_page_plan_context",
   )
   const fallbackStatus = await f.core.status({ task_id: imported.task_id })
   assert.equal(fallbackStatus.wiki_projection.finalize_first, false)
@@ -1677,20 +1153,12 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
       existing.sourceRefs = [...new Set([...existing.sourceRefs, requirement.requirement_id])]
       continue
     }
-    const semanticContent = `A reconciled cross-batch summary for ${requirement.title}.`
-    finalPatchesByPath.set(requirement.patch_scaffold.path, requirement.patch_scaffold.operation === "merge"
-      ? {
-          ...requirement.patch_scaffold,
-          sectionChanges: [{ operation: "upsert_section", heading: "Overview", level: 2, content: semanticContent }],
-          summary: semanticContent,
-          tags: [requirement.page_kind],
-        }
-      : {
-          ...requirement.patch_scaffold,
-          content: `# ${requirement.title}\n\n## Overview\n\n${semanticContent}\n`,
-          summary: semanticContent,
-          tags: [requirement.page_kind],
-        })
+    finalPatchesByPath.set(requirement.patch_scaffold.path, {
+      ...requirement.patch_scaffold,
+      content: `# ${requirement.title}\n\n## Overview\n\nA reconciled cross-batch summary for ${requirement.title}.\n`,
+      summary: `A reconciled cross-batch summary for ${requirement.title}.`,
+      tags: [requirement.page_kind],
+    })
   }
   const finalPatches = [...finalPatchesByPath.values()]
   const stable = await f.core.commitPages({
@@ -1705,22 +1173,16 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   assert.deepEqual(stable.provisional_pages, [])
   assert.equal(stable.wiki_projection.final_completed, true)
   const finalized = await f.core.finalize({ task_id: imported.task_id })
-  assert.equal(finalized.created_pages.includes("wiki/topics/projected-entity.md"), true)
-  assert.equal(finalized.created_pages.includes("wiki/index.md"), true)
+  assert.deepEqual(finalized.created_pages, ["wiki/topics/projected-entity.md"])
   assert.deepEqual(finalized.updated_pages, [])
-  const completedStatus = await f.core.status({ task_id: imported.task_id })
-  assert.equal(completedStatus.completion_gate.task_complete, true)
-  assert.equal(completedStatus.completion_gate.may_report_completion, true)
-  assert.equal(completedStatus.completion_gate.automatic_continuation_required, false)
-  // A final drafter receives bounded context, so a truncated existing page
-  // gets section-upsert merge and cannot delete unseen provisional material.
+  // replace is a complete final-body rewrite. Provisional-only content must
+  // be intentionally reintroduced by the final Writer if it remains valid.
   const completed = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["reconciled cross-batch summary"] })
   assert.equal(completed.retrieval_phase, "knowledge-base-complete")
-  assert.deepEqual(completed.available_channels, ["bm25", "wiki"])
-  assert.deepEqual(completed.fallback_channels, ["feature_hash"])
+  assert.deepEqual(completed.available_channels, ["bm25", "embedding", "wiki"])
   assert.equal(completed.hits.some((hit) => hit.path === "wiki/topics/projected-entity.md"), true)
   const provisionalAfterReplace = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["ProvisionalOnlyMarker"] })
-  assert.equal(provisionalAfterReplace.hits.some((hit) => hit.path === "wiki/topics/projected-entity.md"), true)
+  assert.equal(provisionalAfterReplace.hits.some((hit) => hit.path === "wiki/topics/projected-entity.md"), false)
 
   // Simulate a process exit after the generation pointer was durable but
   // before task/result completion. A fresh Core instance must repair only the
@@ -1819,7 +1281,6 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
       task_id: imported.task_id,
       batch_id: batch.batch_id,
       worker_id: batch.worker_id,
-      lease_token: batch.lease_token,
       analysis,
       idempotency_key: `writer-backlog-analysis-${index}`,
     })
@@ -1845,15 +1306,7 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
   }
   await writeFile(taskPath, JSON.stringify(persisted))
 
-  const unfencedJoin = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 40_000 })
-  assert.equal(unfencedJoin.waiting, true)
-  assert.equal(unfencedJoin.projection.writer_busy, true)
-  const first = await f.core.getPagePlanContext({
-    task_id: imported.task_id,
-    writer_id: "wiki-writer-1",
-    projection_id: "projection-legacy-writer-backlog",
-    max_chars: 40_000,
-  })
+  const first = await f.core.getPagePlanContext({ task_id: imported.task_id, writer_id: "wiki-writer-1", max_chars: 40_000 })
   assert.equal(first.projection.mode, "incremental")
   assert.equal(first.projection.batch_ids.length, 8)
   assert.equal(first.projection.safely_repartitioned, true)
@@ -1914,7 +1367,7 @@ test("Wiki writer drains a backlog in bounded projections without resending unre
   assert.equal(second.existing_page_catalog.some((page) => page.path === "wiki/concepts/unrelated-large.md"), true)
 })
 
-test("current manifest projection reaches semantic reconciliation and final commits remain idempotent", async (t) => {
+test("compatibility projection redirects to the semantic Writer and final commits remain idempotent", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
   const imported = await f.core.importFiles({ files: [{ path: f.source }] })
@@ -1937,7 +1390,6 @@ test("current manifest projection reaches semantic reconciliation and final comm
     task_id: imported.task_id,
     batch_id: batch.batch_id,
     worker_id: batch.worker_id,
-    lease_token: batch.lease_token,
     idempotency_key: "fast-projection-analysis-v1",
     analysis: {
       schemaVersion: 1,
@@ -1964,20 +1416,22 @@ test("current manifest projection reaches semantic reconciliation and final comm
 
   const before = await f.core.status({ task_id: imported.task_id })
   assert.equal(before.next_action.tool, "llm_wiki_get_page_plan_context")
-  const projectedManifest = await f.core.getPagePlanContext({
+  const projectedManifest = await f.core.applyWikiProjection({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
-    view: "manifest",
+    max_projections: 6,
   })
   const projected = await f.core.getPagePlanContext({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
     projection_id: projectedManifest.projection.projection_id,
+    view: "plan",
     cursor: 0,
     max_chars: 200_000,
   })
-  assert.equal(projectedManifest.view, "manifest")
-  assert.equal(projectedManifest.page_plan_complete, true)
+  assert.equal(projectedManifest.accepted, true)
+  assert.equal(projectedManifest.automated, false)
+  assert.equal(projectedManifest.writer_mode, "legacy-semantic")
   assert.equal(projectedManifest.parallel_drafting.partition_key, "page_requirement.patch_scaffold.path")
   assert.equal(projectedManifest.parallel_drafting.same_path_requirements_are_indivisible, true)
   assert.equal(projectedManifest.parallel_drafting.execution_mode, "coordinator-owned-parallel-drafters")
@@ -2030,7 +1484,7 @@ test("current manifest projection reaches semantic reconciliation and final comm
     writer_id: "wiki-writer-1",
     projection_id: projected.projection.projection_id,
     based_on_wiki_revision: projected.based_on_wiki_revision,
-    idempotency_key: "manifest-semantic-projection-v1",
+    idempotency_key: "legacy-semantic-projection-v1",
     patches: incrementalPatches,
   })
   assert.equal(incremental.wiki_projection.final_completed, false)
@@ -2041,7 +1495,7 @@ test("current manifest projection reaches semantic reconciliation and final comm
     writer_id: "wiki-writer-1",
     projection_id: finalPlan.projection.projection_id,
     based_on_wiki_revision: finalPlan.based_on_wiki_revision,
-    idempotency_key: "manifest-semantic-final-v1",
+    idempotency_key: "legacy-semantic-final-v1",
     patches: finalPlan.page_requirements.map((requirement) => ({
       ...requirement.patch_scaffold,
       content: `# ${requirement.title}\n\n## Overview\n\nSemantically reconciled page for ${requirement.title}.\n`,
@@ -2064,7 +1518,7 @@ test("current manifest projection reaches semantic reconciliation and final comm
   assert.match(aggregatePage, /business-entity/)
 })
 
-test("current manifest Writer keeps projections bounded to the batch window", async (t) => {
+test("legacy semantic Writer keeps projections bounded to the original batch window", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
   const files = []
@@ -2084,7 +1538,6 @@ test("current manifest Writer keeps projections bounded to the batch window", as
       task_id: imported.task_id,
       batch_id: batch.batch_id,
       worker_id: batch.worker_id,
-      lease_token: batch.lease_token,
       idempotency_key: `fast-backlog-analysis-${batch.batch_id}`,
       analysis: {
         schemaVersion: 1,
@@ -2101,15 +1554,16 @@ test("current manifest Writer keeps projections bounded to the batch window", as
   }
   assert.equal(analyzed > 8, true)
 
-  const projected = await f.core.getPagePlanContext({
+  const projected = await f.core.applyWikiProjection({
     task_id: imported.task_id,
     writer_id: "wiki-writer-1",
-    view: "manifest",
+    max_projections: 1,
   })
-  assert.equal(projected.view, "manifest")
+  assert.equal(projected.automated, false)
+  assert.equal(projected.writer_mode, "legacy-semantic")
   assert.equal(projected.projection.mode, "incremental")
   assert.equal(projected.projection.batch_ids.length <= 8, true)
-  assert.equal(projected.draft_manifest.page_count > 0, true)
+  assert.equal(projected.pagination.returned_items > 0, true)
 })
 
 test("knowledge-base deletion requires confirmation, blocks active tasks, and preserves configuration by scope", async (t) => {
@@ -2304,13 +1758,6 @@ test("blocked projection commits discard stale pending manifests before retry", 
   })
 
   const manifest = await f.core.getPagePlanContext({ task_id: waiter.task_id, writer_id: "wiki-writer-1", view: "manifest" })
-  const blockedStatus = await f.core.status({ task_id: waiter.task_id })
-  assert.equal(blockedStatus.wiki_publication.state, "waiting")
-  assert.equal(blockedStatus.next_action.tool, "llm_wiki_status")
-  assert.equal(blockedStatus.next_action.arguments.task_id, owner.task_id)
-  assert.equal(blockedStatus.subagent_recovery.blocked_by_publication, true)
-  assert.equal(blockedStatus.subagent_recovery.roles.drafter.desired_live_invocations, 0)
-  assert.equal(blockedStatus.subagent_recovery.roles.writer.desired_live_invocations, 0)
   const shardAction = manifest.draft_manifest.draft_actions[0].arguments
   let shard = await f.core.getPagePlanContext(shardAction)
   const requirements = [...shard.page_requirements]
@@ -2369,9 +1816,6 @@ test("duplicate content is reused and task recovery and abort stay workspace-sco
   assert.equal(second.duplicates[0].duplicate_of, first.sources[0].source_id)
   assert.equal(second.reused_task, true)
   assert.equal(second.task_id, first.task_id)
-  assert.equal(second.completion_gate.task_complete, false)
-  assert.equal(second.completion_gate.automatic_continuation_required, true)
-  assert.equal(second.subagent_recovery.roles.extractor.desired_live_invocations, 1)
   const listed = await f.core.listTasks({ status: ["prepared"] })
   assert.equal(listed.tasks.length, 1)
   await assert.rejects(
@@ -2382,16 +1826,7 @@ test("duplicate content is reused and task recovery and abort stay workspace-sco
   )
   const aborted = await f.core.abort({ task_id: first.task_id, reason: "test cancellation" })
   assert.equal(aborted.status, "cancelled")
-  const cancelledStatus = await f.core.status({ task_id: first.task_id })
-  assert.equal(cancelledStatus.status, "cancelled")
-  assert.equal(cancelledStatus.completion_gate.task_complete, false)
-  assert.equal(cancelledStatus.completion_gate.task_terminal, true)
-  assert.equal(cancelledStatus.completion_gate.automatic_continuation_required, false)
-  assert.equal(cancelledStatus.completion_gate.partial_progress_is_terminal, true)
-  assert.equal(cancelledStatus.parallel_extraction.enabled, false)
-  assert.equal(cancelledStatus.subagent_recovery.roles.extractor.desired_live_invocations, 0)
-  assert.equal(cancelledStatus.subagent_recovery.roles.drafter.desired_live_invocations, 0)
-  assert.equal(cancelledStatus.subagent_recovery.roles.writer.desired_live_invocations, 0)
+  assert.equal((await f.core.status({ task_id: first.task_id })).status, "cancelled")
   const forced = await f.core.importFiles({ files: [{ path: duplicatePath }], options: { force_reanalyze: true } })
   assert.equal(forced.reused_task, false)
   assert.notEqual(forced.task_id, first.task_id)
@@ -2537,14 +1972,19 @@ test("server-side page manifests keep 50-plus-page projections in durable bounde
   assert.equal(manifest.page_commit_limits.max_patches_per_call, 50)
   assert.equal(manifest.draft_manifest.page_count, 52)
   assert.equal(manifest.draft_manifest.shard_count, 9)
-  assert.equal(manifest.draft_manifest.returned_shard_count, 3)
+  assert.equal(manifest.draft_manifest.returned_shard_count, 4)
   assert.equal(manifest.draft_manifest.complete_manifest_persisted_server_side, true)
   assert.equal(manifest.draft_manifest.shards.every((shard) => shard.page_count <= 6), true)
   assert.equal(manifest.page_requirements, undefined)
   await assert.rejects(
     () => f.core.getPagePlanContext({
-      ...manifest.draft_manifest.draft_actions[0].arguments,
+      task_id: imported.task_id,
+      writer_id: "wiki-writer-1",
+      projection_id: manifest.projection.projection_id,
+      view: "draft-shard",
+      shard_id: "draft-0001",
       cursor: 1,
+      max_chars: 40_000,
     }),
     (error) => error instanceof LlmWikiError
       && error.code === "PAGE_PLAN_CURSOR_MISMATCH"
@@ -2586,10 +2026,6 @@ test("server-side page manifests keep 50-plus-page projections in durable bounde
   const visitedShards = []
   while (action.tool === "llm_wiki_get_page_plan_context") {
     const shard = await f.core.getPagePlanContext(action.arguments)
-    if (shard.view === "manifest") {
-      action = shard.next_action
-      continue
-    }
     assert.equal(shard.view, "draft-shard")
     assert.equal(shard.draft_shard_complete, true)
     assert.equal(shard.page_requirements.length <= 6, true)
@@ -2678,29 +2114,9 @@ test("page drafters stage receipt-only shards and the Writer commits them server
     cursor: 0,
     max_chars: 40_000,
   })
-  let action = manifest.draft_manifest.draft_actions[0]
+  const action = manifest.draft_manifest.draft_actions[0]
   assert.equal(action.action_owner, "coordinator")
   assert.equal(action.delegate_to, "llm-wiki-page-drafter")
-  assert.equal(typeof action.arguments.draft_claim_token, "string")
-  const expiredClaimToken = action.arguments.draft_claim_token
-  const claimTaskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
-  const claimTask = JSON.parse(await readFile(claimTaskPath, "utf8"))
-  claimTask.pageProjection.lease.draftShardClaims[action.arguments.shard_id].expiresAt = new Date(0).toISOString()
-  await writeFile(claimTaskPath, JSON.stringify(claimTask))
-  await assert.rejects(
-    () => f.core.getPagePlanContext(action.arguments),
-    (error) => error instanceof LlmWikiError && error.code === "DRAFT_SHARD_CLAIM_FENCED",
-  )
-  const refreshedManifest = await f.core.getPagePlanContext({
-    task_id: imported.task_id,
-    writer_id: "wiki-writer-1",
-    projection_id: manifest.projection.projection_id,
-    view: "manifest",
-    cursor: 0,
-    max_chars: 40_000,
-  })
-  action = refreshedManifest.draft_manifest.draft_actions[0]
-  assert.notEqual(action.arguments.draft_claim_token, expiredClaimToken)
   const shard = await f.core.getPagePlanContext(action.arguments)
   assert.equal(shard.draft_shard_complete, true)
   assert.equal(shard.context_retrieval_complete, true)
@@ -2717,28 +2133,16 @@ test("page drafters stage receipt-only shards and the Writer commits them server
   const retrievedOnlyStatus = await f.core.status({ task_id: imported.task_id })
   assert.equal(retrievedOnlyStatus.wiki_projection.retrieved_not_staged_draft_shards, 1)
   assert.equal(retrievedOnlyStatus.wiki_projection.staged_uncommitted_draft_shards, 0)
-  assert.equal(retrievedOnlyStatus.wiki_projection.claimed_draft_shards, 1)
-  assert.equal(retrievedOnlyStatus.wiki_projection.draft_claims_are_live_drafters, false)
-  assert.equal(retrievedOnlyStatus.wiki_projection.in_progress_semantics, "persisted-projection-lease-not-live-agent")
-  assert.equal(retrievedOnlyStatus.wiki_projection.process_liveness_known, false)
-  assert.equal(retrievedOnlyStatus.wiki_projection.projection_lease_is_live_writer, false)
-  assert.equal(retrievedOnlyStatus.wiki_projection.pending_shards_are_live_drafters, false)
-  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.extractor.desired_live_invocations, 0)
-  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.work_remaining, true)
-  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.desired_live_invocations, 1)
-  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.retrieved_not_staged_shards, 1)
-  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.persisted_claims, 1)
-  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.claims_are_live_invocations, false)
-  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.pending_shards_are_live_invocations, false)
-  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.drafter.reconcile_action.arguments.view, "manifest")
-  assert.equal(retrievedOnlyStatus.subagent_recovery.roles.writer.desired_live_invocations, 0)
   const patches = shard.page_requirements.map((requirement) => ({
     ...requirement.patch_scaffold,
     content: `# ${requirement.title}\n\n## Summary\n\nA server-staged semantic draft.\n`,
     summary: "A server-staged semantic draft.",
   }))
   const staged = await f.core.stagePageDrafts({
-    ...shard.next_action.arguments,
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: manifest.projection.projection_id,
+    shard_id: shard.shard.shard_id,
     patches,
     idempotency_key: "stage-page-draft-v1",
   })
@@ -2758,17 +2162,11 @@ test("page drafters stage receipt-only shards and the Writer commits them server
   assert.deepEqual(recoveredStatus.projection_recovery.recovered_staged_draft_receipts, [shard.shard.shard_id])
   assert.equal(recoveredStatus.wiki_projection.retrieved_not_staged_draft_shards, 0)
   assert.equal(recoveredStatus.wiki_projection.staged_uncommitted_draft_shards, 1)
-  assert.equal(recoveredStatus.wiki_projection.claimed_draft_shards, 0)
   assert.deepEqual(recoveredStatus.wiki_projection.recoverable_staged_draft_receipts, [
     { shard_id: shard.shard.shard_id, draft_hash: staged.draft_hash },
   ])
   assert.equal(recoveredStatus.next_action.tool, "llm_wiki_get_staged_page_drafts")
   assert.equal(recoveredStatus.next_action.action_owner, "writer")
-  assert.equal(recoveredStatus.subagent_recovery.roles.drafter.desired_live_invocations, 0)
-  assert.equal(recoveredStatus.subagent_recovery.roles.writer.work_ready, true)
-  assert.equal(recoveredStatus.subagent_recovery.roles.writer.desired_live_invocations, 1)
-  assert.equal(recoveredStatus.subagent_recovery.roles.writer.projection_lease_is_live_invocation, false)
-  assert.deepEqual(recoveredStatus.subagent_recovery.roles.writer.resume_action, recoveredStatus.next_action)
   const stagedDraftDir = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "page-drafts")
   const stagedDraftPath = path.join(stagedDraftDir, (await readdir(stagedDraftDir))[0])
   const persistedDraft = JSON.parse(await readFile(stagedDraftPath, "utf8"))
@@ -2802,7 +2200,10 @@ test("page drafters stage receipt-only shards and the Writer commits them server
   const changedPatches = patches.map((patch) => ({ ...patch, content: `${patch.content}\nChanged after receipt.\n` }))
   await assert.rejects(
     () => f.core.stagePageDrafts({
-      ...shard.next_action.arguments,
+      task_id: imported.task_id,
+      writer_id: "wiki-writer-1",
+      projection_id: manifest.projection.projection_id,
+      shard_id: shard.shard.shard_id,
       patches: changedPatches,
       idempotency_key: "stage-page-draft-v2",
     }),
@@ -2825,8 +2226,8 @@ test("page drafters stage receipt-only shards and the Writer commits them server
     idempotency_key: "commit-staged-page-draft-v1",
   })
   assert.equal(committed.accepted, true)
-  assert.deepEqual(committed.committed_draft_receipts, [{ shard_id: shard.shard.shard_id, draft_hash: staged.draft_hash }])
-  assert.deepEqual(committed.committed_draft_receipts, [{ shard_id: shard.shard.shard_id, draft_hash: staged.draft_hash }])
+  assert.deepEqual(committed.committed_staged_draft_shard_ids, [shard.shard.shard_id])
+  assert.deepEqual(committed.committed_staged_draft_receipts, [{ shard_id: shard.shard.shard_id, draft_hash: staged.draft_hash }])
   assert.equal(committed.main_agent_payload, "receipt-only")
   assert.equal(committed.next_action.action_owner, committed.projection.pending_draft_shards > 0 ? "coordinator" : "writer")
   assert.equal(committed.writer_next_action, null)
@@ -2861,10 +2262,9 @@ test("status repairs a legacy empty-committed draft shard and resumes it", async
   assert.equal(recovered.wiki_projection.committed_draft_shards, 0)
   assert.equal(recovered.wiki_projection.next_draft_shard_id, shardId)
   assert.equal(recovered.next_action.tool, "llm_wiki_get_page_plan_context")
-  assert.equal(recovered.next_action.arguments.view, "manifest")
+  assert.equal(recovered.next_action.arguments.shard_id, shardId)
 
-  const recoveredManifest = await f.core.getPagePlanContext(recovered.next_action.arguments)
-  const shard = await f.core.getPagePlanContext(recoveredManifest.draft_manifest.draft_actions[0].arguments)
+  const shard = await f.core.getPagePlanContext(recovered.next_action.arguments)
   assert.equal(shard.draft_shard_complete, true)
   const patches = shard.page_requirements.map((requirement) => ({
     ...requirement.patch_scaffold,
@@ -2921,211 +2321,6 @@ test("draft-shard cursor replay preserves the original max_chars boundary", asyn
   assert.equal(reads["0"].max_chars, 1_000)
 })
 
-test("projection rewrites fully visible pages and section-upserts truncated pages without body duplication", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
-  await analyzeAll(f.core, imported)
-  const concepts = path.join(f.workspace, "wiki", "concepts")
-  await mkdir(concepts, { recursive: true })
-  await writeFile(path.join(concepts, "business-entity.md"), `# Business Entity
-
-## Details
-
-Old short-page fact.
-`)
-  await writeFile(path.join(concepts, "aggregate.md"), `# Aggregate
-
-## Legacy Details
-
-${"Preserved hidden aggregate fact. ".repeat(1_000)}
-
-## Recent Evidence
-
-Old visible tail fact.
-
-### Evidence Details
-
-Old visible nested detail.
-`)
-
-  const manifest = await f.core.getPagePlanContext({
-    task_id: imported.task_id,
-    writer_id: "dual-mode-writer",
-    view: "manifest",
-    cursor: 0,
-    max_chars: 40_000,
-  })
-  const action = manifest.draft_manifest.draft_actions[0].arguments
-  const requirements = []
-  const existingPages = []
-  let cursor = 0
-  let finalShard
-  do {
-    const shard = await f.core.getPagePlanContext({ ...action, cursor })
-    requirements.push(...shard.page_requirements)
-    existingPages.push(...shard.existing_pages)
-    cursor = shard.next_cursor
-    finalShard = shard
-  } while (cursor !== null)
-
-  const shortRequirement = requirements.find((item) => item.patch_scaffold.path === "wiki/concepts/business-entity.md")
-  const largeRequirement = requirements.find((item) => item.patch_scaffold.path === "wiki/concepts/aggregate.md")
-  assert.equal(shortRequirement.draft_mode, "complete-page-rewrite")
-  assert.equal(shortRequirement.patch_scaffold.operation, "replace")
-  assert.equal(largeRequirement.draft_mode, "section-upsert")
-  assert.equal(largeRequirement.patch_scaffold.operation, "merge")
-  assert.deepEqual(largeRequirement.patch_scaffold.sectionChanges, [])
-  const largeContext = existingPages.find((page) => page.path === "wiki/concepts/aggregate.md")
-  assert.equal(largeContext.content_truncated, true)
-  assert.equal(largeContext.editable_section_headings.includes("Recent Evidence"), true)
-  assert.equal(largeContext.protected_section_headings.includes("Legacy Details"), true)
-
-  const patches = requirements.map((requirement) => {
-    if (requirement.patch_scaffold.operation === "merge") {
-      return {
-        ...requirement.patch_scaffold,
-        sectionChanges: [{
-          operation: "upsert_section",
-          heading: "Recent Evidence",
-          level: 2,
-          content: "Reconciled visible tail fact.",
-        }],
-      }
-    }
-    return {
-      ...requirement.patch_scaffold,
-      content: `# ${requirement.title}\n\n## Details\n\nRewritten complete-page fact.\n`,
-    }
-  })
-  const unsafePatches = patches.map((patch) => patch.operation === "merge"
-    ? { ...patch, sectionChanges: [{ operation: "upsert_section", heading: "Legacy Details", level: 2, content: "Unsafe partial rewrite." }] }
-    : patch)
-  await assert.rejects(
-    () => f.core.stagePageDrafts({
-      ...finalShard.next_action.arguments,
-      patches: unsafePatches,
-      idempotency_key: "dual-mode-unsafe-stage-v1",
-    }),
-    (error) => error instanceof LlmWikiError && error.code === "PAGE_DRAFT_SECTION_NOT_FULLY_VISIBLE",
-  )
-  const overlappingPatches = patches.map((patch) => patch.operation === "merge"
-    ? {
-        ...patch,
-        sectionChanges: [
-          { operation: "upsert_section", heading: "Recent Evidence", level: 2, content: "Rewritten parent." },
-          { operation: "upsert_section", heading: "Evidence Details", level: 3, content: "Conflicting child rewrite." },
-        ],
-      }
-    : patch)
-  await assert.rejects(
-    () => f.core.stagePageDrafts({
-      ...finalShard.next_action.arguments,
-      patches: overlappingPatches,
-      idempotency_key: "dual-mode-overlapping-stage-v1",
-    }),
-    (error) => error instanceof LlmWikiError
-      && error.code === "INVALID_PAGE_PATCH"
-      && error.details.overlapping_sections[0].ancestor === "Recent Evidence",
-  )
-
-  const staged = await f.core.stagePageDrafts({
-    ...finalShard.next_action.arguments,
-    patches,
-    idempotency_key: "dual-mode-safe-stage-v1",
-  })
-  const ready = await f.core.getStagedPageDrafts(staged.next_action.arguments)
-  const committed = await f.core.commitPages({
-    ...ready.next_action.arguments,
-    idempotency_key: "dual-mode-safe-commit-v1",
-  })
-  assert.equal(committed.accepted, true)
-  const shortPage = await readFile(path.join(concepts, "business-entity.md"), "utf8")
-  const largePage = await readFile(path.join(concepts, "aggregate.md"), "utf8")
-  assert.doesNotMatch(shortPage, /Old short-page fact/)
-  assert.match(shortPage, /Rewritten complete-page fact/)
-  assert.match(largePage, /Preserved hidden aggregate fact/)
-  assert.doesNotMatch(largePage, /Old visible tail fact/)
-  assert.match(largePage, /Reconciled visible tail fact/)
-  assert.equal((largePage.match(/^# Aggregate$/gm) ?? []).length, 1)
-  assert.equal((largePage.match(/^## Recent Evidence$/gm) ?? []).length, 1)
-})
-
-test("legacy staged merge bodies invalidate the pending plan and recover through a fresh manifest", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
-  await analyzeAll(f.core, imported)
-  const concepts = path.join(f.workspace, "wiki", "concepts")
-  await mkdir(concepts, { recursive: true })
-  await writeFile(path.join(concepts, "aggregate.md"), `# Aggregate\n\n## Existing\n\n${"Legacy grounded content. ".repeat(1_500)}\n`)
-
-  const manifest = await f.core.getPagePlanContext({
-    task_id: imported.task_id,
-    writer_id: "schema-upgrade-writer",
-    view: "manifest",
-  })
-  const action = manifest.draft_manifest.draft_actions[0].arguments
-  const requirements = []
-  let cursor = 0
-  let finalShard
-  do {
-    const shard = await f.core.getPagePlanContext({ ...action, cursor })
-    requirements.push(...shard.page_requirements)
-    cursor = shard.next_cursor
-    finalShard = shard
-  } while (cursor !== null)
-  const patches = requirements.map((requirement) => requirement.patch_scaffold.operation === "merge"
-    ? {
-        ...requirement.patch_scaffold,
-        sectionChanges: [{ operation: "upsert_section", heading: "New Evidence", level: 2, content: "Current schema content." }],
-      }
-    : {
-        ...requirement.patch_scaffold,
-        content: `# ${requirement.title}\n\nCurrent schema content.\n`,
-      })
-  const staged = await f.core.stagePageDrafts({
-    ...finalShard.next_action.arguments,
-    patches,
-    idempotency_key: "schema-upgrade-stage-v1",
-  })
-  const draftDir = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "page-drafts")
-  const draftPath = path.join(draftDir, (await readdir(draftDir))[0])
-  const persistedDraft = JSON.parse(await readFile(draftPath, "utf8"))
-  persistedDraft.patches = persistedDraft.patches.map((patch) => {
-    if (patch.operation !== "merge") return patch
-    const { sectionChanges: _sectionChanges, ...legacyPatch } = patch
-    return { ...legacyPatch, content: `# ${patch.title}\n\nLegacy staged merge body.\n` }
-  })
-  persistedDraft.draft_hash = sha256(stableStringify(persistedDraft.patches))
-  await writeFile(draftPath, JSON.stringify(persistedDraft))
-  const taskPath = path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json")
-  const task = JSON.parse(await readFile(taskPath, "utf8"))
-  task.pageProjection.lease.stagedDraftReceipts[staged.shard_id].draft_hash = persistedDraft.draft_hash
-  await writeFile(taskPath, JSON.stringify(task))
-
-  await assert.rejects(
-    () => f.core.commitPages({
-      task_id: imported.task_id,
-      writer_id: "schema-upgrade-writer",
-      projection_id: manifest.projection.projection_id,
-      based_on_wiki_revision: manifest.based_on_wiki_revision,
-      projection_complete: false,
-      staged_draft_receipts: [{ shard_id: staged.shard_id, draft_hash: persistedDraft.draft_hash }],
-      patches: [],
-      idempotency_key: "schema-upgrade-commit-v1",
-    }),
-    (error) => error instanceof LlmWikiError
-      && error.code === "PAGE_DRAFT_SCHEMA_UPGRADE_REQUIRED"
-      && error.details.projection_plan_invalidated === true,
-  )
-  const recovered = await f.core.status({ task_id: imported.task_id })
-  assert.equal(recovered.wiki_projection.staged_uncommitted_draft_shards, 0)
-  assert.equal(recovered.next_action.tool, "llm_wiki_get_page_plan_context")
-  assert.equal(recovered.next_action.arguments.view, "manifest")
-  await assert.rejects(() => access(draftPath))
-})
-
 test("aborting a task removes uncommitted server-side page drafts", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
@@ -3145,7 +2340,10 @@ test("aborting a task removes uncommitted server-side page drafts", async (t) =>
     summary: "Staged then cancelled.",
   }))
   await f.core.stagePageDrafts({
-    ...shard.next_action.arguments,
+    task_id: imported.task_id,
+    writer_id: "wiki-writer-1",
+    projection_id: manifest.projection.projection_id,
+    shard_id: shard.shard.shard_id,
     patches,
     idempotency_key: "stage-page-draft-abort-v1",
   })

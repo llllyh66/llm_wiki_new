@@ -272,6 +272,7 @@ test("built MCP server survives errors and completes the full workflow over one 
     { name: "llm_wiki_get_page_plan_context", arguments: { task_id: "invalid" } },
     { name: "llm_wiki_stage_page_drafts", arguments: { task_id: "invalid" } },
     { name: "llm_wiki_get_staged_page_drafts", arguments: { task_id: "invalid" } },
+    { name: "llm_wiki_apply_projection", arguments: { task_id: "invalid" } },
     { name: "llm_wiki_commit_pages", arguments: { task_id: "invalid", patches: [], based_on_wiki_revision: "0".repeat(64), idempotency_key: "invalid-pages-v1" } },
     { name: "llm_wiki_update_pages", arguments: { task_id: "invalid", action: "inspect", targets: [{ path: "wiki/concepts/example.md" }] } },
     { name: "llm_wiki_finalize", arguments: { task_id: "invalid" } },
@@ -315,9 +316,8 @@ test("built MCP server survives errors and completes the full workflow over one 
     arguments: { task_id: taskId, queries: ["Business Entity"] },
   })
   assert.equal(retrieval.isError, undefined)
-  assert.equal(retrieval.structuredContent.retrieval_phase, "source-ready")
-  assert.deepEqual(retrieval.structuredContent.available_channels, ["bm25"])
-  assert.deepEqual(retrieval.structuredContent.fallback_channels, ["feature_hash"])
+  assert.equal(retrieval.structuredContent.retrieval_phase, "building")
+  assert.deepEqual(retrieval.structuredContent.available_channels, ["bm25", "embedding"])
 
   // Reproduce the failure sequence seen in real Agent runs: a dense analysis
   // with many validation errors, a malformed retry, and a bad SourceRef. None
@@ -336,6 +336,22 @@ test("built MCP server survives errors and completes the full workflow over one 
       candidatePages: [],
       reviewItems: [],
       batchSummary: "Invalid dense analysis.",
+      unresolvedQuestions: [],
+    },
+    "analysis is not an object",
+    {
+      schemaVersion: 1,
+      taskId,
+      batchId: batch.structuredContent.batch_id,
+      sourceRefs: [{ ...sourceRef, chunkId: "chunk-does-not-exist" }],
+      entities: [],
+      concepts: [],
+      claims: [],
+      relations: [],
+      contradictions: [],
+      candidatePages: [],
+      reviewItems: [],
+      batchSummary: "Invalid SourceRef.",
       unresolvedQuestions: [],
     },
     {
@@ -358,22 +374,6 @@ test("built MCP server survives errors and completes the full workflow over one 
       batchSummary: "Invalid KQI-style title-only grounding.",
       unresolvedQuestions: [],
     },
-    "analysis is not an object",
-    {
-      schemaVersion: 1,
-      taskId,
-      batchId: batch.structuredContent.batch_id,
-      sourceRefs: [{ ...sourceRef, chunkId: "chunk-does-not-exist" }],
-      entities: [],
-      concepts: [],
-      claims: [],
-      relations: [],
-      contradictions: [],
-      candidatePages: [],
-      reviewItems: [],
-      batchSummary: "Invalid SourceRef.",
-      unresolvedQuestions: [],
-    },
   ]
   for (const [index, invalidAnalysis] of invalidAnalyses.entries()) {
     const invalid = await client.callTool({
@@ -388,19 +388,14 @@ test("built MCP server survives errors and completes the full workflow over one 
     assert.equal(invalid.isError, undefined)
     assert.equal(invalid.structuredContent.accepted, false)
     assert.equal(invalid.structuredContent.rejected, true)
-    assert.match(invalid.structuredContent.error.code, /^(?:INVALID_(ANALYSIS|SOURCE_REF)|ANALYSIS_REPAIR_REQUIRED)$/)
+    assert.match(invalid.structuredContent.error.code, /^INVALID_(ANALYSIS|SOURCE_REF)$/)
     if (index === 0) {
       assert.equal(invalid.structuredContent.error.details.validation_error_count, 60)
-      assert.equal(invalid.structuredContent.validation_errors.length, 60)
+      assert.equal(invalid.structuredContent.validation_errors.length, 51)
     }
-    if (index === 1) {
-      assert.equal(invalid.structuredContent.error.details.quality_gate, "source-ref-grounding-v3")
-      assert.equal(invalid.structuredContent.error.details.validation_error_count, 47)
-      assert.equal(Array.isArray(invalid.structuredContent.grounding_warnings), true)
-    }
-    if (index >= 2) {
-      assert.equal(invalid.structuredContent.error.code, "ANALYSIS_REPAIR_REQUIRED")
-      assert.equal(invalid.structuredContent.semantic_repair.coordinator_action, "do_not_launch_new_extractor")
+    if (index === 3) {
+      assert.equal(invalid.structuredContent.error.details.quality_gate, "source-ref-grounding-v1")
+      assert.equal(invalid.structuredContent.error.details.validation_error_count, 48)
     }
     assert.equal((await client.listTools()).tools.length, 18)
     const liveStatus = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: taskId } })
@@ -430,12 +425,13 @@ test("built MCP server survives errors and completes the full workflow over one 
   assert.equal(analyzed.structuredContent.normalized_source_ref_indexes, 3)
   assert.equal(analyzed.structuredContent.next_action.tool, "llm_wiki_get_page_plan_context")
   const projected = await client.callTool({
-    name: "llm_wiki_get_page_plan_context",
-    arguments: { task_id: taskId, writer_id: "stdio-wiki-writer", view: "manifest" },
+    name: "llm_wiki_apply_projection",
+    arguments: { task_id: taskId, writer_id: "stdio-wiki-writer", max_projections: 6 },
   })
   assert.equal(projected.isError, undefined)
-  assert.equal(projected.structuredContent.view, "manifest")
-  assert.equal(projected.structuredContent.page_plan_complete, true)
+  assert.equal(projected.structuredContent.automated, false)
+  assert.equal(projected.structuredContent.writer_mode, "legacy-semantic")
+  assert.equal(projected.structuredContent.semantic_writer_required, true)
   assert.equal(projected.structuredContent.next_action.tool, "llm_wiki_get_page_plan_context")
   assert.equal(projected.structuredContent.page_commit_limits.max_patches_per_call, 50)
   const shardCall = await client.callTool({

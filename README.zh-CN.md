@@ -56,15 +56,11 @@ Related 的 canonical 格式是 frontmatter 中的 `collection/slug`，以及正
 - Word：`.docx`，保留表头、行列和合并单元格元数据
 - Excel：`.xlsx`，保留工作表名、A1 范围、合并单元格、隐藏行列、
   日期和公式缓存结果
-- PDF：`.pdf`，优先读取文本层，扫描页自动 OCR，保留页码
-- PowerPoint：`.pptx`、`.pptm`，提取幻灯片文本、表格，并对内嵌图片做 OCR
-- 图片：`.png`、`.jpg`、`.jpeg`、`.webp`、`.bmp`、`.tif`、`.tiff`，
-  使用离线中英文 OCR
+- PDF：带文本层的 `.pdf`，保留页码
 
-当前不支持老式 `.xls`、`.ppt`、含宏 `.xlsm`、音频和视频。
-请先将 `.xls` 另存为 `.xlsx`，将 `.ppt` 另存为 `.pptx`。Excel 公式和
-PowerPoint 宏都不会被执行，Core 也不会访问外链接。OCR 使用随包
-安装的简体中文和英文模型，不依赖运行时网络。
+当前不支持老式 `.xls`、含宏 `.xlsm`、PPTX、图片、音频和扫描版 PDF OCR。
+请先将 `.xls` 另存为 `.xlsx`。Excel 公式不会被执行，Core 只读取文件中
+已保存的缓存结果，也不会访问外部链接。
 
 ## 新电脑安装
 
@@ -226,25 +222,6 @@ ToolSearch 发现工具，而不是直接判定 MCP 不可用。
 如果租约已消失但 batch 尚未全部完成，立即用该 ID 领取下一批。
 不会再因为“两个 lease 都 active”而等待另一个 Agent 完成。
 
-同一套存活对账现在覆盖所有后台角色。`llm_wiki_status` 会通过统一的
-`subagent_recovery` 分别报告 Extractor、Drafter 和 Writer 的期望活跃数；主 Agent
-则只根据宿主当前进程句柄维护 `running_worker_ids`、`running_draft_shard_ids` 和
-`running_writer_projection_ids`。租约、`in_progress`、pending shard 和 staged receipt
-都只是可恢复的持久化状态，不表示对应 SubAgent 仍然存活。任何 Agent 完成、失败、
-Writer wave 返回、任务恢复或上下文压缩后都必须重新对账并立即补齐空槽；只要还有
-工作但缺少对应活跃句柄，就不能显示“等待完成”。
-
-Manifest 返回的每个 draft action 现在都带有具备 TTL 的
-`draft_claim_token`。Drafter 必须在所有 shard cursor 和 staging 调用中原样
-传递该 token；过期的 invocation 会被 fencing，并需要重新获取 manifest。
-Claim 仍然只是持久化预留，不代表 Drafter 进程存活。
-
-状态现在还会返回 `completion_gate`。一个 manifest 的所有 shard 完成，仅代表当前
-有界 projection 窗口完成；并行抽取可能在此期间产生新的 batch 和下一轮 catch-up
-窗口。只要状态要求自动续接，协调器就必须执行精确 next action，不能询问用户是否
-处理剩余内容。只有 gate 明确报告 Finalize 就绪时才允许调用 Finalize；过早调用会
-返回 `FINALIZE_CATCHUP_REQUIRED` 及精确恢复动作。
-
 ### 3. 检查 Skill
 
 项目必须存在真实文件：
@@ -353,10 +330,7 @@ Skill 会先调用 `llm_wiki_list_tasks` 和 `llm_wiki_status`，然后按 `next
 
 ### 使用已生成的 Wiki
 
-可直接向主 Agent 提问。凡是答案可能存在于已导入文档或生成的 Wiki 中，
-Skill 都会在回答前调用 `llm_wiki_retrieve_context` 召回证据，不会只凭对话记忆
-作答。普通全任务问答不传 `batch_id`；任务仍在构建时，回答会明确保留
-`retrieval_phase: building` 的不完整性提示。
+可直接向主 Agent 提问，Skill 会使用 `llm_wiki_retrieve_context` 召回证据；
 也可以明确让 Agent 综合 `wiki/`：
 
 ```text
@@ -384,12 +358,14 @@ Skill 都会在回答前调用 `llm_wiki_retrieve_context` 召回证据，不会
   持久化，后续 status 不会重复尝试快速 `finalize`。
 
 `llm_wiki_retrieve_context` 会并行考虑受管理的源文档块、已提交分析和 Wiki
-页面分段。任务构建期间，每个 source 解析完就原子发布 task-local BM25；
-真实 Embedding 在后台异步追赶，不阻塞首次查询。因此主 Agent 无需等待慢速
-Wiki 构建就可先用已就绪的 BM25 + Embedding 召回；`finalize` 完成后再加入 Wiki
-标题/路径/双向链接图通道。响应会明确返回耐久阶段、逐 source 就绪度、
-请求通道、实际活跃通道与降级通道。持久索引不会因固定 10,000 候选上限
-静默遗漏后续 Chunk；输出本身仍有有界大小。
+页面分段。任务构建期间默认先用 BM25 + Embedding 并以 RRF 融合，主 Agent
+无需等待 Wiki 完成即可回答问题；`finalize` 完成后，同一个无 `channels` 调用
+会自动切换为 BM25 + Embedding + Wiki 标题/路径/双向链接图三路 RRF。
+`retrieval_phase` 会明确返回 `building` 或 `knowledge-base-complete`。构建期
+回答可能不完整，主 Agent 应向用户保留这一状态。大型语料采用公平、有上限
+的候选集，返回值中的
+`corpus.truncated`、`corpus.max_documents` 和 `channel_status` 会说明是否截断
+或降级。
 已完成的旧 Wiki 页在新任务构建期仍可通过 BM25/Embedding 召回；只有
 未完成投影生成的 provisional 路径会被排除。
 
@@ -399,8 +375,8 @@ Domain → ABE → BE 分类链；`action: "search"` 可按 `domain_schema_id`�
 `snapshot_hash`、Domain、ABE、BE、分类状态或路径前缀组合过滤全部已分类页面。
 搜索结果只返回路径、标题、摘要和分类元数据，并通过 `next_cursor` 分页，不批量返回页面正文。
 
-Embedding 默认关闭；此时本地 feature-hash 作为独立降级通道显式标记，
-不会冒充真实 Embedding，也不影响 BM25 与 Wiki 通道。配置 OpenAI-compatible 服务：
+Embedding 默认关闭；此时该通道自动使用本地 feature-hash 后备，不影响 BM25
+与 Wiki 通道。配置 OpenAI-compatible 服务：
 
 ```bash
 export LLM_WIKI_EMBEDDING_PROVIDER=openai-compatible
@@ -410,11 +386,12 @@ export LLM_WIKI_EMBEDDING_API_KEY=运行时密钥  # 服务不要求时可省略
 ```
 
 使用 Ollama 时将 Provider 设为 `ollama` 并设置模型；默认地址为
-`http://127.0.0.1:11434/api/embed`。在线查询只生成有界 query vector，文档向量由后台生成并以
-generation-scoped float32 产物发布。端点超时、断开或返回畸形向量时，工具
-会显式降级并保持 MCP 连接可用。可在 `.llm-wiki/config.json` 的 `retrieval`
-中调整 `rrfK`，以及 Embedding 的 `batchSize`、`timeoutMs`、`totalTimeoutMs`和
-`maxInputChars`；不要把 API Key 写入该文件。
+`http://127.0.0.1:11434/api/embed`。请求会分批、超时控制，并按内容哈希缓存到
+`.llm-wiki/indexes/embeddings/` 的分片目录。端点超时、断开或返回畸形向量时，
+工具会自动降级并保持 MCP 连接可用。可在 `.llm-wiki/config.json` 的
+`retrieval` 中调整 `maxDocuments`、`rrfK`，以及 Embedding 的 `batchSize`、
+`timeoutMs`、`totalTimeoutMs`、`maxInputChars` 和 `maxDocuments`；不要把 API
+Key 写入该文件。
 
 ## CLI 用法
 
@@ -431,6 +408,7 @@ npm run cli -- lint --workspace .
 npm run cli -- abort <task-id> --workspace .
 npm run cli -- delete wiki --confirm-delete-knowledge-base --workspace .
 npm run cli -- delete knowledge_base --confirm-delete-knowledge-base --workspace .
+npm run cli -- migrate-legacy raw/sources --workspace .
 ```
 
 `import` 只创建待 Agent 分析的持久化任务，不会自动调用模型完成页面生成。
@@ -652,23 +630,10 @@ Core 会将 requirement ID 解析为任务中已验证的精确 quote 和 locato
 不要把 `reviewItems` 写成字符串数组。无法从目录中的精确证据支持的问题应放入
 `unresolvedQuestions`，不要重新读取源文件猜 quote。
 
-Wiki 抽取是证据支撑的语义归纳，不是原文摘抄。`evidence_catalog` 每项同时提供
-`primary_quote`、`context_quotes` 和表头/列名/章节上下文；Agent 看到的上下文与
-Core 提交时使用的上下文一致。允许摘要化、同义改写、关系谓词归一和实体别名，
-但数字、比例、编号、日期、单位以及“可能/确定”等事实语义必须保持等价。
-普通词汇不重合只产生 warning；SourceRef 来源真实性、类型化事实锚点和明显极性/确定性
-矛盾才会硬失败。门禁拒绝时按结构化 `validation_diagnostics` 修复同一批次，最多两次；
-出现 `repair_required=true` 后停止启动新的 Extractor，转入人工/协调器复核。
-
-Grounding v3 可为候选增加两个正交字段：`factKind` 表示知识类型，`supportMode`
-表示证据支持方式。表格行、公式、SQL 和配置结构使用
-`structured_entailment`；候选页面摘要使用 `summary`；`derived` 候选必须声明
-`derivation` 规则或方法。Validator 会先把候选定位到
-匹配的 primary 行或片段，再检查事实锚点和适用的确定性/极性，避免同一表格中“成功、
-失败、取消”等其他行污染当前事实。Relation 应提供归一化 `predicate` 和可解析的
-source/target localId；公式、条件、单位和来源表应保存在 `metric_definition` 或
-`parameter_definition` 中。诊断返回 quote hash、locator、`knowledge_coverage`，修复成功后
-还会报告 `repair_coverage`，用于发现“删到通过”造成的候选或证据覆盖下降。
+标题引用不能支撑整张表的详细结论。`claims`、`relations`、
+`contradictions` 和 `reviewItems` 的 quote 必须包含该条目的关键术语；大型
+表格应按行或主题建立多个 SourceRef。单个 SourceRef 最多支撑 8 个候选条目，
+超过时 `commit_analysis` 会返回可恢复的 `accepted: false`。
 
 ### Excel 无法导入
 
@@ -679,10 +644,8 @@ source/target localId；公式、条件、单位和来源表应保存在 `metric
 
 ### PDF 没有提取到文字
 
-- 带文本层的页会直接提取，没有有效文本层的页会自动 OCR。
-- 默认识别简体中文和英文；手写、低分辨率、大角度旋转或严重压缩图像
-  仍可能识别不完整。
-- 查看提取后 `document.json` 的 `metadata.ocrPages`，可确认哪些页使用了 OCR。
+当前只支持带文本层的 PDF。扫描件需要先使用 OCR 工具转换为可搜索 PDF
+或 UTF-8 文本。
 
 ## 安全边界
 

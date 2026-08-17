@@ -17,10 +17,7 @@ exception. A successful `llm_wiki_status` call proves the current turn's MCP
 connection is usable.
 
 Lease state does not expose process liveness. Maintain live subagents in the
-coordinator's own `running_worker_ids`, `running_draft_shard_ids`, and
-`running_writer_projection_ids` sets. Rebuild these sets only from current
-host-runtime handles, never from persisted task state or an earlier turn's
-launch acknowledgements. When a worker completion
+coordinator's own `running_worker_ids` set. When a worker completion
 notification arrives, remove that ID first. If status still lists a lease for
 the completed ID, restart it immediately with that same worker and batch ID.
 If no lease remains but batches are incomplete, reuse the freed ID to request
@@ -32,7 +29,7 @@ large for the host reader, resume that lease with the same worker and batch IDs
 after rebuilding the current server. `get_batch` enforces hard Agent-facing
 ceilings (3K text per chunk, 9K source text per batch, and 24 KiB serialized
 chunk payload per batch), budgets the complete response, compacts oversized structured table
-metadata, and repairs unfinished bounded batches without discarding the lease.
+metadata, and repairs unfinished legacy batches without discarding the lease.
 Do not wait for expiry or send another worker to repeat the same unreadable
 response.
 
@@ -56,20 +53,11 @@ new idempotency key for a changed payload, and resubmit before continuing.
 Treat `accepted: false` as a normal validation result, not an MCP failure; do
 not restart or create another task for it.
 Submit `analysis` as an object rather than a serialized JSON string or Markdown
-code block. For grounding failures, repair the returned structured diagnostics
-while preserving valid candidates and evidence indexes. Keep the same worker
-and lease for this application-level repair. The gate allows Wiki paraphrase
-and normalization, but typed anchors (numbers, identifiers, dates, units) and
-certainty/polarity must remain equivalent. A second semantic failure for the
-same batch sets `repair_required=true`: stop launching a new Extractor and
-escalate the batch instead of looping. When the envelope shape itself is
-invalid, rebuild it from the schema while preserving valid candidates, and
-check every evidence index against the catalog length.
-Grounding v3 diagnostics include quote hashes, locators, scoped evidence, and
-`knowledge_coverage`. Repair scoped polarity or typed-field problems before
-rewriting prose. Preserve supported candidates when `repair_coverage` reports
-a negative candidate or primary-evidence-span delta; a negative delta is a
-review signal, not permission to delete unrelated knowledge.
+code block. When many entries fail validation, rebuild a minimal envelope from
+the schema and include complete SourceRef objects on every grounded entry
+or valid zero-based indexes into the top-level catalog. Check every index
+against the catalog length instead of incrementally mutating the rejected
+payload.
 For a spreadsheet locator rejection, copy the SourceRef again from the leased
 chunk's `source_ref_templates`; `allowed_sheet_names` and
 `allowed_cell_ranges` in the error are diagnostic values, not text to guess or
@@ -98,8 +86,8 @@ same task. A `WIKI_REVISION_CONFLICT` from an unrelated-path change indicates
 an older Core process is still running; restart that process on the updated
 build, then resume the existing task and lease instead of creating a new task.
 
-`PAGE_PLAN_INCOMPLETE` requires restarting the same projection with
-`view: "manifest"`; Core persists the complete plan and returns
+`PAGE_PLAN_INCOMPLETE` is a legacy-plan recovery. Prefer restarting the same
+projection with `view: "manifest"`; Core persists the complete plan and returns
 bounded `draft-shard` actions, so the model never has to retain every cursor.
 Read `page_commit_limits` before drafting. Partition paths first, generate only
 one shard or bounded wave, and commit it with `projection_complete: false`.
@@ -118,46 +106,22 @@ durable and are not part of this retry.
 
 If a multipart projection invocation stops, inspect `wiki_projection` in
 status. While `in_progress` remains true, keep the same projection and Writer
-ID, but do not interpret `in_progress` as a live Writer or Drafter. Clear the
-ended invocation from the matching live set, read `subagent_recovery`, and
-resume every missing desired slot before waiting. The coordinator resumes the returned manifest/Drafter action; it does not
+ID. The coordinator resumes the returned manifest/Drafter action; it does not
 launch the Writer until hash-bound staged receipts exist. If a Drafter stopped before
 staging, relaunch only that Drafter with the exact shard action. If the Writer
 stopped during a receipt commit, replay the same `{shard_id, draft_hash}` receipts and idempotency
 key. Paths written by an incomplete projection remain provisional and excluded
-from retrieval. After a configuration change, resume that same projection from
-cursor zero. Core shrinks an oversized incremental lease to the current bounded
-window and reports `projection.safely_repartitioned: true`; remaining batches
+from retrieval. After upgrading from an older server, resume that same
+projection from cursor zero;
+Core automatically shrinks an oversized legacy incremental lease to eight
+batches and reports `projection.safely_repartitioned: true`. Remaining batches
 stay queued and are not discarded.
-The manifest action's `draft_claim_token` must be copied through every cursor
-and staging call. A claim is a resumable reservation, not process liveness. If
-it is fenced or expired, discard the stale invocation result, refresh the
-manifest, and relaunch only the newly claimed action.
 After each Writer receipt wave returns, follow its coordinator-owned next
 action, launch the next Drafter wave, and launch the Writer again only after new
 receipts exist. The coordinator quantum is six projections and each lease is
 capped at eight batches, so one orchestration invocation can drain up to 48
 queued batches. A ready backlog of at least four batches bypasses the normal
 debounce.
-
-The quantum bounds one orchestration invocation, not the user's build request.
-After the quantum or a `projection_complete=true` acknowledgement, call status.
-If `completion_gate.automatic_continuation_required=true`, begin the next
-bounded invocation immediately. Never convert an unprojected batch or missing
-requirement count into a “continue?” question.
-
-Never emit a progress line ending in “waiting” solely because pending shards,
-worker leases, or a projection lease exist. Waiting requires current host
-handles for all desired invocations. If status reports work but those handles
-are absent, this is a relaunch condition, not a wait condition.
-
-When manifest acquisition returns `waiting=true`, do not infer a reason from
-that compatibility flag. Read `waiting_reason`. For
-`projection_lease_held`, execute the returned exact `next_action` using the
-persisted Writer/projection identities; the lease is not a live Writer. For
-`projection_not_ready`, keep the reported Extractor demand live and re-check at
-`next_ready_at`. `wait_for_all_extractors=false` is authoritative: incremental
-Projection can overlap extraction.
 
 ## Failed Finalize
 
@@ -169,11 +133,6 @@ codes and follow `details.next_action` to the single Writer's final semantic
 projection; it is not an MCP transport failure. After that projection
 completes, call Finalize once more. Do not retry Finalize against the unchanged
 failed audit or reconstruct a different projection action.
-
-`FINALIZE_CATCHUP_REQUIRED` occurs earlier than the semantic audit. It means a
-projection window was completed while extraction or another incremental window
-remains. Follow its exact `details.next_action`; do not summarize missing
-requirements as final audit failures and do not request user confirmation.
 
 ## Abort
 

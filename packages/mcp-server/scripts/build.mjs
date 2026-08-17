@@ -1,4 +1,4 @@
-import { chmod, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
+import { chmod, cp, mkdir, rm, writeFile } from "node:fs/promises"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 
@@ -13,7 +13,6 @@ await chmod(new URL("../dist/http-supervisor.js", import.meta.url), 0o755)
 await chmod(new URL("../dist/ensure-daemon.js", import.meta.url), 0o755)
 
 let gitCommit = "unknown"
-const packageMetadata = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"))
 try {
   const result = await execFileAsync("git", ["rev-parse", "--short", "HEAD"], { cwd: new URL("../../..", import.meta.url) })
   gitCommit = result.stdout.trim() || gitCommit
@@ -23,6 +22,6 @@ try {
 }
 await writeFile(
   new URL("../dist/build-info.json", import.meta.url),
-  `${JSON.stringify({ schemaVersion: 1, packageVersion: packageMetadata.version, gitCommit, builtAt: new Date().toISOString() }, null, 2)}\n`,
+  `${JSON.stringify({ schemaVersion: 1, packageVersion: "1.0.6-1", gitCommit, builtAt: new Date().toISOString() }, null, 2)}\n`,
   "utf8",
 )

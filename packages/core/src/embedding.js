@@ -111,56 +111,6 @@ export async function embedQueryAndDocuments(workspace, query, documents) {
   }
 }
 
-// Online retrieval must never turn a user query into a bulk indexing job.
-// This path reads only vectors that a background/finalization indexer already
-// published, then requests the single query vector within the online budget.
-export async function embedQueryFromCache(workspace, query, documents, seedVectors = new Map()) {
-  const config = resolveEmbeddingConfig(workspace)
-  if (!config.enabled) {
-    return { available: false, reason: config.supported ? "not_configured" : "unsupported_provider", config: publicConfig(config), vectors: new Map(), indexedDocuments: 0, skippedDocuments: documents.length, cacheHits: 0 }
-  }
-  const cacheRoot = path.join(workspace.paths.indexes, "embeddings", config.fingerprint)
-  const candidateIds = new Set(documents.map((document) => document.id))
-  const vectors = new Map([...seedVectors].filter(([documentId]) => candidateIds.has(documentId)))
-  try {
-    for (const group of chunkArray(documents, 64)) {
-      await Promise.all(group.map(async (document) => {
-        const cached = await readCachedVector(cacheRoot, document.hash)
-        if (cached) vectors.set(document.id, cached)
-      }))
-    }
-    if (vectors.size === 0) {
-      return { available: false, reason: "index_not_ready", config: publicConfig(config), vectors, indexedDocuments: 0, skippedDocuments: documents.length, cacheHits: 0 }
-    }
-    // A query-vector request uses the per-request timeout, not the historical
-    // ten-minute bulk indexing budget.
-    const [queryVector] = await requestEmbeddings([String(query).slice(0, config.maxInputChars)], {
-      ...config,
-      timeoutMs: Math.min(config.timeoutMs, 5_000),
-    })
-    return {
-      available: true,
-      queryVector: normalizeVector(queryVector),
-      vectors,
-      indexedDocuments: vectors.size,
-      skippedDocuments: Math.max(0, documents.length - vectors.size),
-      cacheHits: vectors.size,
-      config: publicConfig(config),
-    }
-  } catch (error) {
-    return {
-      available: false,
-      reason: error instanceof LlmWikiError ? error.code : "EMBEDDING_UNAVAILABLE",
-      message: error instanceof Error ? error.message : String(error),
-      config: publicConfig(config),
-      vectors: new Map(),
-      indexedDocuments: vectors.size,
-      skippedDocuments: Math.max(0, documents.length - vectors.size),
-      cacheHits: vectors.size,
-    }
-  }
-}
-
 function requestWithinBudget(inputs, config, deadline) {
   const remaining = deadline - Date.now()
   if (remaining < 100) {
@@ -172,52 +122,15 @@ function requestWithinBudget(inputs, config, deadline) {
 export async function warmEmbeddingCache(workspace, documents) {
   const config = resolveEmbeddingConfig(workspace)
   if (!config.enabled) return { status: "not_configured", provider: config.provider, model: config.model || null, indexed_documents: 0 }
-  let indexedDocuments = 0
-  let cacheHits = 0
-  for (const group of chunkArray(documents, config.maxDocuments)) {
-    const result = await embedQueryAndDocuments(workspace, "embedding index warmup", group)
-    if (!result.available) {
-      return { status: "degraded", provider: config.provider, model: config.model, reason: result.reason, indexed_documents: indexedDocuments, skipped_documents: documents.length - indexedDocuments, cache_hits: cacheHits }
-    }
-    indexedDocuments += result.indexedDocuments
-    cacheHits += result.cacheHits
-  }
+  const result = await embedQueryAndDocuments(workspace, "embedding index warmup", documents)
+  if (!result.available) return { status: "degraded", provider: config.provider, model: config.model, reason: result.reason, indexed_documents: 0 }
   return {
-    status: indexedDocuments === documents.length ? "completed" : "partial",
+    status: result.skippedDocuments > 0 ? "partial" : "completed",
     provider: config.provider,
     model: config.model,
-    indexed_documents: indexedDocuments,
-    skipped_documents: Math.max(0, documents.length - indexedDocuments),
-    cache_hits: cacheHits,
-  }
-}
-
-export async function buildEmbeddingSnapshot(workspace, documents) {
-  const warmed = await warmEmbeddingCache(workspace, documents)
-  const config = resolveEmbeddingConfig(workspace)
-  if (!config.enabled || warmed.status !== "completed") {
-    return { schemaVersion: 2, generatedAt: new Date().toISOString(), fingerprint: config.fingerprint, ...warmed, documents: [], vectors: [] }
-  }
-  const cacheRoot = path.join(workspace.paths.indexes, "embeddings", config.fingerprint)
-  const storedDocuments = []
-  const vectors = []
-  for (const document of documents) {
-    const vector = await readCachedVector(cacheRoot, document.hash)
-    if (!vector) continue
-    storedDocuments.push({ id: document.id, hash: document.hash })
-    vectors.push(vector)
-  }
-  return {
-    schemaVersion: 2,
-    generatedAt: new Date().toISOString(),
-    fingerprint: config.fingerprint,
-    dimensions: vectors[0]?.length ?? 0,
-    ...warmed,
-    indexed_documents: storedDocuments.length,
-    skipped_documents: Math.max(0, documents.length - storedDocuments.length),
-    status: storedDocuments.length === documents.length ? "completed" : "partial",
-    documents: storedDocuments,
-    vectors,
+    indexed_documents: result.indexedDocuments,
+    skipped_documents: result.skippedDocuments,
+    cache_hits: result.cacheHits,
   }
 }
 

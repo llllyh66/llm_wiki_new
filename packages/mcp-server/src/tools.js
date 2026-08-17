@@ -1,5 +1,4 @@
 import { LlmWikiError, asLlmWikiError } from "@llm-wiki/core"
-import { createHash } from "node:crypto"
 import { TOOL_DEFINITIONS } from "./tool-definitions.js"
 
 const MAX_MCP_INPUT_BYTES = 12 * 1024 * 1024
@@ -14,7 +13,7 @@ const MAX_MCP_IN_FLIGHT = 8
 const MAX_TASK_IN_FLIGHT = 4
 const BUSY_RETRY_AFTER_MS = 1_500
 const MCP_SIGNAL = Symbol.for("llm-wiki.mcp.signal")
-const SEMANTIC_ANALYSIS_CODES = new Set(["INVALID_ANALYSIS", "INVALID_DOMAIN_ANALYSIS", "INVALID_SOURCE_REF", "ANALYSIS_TOO_LARGE", "ANALYSIS_REPAIR_REQUIRED"])
+const RECOVERABLE_ANALYSIS_CODES = new Set(["INVALID_ANALYSIS", "INVALID_DOMAIN_ANALYSIS", "INVALID_SOURCE_REF", "ANALYSIS_TOO_LARGE"])
 const ATOMIC_PAGE_REJECTION_CODES = new Set([
   "INVALID_PAGE_PATCH",
   "INVALID_WIKI_UPDATE",
@@ -28,13 +27,10 @@ const ATOMIC_PAGE_REJECTION_CODES = new Set([
   "INCOMPLETE_PAGE_COVERAGE",
   "PAGE_DRAFT_SHARDS_INCOMPLETE",
   "PAGE_DRAFT_SHARD_NOT_READY",
-  "PAGE_DRAFT_SECTION_NOT_FULLY_VISIBLE",
-  "PAGE_DRAFT_SCHEMA_UPGRADE_REQUIRED",
   "STAGED_DRAFT_NOT_FOUND",
   "STAGED_DRAFT_EXISTS",
   "STAGED_DRAFT_HASH_MISMATCH",
   "PAGE_DRAFT_STAGING_UNAVAILABLE",
-  "DRAFT_SHARD_CLAIM_FENCED",
   "DUPLICATE_PAGE_COVERAGE",
   "FILE_HASH_CONFLICT",
   "PROVISIONAL_PAGE_CONFLICT",
@@ -123,75 +119,32 @@ function serializeResult(data) {
     return serializeCompactMcpError({ ...data, __serializedOutputBytes: outputBytes })
   }
   const result = { content: [{ type: "text", text }] }
-  // Analysis repair diagnostics are intentionally structured even when their
-  // pretty JSON exceeds the normal duplication threshold. They remain bounded
-  // by MAX_MCP_OUTPUT_BYTES, while generic large tool results still use the
-  // one-copy wire path.
-  const structuredAnalysisDiagnostics = Array.isArray(data?.validation_errors)
-    && data?.semantic_repair?.required === true
-    && outputBytes <= MAX_MCP_OUTPUT_BYTES
-  if (outputBytes <= STRUCTURED_CONTENT_DUPLICATION_LIMIT || structuredAnalysisDiagnostics) result.structuredContent = data
+  if (outputBytes <= STRUCTURED_CONTENT_DUPLICATION_LIMIT) result.structuredContent = data
   if (data?.ok === false || data?.accepted === false) result._meta = { llmWikiStatus: "rejected" }
   return result
 }
 
 function errorResult(error, context = {}) {
   const normalized = asLlmWikiError(error)
-  const semanticAnalysisFailure = context.tool === "llm_wiki_commit_analysis" && SEMANTIC_ANALYSIS_CODES.has(normalized.code)
-  const repairRequired = normalized.details?.repair_required === true
-  const analysisRetry = semanticAnalysisFailure && !repairRequired
-  const atomicPageRejection = ["llm_wiki_commit_pages", "llm_wiki_update_pages", "llm_wiki_stage_page_drafts"].includes(context.tool)
-    && ATOMIC_PAGE_REJECTION_CODES.has(normalized.code)
+  const analysisRetry = context.tool === "llm_wiki_commit_analysis" && RECOVERABLE_ANALYSIS_CODES.has(normalized.code)
+  const atomicPageRejection = ["llm_wiki_commit_pages", "llm_wiki_update_pages"].includes(context.tool) && ATOMIC_PAGE_REJECTION_CODES.has(normalized.code)
   const submittedItems = context.tool === "llm_wiki_update_pages" ? context.args?.updates : context.args?.patches
-  const normalizedJson = normalized.toJSON()
-  const errorData = {
-    ...normalizedJson,
-    ...(semanticAnalysisFailure && normalizedJson.details
-      ? { details: compactAnalysisErrorDetails(normalizedJson.details) }
-      : {}),
-    retryable: normalized.retryable || analysisRetry,
-  }
-  const busy = normalized.code === "TASK_BUSY" || normalized.code === "MCP_BUSY"
+  const errorData = { ...normalized.toJSON(), retryable: normalized.retryable || analysisRetry }
   return {
     ok: false,
     accepted: false,
     rejected: true,
     error: errorData,
-    ...(busy ? {
-      retry_after_ms: BUSY_RETRY_AFTER_MS,
-      retry_action: {
-        tool: context.tool,
-        reuse_original_arguments: true,
-        request_fingerprint: createHash("sha256").update(JSON.stringify(context.args ?? {})).digest("hex"),
-      },
-    } : {}),
     ...(Array.isArray(normalized.details?.validation_errors)
       ? { validation_errors: normalized.details.validation_errors }
-      : semanticAnalysisFailure ? { validation_errors: [normalized.message] } : {}),
-    ...(Array.isArray(normalized.details?.validation_diagnostics)
-      ? { validation_diagnostics: normalized.details.validation_diagnostics }
-      : {}),
-    ...(Array.isArray(normalized.details?.grounding_warnings)
-      ? { grounding_warnings: normalized.details.grounding_warnings }
-      : {}),
-    ...(typeof normalized.details?.validation_fingerprint === "string"
-      ? { validation_fingerprint: normalized.details.validation_fingerprint }
-      : {}),
-    ...(normalized.details?.repair_required === true ? { repair_required: true } : {}),
-    ...(normalized.details?.completion_gate && typeof normalized.details.completion_gate === "object"
-      ? { completion_gate: normalized.details.completion_gate }
-      : {}),
-    ...(semanticAnalysisFailure ? {
-      semantic_repair: {
+      : analysisRetry ? { validation_errors: [normalized.message] } : {}),
+    ...(analysisRetry ? {
+      worker_restart: {
         required: true,
-        strategy: repairRequired ? "stop-after-repair-budget" : "repair-same-batch-same-worker",
-        task_id: context.args?.task_id,
-        batch_id: context.args?.batch_id,
+        strategy: "restart-same-worker-id-immediately",
         worker_id: context.args?.worker_id,
-        ...(normalized.details?.validation_fingerprint ? { validation_fingerprint: normalized.details.validation_fingerprint } : {}),
-        ...(normalized.details?.validation_attempt ? { validation_attempt: normalized.details.validation_attempt } : {}),
-        ...(normalized.details?.validation_max_attempts ? { max_attempts: normalized.details.validation_max_attempts } : {}),
-        ...(repairRequired ? { coordinator_action: "do_not_launch_new_extractor" } : {}),
+        batch_id: context.args?.batch_id,
+        delay_ms: 0,
       },
     } : {}),
     ...(atomicPageRejection ? {
@@ -212,24 +165,11 @@ function errorResult(error, context = {}) {
   }
 }
 
-function compactAnalysisErrorDetails(details) {
-  if (!details || typeof details !== "object" || Array.isArray(details)) return details
-  const compact = Object.fromEntries(Object.entries(details).filter(([key]) => ![
-    "validation_errors",
-    "validation_error_messages",
-    "validation_diagnostics",
-    "grounding_warnings",
-  ].includes(key)))
-  return Object.keys(compact).length > 0 ? compact : undefined
-}
-
 function pageCommitRetryScope(code) {
   if (["WIKI_PAGE_NOT_FOUND", "WIKI_SECTION_NOT_FOUND", "WIKI_SECTION_AMBIGUOUS", "INVALID_WIKI_UPDATE"].includes(code)) return "entire_rejected_update_set_after_reinspection"
   if (code === "PAGE_PLAN_INCOMPLETE") return "prepare_server_manifest_then_process_one_bounded_shard"
   if (code === "PAGE_DRAFT_SHARDS_INCOMPLETE") return "process_next_uncommitted_server_shard"
   if (code === "PAGE_DRAFT_SHARD_NOT_READY") return "retrieve_all_cursors_for_the_reported_server_shard"
-  if (code === "PAGE_DRAFT_SECTION_NOT_FULLY_VISIBLE") return "redraft_entire_shard_using_only_new_or_fully_visible_sections"
-  if (code === "PAGE_DRAFT_SCHEMA_UPGRADE_REQUIRED") return "refresh_manifest_and_redraft_retired_merge_payloads"
   if (code === "STAGED_DRAFT_NOT_FOUND") return "restage_the_reported_shard_then_retry_server_commit"
   if (code === "STAGED_DRAFT_EXISTS") return "do_not_resubmit_an_accepted_shard"
   if (code === "PAGE_DRAFT_STAGING_UNAVAILABLE") return "resume_the_active_manifest_projection_before_server_commit"
@@ -245,12 +185,9 @@ function pageCommitRetryInstruction(code) {
   if (code === "PAGE_PLAN_INCOMPLETE") return "Return control to the coordinator. It requests view=manifest, launches a Drafter for one bounded shard, and starts the Writer only after a receipt exists."
   if (code === "PAGE_DRAFT_SHARDS_INCOMPLETE") return "Return the next shard to the coordinator, which launches its Drafter; accepted earlier shards are durable and must not be regenerated."
   if (code === "PAGE_DRAFT_SHARD_NOT_READY") return "The coordinator must relaunch the shard's Drafter to retrieve every cursor and stage a receipt before restarting the Writer."
-  if (code === "PAGE_DRAFT_SECTION_NOT_FULLY_VISIBLE") return "Redraft the entire rejected shard. Upsert only new headings or headings listed in editable_section_headings; leave protected sections unchanged."
-  if (code === "PAGE_DRAFT_SCHEMA_UPGRADE_REQUIRED") return "The retired staged merge payload was discarded safely. Refresh the manifest and redraft every returned shard with the current PagePatch schema."
   if (code === "STAGED_DRAFT_NOT_FOUND") return "Return control to the coordinator so it can relaunch the reported Drafter; retry the Writer only after a replacement receipt exists."
   if (code === "STAGED_DRAFT_EXISTS") return "Do not resubmit an accepted shard; continue with the next uncommitted manifest shard."
   if (code === "PAGE_DRAFT_STAGING_UNAVAILABLE") return "Return control to the coordinator so it can resume the active manifest and stage the shard before restarting the Writer."
-  if (code === "DRAFT_SHARD_CLAIM_FENCED") return "Discard the stale Drafter result, refresh the active manifest, and relaunch only the newly claimed shard action."
   if (code === "INCOMPLETE_PAGE_COVERAGE") return "Add the reported missing coverage to the rejected set and resubmit it; no patch from the rejected call was stored."
   if (code === "DUPLICATE_PAGE_COVERAGE") return "Keep every requirement ID on one canonical path, repair all reported duplicate owners, and resubmit the whole rejected set."
   if (code === "WIKI_PUBLICATION_BUSY") return "Do not create another task or retry in a loop. Resume the owning task, then refresh this projection against the published Wiki before retrying."
@@ -259,38 +196,17 @@ function pageCommitRetryInstruction(code) {
 }
 
 function recoveryAction(tool, args, error) {
-  if (tool === "llm_wiki_finalize"
-    && ["FINALIZE_CATCHUP_REQUIRED", "FINAL_PROJECTION_REQUIRED"].includes(error.code)
-    && error.details?.next_action?.tool) {
-    return error.details.next_action
-  }
   if (error.code === "WIKI_PUBLICATION_BUSY" && typeof error.details?.owner_task_id === "string") {
     return { tool: "llm_wiki_status", arguments: { task_id: error.details.owner_task_id } }
   }
   if (error.code === "TASK_BUSY") {
-    return { tool, reuse_original_arguments: true, retry_after_ms: BUSY_RETRY_AFTER_MS }
+    return typeof args?.task_id === "string"
+      ? { tool: "llm_wiki_status", arguments: { task_id: args.task_id } }
+      : { tool: "llm_wiki_list_tasks", arguments: {} }
   }
-  if (error.code === "MCP_BUSY") return { tool, reuse_original_arguments: true, retry_after_ms: BUSY_RETRY_AFTER_MS }
-  if (tool === "llm_wiki_commit_analysis" && SEMANTIC_ANALYSIS_CODES.has(error.code)) {
-    if (error.details?.repair_required === true) {
-      return {
-        tool: "llm_wiki_status",
-        action_owner: "coordinator",
-        arguments: { task_id: args?.task_id },
-        reason: "analysis_repair_required",
-      }
-    }
-    return {
-      tool,
-      action_owner: "same-worker",
-      arguments: {
-        task_id: args?.task_id,
-        batch_id: args?.batch_id,
-        worker_id: args?.worker_id,
-        ...(typeof args?.lease_token === "string" ? { lease_token: args.lease_token } : {}),
-      },
-      reason: "repair_same_batch_without_restarting_extractor",
-    }
+  if (error.code === "MCP_BUSY") return { tool: "llm_wiki_list_tasks", arguments: {} }
+  if (tool === "llm_wiki_commit_analysis" && RECOVERABLE_ANALYSIS_CODES.has(error.code)) {
+    return { tool, arguments: { task_id: args?.task_id, batch_id: args?.batch_id, worker_id: args?.worker_id } }
   }
   if (tool === "llm_wiki_commit_analysis" && error.code === "BATCH_LEASE_REQUIRED") {
     return {
@@ -316,37 +232,7 @@ function recoveryAction(tool, args, error) {
   if (tool === "llm_wiki_update_pages" && ["WIKI_UPDATE_PUBLISH_FAILED", "WORKSPACE_CHANGED_DURING_INDEXING"].includes(error.code)) {
     return { tool: "llm_wiki_finalize", arguments: { task_id: args?.task_id } }
   }
-  if (tool === "llm_wiki_stage_page_drafts" && ["INVALID_PAGE_PATCH", "INVALID_PAGE_PATH", "INVALID_SOURCE_REF", "INCOMPLETE_PAGE_COVERAGE", "DUPLICATE_PAGE_COVERAGE", "PAGE_COMMIT_TOO_LARGE", "PAGE_DRAFT_SECTION_NOT_FULLY_VISIBLE"].includes(error.code)) {
-    return {
-      tool,
-      action_owner: "drafter",
-      delegate_to: "llm-wiki-page-drafter",
-      arguments: {
-        task_id: args?.task_id,
-        writer_id: args?.writer_id,
-        projection_id: args?.projection_id,
-        shard_id: args?.shard_id,
-        draft_claim_token: args?.draft_claim_token,
-      },
-      required_generated_arguments: ["patches", "idempotency_key"],
-    }
-  }
   if (tool === "llm_wiki_commit_pages" && error.code === "PAGE_PLAN_INCOMPLETE") {
-    return {
-      tool: "llm_wiki_get_page_plan_context",
-      action_owner: "coordinator",
-      delegate_to: "llm-wiki-page-drafter",
-      arguments: {
-        task_id: args?.task_id,
-        writer_id: args?.writer_id,
-        projection_id: args?.projection_id,
-        view: "manifest",
-        cursor: 0,
-        max_chars: 40_000,
-      },
-    }
-  }
-  if (tool === "llm_wiki_commit_pages" && error.code === "PAGE_DRAFT_SCHEMA_UPGRADE_REQUIRED") {
     return {
       tool: "llm_wiki_get_page_plan_context",
       action_owner: "coordinator",
@@ -380,11 +266,13 @@ function recoveryAction(tool, args, error) {
     return {
       tool: "llm_wiki_get_page_plan_context",
       action_owner: "coordinator",
+      delegate_to: "llm-wiki-page-drafter",
       arguments: {
         task_id: args?.task_id,
         writer_id: args?.writer_id,
         projection_id: args?.projection_id,
-        view: "manifest",
+        view: "draft-shard",
+        shard_id: error.details.next_draft_shard.shard_id,
         cursor: 0,
         max_chars: 40_000,
       },
@@ -416,27 +304,13 @@ function recoveryAction(tool, args, error) {
         projection_id: args?.projection_id,
         based_on_wiki_revision: args?.based_on_wiki_revision,
         projection_complete: args?.projection_complete !== false,
-        ...(Array.isArray(args?.staged_draft_receipts) ? { staged_draft_receipts: args.staged_draft_receipts } : {}),
+        ...(Array.isArray(args?.staged_draft_shard_ids) ? { staged_draft_shard_ids: args.staged_draft_shard_ids } : {}),
       },
     }
   }
   if (tool === "llm_wiki_get_page_plan_context" && ["PAGE_PLAN_CURSOR_MISMATCH", "PAGE_PLAN_SNAPSHOT_MISSING", "PAGE_DRAFT_SHARD_NOT_FOUND"].includes(error.code)) {
     return {
       tool,
-      action_owner: "coordinator",
-      arguments: {
-        task_id: args?.task_id,
-        writer_id: args?.writer_id,
-        projection_id: args?.projection_id,
-        view: "manifest",
-        cursor: 0,
-        max_chars: 40_000,
-      },
-    }
-  }
-  if (["llm_wiki_get_page_plan_context", "llm_wiki_stage_page_drafts"].includes(tool) && error.code === "DRAFT_SHARD_CLAIM_FENCED") {
-    return {
-      tool: "llm_wiki_get_page_plan_context",
       action_owner: "coordinator",
       arguments: {
         task_id: args?.task_id,
@@ -484,7 +358,6 @@ export class HeadlessToolRouter {
     switch (name) {
       case "llm_wiki_import_files": return this.core.importFiles(args)
       case "llm_wiki_get_batch": return this.core.getBatch(args)
-      case "llm_wiki_renew_lease": return this.core.renewLease(args)
       case "llm_wiki_get_domain_schema": return this.core.getDomainSchema(args)
       case "llm_wiki_retrieve_context": return this.core.retrieveContext(args)
       case "llm_wiki_query_domain_pages": return this.core.queryDomainPages(args)
@@ -492,6 +365,7 @@ export class HeadlessToolRouter {
       case "llm_wiki_get_page_plan_context": return this.core.getPagePlanContext(args)
       case "llm_wiki_stage_page_drafts": return this.core.stagePageDrafts(args)
       case "llm_wiki_get_staged_page_drafts": return this.core.getStagedPageDrafts(args)
+      case "llm_wiki_apply_projection": return this.core.applyWikiProjection(args)
       case "llm_wiki_commit_pages": return this.core.commitPages(args)
       case "llm_wiki_update_pages": return this.core.updatePages(args)
       case "llm_wiki_finalize": return this.core.finalize(args)

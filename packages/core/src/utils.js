@@ -106,25 +106,6 @@ export async function writeTextAtomic(filePath, content) {
   }
 }
 
-export async function writeBufferAtomic(filePath, content) {
-  await ensureDir(path.dirname(filePath))
-  const temp = `${filePath}.tmp-${process.pid}-${randomUUID()}`
-  try {
-    const handle = await open(temp, "wx", 0o600)
-    try {
-      await handle.writeFile(content)
-      await handle.sync()
-    } finally {
-      await handle.close().catch(() => {})
-    }
-    await rename(temp, filePath)
-    await syncDirectory(path.dirname(filePath))
-  } catch (error) {
-    await rm(temp, { force: true }).catch(() => {})
-    throw error
-  }
-}
-
 async function syncDirectory(directory) {
   let handle
   try {

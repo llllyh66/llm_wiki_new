@@ -857,23 +857,6 @@ export interface AnalysisEnvelope {
 }
 ```
 
-新抽取器应把关系的原文陈述与规范化结构分开：
-
-```ts
-export interface RelationCandidate {
-  localId: string;
-  sourceEntityLocalId?: string;
-  predicate?: string;
-  targetEntityLocalId?: string;
-  content: string;
-  confidence?: number;
-  sourceRefs: SourceRef[] | number[];
-}
-```
-
-`content` 是 evidence-facing statement；`predicate` 可作为关系分类字段，
-但关系表述仍必须直接得到所选证据支持。
-
 `AnalysisEnvelope.sourceRefs` 是本批次使用的完整 `SourceRef` 对象目录。各
 Candidate 的 `sourceRefs` 在线路输入中优先使用指向该目录的零起始整数索引；
 Core 在校验前将其确定性解析为完整 `SourceRef[]`，并仅持久化规范化对象。
@@ -881,13 +864,10 @@ Core 在校验前将其确定性解析为完整 `SourceRef[]`，并仅持久化�
 `content` 和可解析的 `sourceRefs`。无法引用原文的问题放入
 `unresolvedQuestions`。
 
-Core 在结构校验之后使用面向 Wiki 的 Grounding Quality Gate：SourceRef 的
-quote 来源真实性继续硬校验；数字、比例、编号、日期、单位和确定性/极性等事实
-锚点必须保持等价。候选正文可以摘要化、同义改写、归一关系谓词并合并别名，普通
-词汇不重合只产生 warning；主证据复用按表格/章节/候选类型记录诊断，不再有全局
-八次硬限制。表格证据目录显式携带 `primary_quote`、`context_quotes`、列名和章节
-上下文，Core 使用与 Agent 相同的证据集合。失败返回结构化 diagnostics，单批次最多
-两次语义修复；`repair_required=true` 后不得启动新的 Extractor。
+Core 在结构校验之后执行确定性的 Grounding Quality Gate：详细 claim、关系、
+矛盾和 review item 的短 quote 必须与候选内容存在关键术语覆盖；文档标题不能
+作为整张表的通用证据。大型表格应按行或连贯主题拆分引用，单个 SourceRef
+最多支撑 8 个候选条目。门禁失败属于可恢复的业务拒绝，不是 MCP 传输错误。
 
 ## 9.6 Page Patch
 

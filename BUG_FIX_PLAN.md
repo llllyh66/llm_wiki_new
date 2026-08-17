@@ -1,728 +1,435 @@
-# llm_wiki 1.0.8 Bug 全量修复计划与执行记录
+# llm_wiki V1.0.1 Bug 修复计划与实施方案
 
-> 对应审计：[BUG_AUDIT_REPORT.md](BUG_AUDIT_REPORT.md)
->
-> 计划日期：2026-08-14
->
-> 范围：`AUD-001`–`AUD-035`，全部必修，不保留“暂缓/接受风险”项
->
-> 目标：建立唯一新流程、可审计投影、不静默漏召回的 1.0.8
->
-> 执行状态：`AUD-001`–`AUD-035` 全部 Done，二次审计通过
+## 1. 目标与边界
 
-## 0. 执行结果
+本文基于 `BUG_AUDIT_REPORT.md`，覆盖其中 6 个确认问题（含依赖问题）和 7 个高概率问题。本文只定义修复设计、实施步骤、验证方法和完成标准；本轮不修改生产源码、测试、依赖或构建配置。
 
-| 批次 | 状态 | 完成结果 |
-|---|---|---|
-| R0 | Done | 保留 35 项追踪 ID，新增构建期召回、>10K、租约、真 OCR 专项回归 |
-| R1 | Done | 长页默认 merge，全语义 requirement，Finalize 无条件快审计，无标题回退 |
-| R2 | Done | progressive import、task-local BM25/feature store、后台 Embedding、全量持久多路索引 |
-| R3 | Done | active generation 统一公开读，staging 校验后原子 pointer 发布 |
-| R4 | Done | 宿主容量、通用 Agent 角色、token/epoch fencing、renew、quarantine、exact retry |
-| R5 | Done | Skill/MCP/公开文档只剩当前 manifest→shard→receipt→Writer→Finalize 协议 |
-| R6 | Done | 共享真 OCR、解码前图像防护、PDF 预算，PPTX 顺序与复合内容抽取 |
-| R7 | Done | Core 72/72、MCP 23/23、CLI 3/3，Skill validator、build、pack dry-run、dependency audit、diff check 通过 |
+目标版本建议为 V1.0.2。修复完成前继续以 V1.0.1/main 的审计基线 `4ed5c2c` 作为对照，不移动 V1.0.1 标签。
 
-## 1. 修复原则
+## 2. 总体原则
 
-1. **每个 Bug 先有失败测试**：测试必须在旧实现上稳定失败，再修改生产代码。
-2. **不以警告代替正确性**：对数据丢失、未物化知识、索引不完整和 provisional 暴露采用 fail-closed。
-3. **单一真相**：页面、BM25、Embedding、graph、lint、Domain Query 和 Finalize result 必须属于同一 generation manifest。
-4. **唯一新协议**：新任务只允许 manifest → draft-shard → staged receipt → single writer → audited Finalize。旧数据迁移使用独立工具，不进入 Skill 主流程。
-5. **租约必须可 fencing**：worker name 用于人类诊断，真正提交权由不透明 lease token/epoch 决定。
-6. **召回完整性是发布条件**：部分 Embedding 或截断 corpus 不得标记为完成知识库。
-7. **一个修复提交一类契约**：不把向量存储、Finalize 发布、Agent 调度和 OCR 改造混成一个难以回滚的提交。
-
-## 2. 目标状态
-
-```text
-Register source + create task immediately
-  -> parser emits bounded/overlapped verified chunk batches
-  -> each batch atomically enters task-local BM25; async Embedding catches up
-  -> retrieval returns ready results plus per-source/channel coverage
-  -> capacity-aware Extractors with fenced renewable leases
-  -> complete semantic Requirement Ledger
-  -> path-disjoint Drafters -> hash-bound receipts -> one fenced Writer
-  -> server-enforced lossless page operations
-  -> Finalize validates every requirement and builds one staging generation
-  -> lint/index/manifest pass
-  -> atomic current-generation pointer publish
-  -> every public query reads that generation
-```
+1. 先锁定契约和失败用例，再改实现。每个修复先加入能稳定复现问题的测试，确认测试在旧实现上失败后再实现。
+2. P1 修复先于 P2；持久化协议先于其上的 Finalize、缓存清理等功能。
+3. 崩溃恢复不能依赖内存状态。所有恢复判断必须来自可 fsync 的 journal、目标文件 hash 和 task ledger。
+4. 安全边界采用 fail-closed：无法证明输入类型、响应大小或恢复状态安全时，返回可恢复错误，不猜测继续执行。
+5. 每个改动拆成可单独审查的提交；不在依赖升级提交中混入业务重构。
+6. 每阶段都运行 Core、MCP、CLI 全套测试，并在最后运行 Node 20 的三平台 CI 与真实 MCP 宿主冒烟测试。
 
 ## 3. 修复批次和依赖顺序
 
-| 批次 | 目标 | Bug | 合并门槛 |
-|---|---|---|---|
-| R0 | 锁定契约、最小复现和压力测试框架 | 全部 | 35 项都有独立测试 ID 和 fixture |
-| R1 | 修复页面数据丢失与最终覆盖漏洞 | 001、002、003、014 | P0 复现全绿，Finalize 无法跳过 ledger |
-| R2 | 重建渐进导入、构建期快速召回和完成后全量多路索引 | 004、005、015–019、030–035 | 首个完整 chunk 提前可搜，>10K 无静默漏召回，查询实际消费索引 |
-| R3 | 统一 generation 发布和所有公开读路径 | 006、007、029 | 故障注入下无双重真相 |
-| R4 | 修复 Agent 容量、身份、租约与背压 | 008–012、026、027 | Codex/Claude/CAC 真实多 Agent 用例全绿 |
-| R5 | 删除当前协议中的旧流程并统一版本 | 013、028 | Skill/MCP 主路径零 legacy branch |
-| R6 | 完成 OCR/PPTX 安全性、性能和内容覆盖 | 020–025 | fresh install 真实 OCR/PDF/PPTX 集成通过 |
-| R7 | 全量回归、性能、崩溃恢复与发布验证 | 全部 | 所有 Definition of Done 满足 |
+| 批次 | 内容 | 优先级 | 依赖 | 合并门槛 |
+|---|---|---:|---|---|
+| R0 | 契约决策、基线测试和故障注入设施 | P1 | 无 | 所有现存问题都有稳定失败测试或明确风险测试 |
+| R1 | BUG-002 MCP OOM | P1 | R0 | 超大/循环结果不会终止进程，输出严格小于上限 |
+| R2 | DEP-001 依赖升级 | P1 | R0 | production audit 无 high，PDF 回归通过 |
+| R3 | HP-001 + HP-002 可恢复事务与幂等 WAL | P1 | R0 | 全崩溃点重启后收敛且 exact replay |
+| R4 | BUG-001 最终投影契约落地 | P1 发布门槛 | R0；建议在 R3 后 | Core 全套恢复为绿色，replace/merge 语义明确 |
+| R5 | BUG-003、BUG-004、BUG-005 输入和证据正确性 | P2 | R0 | 类型、locator、graph property tests 通过 |
+| R6 | HP-003 Finalize generation 发布协议 | P2 | R3 | 页面、索引、lint、result 指向同一 generation |
+| R7 | HP-004、HP-005、HP-006 资源上限和 GC | P2 | HP-006 依赖 R3 | 内存/磁盘预算测试通过，恢复期数据不被清除 |
+| R8 | HP-007 Schema matcher | P2 | R0 | 边界、重叠、歧义测试通过 |
+| R9 | 未验证风险、跨平台和真实宿主验证 | 发布验证 | R1-R8 | Node 20 三平台、真实宿主、fresh package 全通过 |
 
-R1 是其他功能开发的前置门槛。R2 的新索引格式必须在 R3 generation manifest 中发布。R4 的新协议稳定后才最终精简 R5 Skill，避免提示词先于服务端实现。
+## 4. R0：修复前准备
 
-## 4. R0：修复前契约与测试设施
+### 4.1 建立修复分支和证据基线
 
-### 4.1 新增测试设施
+实施时执行：
 
-- `packages/core/test/fixtures/large-page/`：头、中、尾都有唯一已根据事实的 >40K 页面。
-- `packages/core/test/fixtures/retrieval/`：慢导入/首 chunk、>10K docs、semantic-only、lexical-only、cross-boundary、中英改写、stable Wiki 干扰和同 path 多 section 数据集。
-- `packages/core/test/fixtures/ocr/`：小型中英图片、超大维度头、多页扫描 PDF、取消测试。
-- `packages/core/test/fixtures/pptx/`：文件名顺序与展示顺序不同、chart、SmartArt、embedded workbook。
-- `packages/core/test/fault-injection.test.js`：Finalize generation 各阶段 kill/restart。
-- `packages/core/test/multi-coordinator.test.js`：相同 worker name、旧 lease token、租约续租和过期竞争。
-- `packages/mcp-server/test/host-capabilities.test.js`：总槽位 1–8、部分 spawn 失败、busy exact retry。
+```bash
+git switch main
+git pull --ff-only
+git switch -c codex/v1.0.2-bugfix
+npm ci
+npm run build
+npm test
+```
 
-### 4.2 测试要求
+保留 BUG-001 的当前失败结果作为基线。不要先改断言让 CI 变绿。
 
-- 每个 `AUD-xxx` 至少一个同名 test case，便于从 CI 直接追溯。
-- 召回测试不只断言 `truncated` 字段；必须断言末尾目标实际被召回。
-- 构建期测试必须在最后一个文件仍被 parser 阻塞时查询首个已发布 chunk，不能以 `import_files` 已完成代替“上传后快速可用”。
-- Embedding 测试必须区分真实模型、未配置和服务故障；feature-hash 不能满足“Embedding available”断言。
-- 崩溃恢复用独立子进程和 `SIGKILL`，不以普通异常代替。
-- 多 Agent 测试同时检查语义调用数量、提交数量和磁盘 ledger，不只检查最终状态。
+### 4.2 增加统一故障注入点
 
-## 5. R1：页面完整性与 Finalize Coverage Ledger
+在事务、任务保存、幂等记录和 Finalize 的关键写入后加入仅测试可用的 fault hook，例如 `faultInjector.hit("transaction.pages_applied")`。生产默认实现为空操作，测试通过 child process 环境变量选择一个点并执行 `process.kill(process.pid, "SIGKILL")`。
 
-### AUD-001 修复：服务端保证长页面无损更新
+建议覆盖的事件：
 
-**实现**
+- `transaction.intent_durable`
+- `transaction.backups_ready`
+- `transaction.page_renamed`
+- `transaction.pages_applied`
+- `transaction.task_linked`
+- `idempotency.pending_durable`
+- `idempotency.operation_completed`
+- `idempotency.response_durable`
+- `finalize.pages_published`
+- `finalize.indexes_built`
+- `finalize.generation_published`
+- `finalize.task_completed`
 
-1. 在 `existing_pages` 和 patch scaffold 中加入 `content_mode: full|excerpt`、`original_content_hash`、`section_manifest`。
-2. `content_mode=excerpt` 时不生成 `replace`；默认生成服务端 section operation，仅更新指定 heading/requirement-owned block。
-3. 如果业务必须完整 rewrite，Drafter 通过有界 cursor 读完所有 section，Core 记录 `full_content_read=true` 后才接受 replace。
-4. commit 时使用 expected hash 做三方合并/冲突判定；不能从 excerpt 推断未读区域可删除。
+测试必须使用独立 Node 子进程和临时 workspace，不能通过抛普通异常代替 SIGKILL，因为 `finally`/catch 会掩盖真实崩溃窗口。
 
-**测试**
+## 5. BUG-002：MCP 超大结果递归导致 OOM
 
-- `AUD-001 truncated replace rejected`。
-- `AUD-001 section patch preserves head middle tail`。
-- `AUD-001 full cursor rewrite may replace after complete read`。
-- 多 requirement 同 path、hash conflict、页面上限 200K 回归。
+### 推荐方案
 
-**完成标准**
+把 `serializeResult` 改成最多两次、无递归的序列化流程。超限错误必须从固定 schema 构造，不能复制原始 `data.next_action`、`error.details` 或任意嵌套对象。
 
-- 任何 Agent 从截断上下文生成的 patch 都无法删除未读 section。
-- 审计复现中的中间 marker 在更新后仍存在。
+定义 `boundedNextAction(value)`：
 
-### AUD-002 修复：建立全语义 Requirement Ledger
+- `tool` 只接受工具注册表中的字符串，并限制长度；非法值回退到 `llm_wiki_list_tasks`。
+- `arguments` 只保留小型标量白名单，如 `task_id`、`batch_id`、`cursor`、`limit`；每个字符串和总 JSON 字节数都设上限。
+- 不保留数组、任意 payload、嵌套 `next_action` 或宿主提供的大对象。
 
-**实现**
+定义 `serializeFallback()`：直接序列化一个内部常量结构；如果该固定结构仍超过上限或序列化异常，返回预先构造的小型 JSON 字符串。该分支不得再次调用 `serializeResult`。
 
-1. 为 entity、concept、candidate page、claim、relation、contradiction、review item 和 unresolved question 生成稳定 requirement ID。
-2. 对不需要独立页面的 fact requirement，必须绑定一个 owner page/section，不能仅依赖模型自觉。
-3. contradiction/review/unresolved 建立专用“冲突与待复核”页或绑定到对应主题页，保留状态和 SourceRefs。
-4. ledger 记录 `required|resolved|materialized|superseded`，`superseded` 需要新 requirement ID 和根据证据。
-5. PagePatch 必须携带实际 requirement marker/结构化 section mapping，Core 验证内容不是只写 `covers` 元数据。
+### 具体操作
 
-**测试**
+1. 修改 `packages/mcp-server/src/tools.js`，将递归 catch 和递归 output-too-large 分支替换为线性控制流。
+2. 提取 `safeErrorSummary` 和 `boundedNextAction`，对 error code、message、task_id 分别限制字符数。
+3. 超限响应不设置 `structuredContent`，避免文本和对象在宿主侧重复占用内存。
+4. 在最终返回前再次计算 UTF-8 字节数，并以 `MAX_MCP_OUTPUT_BYTES` 作为硬断言。
+5. 在 `packages/mcp-server/test/contract.test.js` 增加普通超限、超大 `next_action.arguments`、循环引用、超大错误 details 测试。
+6. 在 `packages/mcp-server/test/stdio.test.js` 或新建 `output-limit.test.js`，用 `--max-old-space-size=128` 启动子进程复现 0.5–5 MiB 输入。
 
-- review-only、contradiction-only、claim-only、relation-only 各一个任务。
-- requirement 写了 covers 但没有对应 section 时提交被拒绝。
-- 一个矛盾被根据新证据显式 resolved 的迁移测试。
+### 完成标准
 
-**完成标准**
+- 所有响应序列化路径无递归。
+- 0.5 MiB、5 MiB 和循环对象均返回结构化小错误，Node 子进程不退出。
+- 返回字节数小于 450 KiB，后续同一 STDIO 连接调用成功。
 
-- 任何已接受 Analysis 中的必要语义项都能追溯到最终 generation 的页面/section 或有证据的 resolution。
+## 6. DEP-001：高危依赖 advisory
 
-### AUD-003 修复：Finalize 无条件执行最终 ledger audit
+### 推荐方案
 
-**实现**
+分开升级 PDF 解析依赖和 MCP SDK 链路，避免一次 lockfile 大改难以定位回归。不要使用 `npm audit fix --force`。
 
-1. 将 `finalCompleted` 改为不可由空 acknowledgement 单独设置的派生状态。
-2. Finalize 在构建 generation 前每次重新计算 ledger coverage、page hashes、SourceRefs、owner、contradictions/review resolution。
-3. 最终投影的空 acknowledgement 只表示 shard traversal 完成，不表示语义审计通过。
-4. 审计结果持久为 hash-bound artifact，Finalize 验证其 input hashes 未变更。
+### 具体操作
 
-**测试**
+1. 保存修复前依赖树：
 
-- 精确复制审计中的两次空投影路径，断言第二次 Finalize 仍被拒绝。
-- ledger 完整时空 acknowledgement 可正常结束 traversal。
-- audit 后页面被外部更改时 Finalize 重新审计。
+   ```bash
+   npm ls pdfjs-dist fast-uri hono @modelcontextprotocol/sdk
+   npm audit --omit=dev --json
+   npm audit fix --dry-run
+   ```
 
-**完成标准**
+2. 查询 advisory 指定的首个已修复版本和 PDF.js breaking changes；选择包含修复且支持 Node 20 的最小版本。版本号必须以实施当天的 npm/GitHub advisory 为准，不在计划阶段硬编码可能过期的版本。
+3. 单独升级 `packages/core/package.json` 的 `pdfjs-dist`，更新 lockfile；复核 legacy import 路径、`getDocument` 参数和文本抽取 API。
+4. 保留 `isEvalSupported: false`、`disableFontFace: true`、`useWorkerFetch: false`，并设置 PDF 页数、解压后字节数、单页文本和总解析时间上限。
+5. 单独升级 `@modelcontextprotocol/sdk`，确认其锁定树不再包含有漏洞的 `fast-uri`/`hono`；若上游仍未解除，则使用 npm `overrides` 前先跑 SDK contract，不直接覆盖不兼容主版本。
+6. 增加正常、损坏、加密、超大页数和安全 corpus PDF 测试；PDF 测试在 child process 中运行并设置内存上限。
+7. 重新运行 `npm audit --omit=dev --audit-level=high`，归档 JSON 结果。
 
-- 不存在任何通过状态标志跳过最终 coverage audit 的路径。
+### 完成标准
 
-### AUD-014 修复：无标题页面安全回退
+- production dependency audit 无 high/critical。
+- PDF 正常抽取结果与基线可解释一致，恶意/异常样本在资源上限内失败。
+- MCP 16 个工具 schema、STDIO handshake 和错误通道无回归。
 
-**实现**
+## 7. HP-001 + HP-002：可恢复事务和幂等 WAL
 
-- snapshot 显式保留 relative path，回退标题由 relative basename 得到；不使用作用域外的 `file`。
-- parse warning 进入 plan diagnostics，但不阻断其他页面。
+### 推荐方案
 
-**测试/完成标准**
-
-- 无 frontmatter、无 H1、损坏 frontmatter、Unicode 文件名全部可规划，标题回退确定且无异常。
-
-## 6. R2：全量多路召回与向量存储
-
-### 6.1 构建期快速可用协议
+把页面事务和幂等执行统一为 durable operation。核心状态机建议为：
 
 ```text
-source durable-registered
-  -> task_id returned
-  -> parser emits verified chunk batch
-  -> atomic task retrieval mini-generation publish
-       ├─ BM25: synchronous ready（可用性保底）
-       └─ Embedding: asynchronous queue（质量增强，不阻塞查询）
-  -> retrieve_context reads one immutable ready snapshot
-  -> Finalize builds complete generation indexes
-  -> pointer atomically switches to published multi-route generation
+PREPARED -> APPLYING -> PAGES_APPLIED -> TASK_LINKED -> COMMITTED
+                    \-> ROLLING_BACK -> ROLLED_BACK
 ```
 
-构建期的可用性由 BM25 保底，真实 Embedding 异步追赶。所谓“两路召回”不得解释为必须等待两路都完成后才回答；否则慢向量服务会重新阻塞快速路径。每次响应必须告诉调用方本次实际使用了哪些路、每路覆盖多少文档，以及哪些 source 尚未可搜。
+在第一次页面 rename 前写入并 fsync `operation.json`，内容至少包括：`operationId`、`transactionId`、`taskId`、`idempotencyKeyHash`、`requestHash`、目标路径、旧/新 hash、staging/backup 路径、预期 task delta、状态和时间戳。每次状态转换使用原子写并 fsync 文件及父目录。
 
-task retrieval mini-generation 必须不可变并可原子切换，避免查询读到一半 postings、一半 vectors。解析失败只标记对应 source/chunk，不得撤销其他已就绪 source；重试使用 source content hash 和 chunk policy fingerprint 保证幂等。
+幂等 shard 在调用副作用前写 `PENDING`，并引用同一个 `operationId`；成功后写 `COMMITTED + response`。重放遇到 `PENDING` 时不得直接再次执行，而是调用 operation-specific reconciler。
 
-### 目标索引格式
+### 具体操作
 
-generation/task retrieval manifest 至少包含：
+1. 在 `packages/core/src/transaction.js` 增加 journal schema v2 和显式状态转换函数。
+2. staging 全部生成并校验 hash 后，写 `PREPARED` intent；只有 intent durable 后才允许备份和 rename。
+3. 每个目标应用后更新已应用集合；全部完成后写 `PAGES_APPLIED`。
+4. 将 commits ledger 和 task 需要更新的字段写入 journal 的 `taskDelta`。ledger/task 成功后写 `TASK_LINKED`，最后记录 response 并写 `COMMITTED`。
+5. 修改 `withIdempotency`：先持久化 `{status:"pending", requestHash, operationId}`，再执行操作；完成后原子替换为 committed response。
+6. 给 `commit_analysis`、PagePlan/投影提交、`commit_pages` 分别实现 reconciler。恢复器根据 journal 状态和磁盘 hash 做三选一：安全完成、完整回滚、标记 `RECOVERY_REQUIRED`；不能在状态不明时猜测覆盖。
+7. workspace 初始化时，在持有恢复锁和 `write.lock` 的情况下扫描未终态 journal。恢复完成前拒绝新的写操作，但允许只读状态查询返回恢复进度。
+8. 对旧 schema v1 journal 保持只读兼容；没有足够证据自动恢复时给出明确人工处置报告，不删除。
+9. 在 `packages/core/test/` 新增 child-process crash matrix，逐个 fault point 杀进程、重启 Core、重放同一 idempotency key。
 
-```json
-{
-  "schemaVersion": 3,
-  "generationId": "...",
-  "tokenizerFingerprint": "...",
-  "embeddingFingerprint": "...",
-  "documentCount": 12345,
-  "readiness": { "state": "source-ready", "readyDocuments": 12345, "totalDocuments": 12345, "exact": true },
-  "sources": { "accepted": 3, "parsed": 3, "bm25Indexed": 3, "embeddingIndexed": 2, "failed": 0 },
-  "documentsSha256": "...",
-  "bm25": { "complete": true, "shards": [] },
-  "vectors": { "complete": true, "dimensions": 0, "shards": [] },
-  "graph": { "complete": true, "path": "graph.json" }
-}
-```
+### 恢复判定规则
 
-任一 requested channel `complete=false` 时，完成后查询不得宣称全通道可用。
+- 目标 hash 等于 `newHash` 且 task 未链接：继续链接 ledger/task，再提交幂等 response。
+- 目标 hash 等于 `oldHash` 且 staging 完整：从 PREPARED 继续应用。
+- 部分目标为新 hash、其余为旧 hash：按 journal 完成剩余目标；若 staging 缺失但 backup 完整，则整体回滚。
+- 目标既非 oldHash 也非 newHash：停止自动恢复，返回 `RECOVERY_REQUIRED`，保留全部证据。
+- COMMITTED operation 的同 key、同 request 必须返回原 response；同 key、不同 request 必须返回冲突。
 
-### AUD-030 修复：注册先行、解析和索引渐进发布
+### 完成标准
 
-**实现**
+- 每个 rename/journal/task/idempotency 崩溃点重启后都收敛到全提交或全回滚。
+- 同一幂等 key 无重复 analysis、transaction、页面或 commit ledger 项。
+- 未知外部修改不会被恢复流程覆盖。
+- 恢复后 retrieval、result、task status 和 Wiki hash 一致。
 
-1. `import_files` 先校验路径和基础元数据，持久创建 ingestion/task/source records，立即返回 task ID 与 `retrieval_readiness=importing`。
-2. 文件复制、解析/OCR 和 Chunk 改成可恢复后台阶段；每个 source 或有界 chunk batch 完整写入后更新 source epoch。
-3. 在独立 staging 中更新 task-local BM25/文档 manifest，校验通过后原子切换 retrieval pointer。
-4. 不再让长 parser 全程持有 workspace 全局写锁；只在短事务更新 source/task/index pointer 时持锁。
-5. 幂等重试按 source hash、parser fingerprint、chunk policy fingerprint 复用已完成阶段。
+## 8. BUG-001：最终投影 body 保留契约
 
-**测试/完成标准**
+### 推荐契约
 
-- 第二个文件用 barrier 阻塞时，第一个文件的唯一词已能通过同一 task ID 命中。
-- 扫描 PDF OCR 进行中时，已完成页面可搜，状态精确显示剩余页；kill/restart 后不丢已发布 chunk、不重复 doc ID。
-- source 注册失败、解析失败、部分成功和取消均有确定状态，其他 ready source 不受影响。
+建议明确：`replace` 是最终页面正文的完整权威替换，不隐式拼接 provisional body；`merge` 才用于显式保留现有内容。原因是自动拼接旧正文会保留重复、冲突或已被最终 reconciliation 否定的事实。
 
-### AUD-031 修复：真实通道身份和降级语义
+需要保留的 provisional 事实必须由最终 Writer 基于 SourceRef 重新写入 final patch，不能依赖 Core 隐式复制旧文本。
 
-**实现**
+### 具体操作
 
-- 响应分开返回 `requested_channels`、`active_channels`、`effective_channels` 和 `fallback_channels`。
-- 只有通过 embedding fingerprint/dimension 校验的真实向量索引才可出现在 `active_channels.embedding`。
-- feature-hash 使用独立名称和权重；默认不作为与 BM25 等权的独立 RRF 证据，避免高度相关信号重复加分。
-- 若产品必须保证真实 BM25+Embedding，两种可接受方案二选一：随发布包提供受测试的本地模型，或 workspace 初始化时要求配置并通过一次健康检查；文档不得继续把未配置状态写成真实两路可用。
+1. 在 PagePatch schema、README、Skill Writer 指令中写明 create/replace/merge 三种语义。
+2. 修改失败 e2e：最终检索使用 final patch 中实际存在的 `reconciled overview`；同时断言 `ProvisionalOnlyMarker` 不再可检索，证明完整替换生效。
+3. 新增 merge 用例：显式 merge 时保留指定旧事实，并验证重复 Related/frontmatter 不产生。
+4. 新增 final Writer 完整性用例：如果 provisional fact 仍有有效 SourceRef，Writer 必须在 final patch 中显式携带；Core 不负责语义猜测。
+5. 若产品负责人选择“replace 也必须保留旧事实”，则不要复用字符串拼接；新增结构化 `preserve_sections`/`remove_sections` 合约，并对冲突做显式失败。该方案工作量和数据歧义明显更高，不作为默认建议。
 
-**测试/完成标准**
+### 完成标准
 
-- 默认 `provider=none` 时 `available_channels` 不含 Embedding，响应明确 `feature_hash.degraded=true`。
-- provider 可用、超时、维度变化、模型切换分别返回真实且可机读的通道状态。
-- 同一 lexical 信号不会因 BM25+feature-hash 被无条件双倍 RRF 加权。
+- 契约文档、tool schema、Skill prompt、实现和测试对 replace/merge 的定义一致。
+- 当前唯一 Core 红测恢复为绿色，且包含“replace 不隐式保留、merge 显式保留”的双向断言。
 
-### AUD-032 修复：Embedding 离开在线批量补算路径
+## 9. BUG-003：display_name 伪造解析类型
 
-**实现**
+### 推荐方案
 
-- source chunk 和 analysis commit 后写 durable embedding queue；worker 批量生成向量并发布新的 task retrieval snapshot。
-- 在线查询只生成 query vector并查询已发布 ANN；不得为候选文档发起 Embedding。
-- query vector 调用有独立严格延迟预算；超时立即降级 BM25，并保留可重试诊断，不等待默认 600 秒总预算。
-- Finalize 在 pointer 切换前验证 stable Wiki 的全部必需向量；source/analysis 是否进入完成代索引由 manifest 明确声明，不能隐式首查补算。
+把展示名和类型判定彻底分离。实际路径扩展名受支持时，它是权威类型；`display_name` 只作为 label。实际路径无扩展名时，需要受信宿主传入 `media_type`，并对 PDF/DOCX/XLSX 做文件签名/ZIP 结构校验。无法可靠判定时拒绝导入。
 
-**测试/完成标准**
+作为纵深防御，Markdown/HTML 共用危险原始 HTML 清理策略，至少移除 script、style、iframe、object 和事件属性；代码围栏内的示例文本不能被误清理。
 
-- 冷缓存首次查询不会产生 document embedding 请求；只允许一个有界 query embedding 请求。
-- embedding worker 被暂停或服务超时时，BM25 在在线预算内返回，coverage 显示部分/不可用。
-- 构建完成后首次查询也不批量写向量缓存。
+### 具体操作
 
-### AUD-033 修复：构建期 task-local 优先与稳定 Wiki 隔离
+1. 在 `packages/core/src/source-store.js` 提取 `resolveSourceMediaType({sourcePath, displayName, declaredMediaType})`。
+2. 若真实扩展名存在且受支持，忽略 display_name 扩展名；两者不一致时返回包含两者的 `SOURCE_TYPE_MISMATCH`，或按兼容策略记录 warning 后使用真实扩展名。安全默认建议直接拒绝。
+3. 对 `%PDF-`、ZIP 容器中的 `word/`、`xl/` 条目做签名确认；二进制签名与扩展名不一致时拒绝。
+4. 为 extensionless attachment 增加明确 schema 字段 `media_type`，并限定枚举；不要继续从可编辑展示名静默推断。
+5. 将原始 HTML 清理放在统一文本规范化边界，确保错误分类也不能把可执行标签带入 Wiki renderer。
+6. 增加 HTML/Markdown/TXT 的交叉 display_name、二进制扩展伪装、无扩展名和签名不符测试。
 
-**实现**
+### 完成标准
 
-- 构建期默认检索域为当前 task 的 ready source + committed analyses；对最新上传 source 设置保底候选配额。
-- 上一 published generation 作为显式 `stable_wiki` 辅助通道，使用独立 top-k、权重和来源标签；默认不得占用 task-local vector quota。
-- 如果用户主动要求全 workspace 联合查询，先在各 scope 内完整召回，再做跨 scope fusion，不能在召回前 `fairTake` 混切。
+- `real.html + spoof.md` 不能进入 Markdown parser。
+- 所有二进制格式均验证签名；无法确定类型的输入以结构化错误退出。
+- display_name 的修改不改变同一文件的 parser 选择和内容 hash。
 
-**测试/完成标准**
+## 10. BUG-004：长块分片 locator 错误
 
-- 构造 10K 旧 Wiki + 1 个新 source，普通构建期查询必须命中新 source 的 lexical-only 和 semantic-only 目标。
-- 不传 `batch_id` 也能得到 task-local source 保底；显式 stable Wiki 联合查询时两种 scope 可区分且可复现。
+### 推荐方案
 
-### AUD-034 修复：由 durable readiness 驱动阶段和通道
+把 `splitText` 改成返回 `{text, relativeStart, relativeEnd}`，偏移相对于未 trim 的 block 原文；`chunkDocument` 再加上 `block.startOffset` 得到绝对 locator。明确 offset 单位为 JavaScript UTF-16 code unit，并在协议文档中固定。
 
-**实现**
+### 具体操作
 
-- phase 由 task retrieval manifest、index completeness 和 publication pointer 共同派生，不直接等同于 `task.status`。
-- 支持 `importing/source-ready/analyzing/wiki-staging/published/degraded` 状态机，定义每个转移的原子写和恢复规则。
-- completed 但 generation/index 不完整时 fail-closed 为 degraded，不宣称多路完整；pointer 已发布时以 pointer 所指 manifest 为准。
+1. 将 `splitText(text, maxChars)` 替换为 `splitTextWithOffsets(text, maxChars)`。
+2. 切片时记录原始 cursor；leading/trailing whitespace 的删除量分别计入 start/end，禁止先 trim 后再猜偏移。
+3. paragraph/code/table 使用片段级绝对偏移；多个小 block 合并时 locator 为首块 start 到末块 end。
+4. heading 的渲染前缀 `# ` 属于合成文本，locator 仍指向源 heading 内容；不要把合成字符计入源 offset。
+5. 对 Markdown 规范化（CRLF 转 LF）建立 offset map，或把 locator 明确定义为规范化源文本偏移并让 SourceRef/UI 使用同一文本。推荐保留原始到规范化的映射，以便准确高亮原文件。
+6. 表格 fragment 附带 cell/sheet 信息和片段 offset；不要只复制整表 locator。
+7. 添加 property tests：区间单调、范围合法、source slice 与 quote 对应、Unicode surrogate 不被切断，并覆盖 CRLF、CJK、emoji、长代码块和长表格。
 
-**测试/完成标准**
+### 完成标准
 
-- 在 task status 更新、index manifest 写入、generation build、pointer publish 的每个边界 kill/restart，phase 与 active channels 都反映实际耐久状态。
-- 不存在仅改 `task.status` 就从两路切到“三路完成”的路径。
+- 10,000 字符单段的各 chunk locator 不再相同，且随片段单调前进。
+- 任一 locator 都在源长度范围内；UTF-16 surrogate pair 不从中间切开。
+- SourceRef UI/检索引用可以用 locator 定位到该 chunk 对应文本。
 
-### AUD-035 修复：逐 source/逐通道 readiness 契约
+## 11. BUG-005：代码块链接污染关系图
 
-**实现**
+### 推荐方案
 
-- import/status/retrieve 共享一个 schema，包含 source 的 `registered/copied/parsed/chunked/bm25-indexed/embedding-indexed/failed` 状态。
-- 每个 channel 返回 `indexed_documents/total_documents/complete/degraded/index_generation`；retrieval 返回 `answer_scope` 和所读 manifest ID。
-- `total_documents` 尚未知时必须 `exact=false`，不得用当前已见数量伪装最终总数。
+建立一个共享的 Markdown 关系提取器，Finalize、buildGraph 和 lint 只能调用这一实现。提取前通过轻量 tokenizer 屏蔽 YAML frontmatter、fenced/indented code、inline code、HTML `code/pre` 和 blockquote。
 
-**测试/完成标准**
+关系规则建议为：正文中的显式 wikilink/合法 Wiki Markdown link可形成边；纯路径只在 Related section 中有效；代码、引用和 frontmatter 中的任何样例链接均不形成边。
 
-- 多文件部分成功、OCR 中途取消、Embedding 积压、重启恢复时三类 API 读到相同 readiness。
-- 当查询未命中且目标 source 尚未 indexed，调用方能仅依赖结构化字段给出正确解释。
+### 具体操作
 
-### AUD-004 修复：全量 Embedding 索引
+1. 在 `wiki-page.js` 或独立 `markdown-links.js` 中实现 `extractRelationshipReferences(content)`，返回 canonical slug 及来源位置/类型。
+2. 复用 `canonicalRelatedPath` 和 `normalizeRelatedSlug`，统一处理 `wiki/`、`.md`、反斜杠、fragment、绝对 URL 和 traversal。
+3. `enrichWikiRelations`、`buildGraph`、`lintWiki` 全部改用共享结果；删除 `core.js` 中直接对整文件运行的 wikilink 正则。
+4. 图边按 `source + target` 去重，并过滤 self-edge；目标不存在仍交给 lint 报告，但不要生成格式不规范 target。
+5. 测试 fence（反引号和波浪线）、嵌套/未闭合 fence、inline code、blockquote、HTML pre/code、普通正文 link、Related legacy path、URL 和 traversal。
 
-**实现**
+### 完成标准
 
-- 构建期：source chunk 入库时加入向量队列，analysis commit 时加入 analysis docs；查询不再仅向量化前 1,000/2,000 个候选。
-- 完成后：Finalize 在发布前为全部 stable Wiki sections 构建向量索引。
-- 向量 provider 不可用时，显式返回 degraded 且运行全量 BM25；不把 feature hash 命名为真实 Embedding。
-- ANN 召回后可与 BM25/Wiki RRF，但不允许 BM25 先硬截断向量语料。
+- 代码块/引用中的链接不会出现在 Related、graph 或 broken-link lint 中。
+- 三个消费者对同一页面生成完全相同的 canonical 边集合。
+- 合法正文关系和 Related 关系保持兼容。
 
-**测试/完成标准**
+## 12. HP-003：Finalize 多产物一致性
 
-- 审计的 1,101 文档 semantic-only 复现命中第 1,051 个文档。
-- 20K 文档中目标分别位于首、中、尾，三者都能命中。
-- channel status 的 indexed/skipped 与 manifest 完全一致；完成索引 `skipped=0`。
+### 推荐方案
 
-### AUD-005 修复：移除 10K 静默语料截断
+采用 generation 发布协议。所有派生产物先写入 `.llm-wiki/generations/<generationId>/`，manifest 记录输入 wikiRevision、taskId、各文件 hash 和状态；全部成功后原子更新 `current-generation.json`。检索只读取 current 指针，不读取正在构建的 generation。
 
-**实现**
+Wiki source pages、Related enrichment、index/overview 先在 staging 中生成，并通过 R3 的页面事务一次发布；随后基于发布后的固定 wikiRevision 构建所有索引。
 
-- 将 `maxDocuments` 从语义完整性上限改为单 shard/单查询内存预算。
-- 按 doc ID 稳定分片，所有 shard 参与 lexical/vector 候选合并。
-- 如果某 shard 缺失或 hash 错误，返回 `RETRIEVAL_INDEX_INCOMPLETE`，不默认仅搜已加载部分。
+### 具体操作
 
-**测试/完成标准**
+1. 新增 `finalization.json`，状态为 `PREPARED -> PAGES_PUBLISHED -> INDEXES_READY -> PUBLISHED -> TASK_COMPLETED`。
+2. source pages、relations、index.md、overview.md 先生成到 staging；`log.md` 使用 taskId 去重，保证重放安全。
+3. 在 `write.lock` 下发布页面集合并记录唯一 wikiRevision。
+4. 基于该 revision 构建 page-source-refs、bm25、vector、embedding、graph、lint，写入 generation 目录并校验 hash。
+5. lint 通过后原子写 `current-generation.json`；task result 同时记录 `generation_id` 和 `wiki_revision`。
+6. 启动恢复器扫描未终态 finalization：未发布 generation 可继续构建或删除 staging；已发布但 task 未完成则只补 task/result，不重建页面。
+7. 修改 retrieval 读取 current generation；对没有 generation 指针的 V1.0.1 workspace 保持旧路径只读兼容，并在下一次 Finalize 迁移。
 
-- 10,001、50,000 文档语料的尾部 lexical/semantic 目标都可召回。
-- 删除一个 shard 时查询 fail-closed，恢复 shard 后可继续。
+### 完成标准
 
-### AUD-015 修复：重叠 Chunk 与 parent-child 召回
+- 任一 Finalize fault point 重启后，读取者只能看到旧完整 generation 或新完整 generation。
+- task result、lint、graph、BM25、embedding 均记录同一 generation/wikiRevision。
+- Finalize 重放不会重复 log、关系或 source page。
 
-**实现**
+## 13. HP-004：embedding cache 无界增长
 
-- Source 使用句子/段落/表行感知窗口，默认 overlap 10%–15%，不跨越不相关 heading。
-- Analysis/Wiki section 使用相同 tokenizer 和 window policy，记录 parentDocumentId、window start/end。
-- SourceRef 仍指向原文精确偏移；overlap 是召回文档，不会造成证据 locator 重写。
-- RRF 后按 parent + evidence range 去重。
+### 推荐方案
 
-**测试/完成标准**
+引入 workspace 级缓存预算、可达性清理和 LRU/TTL。建议默认值先通过真实样本测算后确定；初始候选为 512 MiB、50,000 文件、30 天 TTL，均允许配置覆盖。
 
-- 关系语句、否定词、表头+行、中英标点分别落在原 cut 两侧时仍能召回完整上下文。
-- locator property tests 仍保证 quote 可从原文 slice 验证。
+### 具体操作
 
-### AUD-016 修复：真实持久 BM25 索引
+1. 在 workspace config 增加 `embedding.maxCacheBytes`、`maxCacheFiles`、`cacheTtlDays`，并做上下界校验。
+2. cache entry schema 增加 `createdAt`/`lastUsedAt`；为避免每次读取写盘，可按小时节流更新 mtime 或维护小型访问 manifest。
+3. Finalize 成功后收集当前 generation 可达 document hash；GC 先删过期且不可达项，再按 LRU 删除不可达项直到预算内。
+4. GC 使用独立 lock；遍历时拒绝 symlink，只删除校验通过的 fingerprint/hash 路径。
+5. 保留当前 generation 正在引用的向量，即使暂时超预算；记录 warning 并停止新增 cache，而不是破坏当前检索。
+6. 评估 Float32 二进制存储以减少 JSON 体积；若采用，增加 schema version 和旧 JSON lazy migration。
 
-**实现**
+### 完成标准
 
-- 使用确定 tokenizer fingerprint，持久 vocabulary、DF、doc length、term postings/TF。
-- 新 source/analysis 文档增量写入 task index；Finalize 合并为 generation index。
-- 查询路径读取索引而非重新 tokenize 全 corpus；对小语料保留可验证的 live scorer 作 oracle test，不作生产主路径。
+- 重复导入和多个 fingerprint 后缓存稳定在配置预算内。
+- GC 不删除当前 generation 或正在写入的 entry。
+- 并发检索、Finalize 和 GC 不产生损坏 JSON/向量。
 
-**测试/完成标准**
+## 14. HP-005：非 streaming embedding response 内存峰值
 
-- 持久索引与 oracle BM25 的 top-k/分数排序在 fixture 上一致。
-- 查询不读取原始全 corpus 内容也能完成 BM25 候选。
+### 推荐方案
 
-### AUD-017 修复：可查询向量存储
+生产 fetch 必须提供 Web `ReadableStream`。如果 `response.body.getReader` 不存在，直接返回 `EMBEDDING_UNSUPPORTED_RESPONSE_BODY`，不要调用 `response.text()`。同时使用 Content-Length 做早期拒绝，但不能把它当作唯一边界。
 
-**实现**
+### 具体操作
 
-- 选择本地紧凑存储（如 SQLite + HNSW 扩展或可移植的 HNSW 文件），不再一向量一 JSON。
-- manifest 存 doc ID、content hash、model/endpoint fingerprint、dimensions、generation、tombstone 和 index hash。
-- 新 generation 不复用 fingerprint 不同的旧向量；内容 hash 相同时可复用。
-- 移除或重命名当前 `vector.json` feature-hash 产物，避免把它当成真 Embedding。
+1. 删除 `readBoundedResponseText` 中无 reader 时的 `response.text()` 分支。
+2. 在读取前检查可信格式的 `content-length > maximumBytes` 并 cancel/abort。
+3. streaming 分支继续逐 chunk 计数；超限时 `reader.cancel()` 加 `AbortController.abort()`。
+4. 避免反复字符串拼接造成额外峰值：先保存有界 Uint8Array chunks，最后一次 decode/concat。
+5. 错误响应的 64 KiB 限额和成功响应的 16 MiB 限额都走同一个 reader。
+6. 测试无 body、无 getReader、伪造小 Content-Length 但实际超大、分块超限、UTF-8 多字节边界和慢流超时。
 
-**测试/完成标准**
+### 完成标准
 
-- 构建、重启、增量更新、删除、model 切换、损坏 index 全部有用例。
-- 50K 文档查询不需要为每个文档读 JSON/重新请求 Embedding。
+- 任意响应都在读取过程中执行字节限制，没有“完整读入后检查”的路径。
+- 64–128 MiB 模拟响应在小 heap 子进程中有界失败，Core 降级到 feature-hash fallback。
 
-### AUD-018 修复：证据感知的同 path 多 section 选择
+## 15. HP-006：journal backup 无界增长
 
-**实现/测试**
+### 推荐方案
 
-- 用 MMR 或 section similarity 去重代替固定 2 条上限；per-path cap 作为最终预算而非早期硬切。
-- 一个页面三个互不重复的命中 section 全部可返回；高度重复 section 只返回一个。
+该项必须在 R3 的状态机完成后实施。只清理已 `COMMITTED`/`ROLLED_BACK` 且超过恢复保留期的 backup/staging；保留小型不可变 transaction metadata 供审计。未终态和 `RECOVERY_REQUIRED` journal 永不自动删除。
 
-**完成标准**
+### 具体操作
 
-- 多 section 命中不再因 path 相同被无条件删除。
+1. 在 config 增加 `journal.retentionDays`、`maxBackupBytes`，默认值通过实际 workspace 测算；提供 GC dry-run 结果结构。
+2. journal 终态后写 `cleanupEligibleAt`。GC 在 journal lock 下扫描并校验 transaction ID/path，拒绝 symlink。
+3. 先删除 backup/staging，后把 metadata 标记 `artifactsCleanedAt`；中途崩溃可安全重放。
+4. 超预算时按最老的已终态事务清理；不能通过删除未终态事务来满足预算。
+5. 在 workspace open 或 Finalize 后以低频触发，不放在每个页面提交的关键延迟路径上。
+6. 如需用户操作，新增只读 `journal_gc_plan` 和显式 `journal_gc_apply` API；默认自动模式也必须输出清理统计。
 
-### AUD-019 修复：provisional 读取 fail-closed
+### 完成标准
 
-**实现/测试**
+- 大量 replace 后 backup bytes 按策略回落。
+- 崩溃恢复窗口内的 backup 保留完整；未终态 journal 不被 GC。
+- GC 自身中途退出后可重放，且不会删除 workspace/journal 根目录之外文件。
 
-- 从 active generation 查询时不再需要扫描工作树 provisional owner。
-- 构建期 task-scoped 查询仅包含该 task 允许的 source/analysis，不包含任何未发布 Wiki page。
-- 注入损坏 task.json、原子替换窗口和权限错误，断言未发布 marker 始终不可见。
+## 16. HP-007：Domain Schema substring 误匹配
 
-**完成标准**
+### 推荐方案
 
-- owner 状态不可验证时不存在任何 fail-open 排名路径。
+Latin 文本按 Unicode 字母/数字 token 和连续 token 序列做完整匹配；CJK 使用最长匹配和显式优先级。返回 match evidence（字段、alias、span、match kind、score），分数接近或并列时不自动唯一选择。
 
-## 7. R3：Generation 发布和公开读路径
+### 具体操作
 
-### AUD-006 修复：Domain Query 共用 active generation
+1. 建立 Unicode tokenizer，避免 JavaScript `\b` 对非 ASCII 的局限。
+2. exact id/name/alias 最高分；完整 token/phrase 次之；description/property 只作低权重召回，不允许单独触发高置信自动选择。
+3. CJK 对重叠别名执行 longest-match；同长度冲突按 schema priority，仍并列则返回 ambiguous candidates。
+4. `rankedSchemaMatches` 返回 score 之外的 `matched_terms` 和 spans，供 Agent 解释和调试。
+5. 设定最小分差/置信阈值；未达到时要求显式 type id，而不是静默选第一项。
+6. 添加英文短别名嵌在长单词、连字符、大小写、CJK 重叠、类型/属性同名和并列分数测试。
 
-**实现**
+### 完成标准
 
-- 提取公共 `resolvePublishedWikiRoot(workspace)`，`retrieve_context`、`queryDomainPages search/inspect`、lint/report 的用户可见路径共用。
-- response 返回 generation ID + revision，不再只返回可能来自工作树的 hash。
-- 若需要 task draft inspect，新建内部、显式 task-scoped 工具，不复用公开 Domain Query。
+- 三字符 alias 不会命中更长 Latin 单词内部。
+- CJK 重叠结果稳定且可解释；歧义不会被伪装成确定选择。
+- 旧的 exact id/name/alias 查询结果保持兼容。
 
-**测试/完成标准**
+## 17. 未验证风险的处置方案
 
-- 另一任务写入 classified provisional page 时，search 和 inspect 均只看到已发布 generation。
+这些项目在审计中尚未确认为 bug，应作为发布前威胁模型和平台验证任务，不与已确认 bug 混写。
 
-### AUD-007 修复：单 generation 原子发布
+### 17.1 外部路径读取
 
-**实现**
+- 明确 MCP 输入是否属于受信 operator 能力。若不可信，把附件限定在宿主 materialization roots/workspace allowlist。
+- 使用 realpath 后再校验根目录；覆盖 symlink、hardlink、路径替换竞态和 workspace 外文件。
+- domain schema path 使用相同边界，不保留第二套较弱规则。
 
-1. Finalize 从上一 active generation + task transaction diff 生成 staging Wiki，不就地改写公开工作树。
-2. 在 staging generation 内生成 source/index/overview/log、BM25、vector、graph、lint、page-source-refs 和 manifest。
-3. 校验所有 artifact hash、ledger coverage、lint 和 retrieval completeness。
-4. 仅通过一次 atomic pointer update 发布。
-5. pointer 成功后再更新 task result；恢复器根据 pointer/manifest 完成 ledger，不再写 V1.0.1 固定路径。
+### 17.2 Embedding SSRF 和错误泄露
 
-**故障注入**
+- 若 endpoint 可由项目/Agent 配置，仅允许 `https` 和显式 host allowlist；默认拒绝 loopback、link-local、私网和 cloud metadata 地址。
+- 每次重定向重新校验目标；限制重定向次数。
+- 外部错误只返回状态码和固定摘要，不回传可能包含 secret 的前 1,000 字符原文；详细信息写入受控日志并脱敏。
 
-- staging pages、indexes ready、lint ready、manifest ready、pointer published、task completed 每个点 kill/restart。
-- 无论在哪个点崩溃，公开查询要么全部看旧 generation，要么全部看新 generation。
+### 17.3 Windows 原子写和目录耐久性
 
-**完成标准**
+- 在 Node 20 Windows/macOS/Linux 跑真实覆盖写、rename existing target、目录 fsync 能力和 kill/restart 测试。
+- 对 Windows replace 采用经测试的双 rename/backup 协议；失败时保留 journal，不假设 POSIX 语义。
 
-- lint 失败、Embedding 不完整或 graph 构建失败都不会改变任何公开读结果。
+### 17.4 Build artifact drift
 
-### AUD-029 修复：基于 manifest diff 的完整变更报告
+- MCP 启动时比较 `dist/build-info.json` 与 package version/source build stamp，不一致时快速失败并提示 `npm run build`。
+- 发布 CI 从 fresh checkout 生成 tarball，解包后直接运行 MCP smoke test，确保 npm package 自带可执行 dist。
 
-**实现/测试**
-
-- manifest 为每个 page 保存 path、origin（agent/source/index/overview/log）、old/new hash、created/updated/unchanged/deleted。
-- Finalize result 的 created/updated 由上一 generation 和新 generation diff 生成。
-- 用一次新 source page + overview/index/log 更新 fixture 验证报告完整且无重复。
-
-**完成标准**
-
-- result 列表与 generation manifest diff 完全一致。
-
-## 8. R4：多 Agent、租约、恢复和背压
-
-### AUD-008 修复：宿主容量感知调度
-
-**实现**
-
-- 协调器在首波调度前得到 `max_total_agents`、`coordinator_slots`、`available_background_slots`、`supports_named_roles`。
-- Core 只返回理想 recommendation 和 pipeline limits；Skill 计算 effective wave，不再要求无条件“精确启动 4”。
-- 部分 spawn 失败时保留已成功 worker 集合，仅回填空缺槽；不允许协调器同时重做已分配工作。
-
-**测试/完成标准**
-
-- 4 总槽位的 Codex 计划最多 3 个后台 Agent；投影重叠时能在 1+2 或 2+1 之间确定分配。
-- 第 N 个 spawn 失败时不会重启前 N-1 个 worker 或转入重复前台抽取。
-
-### AUD-009 修复：可移植 role contract
-
-**实现**
-
-- 将 Extractor/Drafter/Writer 权限、允许工具、输入和输出定义为简短、版本化 role contract。
-- Claude/CAC 命名 Agent 只是 adapter；Codex 等宿主可使用通用 subagent + 签名 contract，不需要伪造 `subagent_type`。
-- 增加宿主 adapter 合约测试，验证工具权限、稳定 ID、回执和不能并行 commit。
-
-**完成标准**
-
-- Skill 不再把 Claude `Agent(team_name/subagent_type)` 参数当成通用协议；每个目标宿主都有实际可调用路径。
-
-### AUD-010 修复：有界续租
-
-**实现**
-
-- 新增 renew lease operation，输入 task/batch(or projection)/worker/lease token，返回新 expiry 和同 epoch token。
-- 最小续租间隔、最大总租期、任务状态和 cancellation 都由 Core 校验。
-- Agent 在语义生成阶段由宿主轻量 heartbeat 续租，不将 source 内容重发。
-
-**测试/完成标准**
-
-- 可控时钟下跨越原 30/60 分钟的活跃 Agent 不会被重新分配；停止心跳后在有界时间内可恢复。
-
-### AUD-011 修复：fencing token/epoch
-
-**实现**
-
-- 每次新租约生成高熅 `lease_token` 和单调 epoch，持久化 hash，明文只返回持有者。
-- `commit_analysis`、stage drafts、Writer commit、renew 都必须匹配 token+epoch。
-- 重新授权后旧 token 即使 worker name 相同也被拒绝为 `STALE_LEASE_FENCE`。
-
-**测试/完成标准**
-
-- 两协调器复用同一 worker name，只有当前 token 可提交；旧 Agent 无法在新租约后写入。
-
-### AUD-012 修复：新流程必须显式 worker/writer ID
-
-**实现/测试**
-
-- MCP schema 和 Core 新 protocol version 都将 worker/writer ID 设为 required；空值和缺省值结构化拒绝。
-- 迁移工具如需读旧默认 ID，在离线迁移阶段转换，不进入新运行时。
-
-**完成标准**
-
-- 并行任务不存在 `worker-default`/`writer-default` 身份。
-
-### AUD-026 修复：过期 projection artifact 隔离与 GC
-
-**实现/测试**
-
-- lease 过期时在 task lock 下把 plan/draft 移入 `orphaned/<projection-id>`，记录 reason/hash/retention deadline。
-- 新 projection 仅能读当前 ID 且验证 writer/token。
-- 重复过期、进程崩溃在 move 中间、GC 与恢复并发用例通过。
-
-**完成标准**
-
-- 过期文件不会被新投影使用，也不会无期增长。
-
-### AUD-027 修复：可精确重放的 busy 合约
-
-**实现/测试**
-
-- Router 对 busy 返回 `retry_after_ms`、`operation`、有界 `retry_action` 或服务端 opaque replay token。
-- 保留原 idempotency key；等待后重试同一操作，不转为 status/list loop。
-- 造成 global/task 背压，验证第四次或客户端重试仍执行一次原操作，无重复副作用。
-
-**完成标准**
-
-- Skill、tool schema、Router 和 Core 对 busy 的唯一语义都是“延迟后精确重试原操作”。
-
-## 9. R5：删除旧流程与版本统一
-
-### AUD-013 修复：新流程与迁移完全隔离
-
-**服务端**
-
-- 从当前 tool list 删除 `llm_wiki_apply_projection`。
-- `llm_wiki_get_page_plan_context` 删除 `view=plan`，只保留 `manifest|draft-shard`。
-- `commit_pages` 删除裸 `staged_draft_shard_ids`，只接受 hash-bound receipts。
-- retrieval channel 删除 `vector|graph` alias，仅保留精确 `bm25|embedding|wiki`。
-- 删除 V1.0.1 固定路径写入和 `legacy-plan-compatibility` execution mode。
-- old workspace 识别为 `MIGRATION_REQUIRED`，不在运行时自动修复旧 batch/plan/locator。
-
-**Skill/Agents**
-
-- 将核心 Skill 改为简短状态机：Import、capacity-aware extraction、manifest drafting、single writer、audited finalize、query/recovery。
-- 移除 old server 6000 fallback、legacy complete SourceRef、legacy locator repair、Team 历史绕行和 apply projection 说明。
-- 将宿主 adapter 差异放入各自的小型 adapter doc，不污染核心协议。
-- 迁移说明放入 `docs/migrations/<from>-to-<to>.md`，CLI 迁移工具不在 Skill 中被调用。
-
-**测试**
-
-- tool snapshot 中不存在被删除入口/alias。
-- 对 Skill/MCP/current runtime 运行禁用词扫描，核心新流程不得出现 `legacy`、`old server`、`view=plan`、`apply_projection`。
-- 旧 workspace 只能经显式 migration fixture 迁移后打开，新 workspace 不运行任何兼容分支。
-
-**完成标准**
-
-- 当前新任务运行时只存在一条协议路径；迁移代码不能被新任务调用。
-
-### AUD-028 修复：版本单一来源
-
-**实现/测试**
-
-- protocol server 从 package.json 或构建生成的 version module 读取版本，不再手写。
-- 新增 root/core/mcp/cli/protocol/build-info 一致性测试。
-
-**完成标准**
-
-- 每次版本发布只需修改一个受控来源，协议 handshake 与包版本一致。
-
-## 10. R6：OCR/PPTX 新改造
-
-### AUD-020 修复：Import-scoped OCR session pool
-
-**实现**
-
-- `importSources` 创建最多 N 个 OCR Worker（默认 1，可配 1–2），所有需 OCR 的文件复用。
-- 非 OCR 文件不创建 Worker；首个 OCR job 懒加载。
-- 任意文件失败不终止整个 pool，operation finally 只统一 terminate 一次。
-
-**测试/完成标准**
-
-- 20 张图片只创建一次 worker/language directory；识别结果与单文件一致，失败时无进程/临时目录泄漏。
-
-### AUD-021 修复：OCR 预算和取消
-
-**实现**
-
-- 配置 `maxPdfPages`、`maxOcrPages`、`maxRenderedPixelsTotal`、`maxOcrInputBytesTotal`、`maxOcrWallMs`、`maxOcrTextChars`。
-- 超限时返回结构化 `SOURCE_PARSE_BUDGET_EXCEEDED`，附带已完成页数，但不把部分结果当完整导入。
-- Core 的 MCP AbortSignal 传递至 source-store、parser、PDF 循环、render 和 OCR recognize。
-
-**测试/完成标准**
-
-- 超页数、超耗时、累计像素超限和中途取消均在预算内结束，锁和 Worker 被释放。
-
-### AUD-022 修复：像素和解压炸弹防护
-
-**实现**
-
-- PDF scale 使用 `min(maxScale, sqrt(maxPixels/basePixels))`，允许小于 1，但设置可读的最小边长/失败阈值。
-- canvas 创建前使用安全整数检查 width*height*channels，防止溢出。
-- PNG/JPEG/WebP/BMP/TIFF 先读 header metadata，限制 width、height、pixels、frames、decoded bytes；动画只允许明确的帧策略。
-
-**测试/完成标准**
-
-- 构造巨型维度头、多帧 TIFF/WebP、巨型 PDF viewport，子进程在内存上限内返回结构化错误。
-
-### AUD-023 修复：真实 OCR 发布门禁
-
-**实现**
-
-- CI 有一个不注入 fake recognizer 的真实 Tesseract 测试，使用仓库自有小 fixture。
-- 在 fresh temp directory 执行 `npm pack` → 安装打包产物 → OCR，验证语言包在发布包中可 resolve。
-- 显式校验 Node 20 和项目支持的当前 Node 版本。
-
-**完成标准**
-
-- 空 `node_modules` 经 fresh install 后，断网状态可识别 fixture 中英文并正常 terminate Worker。
-
-### AUD-024 修复：权威 PPTX slide 顺序
-
-**实现**
-
-- 解析 `ppt/presentation.xml` 的 `p:sldIdLst`，通过 `ppt/_rels/presentation.xml.rels` 解析每个 target。
-- 校验 target 在 archive 内、无 traversal、类型为 slide；重复/缺失 relation 结构化拒绝。
-- locator.slide 是展示序号，metadata 另保存 slide part/relationship ID。
-
-**测试/完成标准**
-
-- `slide1.xml, slide2.xml, slide3.xml` 的权威展示顺序为 3,1,2 时，输出和 SourceRef locator 严格按 3,1,2。
-
-### AUD-025 修复：PPTX 复合内容覆盖
-
-**实现**
-
-- Chart：解析 chart XML 的 series/category/value cache，如有 embedded workbook 则以受限 XLSX parser 验证。
-- SmartArt：解析 diagram data model 中的文本和关系。
-- Embedded workbook：使用现有 XLSX 安全上限，不执行公式/宏/外部连接。
-- 未支持的 OLE/object 生成 `unextractedObjects` metadata 和已根据 review item，显式告知完整性缺口。
-
-**测试/完成标准**
-
-- chart 数值、SmartArt 节点、embedded sheet 行都进入 chunk/retrieval；不支持 object 不得静默消失。
-
-## 11. 追踪矩阵：35 项 Bug 全覆盖
-
-二次审计状态：下表 35 项全部 **Done**；逐项证据见
-[BUG_AUDIT_REPORT.md](BUG_AUDIT_REPORT.md) 的“1.0.8 二次审计闭环矩阵”。
-
-| Bug | 主要代码区域 | 先失败测试 | 实现产物 | 完成定义 |
-|---|---|---|---|---|
-| AUD-001 | Core page planning/transaction | truncated replace | section/full-read contract | 未读正文零丢失 |
-| AUD-002 | requirement derivation/validation | review/contradiction/claim-only | semantic ledger | 每个必要项有最终 owner/resolution |
-| AUD-003 | projection completion/Finalize | double empty final projection | unconditional audit | 无 audit bypass |
-| AUD-004 | retrieval/embedding | semantic target >1000 | full vector index | semantic-only 尾部可召回 |
-| AUD-005 | retrieval corpus | target >10K | sharded full index | 无静默 corpus cut |
-| AUD-006 | Domain Query | provisional classified page | published root resolver | 只见 active generation |
-| AUD-007 | Finalize/publication | kill/lint fail matrix | staging generation | 公开读只见完整旧/新版 |
-| AUD-008 | Skill/scheduler | 4-slot host/partial spawn | capability-aware waves | 不超槽且不重复工作 |
-| AUD-009 | host adapters | Codex role launch | portable role contract | 所有目标宿主可执行 |
-| AUD-010 | lease lifecycle | controlled clock renewal | bounded renew | 活跃 worker 不被抢租 |
-| AUD-011 | lease commits | same name/stale token | fence token+epoch | 旧持有者无法写入 |
-| AUD-012 | schemas/Core IDs | missing worker/writer | required IDs | 无默认共享身份 |
-| AUD-013 | Skill/MCP/runtime | forbidden legacy snapshot | one current protocol | 新任务零 legacy branch |
-| AUD-014 | page plan | titleless page | safe fallback | 规划不崩溃 |
-| AUD-015 | parser/retrieval chunking | boundary facts | overlap+parent IDs | 跨边界事实可召回 |
-| AUD-016 | BM25 builder/query | persisted-vs-oracle | real inverted index | 查询实际消费索引 |
-| AUD-017 | vector storage | restart/model switch/50K | compact ANN store | 无一向量一 JSON 主路径 |
-| AUD-018 | hit selection | 3 unique same-path sections | MMR/diversity | 不因固定 2 条丢证据 |
-| AUD-019 | provisional filter | corrupt owner task | fail-closed scope | 损坏状态不暴露草稿 |
-| AUD-020 | import/OCR | 20-image worker count | shared pool | worker 加载次数有界 |
-| AUD-021 | PDF/OCR/cancel | pages/time/cancel budgets | propagated signal+budgets | 超限可控结束 |
-| AUD-022 | image/PDF decode | bomb fixtures | pixel/frame guards | 内存上限内失败 |
-| AUD-023 | packaging/CI | fresh real OCR | package smoke gate | 离线真 OCR 可用 |
-| AUD-024 | PPTX ordering | rel order != filename | presentation rel parser | locator 按展示顺序 |
-| AUD-025 | PPTX completeness | chart/SmartArt/workbook | extraction/review metadata | 复合内容不静默消失 |
-| AUD-026 | projection GC | expiry/crash/GC race | quarantine+retention | 旧 artifact 不可被复用 |
-| AUD-027 | MCP backpressure | exhausted retry | exact retry token/action | 背压后重放原操作 |
-| AUD-028 | version metadata | package/handshake mismatch | generated version | 全包版本一致 |
-| AUD-029 | Finalize result | deterministic pages diff | manifest-derived report | 报告与 generation diff 一致 |
-| AUD-030 | import/task lifecycle | slow second file barrier | progressive task/source publish | 全量导入结束前首 chunk 可搜 |
-| AUD-031 | retrieval channel identity | provider none/failure | effective channel contract | fallback 不冒充 Embedding |
-| AUD-032 | embedding online path | cold-cache request count/latency | async vector queue | 首查不补算文档向量 |
-| AUD-033 | building corpus/fusion | 10K stable Wiki + new source | task-local quotas/scopes | 新上传 source 有召回保底 |
-| AUD-034 | readiness/publication state | phase-boundary kill matrix | durable retrieval state machine | 阶段由真实就绪度派生 |
-| AUD-035 | import/status/retrieve schema | partial multi-source lifecycle | shared readiness contract | 可判断每个 source/channel 是否可搜 |
-
-## 12. 每批次验证命令
-
-每个批次至少执行：
+## 18. 每批次的验证命令
 
 ```bash
 npm run build
 npm test
 npm audit --omit=dev --audit-level=high
-git diff --check
 ```
 
-root `npm test` 已依次包含 Core、MCP 和 CLI；CI 报告仍必须分别展示三者计数。
+发布候选还需要：
 
-R2 额外执行渐进导入 barrier、冷首查请求计数/延迟、10K/50K retrieval benchmark 和索引损坏测试。R3 执行 Finalize kill matrix。R4 执行真实宿主多 Agent 冒烟。R6 必须从 fresh packed artifact 运行 OCR/PPTX，不使用开发目录的现成 `node_modules`。
+1. GitHub Actions Node 20：Ubuntu、macOS、Windows 全绿。
+2. Node 20 和当前 LTS 的 child-process crash/OOM 测试。
+3. fresh checkout -> `npm ci` -> build -> package/tarball smoke。
+4. Codex、Claude Code、OpenCode 各跑单文件、多 batch、断线重连和重复幂等 key。
+5. 检查 `git diff --check`、版本号、CHANGELOG、build-info 和 lockfile 一致。
 
-## 13. 发布门禁
+## 19. 建议提交拆分
 
-下一个发布候选版必须同时满足：
+1. `test: add v1.0.1 bug regression fixtures and fault injection harness`
+2. `fix(mcp): bound oversized result serialization without recursion`
+3. `chore(deps): upgrade pdf parser security fixes`
+4. `chore(deps): upgrade mcp sdk transitive security fixes`
+5. `feat(core): add recoverable operation and page transaction journal v2`
+6. `fix(core): make idempotent operations crash-replayable`
+7. `docs(core): define final projection replace and merge semantics`
+8. `test(core): align projection assertions with the documented contract`
+9. `fix(core): resolve parser type independently from display name`
+10. `fix(core): preserve source offsets across long-block splitting`
+11. `fix(core): share context-aware wiki relationship parser`
+12. `feat(core): publish finalize artifacts by generation`
+13. `feat(core): enforce embedding response and cache budgets`
+14. `feat(core): add recoverable journal retention and garbage collection`
+15. `fix(core): use token-aware domain schema matching`
+16. `test: add node20 cross-platform and real-host release smoke coverage`
 
-- [x] `AUD-001`–`AUD-035` 追踪矩阵全部 Done。
-- [x] P0 数据完整性复现全部通过。
-- [x] 构建期首 source 在后续导入未完成时已可经 task-local BM25 命中。
-- [x] 构建期 BM25+Embedding 与完成后 BM25+Embedding+Wiki 路由及真实降级语义通过。
-- [x] import/status/retrieve 共享逐 source/channel readiness、coverage 和 manifest 合约。
-- [x] 完成代索引无固定 corpus/Embedding 静默裁剪。
-- [x] 所有公开读工具统一 active generation。
-- [x] 宿主容量、续租、旧 token fencing、Drafter receipt 和单 Writer 合约/集成通过。
-- [x] 当前 Skill/MCP/Agent 无 old server 或可选旧流程分支。
-- [x] 无注入真 OCR、PDF 预算、PPTX 顺序与复合内容测试通过。
-- [x] Finalize 和 generation 公开可见性故障回归通过。
-- [x] 当前支持的 Node `>=22.13.0` 环境全量回归通过。
-- [x] Core/MCP/CLI 的 `npm pack --dry-run` 文件清单完整，production dependency audit 为 0 vulnerabilities。
+## 20. V1.0.2 发布完成定义
 
-## 14. 回滚和迁移策略
-
-- 新 BM25/vector/generation/lease 格式全部使用新 schema version，不就地覆盖旧格式。
-- 旧工作区由新版 Core 的耐久恢复路径重建 generation，当前 CLI/Skill 不暴露旧流程迁移命令。
-- 回滚只切回上一个已验证 generation pointer；不覆盖当前页面或删除新索引证据。
-- 旧客户端如不支持新协议，应显式收到 `CLIENT_UPGRADE_REQUIRED`，不在新 Core 中透明进入旧分支。
-
-## 15. 完成报告模板
-
-每个 Bug 关闭时必须记录：
-
-```text
-Bug ID:
-Root cause fixed:
-Production files changed:
-Failing test before fix:
-Passing test after fix:
-Migration impact:
-Performance impact:
-Security/correctness impact:
-Commit/PR:
-Reviewer:
-```
-
-只有代码、失败测试、回归测试、迁移说明和相关 Skill/MCP 契约同时更新后，该 Bug 才能标记完成。
+- BUG-002、DEP-001、HP-001、HP-002 已关闭，BUG-001 契约已明确并全栈一致。
+- 所有 CONFIRMED 和 HIGH-PROBABILITY 条目都有回归测试；高概率条目经故障注入后转为已验证修复。
+- Core、MCP、CLI 全套测试通过，production audit 无 high/critical。
+- Node 20 三平台 CI 通过，Windows 原子写和 kill/restart 有实测证据。
+- fresh package 的 MCP build-info 与 V1.0.2 commit 一致。
+- 真实 Codex/Claude Code/OpenCode 宿主完成 handshake、长任务、断线重连和幂等重放。
+- 迁移和回滚文档完成：V1.0.1 journal/cache 可读，V1.0.2 写入的新 schema 有版本标记，降级限制明确。

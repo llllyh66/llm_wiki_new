@@ -35,12 +35,15 @@ test("CAC documentation does not assume every compatible host installs a cac exe
   assert.match(readme, /actual launcher command/i)
 })
 
-test("project agents and canonical Skill expose only the current capacity-aware protocol", async () => {
+test("Claude project agents inherit llm-wiki MCP without a restrictive tool allowlist", async () => {
   const extractor = await readFile(new URL("../../../.claude/agents/llm-wiki-extractor.md", import.meta.url), "utf8")
   const writer = await readFile(new URL("../../../.claude/agents/llm-wiki-writer.md", import.meta.url), "utf8")
   const drafter = await readFile(new URL("../../../.claude/agents/llm-wiki-page-drafter.md", import.meta.url), "utf8")
   const settings = JSON.parse(await readFile(new URL("../../../.claude/settings.json", import.meta.url), "utf8"))
   const skill = await readFile(new URL("../../../.agents/skills/llm-wiki-builder/SKILL.md", import.meta.url), "utf8")
+  const analysisRules = await readFile(new URL("../../../.agents/skills/llm-wiki-builder/references/analysis-rules.md", import.meta.url), "utf8")
+  const domainSchema = await readFile(new URL("../../../.agents/skills/llm-wiki-builder/references/domain-schema.md", import.meta.url), "utf8")
+  const recovery = await readFile(new URL("../../../.agents/skills/llm-wiki-builder/references/recovery.md", import.meta.url), "utf8")
 
   for (const agent of [extractor, writer, drafter]) {
     assert.doesNotMatch(agent, /^tools:/m)
@@ -48,20 +51,25 @@ test("project agents and canonical Skill expose only the current capacity-aware 
     assert.match(agent, /^mcpServers:\n  - llm-wiki$/m)
     assert.match(agent, /^permissionMode: dontAsk$/m)
   }
+  assert.match(extractor, /ToolSearch/)
+  assert.match(writer, /ToolSearch/)
+  assert.doesNotMatch(writer, /^skills:/m)
   assert.match(extractor, /^disallowedTools:.*llm_wiki_delete_knowledge_base.*llm_wiki_lint$/m)
   assert.match(writer, /^disallowedTools:.*llm_wiki_delete_knowledge_base.*llm_wiki_lint$/m)
-  assert.match(drafter, /^disallowedTools:.*ToolSearch.*llm_wiki_lint$/m)
+  assert.match(drafter, /^disallowedTools:.*ToolSearch$/m)
   assert.match(drafter, /^disallowedTools:.*llm_wiki_update_pages/m)
   assert.match(drafter, /^mcpServers:\n  - llm-wiki$/m)
   assert.match(drafter, /llm_wiki_stage_page_drafts/)
+  assert.match(drafter, /never returns page bodies/i)
   assert.match(drafter, /^permissionMode: dontAsk$/m)
-  assert.match(drafter, /one PagePatch per/)
-  assert.match(drafter, /draft_hash/)
+  assert.match(drafter, /one bounded shard/)
+  assert.match(drafter, /no duplicate paths/)
+  assert.match(drafter, /`accepted: true`, `staged: true`/)
+  assert.match(drafter, /is not staging success/)
   assert.deepEqual(agentMcpTools(extractor), [
     "llm_wiki_commit_analysis",
     "llm_wiki_get_batch",
     "llm_wiki_get_domain_schema",
-    "llm_wiki_renew_lease",
     "llm_wiki_retrieve_context",
   ])
   assert.deepEqual(agentMcpTools(drafter), [
@@ -72,7 +80,6 @@ test("project agents and canonical Skill expose only the current capacity-aware 
     "llm_wiki_commit_pages",
     "llm_wiki_get_page_plan_context",
     "llm_wiki_get_staged_page_drafts",
-    "llm_wiki_renew_lease",
   ])
   assert.equal(settings.enableAllProjectMcpServers, true)
   assert.equal(settings.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS, "0")
@@ -92,36 +99,97 @@ test("project agents and canonical Skill expose only the current capacity-aware 
   for (const tool of TOOL_DEFINITIONS) {
     assert.equal(settings.permissions.allow.includes(`mcp__llm-wiki__${tool.name}`), true)
   }
-  assert.match(skill, /progressive_import/)
-  assert.match(skill, /effective_workers = min\(recommended_workers, max_background_agents_total, host_available_background_slots\)/)
-  assert.match(skill, /lease_token/)
-  assert.match(skill, /llm_wiki_renew_lease/)
-  assert.match(skill, /manifest → draft-shard → staged receipt → single Writer → audited Finalize/)
+  assert.doesNotMatch(skill, /mode=capability-probe/)
+  assert.match(skill, /calling `llm_wiki_status` directly in the coordinator/)
+  assert.match(skill, /Agent\/Team initialization errors do not prove MCP readiness/)
+  assert.match(skill, /do not simultaneously run\s+the same extraction quantum in the coordinator/)
+  assert.match(skill, /do not retry with a\s+`general-purpose`/)
+  assert.match(skill, /Agent type\s+`llm-wiki-extractor` explicitly/)
+  assert.match(skill, /Agent\s+call must omit `team_name` entirely/)
+  assert.match(skill, /Launch `extractor-1` first and inspect only the immediate result/)
+  assert.match(skill, /`Backgrounded agent`, `Running`, a background\s+task\/agent ID/)
+  assert.match(skill, /Do not wait\s+for a completion notification/)
+  assert.match(skill, /Immediately add\s+`extractor-1` to `running_worker_ids` and issue all remaining/)
+  assert.match(skill, /initial wave is one indivisible coordinator action/)
+  assert.match(skill, /do not narrate\s+"waiting for extractor-1 initialization"/)
+  assert.match(skill, /Return control to the user only after the complete initial\s+worker wave/)
+  assert.match(skill, /Do not call `spawnTeam`\s+or `TeamCreate`/)
+  assert.match(skill, /do not repeat the same failing launch for the remaining\s+slots/)
+  assert.match(skill, /Never launch these slots as `general-purpose`/)
+  assert.match(skill, /worker_batch_quantum/)
+  assert.match(skill, /never more than six/)
+  assert.match(skill, /commits a durable checkpoint after every batch/)
+  assert.match(skill, /same\s+`worker_id`/)
+  assert.match(skill, /Never claim that MCP is "unreliable across\s+turns"/)
   assert.match(skill, /running_worker_ids/)
-  assert.match(skill, /running_draft_shard_ids/)
-  assert.match(skill, /running_writer_projection_ids/)
-  assert.match(skill, /Do not say “waiting”/)
-  assert.match(skill, /Never call\s+`TeamCreate` or `TeamDelete`, and never pass `team_name`/)
-  assert.match(skill, /never relaunch them because a later\s+Team lifecycle message fails/)
-  assert.match(skill, /waiting_reason/)
-  assert.match(skill, /never means all Extractors must finish/)
-  assert.match(skill, /never hard-code a `2 Extractors \+ 1\s+Drafter` topology/)
-  assert.match(skill, /may use several concurrently/)
-  assert.match(skill, /language of directly supporting source evidence/)
-  assert.match(extractor, /language of their directly supporting source evidence/)
-  assert.match(drafter, /language of its directly supporting source evidence/)
-  assert.match(writer, /source evidence language/)
-  assert.match(skill, /completion_gate\.finalize_ready=true/)
-  assert.match(skill, /FINALIZE_CATCHUP_REQUIRED/)
-  assert.match(skill, /do not ask whether the user wants remaining batches or requirements/i)
-  assert.match(extractor, /active lease does not mean this Agent remains alive/)
-  assert.match(drafter, /Pending or retrieved shard state does not mean this\s+Drafter remains alive/)
-  assert.match(drafter, /draft_claim_token/)
-  assert.match(skill, /DRAFT_SHARD_CLAIM_FENCED/)
-  assert.match(writer, /projection lease does not mean this\s+Writer remains alive/i)
-  assert.match(skill, /feature fallback/)
-  assert.match(skill, /retry the exact original tool and arguments/i)
-  assert.doesNotMatch(skill, /apply_projection|view.?[=:].?['"]plan|staged_draft_shard_ids|vector\/graph|old server|legacy/i)
+  assert.match(skill, /immediately relaunch\s+`llm-wiki-extractor` with that same worker ID/)
+  assert.match(skill, /never wait\s+for lease expiry/)
+  assert.match(skill, /Never say "both leases active, waiting\s+for the other Agent"/)
+  assert.match(skill, /level\s+`"domains"`/)
+  assert.match(skill, /progressive-directory-v2/)
+  assert.match(skill, /classification_scaffold/)
+  assert.match(skill, /be_pointer_hints/)
+  assert.match(extractor, /plain string, never an object/)
+  assert.match(skill, /Skip\s+`llm_wiki_retrieve_context` by default/)
+  assert.match(skill, /do not call `llm_wiki_status` inside this\s+worker/)
+  assert.match(skill, /Start by copying `analysis_scaffold`/)
+  assert.match(skill, /server has already generated exact quotes/)
+  assert.match(skill, /never retype a quote, read the\s+original source file/)
+  assert.match(extractor, /cite `evidence_index` values directly/)
+  assert.match(extractor, /including `batch_count: 1`/)
+  assert.match(skill, /at most two `commit_analysis` attempts for each batch/)
+  assert.match(skill, /both permitted validation attempts is the exception/)
+  assert.match(extractor, /second validation rejection.*`restart_required: false`/s)
+  assert.match(skill, /leave the\s+scaffold's prefilled numeric top-level `sourceRefs` catalog unchanged/)
+  assert.match(analysisRules, /"sourceRefMode": "batch-evidence-index"/)
+  assert.doesNotMatch(domainSchema, /customer_management#\/businessEntities/)
+  assert.match(writer, /Normal mode: staged receipts only/)
+  assert.match(writer, /never launches or asks to\s+launch a Drafter/)
+  assert.match(writer, /waiting_for_drafter_receipts/)
+  assert.match(writer, /After one accepted staged wave, inspect only its returned action/)
+  assert.match(writer, /execute it once in this same invocation and then stop/)
+  assert.match(writer, /action_owner: "coordinator"/)
+  assert.match(writer, /300–1,200 characters/)
+  assert.match(writer, /stable server-side Wiki committer/)
+  assert.match(writer, /main coordinator owns the\s+projection manifest/)
+  assert.match(skill, /incremental projection leases at most eight batches/)
+  assert.match(skill, /resumes an existing projection with an exact coordinator-owned\s+`view: "draft-shard"` action/)
+  assert.match(skill, /must never call\s+`llm_wiki_get_staged_page_drafts` or `llm_wiki_commit_pages`/)
+  assert.match(writer, /`patches: \[\]` is the required staged-commit form/)
+  assert.match(skill, /`llm_wiki_apply_projection`\s+is only a compatibility redirect/)
+  assert.match(writer, /stable Wiki committer/)
+  assert.match(writer, /^disallowedTools: Agent,/m)
+  assert.match(writer, /explicit-serial-writer-fallback-only/)
+  assert.match(writer, /Never import or extract sources, launch Agents, coordinate Drafters/)
+  assert.match(skill, /at most four concurrent/)
+  assert.match(skill, /background subagents cannot reliably spawn nested subagents/i)
+  assert.match(skill, /path is indivisible.*requirement sharing\s+`patch_scaffold\.path`/s)
+  assert.match(skill, /parallel draft generation must\s+never become parallel commits/)
+  assert.match(skill, /Launch one project Agent\s+`llm-wiki-page-drafter` for every returned action/)
+  assert.match(skill, /one-shard\s+manifest where `parallel_drafting.enabled` is false/)
+  assert.match(skill, /Maintain one active-Writer flag/)
+  assert.match(skill, /a\s+Drafter's prose success claim is never a staged receipt/)
+  assert.match(skill, /`recoverable_staged_draft_receipts`/)
+  assert.match(skill, /do not launch a second Writer/)
+  assert.match(skill, /coordinator-owned-parallel-drafters/)
+  assert.match(skill, /Launch the stable `llm-wiki-writer` only\s+after at least one Drafter stages a shard/)
+  assert.match(skill, /A Writer launched without hash-bound receipts must return\s+`waiting_for_drafter_receipts`/)
+  assert.match(skill, /exact Writer-owned empty\s+`projection_complete: true` acknowledgement/)
+  assert.match(skill, /Do not pass a manifest or\s+`draft-shard` action to that Writer/)
+  assert.doesNotMatch(skill, /inspect `writer_next_action`/)
+  assert.match(skill, /Never generate an oversized patch set and split it afterward/)
+  assert.match(skill, /Do not traverse every manifest\s+shard before drafting/)
+  assert.match(skill, /Background-agent priority \(mandatory\)/)
+  assert.match(skill, /including a task with exactly one batch/)
+  assert.match(skill, /Do not call `llm_wiki_get_batch` or perform semantic extraction in the main/)
+  assert.match(skill, /only after a worker creation was attempted and failed/)
+  assert.match(skill, /If its tool is `llm_wiki_finalize`, call Finalize immediately/)
+  assert.match(skill, /An eligible audit promotes those pages without another semantic\s+rewrite/)
+  assert.match(skill, /If Finalize returns `FINAL_PROJECTION_REQUIRED`, follow its exact\s+`details.next_action`/)
+  assert.match(skill, /fast Finalize can publish an incrementally\s+generated page only when its latest task-owned commit still carries every\s+covered requirement and exact SourceRef/)
+  assert.doesNotMatch(skill, /ensure a `final` projection\s+completes.*Then call\s+`llm_wiki_finalize`/s)
+  assert.match(recovery, /persisted fast finalization audit/)
+  assert.match(recovery, /follow `details.next_action`/)
 })
 
 function agentMcpTools(agent) {
@@ -138,11 +206,11 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
     "llm_wiki_import_files",
     "llm_wiki_get_batch",
     "llm_wiki_get_domain_schema",
-    "llm_wiki_renew_lease",
     "llm_wiki_retrieve_context",
     "llm_wiki_query_domain_pages",
     "llm_wiki_commit_analysis",
     "llm_wiki_get_page_plan_context",
+    "llm_wiki_apply_projection",
     "llm_wiki_stage_page_drafts",
     "llm_wiki_get_staged_page_drafts",
     "llm_wiki_commit_pages",
@@ -158,10 +226,6 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
   assert.equal(names.includes("llm_wiki_chat"), false)
   assert.equal(new Set(names).size, names.length)
   assert.match(TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_import_files").description, /background-agent-first extraction even when batch_count=1/)
-  const retrievalTool = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_retrieve_context")
-  assert.match(retrievalTool.description, /Search the llm_wiki knowledge base for evidence needed to answer a user's question/)
-  assert.match(retrievalTool.description, /Call this before answering factual questions about imported documents or generated Wiki content/)
-  assert.match(retrievalTool.description, /Omit batch_id for normal task-wide questions/)
   const importOptions = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_import_files").inputSchema.properties.options.properties
   assert.equal(importOptions.domain_schema, undefined)
   assert.match(importOptions.domain_schema_path.description, /progressive-directory-v2/)
@@ -175,12 +239,6 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
   assert.equal(domainPageQuery.inputSchema.properties.filters.additionalProperties, false)
   assert.equal(domainPageQuery.inputSchema.properties.filters.properties.classification_path_prefix.type, "string")
   assert.match(TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_finalize").description, /Eligible pages are promoted without a second semantic rewrite/)
-  assert.match(TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_finalize").description, /FINALIZE_CATCHUP_REQUIRED/)
-  const statusTool = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_status")
-  assert.match(statusTool.description, /subagent_recovery/)
-  assert.match(statusTool.description, /completion_gate/)
-  assert.match(statusTool.description, /Extractor, Drafter, and Writer/)
-  assert.match(statusTool.description, /cannot observe host process liveness/)
   for (const tool of TOOL_DEFINITIONS) {
     assert.match(tool.name, /^llm_wiki_[a-z_]+$/)
     assert.equal(typeof tool.description, "string")
@@ -193,16 +251,12 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
     assert.equal(tool._meta["anthropic/maxResultSizeChars"] >= 80_000, true)
   }
   const pagePlan = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_get_page_plan_context")
-  assert.deepEqual(pagePlan.inputSchema.properties.view.enum, ["manifest", "draft-shard"])
+  assert.deepEqual(pagePlan.inputSchema.properties.view.enum, ["plan", "manifest", "draft-shard"])
   assert.equal(typeof pagePlan.inputSchema.properties.shard_id, "object")
-  assert.equal(typeof pagePlan.inputSchema.properties.draft_claim_token, "object")
-  const stageDrafts = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_stage_page_drafts")
-  assert.equal(stageDrafts.inputSchema.required.includes("draft_claim_token"), true)
   const pageCommit = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_commit_pages")
   assert.equal(pageCommit.inputSchema.properties.patches.maxItems, 50)
-  assert.equal(pageCommit.inputSchema.properties.staged_draft_shard_ids, undefined)
+  assert.equal(pageCommit.inputSchema.properties.staged_draft_shard_ids.maxItems, 8)
   assert.equal(pageCommit.inputSchema.properties.staged_draft_receipts.maxItems, 8)
-  assert.deepEqual(retrievalTool.inputSchema.properties.channels.items.enum, ["bm25", "embedding", "wiki"])
   assert.match(pageCommit.description, /Hard maximum: 50 patches/)
   assert.match(pageCommit.description, /staged_draft_receipts/)
   const stagedDrafts = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_get_staged_page_drafts")
@@ -213,8 +267,8 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
   assert.equal(pageUpdate.inputSchema.properties.updates.maxItems, 20)
   assert.deepEqual(pageUpdate.inputSchema.properties.updates.items.properties.changes.items.properties.operation.enum, ["upsert_section", "replace_section", "append_to_section", "remove_section"])
   assert.match(pageUpdate.description, /rebuilds retrieval indexes/i)
-  assert.match(pagePlan.description, /coordinator.*draft-shard/i)
-  assert.match(pagePlan.description, /sole Writer/i)
+  assert.match(pagePlan.description, /parallel drafting.*coordinator/i)
+  assert.match(pagePlan.description, /sole committer/i)
   const analysisCommit = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_commit_analysis")
   const analysisInput = analysisCommit.inputSchema.properties.analysis
   assert.equal(analysisInput.additionalProperties, false)
@@ -224,11 +278,6 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
   assert.equal(analysisInput.properties.sourceRefs.items.type, "integer")
   assert.equal(analysisInput.properties.entities.items.$ref, "#/$defs/analysis_groundedCandidate")
   assert.equal(analysisCommit.inputSchema.$defs.analysis_groundedCandidate.properties.confidence.type, "number")
-  assert.equal(analysisCommit.inputSchema.$defs.analysis_groundedCandidate.properties.supportType, undefined)
-  assert.deepEqual(analysisCommit.inputSchema.$defs.analysis_groundedCandidate.properties.factKind.enum, ["entity", "concept", "claim", "relation", "metric_definition", "parameter_definition", "contradiction", "summary", "review_item"])
-  assert.deepEqual(analysisCommit.inputSchema.$defs.analysis_groundedCandidate.properties.supportMode.enum, ["explicit_text", "structured_entailment", "derived", "summary"])
-  assert.equal(analysisCommit.inputSchema.$defs.analysis_groundedCandidate.properties.derivation.oneOf.length, 2)
-  assert.equal(analysisCommit.inputSchema.$defs.analysis_groundedCandidate.properties.predicate.type, "string")
   assert.equal(analysisCommit.inputSchema.$defs.analysis_sourceRefList.items.type, "integer")
   assert.equal(analysisCommit.inputSchema.$defs.analysis_groundedCandidate.properties.schemaClassification.properties.snapshotHash.type, "string")
   const schemaText = JSON.stringify(analysisCommit.inputSchema)
@@ -306,13 +355,12 @@ test("commit_analysis validation failures are recoverable business results, not 
     assert.deepEqual(response.structuredContent.validation_errors, ["fix this field"])
     assert.equal(response.structuredContent.next_action.tool, "llm_wiki_commit_analysis")
     assert.equal(response.structuredContent.next_action.arguments.worker_id, "extractor-4")
-    assert.equal(response.structuredContent.worker_restart, undefined)
-    assert.deepEqual(response.structuredContent.semantic_repair, {
+    assert.deepEqual(response.structuredContent.worker_restart, {
       required: true,
-      strategy: "repair-same-batch-same-worker",
-      task_id: "task-example",
-      batch_id: "batch-0001",
+      strategy: "restart-same-worker-id-immediately",
       worker_id: "extractor-4",
+      batch_id: "batch-0001",
+      delay_ms: 0,
     })
   }
 })
@@ -423,79 +471,6 @@ test("page validation rejection reports atomic whole-subset retry semantics", as
   assert.equal(response.structuredContent.mcp_connection_usable, true)
 })
 
-test("a protected-section draft rejection returns the shard to the same Drafter", async () => {
-  const router = new HeadlessToolRouter({
-    stagePageDrafts: async () => {
-      throw new LlmWikiError("PAGE_DRAFT_SECTION_NOT_FULLY_VISIBLE", "The section was truncated.", {
-        retryable: true,
-        details: { heading: "Legacy Details", editable_section_headings: ["Recent Evidence"] },
-      })
-    },
-  })
-  const response = await router.callMcp("llm_wiki_stage_page_drafts", {
-    task_id: "task-example",
-    writer_id: "wiki-writer-1",
-    projection_id: "projection-example",
-    shard_id: "draft-0001",
-    draft_claim_token: "claim-example",
-    patches: [{ patchId: "patch-example" }],
-    idempotency_key: "protected-section-v1",
-  })
-  assert.equal(response.isError, undefined)
-  assert.equal(response.structuredContent.error.code, "PAGE_DRAFT_SECTION_NOT_FULLY_VISIBLE")
-  assert.equal(response.structuredContent.atomic_commit_applied, false)
-  assert.equal(response.structuredContent.page_commit_recovery.retry_scope, "redraft_entire_shard_using_only_new_or_fully_visible_sections")
-  assert.deepEqual(response.structuredContent.next_action, {
-    tool: "llm_wiki_stage_page_drafts",
-    action_owner: "drafter",
-    delegate_to: "llm-wiki-page-drafter",
-    arguments: {
-      task_id: "task-example",
-      writer_id: "wiki-writer-1",
-      projection_id: "projection-example",
-      shard_id: "draft-0001",
-      draft_claim_token: "claim-example",
-    },
-    required_generated_arguments: ["patches", "idempotency_key"],
-  })
-})
-
-test("a retired staged merge schema routes the coordinator to a fresh manifest", async () => {
-  const router = new HeadlessToolRouter({
-    commitPages: async () => {
-      throw new LlmWikiError("PAGE_DRAFT_SCHEMA_UPGRADE_REQUIRED", "The staged merge schema is retired.", {
-        retryable: true,
-        details: { projection_plan_invalidated: true, resume_view: "manifest" },
-      })
-    },
-  })
-  const response = await router.callMcp("llm_wiki_commit_pages", {
-    task_id: "task-example",
-    writer_id: "wiki-writer-1",
-    projection_id: "projection-example",
-    based_on_wiki_revision: "d".repeat(64),
-    staged_draft_receipts: [{ shard_id: "draft-0001", draft_hash: "e".repeat(64) }],
-    patches: [],
-    idempotency_key: "schema-upgrade-v1",
-  })
-  assert.equal(response.isError, undefined)
-  assert.equal(response.structuredContent.error.code, "PAGE_DRAFT_SCHEMA_UPGRADE_REQUIRED")
-  assert.equal(response.structuredContent.page_commit_recovery.retry_scope, "refresh_manifest_and_redraft_retired_merge_payloads")
-  assert.deepEqual(response.structuredContent.next_action, {
-    tool: "llm_wiki_get_page_plan_context",
-    action_owner: "coordinator",
-    delegate_to: "llm-wiki-page-drafter",
-    arguments: {
-      task_id: "task-example",
-      writer_id: "wiki-writer-1",
-      projection_id: "projection-example",
-      view: "manifest",
-      cursor: 0,
-      max_chars: 40_000,
-    },
-  })
-})
-
 test("unfinished server-side page shards recover without restarting or disconnecting", async () => {
   const nextShard = { shard_id: "draft-0007", paths: ["wiki/entities/example.md"], requirement_ids: ["page-example"] }
   const router = new HeadlessToolRouter({
@@ -522,40 +497,13 @@ test("unfinished server-side page shards recover without restarting or disconnec
   assert.deepEqual(response.structuredContent.next_action, {
     tool: "llm_wiki_get_page_plan_context",
     action_owner: "coordinator",
+    delegate_to: "llm-wiki-page-drafter",
     arguments: {
       task_id: "task-example",
       writer_id: "wiki-writer-1",
       projection_id: "projection-example",
-      view: "manifest",
-      cursor: 0,
-      max_chars: 40_000,
-    },
-  })
-})
-
-test("a fenced Drafter claim routes through a fresh manifest", async () => {
-  const router = new HeadlessToolRouter({
-    getPagePlanContext: async () => {
-      throw new LlmWikiError("DRAFT_SHARD_CLAIM_FENCED", "The Drafter claim expired.", { retryable: true })
-    },
-  })
-  const response = await router.callMcp("llm_wiki_get_page_plan_context", {
-    task_id: "task-example",
-    writer_id: "wiki-writer-1",
-    projection_id: "projection-example",
-    view: "draft-shard",
-    shard_id: "draft-0007",
-    draft_claim_token: "draft-claim-expired",
-  })
-  assert.equal(response.structuredContent.error.code, "DRAFT_SHARD_CLAIM_FENCED")
-  assert.deepEqual(response.structuredContent.next_action, {
-    tool: "llm_wiki_get_page_plan_context",
-    action_owner: "coordinator",
-    arguments: {
-      task_id: "task-example",
-      writer_id: "wiki-writer-1",
-      projection_id: "projection-example",
-      view: "manifest",
+      view: "draft-shard",
+      shard_id: "draft-0007",
       cursor: 0,
       max_chars: 40_000,
     },
@@ -614,39 +562,6 @@ test("publication ownership conflicts direct recovery to the owning task", async
   assert.equal(response.structuredContent.mcp_connection_usable, true)
 })
 
-test("premature Finalize routes directly to catch-up without asking for user confirmation", async () => {
-  const nextAction = {
-    tool: "llm_wiki_get_page_plan_context",
-    action_owner: "coordinator",
-    arguments: { task_id: "task-example", writer_id: "wiki-writer-1", view: "manifest", cursor: 0, max_chars: 40_000 },
-  }
-  const completionGate = {
-    task_complete: false,
-    may_report_completion: false,
-    user_confirmation_required: false,
-    automatic_continuation_required: true,
-    next_action: nextAction,
-  }
-  const router = new HeadlessToolRouter({
-    finalize: async () => {
-      throw new LlmWikiError("FINALIZE_CATCHUP_REQUIRED", "One projection window remains.", {
-        retryable: true,
-        details: {
-          unprojected_batch_count: 1,
-          next_action: nextAction,
-          completion_gate: completionGate,
-        },
-      })
-    },
-  })
-  const response = await router.callMcp("llm_wiki_finalize", { task_id: "task-example" })
-  assert.equal(response.structuredContent.error.code, "FINALIZE_CATCHUP_REQUIRED")
-  assert.deepEqual(response.structuredContent.next_action, nextAction)
-  assert.deepEqual(response.structuredContent.completion_gate, completionGate)
-  assert.equal(response.structuredContent.completion_gate.user_confirmation_required, false)
-  assert.equal(response.structuredContent.mcp_connection_usable, true)
-})
-
 test("every registered MCP tool routes errors without terminating the router", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "llm-wiki-mcp-routes-"))
   t.after(() => rm(root, { recursive: true, force: true }))
@@ -666,13 +581,13 @@ test("every registered MCP tool routes errors without terminating the router", a
     importFiles: failing,
     getBatch: failing,
     getDomainSchema: failing,
-    renewLease: failing,
     retrieveContext: failing,
     queryDomainPages: failing,
     commitAnalysis: failing,
     getPagePlanContext: failing,
     stagePageDrafts: failing,
     getStagedPageDrafts: failing,
+    applyWikiProjection: failing,
     commitPages: failing,
     updatePages: failing,
     finalize: failing,

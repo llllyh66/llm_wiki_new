@@ -119,78 +119,6 @@ export function readWikiPageSection(content, heading) {
   }
 }
 
-export function findOverlappingWikiPageSections(content, headings) {
-  const requested = new Set((headings ?? []).map(normalizedSectionHeading).filter(Boolean))
-  if (requested.size < 2) return []
-  const parsed = parseWikiPage(content)
-  const selected = markdownSectionRanges(parsed.body)
-    .filter((section) => requested.has(normalizedSectionHeading(section.heading)))
-  const overlaps = []
-  for (let leftIndex = 0; leftIndex < selected.length; leftIndex += 1) {
-    for (let rightIndex = leftIndex + 1; rightIndex < selected.length; rightIndex += 1) {
-      const left = selected[leftIndex]
-      const right = selected[rightIndex]
-      const [ancestor, descendant] = left.start <= right.start ? [left, right] : [right, left]
-      if (descendant.start < ancestor.end) {
-        overlaps.push({ ancestor: ancestor.heading, descendant: descendant.heading })
-      }
-    }
-  }
-  return overlaps
-}
-
-export function createWikiPageDraftExcerpt(content, maxChars) {
-  const normalized = String(content ?? "").replace(/\r\n?/g, "\n")
-  const limit = Math.max(1, Number(maxChars) || 1)
-  const parsed = parseWikiPage(normalized)
-  const ranges = markdownSectionRanges(parsed.body)
-  const agentRanges = ranges.filter((section) => !isCoreOwnedSectionHeading(section.heading))
-  const headingCounts = new Map()
-  for (const section of agentRanges) {
-    const key = normalizedSectionHeading(section.heading)
-    headingCounts.set(key, (headingCounts.get(key) ?? 0) + 1)
-  }
-  if (normalized.length <= limit) {
-    return {
-      content: normalized,
-      content_truncated: false,
-      editable_section_headings: agentRanges
-        .filter((section) => headingCounts.get(normalizedSectionHeading(section.heading)) === 1)
-        .map((section) => section.heading),
-      protected_section_headings: agentRanges
-        .filter((section) => headingCounts.get(normalizedSectionHeading(section.heading)) > 1)
-        .map((section) => section.heading),
-    }
-  }
-  const headChars = Math.floor(limit * 0.65)
-  const tailChars = Math.max(1, limit - headChars)
-  const tailStart = Math.max(0, normalized.length - tailChars)
-  const bodyStart = parsed.frontmatter.length
-  const fullyVisible = (section) => {
-    const start = bodyStart + section.start
-    const end = bodyStart + section.end
-    return end <= headChars || start >= tailStart
-  }
-  const editable = agentRanges.filter((section) => (
-    fullyVisible(section) && headingCounts.get(normalizedSectionHeading(section.heading)) === 1
-  ))
-  const editableKeys = new Set(editable.map((section) => normalizedSectionHeading(section.heading)))
-  return {
-    content: `${normalized.slice(0, headChars)}\n\n<!-- draft context excerpt; full page remains server-side -->\n\n${normalized.slice(-tailChars)}`,
-    content_truncated: true,
-    original_content_chars: normalized.length,
-    context_excerpt_chars: limit,
-    editable_section_headings: editable.map((section) => section.heading),
-    protected_section_headings: agentRanges
-      .filter((section) => !editableKeys.has(normalizedSectionHeading(section.heading)))
-      .map((section) => section.heading),
-  }
-}
-
-function isCoreOwnedSectionHeading(value) {
-  return /^(?:related(?:\s+pages?)?|相关页面|关联页面|domain classification|领域分类|领域类型)$/iu.test(String(value ?? "").normalize("NFKC").trim())
-}
-
 export function applyWikiPageSectionChanges(content, changes) {
   const parsed = parseWikiPage(content)
   let body = parsed.body.trim()
@@ -291,13 +219,18 @@ function sectionChangeError(code, message) {
 }
 
 export function prepareWikiPageContent(patch, existingContent = "", date = new Date().toISOString().slice(0, 10)) {
+  const incoming = parseWikiPage(patch.content)
   const existing = parseWikiPage(existingContent)
-  const incoming = patch.operation === "merge"
-    ? parseWikiPage(applyWikiPageSectionChanges(existingContent, patch.sectionChanges).content)
-    : parseWikiPage(patch.content)
   const pageKind = normalizePageKind(patch.pageKind) ?? pageKindForPath(patch.path) ?? "topic"
   let body = incoming.body.trim()
   if (!/^#\s+/m.test(body)) body = `# ${patch.title}\n\n${body}`.trim()
+  if (patch.operation === "merge" && existing.body.trim() && existing.body.trim() !== body) {
+    // replace is intentionally authoritative for the incoming body. Merge is
+    // the explicit opt-in for retaining the existing grounded body; callers
+    // still provide the current file hash so this concatenation cannot race a
+    // concurrent edit.
+    body = `${existing.body.trim()}\n\n${body}`.trim()
+  }
   const bodyLinks = extractRelatedReferences(body)
   const related = uniqueStrings([
     ...existing.related,
@@ -450,19 +383,14 @@ function withDomainClassificationSection(body, classifications) {
   const headings = /^#{2,6}\s+(?:Domain Classification|领域分类|领域类型)\s*$/im
   const match = normalizedBody.match(headings)
   if (classifications.length === 0) return normalizedBody
-  const language = pageContentLanguage(normalizedBody, classifications.map((item) => item.typeName).join(" "))
-  const headingLevel = match?.[0]?.match(/^#{2,6}/)?.[0] ?? "##"
-  const heading = `${headingLevel} ${language === "zh" ? "领域分类" : "Domain Classification"}`
+  const language = classifications.some((item) => /[\u3400-\u9fff]/u.test(item.typeName)) ? "zh" : "en"
+  const heading = language === "zh" ? "## 领域分类" : "## Domain Classification"
   const lines = classifications.map((item) => {
-    const unresolved = item.status === "unresolved" || item.resolved === false
-      ? language === "zh" ? "（待分类）" : " (unresolved)"
-      : ""
-    const domain = item.domain?.name || item.domain?.key || (language === "zh" ? "未知 Domain" : "Unknown Domain")
-    const abe = item.abe?.name || item.abe?.key || (language === "zh" ? "待分类 ABE" : "Unclassified ABE")
-    const be = item.be?.name || item.be?.key || (language === "zh" ? "待分类 BE" : "Unclassified BE")
-    return language === "zh"
-      ? `- Domain：${domain}（\`${item.domain?.key || "?"}\`） → ABE：${abe}（\`${item.abe?.key || "?"}\`） → BE：${be}（\`${item.be?.key || "?"}\`）${unresolved}`
-      : `- Domain: ${domain} (\`${item.domain?.key || "?"}\`) → ABE: ${abe} (\`${item.abe?.key || "?"}\`) → BE: ${be} (\`${item.be?.key || "?"}\`)${unresolved}`
+    const unresolved = item.status === "unresolved" || item.resolved === false ? "（待分类）" : ""
+    const domain = item.domain?.name || item.domain?.key || "未知 Domain"
+    const abe = item.abe?.name || item.abe?.key || "待分类 ABE"
+    const be = item.be?.name || item.be?.key || "待分类 BE"
+    return `- Domain：${domain}（\`${item.domain?.key || "?"}\`） → ABE：${abe}（\`${item.abe?.key || "?"}\`） → BE：${be}（\`${item.be?.key || "?"}\`）${unresolved}`
   })
   const section = `${heading}\n\n${lines.join("\n")}`
   if (!match || match.index === undefined) return `${normalizedBody}\n\n${section}`.trim()
@@ -497,10 +425,8 @@ export function setWikiPageRelated(content, related) {
 function withRelatedSection(body, related) {
   const normalizedBody = String(body ?? "").trim()
   if (related.length === 0) return normalizedBody
+  const section = `## Related\n\n${related.map((slug) => `- [[${slug}]]`).join("\n")}`
   const match = normalizedBody.match(/^#{2,6}\s+(?:Related(?:\s+Pages?)?|相关页面|关联页面)\s*$/im)
-  const headingLevel = match?.[0]?.match(/^#{2,6}/)?.[0] ?? "##"
-  const heading = `${headingLevel} ${pageContentLanguage(normalizedBody) === "zh" ? "相关页面" : "Related"}`
-  const section = `${heading}\n\n${related.map((slug) => `- [[${slug}]]`).join("\n")}`
   if (!match || match.index === undefined) return `${normalizedBody}\n\n${section}`.trim()
   const start = match.index
   const afterHeading = start + match[0].length
@@ -508,16 +434,6 @@ function withRelatedSection(body, related) {
   const nextHeading = remainder.search(/^##\s+/m)
   const end = nextHeading < 0 ? normalizedBody.length : afterHeading + nextHeading
   return `${normalizedBody.slice(0, start).trimEnd()}\n\n${section}\n\n${normalizedBody.slice(end).trimStart()}`.trim()
-}
-
-function pageContentLanguage(content, fallback = "") {
-  const normalized = String(content ?? "").normalize("NFKC")
-  const title = normalized.match(/^#\s+(.+)$/m)?.[1] ?? ""
-  if (/[\u3400-\u9fff]/u.test(title)) return "zh"
-  const sample = `${normalized}\n${String(fallback ?? "")}`
-  const hanCount = [...sample.matchAll(/[\u3400-\u9fff]/gu)].length
-  const latinCount = [...sample.matchAll(/[A-Za-z]/g)].length
-  return hanCount >= 4 && hanCount * 2 >= latinCount ? "zh" : "en"
 }
 
 export function extractWikiLinks(content) {

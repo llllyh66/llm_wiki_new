@@ -2,54 +2,29 @@
 
 ## Analysis
 
-- Keep every extracted name, title, statement, relation, summary, and question
-  in the language used by its directly supporting source evidence. Do not
-  translate source-authored knowledge to the workspace target language. The
-  target language is only a fallback for language-neutral or genuinely
-  undetermined metadata. For multilingual evidence supporting one page, use
-  the predominant evidence language consistently and preserve proper names and
-  source terminology in their original form.
+- Follow the workspace target language while preserving original proper names.
 - Distinguish entities, concepts, processes, metrics, claims, and relations.
-- Use the orthogonal `factKind` and `supportMode` fields for typed grounding
-  when the candidate is structured, derived, relational, or a summary. The
-  knowledge kind says what the fact is; the support mode says how the cited
-  evidence supports it. Use `structured_entailment` for table rows, formulas,
-  SQL, and configuration structures, and `summary` only for candidate-page
-  summaries. A `derived` candidate must declare its derivation rule or method.
-  Do not use the retired `supportType` field.
 - Do not create an entity for every noun.
 - Ground each important fact in at least one SourceRef from the current task.
 - When `get_batch` returns `evidence_catalog`, copy its `analysis_scaffold`
   unchanged and cite `evidence_index` integers in candidate `sourceRefs`. The
   Core resolves them to exact complete SourceRefs and compacts the persisted
-  top-level catalog. Never retype the supplied quotes.
+  top-level catalog. Never retype the supplied quotes. On an older server
+  without this catalog, treat top-level `sourceRefs` as the catalog of unique
+  complete references and use checked zero-based indexes in nested candidates.
 - Write `reviewItems` as objects with non-empty `content` and indexed or
   complete `sourceRefs`; put unsourced questions in `unresolvedQuestions`.
-- Evidence-catalog passages are server-generated contiguous source evidence.
-  Each entry exposes `primary_quote`, `context_quotes`, and `context` (table
-  headers/columns and headings). Select indexes without reading the original
-  source file; never reconstruct or normalize locator fields yourself.
-- Wiki prose is allowed to paraphrase, summarize, normalize predicates, and
-  merge aliases. Preserve typed anchors (numbers, ratios, ranges, percentages,
-  identifiers, dates, units) and certainty/polarity. Lexical mismatch is a
-  warning, not a reason to imitate the source sentence.
-- Citing a table-row evidence index carries the same primary/context set into
-  Core validation. Keep the header and column semantics when the row contains
-  only values; context reuse is not counted as primary evidence reuse.
-- A title-only quote should be treated as a review warning for detailed prose,
-  not as a global lexical hard failure. Split evidence by coherent topic when
-  useful, but reusing a primary passage is allowed when it genuinely supports
-  several candidates.
-- For a relation, put the evidence-supported relationship statement in
-  `content`, add a normalized `predicate`, and reference source/target
-  entity-or-concept `localId` values that are declared in this task. Cite the
-  evidence index containing the relationship. Predicate names may be
-  normalized, but do not add a stronger relationship or certainty than the
-  evidence supports. A table formula with metric, condition, unit, and source
-  table belongs in a `metric_definition`; do not compress the full definition
-  into a graph edge. Put source-grounded
-  concerns in `reviewItems` and unsupported inference in
-  `unresolvedQuestions`.
+- Evidence-catalog quotes are already short, exact, and verbatim. Select their
+  indexes without reading the original source file. Only on a legacy server,
+  start each top-level SourceRef by copying one exact
+  `chunk.source_ref_templates` entry and add a contiguous batch quote; never
+  reconstruct or normalize locator fields yourself.
+- A title-only quote does not support detailed facts from a table. Claims,
+  relations, contradictions, and review items must cite quotes containing their
+  identifying terms. Split table evidence by row or coherent topic; a single
+  SourceRef may ground at most eight candidates.
+- Put the directly supported relation statement in `content` and cite the
+  evidence index containing that statement.
 - Use conservative confidence values between 0 and 1.
 - Put uncertainty in `unresolvedQuestions` instead of guessing.
 - Keep sourced facts separate from inference.
@@ -72,10 +47,12 @@ standalone envelope):
   "sourceRefMode": "batch-evidence-index",
   "sourceRefs": [0, 1],
   "entities": [{ "localId": "entity-1", "name": "Example", "sourceRefs": [0] }],
-  "relations": [{ "localId": "relation-1", "factKind": "relation", "supportMode": "explicit_text", "sourceEntityLocalId": "entity-1", "predicate": "dependsOn", "targetEntityLocalId": "entity-2", "content": "Example depends on Entity 2.", "sourceRefs": [1] }],
   "reviewItems": [{ "content": "A sourced issue requiring review", "sourceRefs": [1] }]
 }
 ```
+
+Only a legacy server without `evidence_catalog` uses complete SourceRef objects
+in the top-level catalog.
 
 ## Page planning
 
@@ -95,9 +72,6 @@ standalone envelope):
 - Split pages when concepts have distinct definitions or lifecycles; merge only
   when they are semantically identical.
 - Preserve useful existing content unless newer evidence supersedes it.
-- Keep each page in the original language of its directly supporting evidence.
-  Do not rewrite an English source page in Chinese, or a Chinese source page in
-  English, merely to make the workspace uniform.
 - Record conflicting sourced claims without silently choosing a winner.
 - Create review items for contradictions that cannot be resolved from evidence.
 - Use only Agent-writable collections exposed by the PagePatch schema.
@@ -109,11 +83,8 @@ standalone envelope):
   endpoints should link to each other, and pages derived from the same source
   should link to the canonical source page when relevant. Finalize mirrors
   resolvable links into both pages' Related navigation.
-- Submit complete rebased `content` for `replace` only when the server marks the
-  existing page as fully visible. For `merge`, submit bounded `sectionChanges`
-  using `upsert_section`; never repeat the old body or edit a protected,
-  partially visible section. Do not upsert both a parent section and one of its
-  nested children in the same patch.
+- Submit complete rebased content for `merge`; the Core does not perform a model
+  merge.
 - Build page patches from each returned `page_requirement.patch_scaffold`.
   Requirement-ID `sourceRefs` are server handles that Core resolves to exact
   quotes and locators; do not copy complete SourceRef objects into a patch.

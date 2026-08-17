@@ -1,21 +1,20 @@
 import { readFile, readdir } from "node:fs/promises"
 import path from "node:path"
-import { buildEmbeddingSnapshot, embedQueryFromCache, warmEmbeddingCache } from "./embedding.js"
-import { listFilesRecursive, pathExists, readJson, relativePosix, safeTextCut, sha256, tokenize, writeBufferAtomic, writeJsonAtomic } from "./utils.js"
+import { embedQueryAndDocuments, warmEmbeddingCache } from "./embedding.js"
+import { listFilesRecursive, pathExists, readJson, relativePosix, safeTextCut, sha256, tokenize } from "./utils.js"
 import { extractWikiLinks } from "./wiki-page.js"
 
 const DEFAULT_RRF_K = 60
 const VECTOR_DIMENSIONS = 256
 const WIKI_SECTION_CHARS = 4_000
 const ANALYSIS_SECTION_CHARS = 4_000
-const MAX_RETRIEVAL_DOCUMENTS = Number.MAX_SAFE_INTEGER
+const MAX_RETRIEVAL_DOCUMENTS = 10_000
 const MAX_QUERY_CHARS = 10_000
 
 export async function retrieveContext(workspace, taskRecord, queries, options = {}) {
   const limit = Math.min(Math.max(Number(options.limit) || 20, 1), 100)
   const maxChars = Math.min(Math.max(Number(options.maxChars) || 60_000, 1_000), 120_000)
-  const publication = await retrievalPublicationState(workspace, taskRecord.task)
-  const completedKnowledgeBase = publication.published
+  const completedKnowledgeBase = taskRecord.task.status === "completed"
   const channelRequest = canonicalChannels(options.channels, completedKnowledgeBase)
   const requested = channelRequest.canonical
   const query = queries.join("\n")
@@ -23,42 +22,25 @@ export async function retrieveContext(workspace, taskRecord, queries, options = 
   const queryTerms = [...new Set(lexicalTokens(query))]
   const corpus = await retrievalDocuments(workspace, taskRecord, options.currentBatchId)
   const documents = corpus.documents
-  const taskIndex = completedKnowledgeBase ? null : await readJson(taskRecord.paths.retrievalIndex, null)
-  const persistedBm25 = completedKnowledgeBase ? await activeRetrievalArtifact(workspace, "bm25.json") : taskIndex?.bm25 ?? null
-  const persistedVectors = completedKnowledgeBase
-    ? await activeFloatVectorArtifact(workspace, "feature-hash.json", false)
-    : await taskFeatureHashArtifact(taskRecord, taskIndex?.featureHash)
-  const persistedEmbedding = completedKnowledgeBase ? await activeEmbeddingArtifact(workspace) : null
   const rankings = {}
   const channelStatus = {}
-  const embeddingIndexedDocumentIds = new Set()
 
   if (requested.has("bm25")) {
-    rankings.bm25 = persistedBm25
-      ? scoreBm25WithPersistedWiki(documents, queryTerms, persistedBm25)
-      : scoreBm25(documents, queryTerms)
-    channelStatus.bm25 = { mode: persistedBm25 ? "persisted-inverted-index" : "task-local-lexical", documents: documents.length }
+    rankings.bm25 = scoreBm25(documents, queryTerms)
+    channelStatus.bm25 = { mode: "lexical", documents: documents.length }
   }
-  const wikiAvailable = requested.has("wiki") && documents.some((document) => document.kind === "wiki-page")
-  const wikiRanking = wikiAvailable
+  const wikiRanking = requested.has("wiki") || requested.has("embedding")
     ? scoreWiki(documents, queryTerms, rankings.bm25 ?? [])
     : []
-  if (wikiAvailable) {
+  if (requested.has("wiki")) {
     rankings.wiki = wikiRanking
     channelStatus.wiki = { mode: "wiki-title-link-graph", documents: documents.filter((item) => item.kind === "wiki-page").length }
   }
   if (requested.has("embedding")) {
-    const candidates = selectEmbeddingCandidates(documents, rankings.bm25 ?? [], wikiRanking, completedKnowledgeBase)
-    const publishedVectors = new Map((persistedEmbedding?.documents ?? []).map((meta, index) => [meta.id, persistedEmbedding.vectors?.[index]]))
-    const embedded = await embedQueryFromCache(workspace, query, candidates, publishedVectors)
+    const candidates = selectEmbeddingCandidates(documents, rankings.bm25 ?? [], wikiRanking)
+    const embedded = await embedQueryAndDocuments(workspace, query, candidates)
     if (embedded.available) {
-      const vectors = new Map(embedded.vectors)
-      for (const [index, meta] of (persistedEmbedding?.documents ?? []).entries()) {
-        const vector = persistedEmbedding.vectors?.[index]
-        if (Array.isArray(vector) || ArrayBuffer.isView(vector)) vectors.set(meta.id, vector)
-      }
-      rankings.embedding = scoreEmbeddingVectors(documents, embedded.queryVector, vectors)
-      for (const documentId of vectors.keys()) embeddingIndexedDocumentIds.add(documentId)
+      rankings.embedding = scoreEmbeddingVectors(documents, embedded.queryVector, embedded.vectors)
       channelStatus.embedding = {
         mode: "embedding",
         ...embedded.config,
@@ -67,10 +49,8 @@ export async function retrieveContext(workspace, taskRecord, queries, options = 
         cache_hits: embedded.cacheHits,
       }
     } else {
-      rankings.feature_hash = persistedVectors
-        ? scoreFeatureHashWithPersistedWiki(documents, candidates, query, persistedVectors)
-        : scoreFeatureHashCandidates(documents, candidates, query)
-      channelStatus.feature_hash = {
+      rankings.embedding = scoreFeatureHashCandidates(documents, candidates, query)
+      channelStatus.embedding = {
         mode: "feature-hash-fallback",
         degraded: true,
         reason: embedded.reason,
@@ -83,16 +63,12 @@ export async function retrieveContext(workspace, taskRecord, queries, options = 
   const fused = fuseRankings(documents, rankings, Number(workspace.config.retrieval?.rrfK) || DEFAULT_RRF_K)
   const hits = []
   const pathUses = new Map()
-  const seenEvidence = new Set()
-  const perPathLimit = clampInteger(workspace.config.retrieval?.maxSectionsPerPath, 1, 20, 6)
   let usedChars = 0
   let truncated = false
   for (const item of fused) {
     if (hits.length >= limit) break
     const pathCount = pathUses.get(item.document.path) ?? 0
-    if (pathCount >= perPathLimit) continue
-    const evidenceKey = `${item.document.path}:${sha256(item.document.content.normalize("NFKC").replace(/\s+/g, " ").trim())}`
-    if (seenEvidence.has(evidenceKey)) continue
+    if (pathCount >= 2) continue
     const snippet = buildSnippet(item.document.content, queryTerms, 900)
     if (usedChars + snippet.length > maxChars) {
       truncated = true
@@ -100,7 +76,6 @@ export async function retrieveContext(workspace, taskRecord, queries, options = 
     }
     usedChars += snippet.length
     pathUses.set(item.document.path, pathCount + 1)
-    seenEvidence.add(evidenceKey)
     hits.push({
       kind: item.document.kind,
       path: item.document.path,
@@ -116,68 +91,23 @@ export async function retrieveContext(workspace, taskRecord, queries, options = 
     })
   }
   const available = Object.keys(rankings)
-  const availableLabels = channelRequest.labels.filter((label) => available.includes(label))
-  const pendingLabels = channelRequest.labels.filter((label) => !available.includes(label))
-  const sourceDocuments = documents.filter((document) => document.kind === "source-chunk")
-  const sourceReadiness = taskRecord.task.sourceIds.map((sourceId) => {
-    const sourceChunks = sourceDocuments.filter((document) => document.sourceId === sourceId)
-    const embeddingChunks = sourceChunks.filter((document) => embeddingIndexedDocumentIds.has(document.id)).length
-    return {
-      source_id: sourceId,
-      parsed: sourceChunks.length > 0,
-      chunk_count: sourceChunks.length,
-      bm25_indexed_chunks: sourceChunks.length,
-      embedding_indexed_chunks: embeddingChunks,
-      embedding_complete: sourceChunks.length > 0 && embeddingChunks === sourceChunks.length,
-    }
-  })
+  const availableLabels = channelRequest.labels.filter((label) => available.includes(channelAlias(label)))
   return {
     hits,
-    retrieval_phase: publication.phase,
+    retrieval_phase: completedKnowledgeBase ? "knowledge-base-complete" : "building",
     fusion: "rrf",
     fusion_details: { k: Number(workspace.config.retrieval?.rrfK) || DEFAULT_RRF_K, channels: available },
     wiki_revision: workspace.revision,
     truncated,
     available_channels: availableLabels,
-    pending_channels: pendingLabels,
-    fallback_channels: available.includes("feature_hash") ? ["feature_hash"] : [],
-    requested_channels: channelRequest.labels,
-    effective_channels: available,
+    pending_channels: channelRequest.labels.filter((label) => !available.includes(channelAlias(label))),
     channel_status: channelStatus,
     corpus: corpus.stats,
-    answer_scope: completedKnowledgeBase ? "published-generation" : "task-local-ready-sources",
-    retrieval_readiness: {
-      state: publication.phase,
-      manifest_generation: publication.generationId,
-      sources: {
-        accepted: taskRecord.task.sourceIds.length,
-        parsed: taskRecord.task.sourceIds.length,
-        bm25_indexed: new Set(sourceDocuments.map((document) => document.sourceId)).size,
-        embedding_indexed_documents: channelStatus.embedding?.indexed_documents ?? 0,
-        failed: 0,
-        by_source: sourceReadiness,
-      },
-      channels: {
-        bm25: { indexed: documents.length, total: corpus.stats.total_documents, complete: !corpus.stats.truncated },
-        embedding: {
-          indexed: channelStatus.embedding?.indexed_documents ?? 0,
-          total: candidatesForStatus(requested, documents.length),
-          complete: Boolean(channelStatus.embedding && channelStatus.embedding.skipped_documents === 0),
-          degraded: !channelStatus.embedding,
-        },
-      },
-    },
   }
 }
 
-function candidatesForStatus(requested, total) {
-  return requested.has("embedding") ? total : 0
-}
-
 async function retrievalDocuments(workspace, taskRecord, currentBatchId) {
-  // maxDocuments is retained as an index-shard tuning hint, never as a
-  // semantic corpus cutoff. All ready documents participate in retrieval.
-  const maximumDocuments = MAX_RETRIEVAL_DOCUMENTS
+  const maximumDocuments = clampInteger(workspace.config.retrieval?.maxDocuments, 100, MAX_RETRIEVAL_DOCUMENTS, MAX_RETRIEVAL_DOCUMENTS)
   const provisionalPaths = await workspaceProvisionalPaths(workspace, taskRecord.task)
   const wikiResult = await wikiDocuments(workspace, maximumDocuments, provisionalPaths)
   const wiki = wikiResult.documents
@@ -229,12 +159,7 @@ async function retrievalDocuments(workspace, taskRecord, currentBatchId) {
       }))
     }
   }
-  // During build, uploaded task-local evidence has a hard priority guarantee.
-  // A previous stable Wiki is auxiliary context and cannot consume the source
-  // quota before every ready source/analysis document participates.
-  const all = taskRecord.task.status === "completed"
-    ? fairTake([current, sources, analyses, wiki], maximumDocuments)
-    : [...current, ...sources, ...analyses, ...wiki].slice(0, maximumDocuments)
+  const all = fairTake([current, wiki, analyses, sources], maximumDocuments)
   const observedTotal = currentTotal + sourcesTotal + wiki.length + analyses.length
   const preTruncated = wikiResult.truncated || analysisTruncated || current.length < currentTotal || sources.length < sourcesTotal
   return {
@@ -265,11 +190,8 @@ async function workspaceProvisionalPaths(workspace, currentTask) {
       const task = await readJson(path.join(workspace.paths.tasks, entry.name, "task.json"))
       for (const provisionalPath of task.pageProjection?.provisionalPagePaths ?? []) paths.add(provisionalPath)
     } catch {
-      // Fail closed: if ownership cannot be proven, the mutable workspace Wiki
-      // is not a safe retrieval source.  Active-generation reads do not need
-      // this set, but keeping a sentinel excludes all worktree pages on the
-      // compatibility path.
-      paths.add("*")
+      // A corrupt or concurrently replaced task record cannot make retrieval
+      // fail; its pages simply keep their normal deterministic ranking.
     }
   }
   return paths
@@ -278,12 +200,11 @@ async function workspaceProvisionalPaths(workspace, currentTask) {
 async function wikiDocuments(workspace, limit = MAX_RETRIEVAL_DOCUMENTS, excludedPaths = new Set(), options = {}) {
   const documents = []
   const wikiRoot = options.wikiRoot ?? await activeWikiRoot(workspace)
-  if (!wikiRoot) return { documents, truncated: false }
   const files = await listFilesRecursive(wikiRoot, (candidate) => candidate.endsWith(".md"))
   let truncated = false
   for (const [fileIndex, file] of files.entries()) {
     const relative = `wiki/${relativePosix(wikiRoot, file)}`
-    if (excludedPaths.has("*") || excludedPaths.has(relative)) continue
+    if (excludedPaths.has(relative)) continue
     if (documents.length >= limit) {
       truncated = fileIndex < files.length
       break
@@ -312,9 +233,9 @@ async function wikiDocuments(workspace, limit = MAX_RETRIEVAL_DOCUMENTS, exclude
 async function activeWikiRoot(workspace) {
   const pointer = await readJson(workspace.paths.currentGeneration, null)
   const generationId = pointer?.generation_id
-  if (typeof generationId !== "string" || !/^generation-[0-9a-f-]+$/i.test(generationId)) return null
+  if (typeof generationId !== "string" || !/^generation-[0-9a-f-]+$/i.test(generationId)) return workspace.paths.wiki
   const generationWikiRoot = path.join(workspace.paths.generations, generationId, "wiki")
-  return await pathExists(generationWikiRoot) ? generationWikiRoot : null
+  return await pathExists(generationWikiRoot) ? generationWikiRoot : workspace.paths.wiki
 }
 
 function scoreBm25(documents, queryTerms) {
@@ -393,7 +314,7 @@ function scoreWiki(documents, queryTerms, seeds) {
   return [...scores].map(([documentIndex, score]) => ({ documentIndex, score })).sort((a, b) => b.score - a.score || documents[a.documentIndex].id.localeCompare(documents[b.documentIndex].id))
 }
 
-function selectEmbeddingCandidates(documents, bm25, wiki, completedKnowledgeBase) {
+function selectEmbeddingCandidates(documents, bm25, wiki) {
   const ordered = []
   const seen = new Set()
   const add = (index) => {
@@ -402,162 +323,10 @@ function selectEmbeddingCandidates(documents, bm25, wiki, completedKnowledgeBase
     seen.add(document.id)
     ordered.push(document)
   }
-  if (!completedKnowledgeBase) {
-    documents.forEach((document, index) => {
-      if (document.kind === "source-chunk" || document.kind === "analysis") add(index)
-    })
-  }
-  bm25.forEach((item) => add(item.documentIndex))
-  wiki.forEach((item) => add(item.documentIndex))
-  for (let index = 0; index < documents.length; index += 1) add(index)
+  bm25.slice(0, 500).forEach((item) => add(item.documentIndex))
+  wiki.slice(0, 250).forEach((item) => add(item.documentIndex))
+  for (let index = 0; index < documents.length && ordered.length < 2_000; index += 1) add(index)
   return ordered
-}
-
-async function retrievalPublicationState(workspace, task) {
-  const pointer = await readJson(workspace.paths.currentGeneration, null)
-  const generationId = typeof pointer?.generation_id === "string" ? pointer.generation_id : null
-  if (task.status !== "completed") {
-    return { published: false, phase: task.status === "importing" || task.status === "parsing" ? "importing" : "source-ready", generationId }
-  }
-  if (!generationId) {
-    return { published: false, phase: "degraded", generationId }
-  }
-  const manifest = await readJson(path.join(workspace.paths.generations, generationId, "manifest.json"), null)
-  if (!manifest || manifest.generationId !== generationId) {
-    return { published: false, phase: "degraded", generationId }
-  }
-  return { published: true, phase: "knowledge-base-complete", generationId }
-}
-
-async function activeRetrievalArtifact(workspace, name) {
-  const pointer = await readJson(workspace.paths.currentGeneration, null)
-  const generationId = pointer?.generation_id
-  if (typeof generationId !== "string" || !/^generation-[0-9a-f-]+$/i.test(generationId)) return null
-  const root = path.join(workspace.paths.generations, generationId)
-  const manifest = await readJson(path.join(root, "manifest.json"), null)
-  const descriptor = manifest?.artifacts?.[name]
-  if (!descriptor || descriptor.path !== name || typeof descriptor.sha256 !== "string") return null
-  const artifactPath = path.join(root, name)
-  try {
-    const text = await readFile(artifactPath, "utf8")
-    if (sha256(text) !== descriptor.sha256) throw new Error("artifact hash mismatch")
-    return JSON.parse(text)
-  } catch (error) {
-    const failure = new Error(`Published retrieval artifact ${name} is missing or corrupt: ${error instanceof Error ? error.message : String(error)}`)
-    failure.code = "RETRIEVAL_INDEX_INCOMPLETE"
-    throw failure
-  }
-}
-
-async function activeEmbeddingArtifact(workspace) {
-  return activeFloatVectorArtifact(workspace, "embedding.json", true)
-}
-
-async function activeFloatVectorArtifact(workspace, metadataName, decodeVectors) {
-  const metadata = await activeRetrievalArtifact(workspace, metadataName)
-  if (!metadata || metadata.documents?.length === 0 || (decodeVectors && metadata.status !== "completed")) return metadata
-  const pointer = await readJson(workspace.paths.currentGeneration, null)
-  const generationId = pointer?.generation_id
-  const root = path.join(workspace.paths.generations, generationId)
-  const manifest = await readJson(path.join(root, "manifest.json"), null)
-  const descriptor = manifest?.artifacts?.[metadata.vector_path]
-  if (!descriptor || descriptor.path !== metadata.vector_path || typeof descriptor.sha256 !== "string") {
-    throw retrievalIndexFailure("Published embedding vector descriptor is missing.")
-  }
-  const bytes = await readFile(path.join(root, metadata.vector_path))
-  if (sha256(bytes) !== descriptor.sha256) throw retrievalIndexFailure("Published embedding vector hash mismatch.")
-  const dimensions = Number(metadata.dimensions) || 0
-  const expectedBytes = metadata.documents.length * dimensions * 4
-  if (dimensions < 1 || bytes.byteLength !== expectedBytes) throw retrievalIndexFailure("Published embedding vector dimensions are inconsistent.")
-  if (!decodeVectors) return { ...metadata, vectorBytes: bytes }
-  const vectors = []
-  for (let documentIndex = 0; documentIndex < metadata.documents.length; documentIndex += 1) {
-    const vector = new Float32Array(dimensions)
-    const offset = documentIndex * dimensions * 4
-    for (let dimension = 0; dimension < dimensions; dimension += 1) {
-      vector[dimension] = bytes.readFloatLE(offset + dimension * 4)
-    }
-    vectors.push(vector)
-  }
-  return { ...metadata, vectors }
-}
-
-function retrievalIndexFailure(message) {
-  const failure = new Error(message)
-  failure.code = "RETRIEVAL_INDEX_INCOMPLETE"
-  return failure
-}
-
-function scoreBm25WithPersistedWiki(documents, queryTerms, index) {
-  const wikiById = new Map(documents.map((document, documentIndex) => [document.id, documentIndex]))
-  const scores = new Map()
-  const count = Number(index.documentCount) || 0
-  const averageLength = Number(index.averageDocumentLength) || 1
-  for (const term of queryTerms) {
-    const posting = index.postings?.[term]
-    if (!posting || !Array.isArray(posting.docs)) continue
-    const df = posting.docs.length
-    const idf = Math.log(1 + (count - df + 0.5) / (df + 0.5))
-    for (const [storedIndex, frequency] of posting.docs) {
-      const meta = index.documents?.[storedIndex]
-      const documentIndex = meta ? wikiById.get(meta.id) : undefined
-      if (documentIndex === undefined || !Number.isFinite(frequency)) continue
-      const length = Number(index.lengths?.[storedIndex]) || 1
-      const denominator = frequency + 1.2 * (0.25 + 0.75 * (length / Math.max(1, averageLength)))
-      scores.set(documentIndex, (scores.get(documentIndex) ?? 0) + idf * ((frequency * 2.2) / denominator))
-    }
-  }
-  const persistedIds = new Set((index.documents ?? []).map((document) => document.id))
-  const liveDocuments = documents.map((document, indexValue) => ({ document, indexValue })).filter(({ document }) => !persistedIds.has(document.id))
-  const liveRanking = scoreBm25(liveDocuments.map(({ document }) => document), queryTerms)
-  for (const item of liveRanking) scores.set(liveDocuments[item.documentIndex].indexValue, item.score)
-  return [...scores].map(([documentIndex, score]) => ({ documentIndex, score }))
-    .sort((left, right) => right.score - left.score || documents[left.documentIndex].id.localeCompare(documents[right.documentIndex].id))
-}
-
-function scoreFeatureHashWithPersistedWiki(documents, candidates, query, index) {
-  const queryVector = embedText(query)
-  const candidateIds = new Set(candidates.map((document) => document.id))
-  const documentIndexes = new Map(documents.map((document, documentIndex) => [document.id, documentIndex]))
-  const scores = []
-  for (const [storedIndex, meta] of (index.documents ?? []).entries()) {
-    if (!candidateIds.has(meta.id)) continue
-    const vector = storedVector(index, storedIndex)
-    const documentIndex = documentIndexes.get(meta.id)
-    if (documentIndex === undefined || !Array.isArray(vector)) continue
-    const score = cosine(queryVector, vector)
-    if (score > 0) scores.push({ documentIndex, score })
-  }
-  const persistedIds = new Set((index.documents ?? []).map((document) => document.id))
-  const liveCandidates = candidates.filter((document) => !persistedIds.has(document.id))
-  scores.push(...scoreFeatureHashCandidates(documents, liveCandidates, query))
-  return scores.sort((left, right) => right.score - left.score || documents[left.documentIndex].id.localeCompare(documents[right.documentIndex].id))
-}
-
-function storedVector(index, storedIndex) {
-  const inline = index.vectors?.[storedIndex]
-  if (Array.isArray(inline) || ArrayBuffer.isView(inline)) return inline
-  const dimensions = Number(index.dimensions) || 0
-  const bytes = index.vectorBytes
-  const offset = storedIndex * dimensions * 4
-  if (!Buffer.isBuffer(bytes) || dimensions < 1 || offset + dimensions * 4 > bytes.length) return null
-  const vector = new Float32Array(dimensions)
-  for (let dimension = 0; dimension < dimensions; dimension += 1) vector[dimension] = bytes.readFloatLE(offset + dimension * 4)
-  return vector
-}
-
-async function taskFeatureHashArtifact(record, metadata) {
-  if (!metadata || metadata.storage !== "contiguous-float32-le") return metadata ?? null
-  try {
-    const bytes = await readFile(record.paths.featureHashVectors)
-    if (sha256(bytes) !== metadata.vectorSha256) throw new Error("hash mismatch")
-    if (bytes.length !== Number(metadata.documentCount) * Number(metadata.dimensions) * 4) throw new Error("size mismatch")
-    return { ...metadata, vectorBytes: bytes }
-  } catch (error) {
-    const failure = new Error(`Task feature-hash index is missing or corrupt: ${error instanceof Error ? error.message : String(error)}`)
-    failure.code = "RETRIEVAL_INDEX_INCOMPLETE"
-    throw failure
-  }
 }
 
 function scoreEmbeddingVectors(documents, queryVector, vectors) {
@@ -660,20 +429,14 @@ function analysisContent(analysis) {
 
 function splitSections(content, maxChars) {
   const sections = []
-  const source = String(content)
-  let cursor = 0
-  const overlapChars = Math.max(1, Math.floor(maxChars * 0.12))
-  while (source.length - cursor > maxChars) {
-    const window = source.slice(cursor, cursor + maxChars + 1)
-    const relativeCut = Math.max(window.lastIndexOf("\n## "), window.lastIndexOf("\n\n"), window.lastIndexOf("\n"), Math.floor(maxChars * 0.6))
-    const cut = safeTextCut(source, cursor + relativeCut, cursor)
-    sections.push(source.slice(cursor, cut).trim())
-    const next = Math.max(cursor + 1, cut - overlapChars)
-    cursor = safeTextCut(source, next, cursor)
-    while (/\s/u.test(source[cursor] ?? "")) cursor += 1
+  let rest = String(content)
+  while (rest.length > maxChars) {
+    const window = rest.slice(0, maxChars + 1)
+    const cut = safeTextCut(rest, Math.max(window.lastIndexOf("\n## "), window.lastIndexOf("\n\n"), window.lastIndexOf("\n"), Math.floor(maxChars * 0.6)))
+    sections.push(rest.slice(0, cut).trim())
+    rest = rest.slice(cut).trimStart()
   }
-  const rest = source.slice(cursor).trim()
-  if (rest || sections.length === 0) sections.push(rest)
+  if (rest.trim() || sections.length === 0) sections.push(rest.trim())
   return sections.filter(Boolean)
 }
 
@@ -692,7 +455,6 @@ function chunkLocator(chunk) {
     ...(Number.isInteger(chunk.startOffset) ? { startOffset: chunk.startOffset } : {}),
     ...(Number.isInteger(chunk.endOffset) ? { endOffset: chunk.endOffset } : {}),
     ...(Number.isInteger(chunk.pageNumber) ? { page: chunk.pageNumber } : {}),
-    ...(Number.isInteger(chunk.slideNumber) ? { slide: chunk.slideNumber } : {}),
     ...(chunk.sheetName ? { sheetName: chunk.sheetName } : {}),
     ...(chunk.cellRange ? { cellRange: chunk.cellRange } : {}),
   }
@@ -701,7 +463,11 @@ function chunkLocator(chunk) {
 function canonicalChannels(value, completedKnowledgeBase) {
   const defaults = completedKnowledgeBase ? ["bm25", "embedding", "wiki"] : ["bm25", "embedding"]
   const labels = [...new Set(Array.isArray(value) && value.length > 0 ? value : defaults)]
-  return { labels, canonical: new Set(labels) }
+  return { labels, canonical: new Set(labels.map(channelAlias)) }
+}
+
+function channelAlias(channel) {
+  return channel === "vector" ? "embedding" : channel === "graph" ? "wiki" : channel
 }
 
 function fairTake(groups, limit) {
@@ -738,156 +504,55 @@ function normalizeWikiTarget(value) {
 
 export async function buildBm25Index(workspace) {
   const loaded = await wikiDocuments(workspace, configuredDocumentLimit(workspace))
-  return persistedBm25Index(loaded.documents, loaded.truncated)
+  const pages = loaded.documents
+  return {
+    schemaVersion: 2,
+    generatedAt: new Date().toISOString(),
+    truncated: loaded.truncated,
+    documents: pages.map((document) => ({ id: document.id, path: document.path, title: document.title, hash: document.hash, length: lexicalTokens(document.content).length })),
+  }
 }
 
-export async function buildFeatureHashIndex(workspace, options = {}) {
+export async function buildVectorIndex(workspace, options = {}) {
   const loaded = await wikiDocuments(workspace, configuredDocumentLimit(workspace), new Set(), options)
   const pages = loaded.documents
   return {
-    schemaVersion: 3,
+    schemaVersion: 2,
     kind: "deterministic-feature-hash-fallback",
     generatedAt: new Date().toISOString(),
     truncated: loaded.truncated,
-    dimensions: VECTOR_DIMENSIONS,
-    documentCount: pages.length,
-    documents: pages.map((document) => ({ id: document.id, path: document.path, hash: document.hash })),
-    vectors: pages.map((document) => embedText(document.content)),
+    documents: pages.map((document) => ({ id: document.id, path: document.path, hash: document.hash, dimensions: VECTOR_DIMENSIONS, vector: embedText(document.content) })),
   }
 }
 
 export async function buildEmbeddingIndex(workspace, options = {}) {
   const loaded = await wikiDocuments(workspace, configuredDocumentLimit(workspace), new Set(), options)
-  return { ...(await buildEmbeddingSnapshot(workspace, loaded.documents)), truncated: loaded.truncated }
+  return { schemaVersion: 1, generatedAt: new Date().toISOString(), truncated: loaded.truncated, ...(await warmEmbeddingCache(workspace, loaded.documents)) }
 }
 
 export async function buildRetrievalIndexes(workspace, options = {}) {
   const loaded = await wikiDocuments(workspace, configuredDocumentLimit(workspace), new Set(), options)
   const pages = loaded.documents
   const generatedAt = new Date().toISOString()
-  const embedding = { ...(await buildEmbeddingSnapshot(workspace, pages)), generatedAt, truncated: loaded.truncated }
+  const embedding = { schemaVersion: 1, generatedAt, truncated: loaded.truncated, ...(await warmEmbeddingCache(workspace, pages)) }
   return {
-    bm25: persistedBm25Index(pages, loaded.truncated, generatedAt),
-    featureHash: {
-      schemaVersion: 3,
+    bm25: {
+      schemaVersion: 2,
+      generatedAt,
+      truncated: loaded.truncated,
+      documents: pages.map((document) => ({ id: document.id, path: document.path, title: document.title, hash: document.hash, length: lexicalTokens(document.content).length })),
+    },
+    vector: {
+      schemaVersion: 2,
       kind: "deterministic-feature-hash-fallback",
       generatedAt,
       truncated: loaded.truncated,
-      dimensions: VECTOR_DIMENSIONS,
-      documentCount: pages.length,
-      documents: pages.map((document) => ({ id: document.id, path: document.path, hash: document.hash })),
-      vectors: pages.map((document) => embedText(document.content)),
+      documents: pages.map((document) => ({ id: document.id, path: document.path, hash: document.hash, dimensions: VECTOR_DIMENSIONS, vector: embedText(document.content) })),
     },
     embedding,
   }
 }
 
-function persistedBm25Index(documents, truncated, generatedAt = new Date().toISOString()) {
-  const postings = Object.create(null)
-  const lengths = []
-  for (const [documentIndex, document] of documents.entries()) {
-    const terms = lexicalTokens(document.content)
-    lengths.push(terms.length)
-    const frequencies = new Map()
-    for (const term of terms) frequencies.set(term, (frequencies.get(term) ?? 0) + 1)
-    for (const [term, frequency] of frequencies) {
-      const posting = postings[term] ??= { docs: [] }
-      posting.docs.push([documentIndex, frequency])
-    }
-  }
-  return {
-    schemaVersion: 3,
-    tokenizerFingerprint: "unicode-word-cjk-bigram-v1",
-    generatedAt,
-    truncated,
-    documentCount: documents.length,
-    averageDocumentLength: lengths.reduce((sum, length) => sum + length, 0) / Math.max(1, lengths.length),
-    documents: documents.map((document) => ({ id: document.id, path: document.path, title: document.title, hash: document.hash })),
-    lengths,
-    postings,
-  }
-}
-
-export async function warmTaskEmbeddingIndex(workspace, batches) {
-  const documents = []
-  for (const batch of batches ?? []) {
-    for (const chunk of batch.chunks ?? []) {
-      documents.push(makeDocument({
-        id: `source:${chunk.sourceId}:${chunk.chunkId}`,
-        kind: "source-chunk",
-        path: `${chunk.sourceId}/${chunk.chunkId}`,
-        title: chunkTitle(chunk),
-        content: chunk.text,
-        sourceId: chunk.sourceId,
-        chunkId: chunk.chunkId,
-        locator: chunkLocator(chunk),
-      }))
-    }
-  }
-  return warmEmbeddingCache(workspace, documents)
-}
-
-export async function buildTaskRetrievalIndex(record) {
-  const documents = []
-  for (const batch of record.batches ?? []) {
-    for (const chunk of batch.chunks ?? []) {
-      documents.push(makeDocument({
-        id: `source:${chunk.sourceId}:${chunk.chunkId}`,
-        kind: "source-chunk",
-        path: `${chunk.sourceId}/${chunk.chunkId}`,
-        title: chunkTitle(chunk),
-        content: chunk.text,
-        sourceId: chunk.sourceId,
-        chunkId: chunk.chunkId,
-        locator: chunkLocator(chunk),
-      }))
-    }
-  }
-  for (const batchId of record.task.completedBatchIds ?? []) {
-    const analysis = await readJson(path.join(record.paths.analysis, `${batchId}.json`), null)
-    if (!analysis) continue
-    for (const [index, section] of splitSections(analysisContent(analysis), ANALYSIS_SECTION_CHARS).entries()) {
-      documents.push(makeDocument({ id: `analysis:${record.task.taskId}:${batchId}:${index}`, kind: "analysis", path: `${record.task.taskId}/${batchId}`, title: analysis.batchSummary || batchId, content: section, section: index }))
-    }
-  }
-  const generatedAt = new Date().toISOString()
-  const featureVectors = documents.map((document) => embedText(document.content))
-  const featureVectorBytes = encodeFloat32Vectors(featureVectors, VECTOR_DIMENSIONS)
-  await writeBufferAtomic(record.paths.featureHashVectors, featureVectorBytes)
-  const value = {
-    schemaVersion: 1,
-    taskId: record.task.taskId,
-    generatedAt,
-    complete: !["importing", "parsing"].includes(record.task.status),
-    documentCount: documents.length,
-    bm25: persistedBm25Index(documents, false, generatedAt),
-    featureHash: {
-      schemaVersion: 3,
-      kind: "deterministic-feature-hash-fallback",
-      generatedAt,
-      truncated: false,
-      dimensions: VECTOR_DIMENSIONS,
-      documentCount: documents.length,
-      documents: documents.map((document) => ({ id: document.id, path: document.path, hash: document.hash })),
-      storage: "contiguous-float32-le",
-      vectorSha256: sha256(featureVectorBytes),
-    },
-  }
-  await writeJsonAtomic(record.paths.retrievalIndex, value)
-  return value
-}
-
-function encodeFloat32Vectors(vectors, dimensions) {
-  const buffer = Buffer.alloc(vectors.length * dimensions * 4)
-  for (let vectorIndex = 0; vectorIndex < vectors.length; vectorIndex += 1) {
-    const vector = vectors[vectorIndex]
-    for (let dimension = 0; dimension < dimensions; dimension += 1) {
-      buffer.writeFloatLE(Number(vector?.[dimension]) || 0, (vectorIndex * dimensions + dimension) * 4)
-    }
-  }
-  return buffer
-}
-
 function configuredDocumentLimit(workspace) {
-  return MAX_RETRIEVAL_DOCUMENTS
+  return clampInteger(workspace.config.retrieval?.maxDocuments, 100, MAX_RETRIEVAL_DOCUMENTS, MAX_RETRIEVAL_DOCUMENTS)
 }
