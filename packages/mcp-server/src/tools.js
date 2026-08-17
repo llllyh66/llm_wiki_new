@@ -14,7 +14,7 @@ const MAX_MCP_IN_FLIGHT = 8
 const MAX_TASK_IN_FLIGHT = 4
 const BUSY_RETRY_AFTER_MS = 1_500
 const MCP_SIGNAL = Symbol.for("llm-wiki.mcp.signal")
-const RECOVERABLE_ANALYSIS_CODES = new Set(["INVALID_ANALYSIS", "INVALID_DOMAIN_ANALYSIS", "INVALID_SOURCE_REF", "ANALYSIS_TOO_LARGE"])
+const SEMANTIC_ANALYSIS_CODES = new Set(["INVALID_ANALYSIS", "INVALID_DOMAIN_ANALYSIS", "INVALID_SOURCE_REF", "ANALYSIS_TOO_LARGE", "ANALYSIS_REPAIR_REQUIRED"])
 const ATOMIC_PAGE_REJECTION_CODES = new Set([
   "INVALID_PAGE_PATCH",
   "INVALID_WIKI_UPDATE",
@@ -123,18 +123,34 @@ function serializeResult(data) {
     return serializeCompactMcpError({ ...data, __serializedOutputBytes: outputBytes })
   }
   const result = { content: [{ type: "text", text }] }
-  if (outputBytes <= STRUCTURED_CONTENT_DUPLICATION_LIMIT) result.structuredContent = data
+  // Analysis repair diagnostics are intentionally structured even when their
+  // pretty JSON exceeds the normal duplication threshold. They remain bounded
+  // by MAX_MCP_OUTPUT_BYTES, while generic large tool results still use the
+  // one-copy wire path.
+  const structuredAnalysisDiagnostics = Array.isArray(data?.validation_errors)
+    && data?.semantic_repair?.required === true
+    && outputBytes <= MAX_MCP_OUTPUT_BYTES
+  if (outputBytes <= STRUCTURED_CONTENT_DUPLICATION_LIMIT || structuredAnalysisDiagnostics) result.structuredContent = data
   if (data?.ok === false || data?.accepted === false) result._meta = { llmWikiStatus: "rejected" }
   return result
 }
 
 function errorResult(error, context = {}) {
   const normalized = asLlmWikiError(error)
-  const analysisRetry = context.tool === "llm_wiki_commit_analysis" && RECOVERABLE_ANALYSIS_CODES.has(normalized.code)
+  const semanticAnalysisFailure = context.tool === "llm_wiki_commit_analysis" && SEMANTIC_ANALYSIS_CODES.has(normalized.code)
+  const repairRequired = normalized.details?.repair_required === true
+  const analysisRetry = semanticAnalysisFailure && !repairRequired
   const atomicPageRejection = ["llm_wiki_commit_pages", "llm_wiki_update_pages", "llm_wiki_stage_page_drafts"].includes(context.tool)
     && ATOMIC_PAGE_REJECTION_CODES.has(normalized.code)
   const submittedItems = context.tool === "llm_wiki_update_pages" ? context.args?.updates : context.args?.patches
-  const errorData = { ...normalized.toJSON(), retryable: normalized.retryable || analysisRetry }
+  const normalizedJson = normalized.toJSON()
+  const errorData = {
+    ...normalizedJson,
+    ...(semanticAnalysisFailure && normalizedJson.details
+      ? { details: compactAnalysisErrorDetails(normalizedJson.details) }
+      : {}),
+    retryable: normalized.retryable || analysisRetry,
+  }
   const busy = normalized.code === "TASK_BUSY" || normalized.code === "MCP_BUSY"
   return {
     ok: false,
@@ -151,17 +167,31 @@ function errorResult(error, context = {}) {
     } : {}),
     ...(Array.isArray(normalized.details?.validation_errors)
       ? { validation_errors: normalized.details.validation_errors }
-      : analysisRetry ? { validation_errors: [normalized.message] } : {}),
+      : semanticAnalysisFailure ? { validation_errors: [normalized.message] } : {}),
+    ...(Array.isArray(normalized.details?.validation_diagnostics)
+      ? { validation_diagnostics: normalized.details.validation_diagnostics }
+      : {}),
+    ...(Array.isArray(normalized.details?.grounding_warnings)
+      ? { grounding_warnings: normalized.details.grounding_warnings }
+      : {}),
+    ...(typeof normalized.details?.validation_fingerprint === "string"
+      ? { validation_fingerprint: normalized.details.validation_fingerprint }
+      : {}),
+    ...(normalized.details?.repair_required === true ? { repair_required: true } : {}),
     ...(normalized.details?.completion_gate && typeof normalized.details.completion_gate === "object"
       ? { completion_gate: normalized.details.completion_gate }
       : {}),
-    ...(analysisRetry ? {
-      worker_restart: {
+    ...(semanticAnalysisFailure ? {
+      semantic_repair: {
         required: true,
-        strategy: "restart-same-worker-id-immediately",
-        worker_id: context.args?.worker_id,
+        strategy: repairRequired ? "stop-after-repair-budget" : "repair-same-batch-same-worker",
+        task_id: context.args?.task_id,
         batch_id: context.args?.batch_id,
-        delay_ms: 0,
+        worker_id: context.args?.worker_id,
+        ...(normalized.details?.validation_fingerprint ? { validation_fingerprint: normalized.details.validation_fingerprint } : {}),
+        ...(normalized.details?.validation_attempt ? { validation_attempt: normalized.details.validation_attempt } : {}),
+        ...(normalized.details?.validation_max_attempts ? { max_attempts: normalized.details.validation_max_attempts } : {}),
+        ...(repairRequired ? { coordinator_action: "do_not_launch_new_extractor" } : {}),
       },
     } : {}),
     ...(atomicPageRejection ? {
@@ -180,6 +210,17 @@ function errorResult(error, context = {}) {
     next_action: recoveryAction(context.tool, context.args, normalized),
     mcp_connection_usable: true,
   }
+}
+
+function compactAnalysisErrorDetails(details) {
+  if (!details || typeof details !== "object" || Array.isArray(details)) return details
+  const compact = Object.fromEntries(Object.entries(details).filter(([key]) => ![
+    "validation_errors",
+    "validation_error_messages",
+    "validation_diagnostics",
+    "grounding_warnings",
+  ].includes(key)))
+  return Object.keys(compact).length > 0 ? compact : undefined
 }
 
 function pageCommitRetryScope(code) {
@@ -230,8 +271,26 @@ function recoveryAction(tool, args, error) {
     return { tool, reuse_original_arguments: true, retry_after_ms: BUSY_RETRY_AFTER_MS }
   }
   if (error.code === "MCP_BUSY") return { tool, reuse_original_arguments: true, retry_after_ms: BUSY_RETRY_AFTER_MS }
-  if (tool === "llm_wiki_commit_analysis" && RECOVERABLE_ANALYSIS_CODES.has(error.code)) {
-    return { tool, arguments: { task_id: args?.task_id, batch_id: args?.batch_id, worker_id: args?.worker_id } }
+  if (tool === "llm_wiki_commit_analysis" && SEMANTIC_ANALYSIS_CODES.has(error.code)) {
+    if (error.details?.repair_required === true) {
+      return {
+        tool: "llm_wiki_status",
+        action_owner: "coordinator",
+        arguments: { task_id: args?.task_id },
+        reason: "analysis_repair_required",
+      }
+    }
+    return {
+      tool,
+      action_owner: "same-worker",
+      arguments: {
+        task_id: args?.task_id,
+        batch_id: args?.batch_id,
+        worker_id: args?.worker_id,
+        ...(typeof args?.lease_token === "string" ? { lease_token: args.lease_token } : {}),
+      },
+      reason: "repair_same_batch_without_restarting_extractor",
+    }
   }
   if (tool === "llm_wiki_commit_analysis" && error.code === "BATCH_LEASE_REQUIRED") {
     return {

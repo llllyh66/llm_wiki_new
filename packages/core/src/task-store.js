@@ -177,6 +177,11 @@ export async function createTask(workspace, sources, options = {}) {
       completedProjectionLeases: [],
     },
     analysisRevision: 0,
+    analysisValidation: {
+      schemaVersion: 1,
+      batches: {},
+      maxSemanticRepairs: 2,
+    },
     pagePlanRevision: 0,
     commitRevision: 0,
     retryCount: 0,
@@ -351,6 +356,9 @@ function compactTaskChunk(chunk) {
   return {
     ...chunk,
     taskPayloadVersion: TASK_CHUNK_PAYLOAD_VERSION,
+    ...(chunk.tableContext && typeof chunk.tableContext === "object"
+      ? { tableContext: compactTableContext(chunk.tableContext) }
+      : {}),
     ...(Array.isArray(chunk.structuredData) ? { structuredData: compactStructuredData(chunk.structuredData) } : {}),
   }
 }
@@ -388,11 +396,24 @@ function compactStructuredData(values) {
   return values.slice(0, 20).map((value) => ({
     kind: "table",
     compacted: true,
+    ...(Array.isArray(value?.headers) && value.headers.length > 0
+      ? { headers: value.headers.slice(0, 100).map((header) => String(header).slice(0, 500)), column_names: value.headers.slice(0, 100).map((header) => String(header).slice(0, 500)) }
+      : {}),
     ...(typeof value?.sheetName === "string" ? { sheetName: value.sheetName.slice(0, 500) } : {}),
     ...(typeof value?.cellRange === "string" ? { cellRange: value.cellRange.slice(0, 100) } : {}),
     ...(typeof value?.sheetState === "string" ? { sheetState: value.sheetState.slice(0, 100) } : {}),
     ...(value?.fragmented === true ? { fragmented: true } : {}),
   }))
+}
+
+function compactTableContext(value) {
+  const headers = Array.isArray(value?.headers)
+    ? value.headers.slice(0, 100).map((header) => String(header).slice(0, 500))
+    : []
+  return {
+    ...(headers.length > 0 ? { headers, column_names: headers } : {}),
+    ...(Number.isInteger(value?.table_count) ? { table_count: value.table_count } : {}),
+  }
 }
 
 function batchBoundsRecord(maxChunkChars, maxBatchChars, maxPayloadBytes) {

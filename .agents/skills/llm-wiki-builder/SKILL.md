@@ -140,23 +140,29 @@ Never submit after `LEASE_FENCED`. Reacquire work and discard the superseded res
 ### Analysis quality
 
 - Every entity, concept, claim, relation, contradiction, and review item needs grounded `sourceRefs`.
-- For every claim, relation, contradiction, and review item, cite a short
-  verbatim quote that contains its identifying terms. Core checks that the
-  candidate content is lexically supported by its selected evidence; do not
-  cite a generic passage for an unrelated candidate. Split table evidence by
-  row or coherent topic instead of reusing one title-only reference.
-- For a table-row `evidence_index`, Core automatically includes its exact table
-  header SourceRef. Cite the row index once; do not remove a supported column
-  label merely because it is not repeated in the row cells.
+- Treat extraction as evidence-supported semantic synthesis for a Wiki, not as
+  sentence copying. Paraphrase, normalize relation predicates, merge aliases,
+  and reconcile multiple supporting passages when the meaning remains faithful.
+- Preserve deterministic factual anchors: numbers, ratios, ranges, percentages,
+  identifiers, dates, units, and the source's certainty/polarity. Core reports
+  ordinary lexical mismatch as a warning; it hard-fails only invalid SourceRefs,
+  altered typed anchors, clear certainty/polarity contradictions, or envelope
+  shape/identity errors.
+- `evidence_catalog[evidence_index]` exposes `primary_quote`, `context_quotes`,
+  and `context` metadata for table headers/columns and headings. Use the row or
+  passage as primary evidence and retain its context; Core validates the same
+  primary/context set that the Agent saw and does not add hidden evidence at
+  commit time.
 - Put source-grounded concerns in `reviewItems`. Put unsupported uncertainty or
   inference in `unresolvedQuestions`; do not invent evidence.
 - For a relation, put the directly supported relationship statement in
   `content` and cite the evidence entry containing it. Do not add a stronger
   relationship than the evidence supports.
-- On `INVALID_ANALYSIS`, correct every returned validation error while keeping
-  the same task, batch, worker, and lease. Use a new idempotency key for a
-  changed payload; if several entries fail, rebuild a small valid envelope
-  from the supplied schema instead of retrying unchanged content.
+- On `INVALID_ANALYSIS`, repair the returned structured diagnostics while
+  keeping the same task, batch, worker, and lease. Use a new idempotency key for
+  a changed payload. The same batch has at most two semantic repairs; when
+  `repair_required=true`, stop launching a new Extractor and escalate the batch
+  for review instead of looping.
 - Preserve conflicting claims. Do not silently choose a winner.
 - Use numeric confidence values.
 
@@ -211,7 +217,8 @@ For each manifest `draft_action`, launch at most the returned capacity. Each Dra
    desired nested content.
 6. Keeps grounded semantic content in the original language of the directly
    supporting evidence. It does not translate pages to make the Wiki
-   monolingual.
+   monolingual. Page prose may paraphrase and summarize; check requirement
+   coverage and SourceRef traceability, not lexical equality with the source.
 7. Calls `llm_wiki_stage_page_drafts` with the exact projection/shard identity and a new idempotency key.
 8. Returns only the accepted `{shard_id, draft_hash}` receipt.
 

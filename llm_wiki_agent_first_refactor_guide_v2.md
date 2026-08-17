@@ -881,11 +881,13 @@ Core 在校验前将其确定性解析为完整 `SourceRef[]`，并仅持久化�
 `content` 和可解析的 `sourceRefs`。无法引用原文的问题放入
 `unresolvedQuestions`。
 
-Core 在结构校验之后恢复 1.0.7 的 Grounding Quality Gate：SourceRef 的
-quote 来源真实性继续硬校验；claim、关系、矛盾和 review item 必须能由所选
-证据的词汇直接支持。单个 SourceRef 被复用超过八次会拒绝整个 analysis。
-门禁失败返回普通的 `validation_errors`，属于可恢复的业务拒绝，不是 MCP
-传输错误；按错误修复同一批次并使用新的幂等键重试。
+Core 在结构校验之后使用面向 Wiki 的 Grounding Quality Gate：SourceRef 的
+quote 来源真实性继续硬校验；数字、比例、编号、日期、单位和确定性/极性等事实
+锚点必须保持等价。候选正文可以摘要化、同义改写、归一关系谓词并合并别名，普通
+词汇不重合只产生 warning；主证据复用按表格/章节/候选类型记录诊断，不再有全局
+八次硬限制。表格证据目录显式携带 `primary_quote`、`context_quotes`、列名和章节
+上下文，Core 使用与 Agent 相同的证据集合。失败返回结构化 diagnostics，单批次最多
+两次语义修复；`repair_required=true` 后不得启动新的 Extractor。
 
 ## 9.6 Page Patch
 

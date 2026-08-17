@@ -19,22 +19,24 @@
 - Write `reviewItems` as objects with non-empty `content` and indexed or
   complete `sourceRefs`; put unsourced questions in `unresolvedQuestions`.
 - Evidence-catalog passages are server-generated contiguous source evidence.
-  Select their indexes without reading the original source file; never
-  reconstruct or normalize locator fields yourself.
-- For every claim, relation, contradiction, and review item, cite a short
-  verbatim quote that contains its identifying terms. Core checks that the
-  candidate content is lexically supported by its selected evidence; do not
-  cite a generic passage for an unrelated candidate.
-- Citing a table-row evidence index automatically resolves both the exact row
-  and exact header SourceRefs, so keep supported column labels even when the
-  row cells contain only values.
-- A title-only quote does not support detailed facts from a table. Claims,
-  relations, contradictions, and review items must cite quotes containing their
-  identifying terms. Split table evidence by row or coherent topic; a single
-  SourceRef may ground at most eight candidates.
-- For a relation, put the directly supported relationship statement in
-  `content` and cite the evidence index containing that statement. Do not add a
-  stronger relationship than the evidence supports. Put source-grounded
+  Each entry exposes `primary_quote`, `context_quotes`, and `context` (table
+  headers/columns and headings). Select indexes without reading the original
+  source file; never reconstruct or normalize locator fields yourself.
+- Wiki prose is allowed to paraphrase, summarize, normalize predicates, and
+  merge aliases. Preserve typed anchors (numbers, ratios, ranges, percentages,
+  identifiers, dates, units) and certainty/polarity. Lexical mismatch is a
+  warning, not a reason to imitate the source sentence.
+- Citing a table-row evidence index carries the same primary/context set into
+  Core validation. Keep the header and column semantics when the row contains
+  only values; context reuse is not counted as primary evidence reuse.
+- A title-only quote should be treated as a review warning for detailed prose,
+  not as a global lexical hard failure. Split evidence by coherent topic when
+  useful, but reusing a primary passage is allowed when it genuinely supports
+  several candidates.
+- For a relation, put the evidence-supported relationship statement in
+  `content` and cite the evidence index containing it. Predicate names may be
+  normalized, but do not add a stronger relationship or certainty than the
+  evidence supports. Put source-grounded
   concerns in `reviewItems` and unsupported inference in
   `unresolvedQuestions`.
 - Use conservative confidence values between 0 and 1.

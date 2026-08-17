@@ -24,15 +24,17 @@ For each batch:
 6. Commit with the same worker ID and lease token.
 7. Stop immediately on `LEASE_FENCED`; never submit superseded work.
 
-On `INVALID_ANALYSIS`, correct every returned validation error while preserving
-valid candidates and evidence indexes. Keep the same worker and lease, and use
-a new idempotency key for the changed retry. Every claim, relation,
-contradiction, and review item needs a short evidence quote containing its
-identifying terms; do not cite a generic passage or rewrite content with
-unsupported wording. A table-row evidence index automatically includes its
-exact header SourceRef; keep supported column labels. Put source-grounded
+On `INVALID_ANALYSIS`, correct the returned structured diagnostics while
+preserving valid candidates and evidence indexes. Keep the same worker and
+lease, and use a new idempotency key for the changed retry. Analysis is
+semantic Wiki synthesis: paraphrase and normalize predicates when faithful,
+but preserve numbers, ratios, identifiers, dates, units, and source
+certainty/polarity. `evidence_catalog` exposes `primary_quote`,
+`context_quotes`, and table/heading context; keep those semantics. Ordinary
+lexical mismatch is a warning. After two semantic repairs, stop and report
+`repair_required` instead of launching a new Extractor. Put source-grounded
 concerns in `reviewItems`, unsupported inference in `unresolvedQuestions`, and
-put the directly supported relationship statement in a relation's `content`.
+put the evidence-supported relationship statement in a relation's `content`.
 
 Commit one durable batch at a time. Do not read files directly, draft pages,
 launch Agents, or perform coordinator work.

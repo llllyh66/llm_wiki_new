@@ -608,6 +608,16 @@ function chunkDocument(document, options) {
     const cellRanges = [...new Set(structured.map((table) => table.cellRange).filter(Boolean))]
     if (sheetNames.length === 1) chunks.at(-1).sheetName = sheetNames[0]
     if (cellRanges.length === 1) chunks.at(-1).cellRange = cellRanges[0]
+    const tableHeaders = structured
+      .flatMap((table) => Array.isArray(table?.headers) ? [table.headers] : [])
+      .filter((headers) => headers.length > 0)
+    if (tableHeaders.length > 0) {
+      chunks.at(-1).tableContext = {
+        headers: tableHeaders[0],
+        column_names: tableHeaders[0],
+        table_count: tableHeaders.length,
+      }
+    }
     pending = []
     pendingKinds = []
     pendingStructured = []
@@ -699,11 +709,15 @@ function isMarkdownTableDelimiter(value) {
 }
 
 function tableFragment(block, markdown) {
+  const headers = Array.isArray(block?.headers) && block.headers.length > 0
+    ? block.headers
+    : parseMarkdownTableRow(markdown.split("\n")[0] ?? "")
   return {
     kind: "table",
     markdown,
     text: markdown,
     fragmented: true,
+    ...(headers.length > 0 ? { headers, column_names: headers } : {}),
     ...(block.sheetName ? { sheetName: block.sheetName } : {}),
     ...(block.cellRange ? { cellRange: block.cellRange } : {}),
     ...(block.sheetState ? { sheetState: block.sheetState } : {}),

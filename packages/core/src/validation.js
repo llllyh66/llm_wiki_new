@@ -1,14 +1,15 @@
 import { lstat } from "node:fs/promises"
 import path from "node:path"
 import { fail } from "./errors.js"
-import { stableStringify, tokenize } from "./utils.js"
+import { sha256, stableStringify, tokenize } from "./utils.js"
 import { AGENT_PAGE_ROOTS, normalizePageKind, pageKindForPath } from "./wiki-page.js"
 
 const ANALYSIS_ARRAYS = ["sourceRefs", "entities", "concepts", "claims", "relations", "contradictions", "candidatePages", "reviewItems", "unresolvedQuestions"]
 const GROUNDED_ANALYSIS_COLLECTIONS = new Set(["entities", "concepts", "claims", "relations", "contradictions", "candidatePages", "reviewItems"])
-const MAX_ANALYSIS_VALIDATION_ERRORS = 50
-const MAX_SOURCE_REF_REUSE = 8
-const GROUNDING_QUALITY_COLLECTIONS = new Set(["claims", "relations", "contradictions", "reviewItems"])
+const MAX_ANALYSIS_VALIDATION_ERRORS = 2_000
+const SOURCE_REF_REUSE_WARNING_THRESHOLD = 8
+const GROUNDING_QUALITY_COLLECTIONS = new Set(["entities", "concepts", "claims", "relations", "contradictions", "candidatePages", "reviewItems"])
+const FACT_ASSERTION_COLLECTIONS = new Set(["entities", "concepts", "claims", "relations", "contradictions", "reviewItems"])
 const GENERIC_GROUNDING_TERMS = new Set(["content", "data", "document", "item", "内容", "数据", "文档", "指标", "体系", "关系", "概述", "包含", "包括"])
 const ALLOWED_PAGE_ROOTS = new Set(AGENT_PAGE_ROOTS)
 const SYSTEM_PAGES = new Set(["wiki/index.md", "wiki/overview.md", "wiki/log.md"])
@@ -258,73 +259,225 @@ export function validateAnalysisShape(analysis, taskId, batchId) {
   if (errors.length > 0) fail("INVALID_ANALYSIS", "Analysis envelope validation failed.", { details: { validation_errors: errors, validation_error_count: errorCount } })
 }
 
-export function validateGroundingQuality(analysis) {
-  const errors = []
+/**
+ * Validate semantic grounding without requiring Wiki prose to be copied from
+ * the source. SourceRef authenticity is handled by validateSourceRefs; this
+ * gate only hard-fails on altered typed facts or a clear certainty/polarity
+ * contradiction. Ordinary lexical mismatch is returned as a warning.
+ */
+export function validateGroundingQuality(analysis, options = {}) {
+  const hardErrors = []
+  const warnings = []
+  let hardErrorCount = 0
+  let warningCount = 0
   const refUses = new Map()
+  const maxDiagnostics = Number.isInteger(options.maxDiagnostics) && options.maxDiagnostics > 0
+    ? options.maxDiagnostics
+    : MAX_ANALYSIS_VALIDATION_ERRORS
+
+  const addDiagnostic = ({ collection, itemIndex, field, reasonCode, severity, observed, expected, sourceRefs, message }) => {
+    const refs = (Array.isArray(sourceRefs) ? sourceRefs : []).filter(isSourceRefObject)
+    const diagnostic = {
+      path: `${collection}[${itemIndex}]${field ? `.${field}` : ""}`,
+      field: field ?? null,
+      reason_code: reasonCode,
+      observed: boundDiagnosticValue(observed),
+      expected: boundDiagnosticValue(expected),
+      sourceRefs: refs.map(sourceRefDiagnostic),
+      roles: refs.map((ref) => sourceRefRole(ref)),
+      message: message ?? `${reasonCode} at ${collection}[${itemIndex}]`,
+    }
+    const target = severity === "warning" ? warnings : hardErrors
+    if (severity === "warning") warningCount += 1
+    else hardErrorCount += 1
+    if (target.length < maxDiagnostics) target.push(diagnostic)
+    return diagnostic
+  }
+
   for (const collection of GROUNDED_ANALYSIS_COLLECTIONS) {
     for (const [itemIndex, item] of (Array.isArray(analysis?.[collection]) ? analysis[collection] : []).entries()) {
       if (!item || typeof item !== "object" || !Array.isArray(item.sourceRefs)) continue
-      for (const ref of item.sourceRefs) {
-        if (!isSourceRefObject(ref)) continue
-        const signature = stableStringify(ref)
-        const current = refUses.get(signature) ?? { count: 0, paths: [] }
+      const refs = item.sourceRefs.filter(isSourceRefObject)
+      const primaryRefs = refs.filter((ref) => sourceRefRole(ref) !== "context")
+      for (const ref of primaryRefs) {
+        const key = stableStringify({
+          sourceId: ref.sourceId,
+          chunkId: ref.chunkId,
+          quote: ref.quote ?? null,
+          locator: ref.locator ?? null,
+          collection,
+          context_group: sourceRefContextGroup(ref),
+        })
+        const current = refUses.get(key) ?? { count: 0, paths: [], ref }
         current.count += 1
-        if (current.paths.length < 3) current.paths.push(`${collection}[${itemIndex}]`)
-        refUses.set(signature, current)
+        if (current.paths.length < 5) current.paths.push(`${collection}[${itemIndex}]`)
+        refUses.set(key, current)
       }
       if (!GROUNDING_QUALITY_COLLECTIONS.has(collection)) continue
-      const semanticText = candidateSemanticText(item)
-      if (!semanticText) continue
-      const evidenceText = item.sourceRefs
-        .filter(isSourceRefObject)
+      const semanticText = candidateSemanticText(item, collection)
+      const evidenceText = refs
         .map((ref) => typeof ref.quote === "string" ? ref.quote.trim() : "")
         .filter(Boolean)
         .join("\n")
-      if (!evidenceText) {
-        errors.push(`${collection}[${itemIndex}] requires a non-empty SourceRef quote that supports its content`)
-      } else if (!evidenceSupportsCandidate(semanticText, evidenceText, item)) {
-        errors.push(`${collection}[${itemIndex}] SourceRef quote does not lexically support the candidate content; cite the relevant row or passage`)
+      const primaryEvidenceText = primaryRefs
+        .map((ref) => typeof ref.quote === "string" ? ref.quote.trim() : "")
+        .filter(Boolean)
+        .join("\n")
+      // Legacy entity/concept envelopes sometimes cite a source_ref_template
+      // without copying its quote. Keep those metadata-only candidates
+      // compatible; claims, relations, contradictions, and review items still
+      // require an auditable quote.
+      if (!evidenceText && FACT_ASSERTION_COLLECTIONS.has(collection) && !["entities", "concepts"].includes(collection)) {
+        addDiagnostic({
+          collection,
+          itemIndex,
+          field: factFieldFor(collection, item),
+          reasonCode: "MISSING_EVIDENCE_QUOTE",
+          severity: "hard",
+          observed: semanticText,
+          expected: "a SourceRef with a non-empty quote",
+          sourceRefs: refs,
+          message: `${collection}[${itemIndex}] requires a non-empty SourceRef quote for its factual assertion`,
+        })
+        continue
+      }
+      if (!evidenceText) continue
+
+      const assertionTexts = candidateAssertionTexts(item, collection)
+      for (const assertion of assertionTexts) {
+        const anchorReport = compareFactAnchors(assertion, evidenceText)
+        for (const mismatch of anchorReport.mismatches) {
+          addDiagnostic({
+            collection,
+            itemIndex,
+            field: factFieldFor(collection, item),
+            reasonCode: mismatch.reason_code,
+            severity: "hard",
+            observed: mismatch.observed,
+            expected: mismatch.expected,
+            sourceRefs: refs,
+            message: `${collection}[${itemIndex}] ${mismatch.message}`,
+          })
+        }
+        const certainty = compareCertainty(assertion, primaryEvidenceText || evidenceText)
+        for (const mismatch of certainty) {
+          addDiagnostic({
+            collection,
+            itemIndex,
+            field: factFieldFor(collection, item),
+            reasonCode: mismatch.reason_code,
+            severity: "hard",
+            observed: mismatch.observed,
+            expected: mismatch.expected,
+            sourceRefs: refs,
+            message: `${collection}[${itemIndex}] ${mismatch.message}`,
+          })
+        }
+      }
+      if (semanticText && !evidenceSupportsCandidate(semanticText, evidenceText, item, collection)) {
+        addDiagnostic({
+          collection,
+          itemIndex,
+          field: factFieldFor(collection, item),
+          reasonCode: "LEXICAL_MISMATCH",
+          severity: "warning",
+          observed: semanticText,
+          expected: "semantically related evidence; wording may be paraphrased",
+          sourceRefs: refs,
+          message: `${collection}[${itemIndex}] wording differs from the evidence; typed anchors remain the hard check`,
+        })
+      }
+      if (["entities", "concepts"].includes(collection)) {
+        const evidenceNormalized = normalizeGroundingText(evidenceText)
+        const matchedAliases = [...new Set(candidateAliasValues(item)
+          .filter((alias) => normalizeGroundingText(alias).length >= 2)
+          .filter((alias) => evidenceNormalized.includes(normalizeGroundingText(alias))))]
+        if (matchedAliases.length > 1) {
+          addDiagnostic({
+            collection,
+            itemIndex,
+            field: "aliases",
+            reasonCode: "ENTITY_ALIAS_AMBIGUITY",
+            severity: "warning",
+            observed: matchedAliases,
+            expected: "one canonical alias or explicit review",
+            sourceRefs: refs,
+            message: `${collection}[${itemIndex}] has multiple aliases supported by the same evidence; review canonicalization`,
+          })
+        }
       }
     }
   }
-  for (const { count, paths } of refUses.values()) {
-    if (count > MAX_SOURCE_REF_REUSE) {
-      errors.push(`one SourceRef is reused by ${count} grounded candidates (${paths.join(", ")}, ...); split evidence by row or topic (maximum ${MAX_SOURCE_REF_REUSE} uses per reference)`)
-    }
-  }
-  if (errors.length > 0) {
-    fail("INVALID_ANALYSIS", "Analysis grounding quality validation failed.", {
-      details: {
-        validation_errors: errors.slice(0, MAX_ANALYSIS_VALIDATION_ERRORS),
-        validation_error_count: errors.length,
-        quality_gate: "source-ref-grounding-v1",
-      },
+
+  // Reuse is diagnostic only. Context references (for example one table
+  // header shared by many rows) are deliberately excluded from this count.
+  for (const { count, paths, ref } of refUses.values()) {
+    if (count <= SOURCE_REF_REUSE_WARNING_THRESHOLD) continue
+    addDiagnostic({
+      collection: "sourceRefs",
+      itemIndex: 0,
+      field: null,
+      reasonCode: "SOURCE_REF_REUSE",
+      severity: "warning",
+      observed: count,
+      expected: `reuse is grouped by ${sourceRefContextGroup(ref)} and candidate type; no hard global limit`,
+      sourceRefs: [ref],
+      message: `A primary SourceRef is reused by ${count} candidates (${paths.join(", ")}); reuse is allowed but review the evidence granularity`,
     })
   }
+
+  const allDiagnostics = [...hardErrors, ...warnings]
+  const validationFingerprint = sha256(stableStringify({
+    count: hardErrorCount,
+    errors: hardErrors.map(({ path, field, reason_code, observed, expected, sourceRefs }) => ({ path, field, reason_code, observed, expected, sourceRefs })),
+  })).slice(0, 32)
+  const report = {
+    quality_gate: "source-ref-grounding-v2",
+    validation_error_count: hardErrorCount,
+    validation_errors: hardErrors,
+    validation_error_messages: hardErrors.map((diagnostic) => diagnostic.message),
+    grounding_warnings: warnings,
+    validation_diagnostics: allDiagnostics,
+    validation_fingerprint: validationFingerprint,
+    warning_count: warningCount,
+    diagnostics_truncated: hardErrorCount > maxDiagnostics || warningCount > maxDiagnostics,
+  }
+  if (hardErrorCount > 0) {
+    fail("INVALID_ANALYSIS", "Analysis grounding quality validation failed for typed facts or certainty.", {
+      details: report,
+    })
+  }
+  return report
 }
 
-function candidateSemanticText(item) {
-  return [item.name, item.title, item.text, item.content, item.subject, item.predicate, item.object]
-    .filter((value) => typeof value === "string" && value.trim())
-    .join(" ")
+function candidateSemanticText(item, collection = "claims") {
+  return [...candidateAssertionTexts(item, collection), ...candidateAliasValues(item)].join(" ")
 }
 
-function evidenceSupportsCandidate(semanticText, evidenceText, item) {
+function factFieldFor(collection, item) {
+  if (collection === "reviewItems") return "content"
+  if (collection === "relations" && (item.content || item.text)) return item.content ? "content" : "text"
+  if (item.content) return "content"
+  if (item.text) return "text"
+  if (collection === "relations" && (item.subject || item.object)) return "subject/object"
+  return "assertion"
+}
+
+function evidenceSupportsCandidate(semanticText, evidenceText, item, collection) {
   const normalizedEvidence = normalizeGroundingText(evidenceText)
   const evidenceTerms = new Set(groundingTerms(evidenceText))
-  // Schema relation names can be long canonical identifiers which are not
-  // expected to occur verbatim in source prose. Judge the actual assertion
-  // independently first so a directly quoted fact cannot be diluted by its
-  // classification label (for example, a billing-account relation type).
-  for (const assertion of candidateAssertionTexts(item)) {
+  // Schema relation names, titles, aliases, and page labels are metadata. They
+  // may be normalized without being copied verbatim into source prose.
+  for (const assertion of candidateAssertionTexts(item, collection)) {
     const normalizedAssertion = normalizeGroundingText(assertion)
     if (normalizedAssertion.length >= 3 && normalizedEvidence.includes(normalizedAssertion)) return true
     if (groundingTermsSupported(assertion, evidenceTerms)) return true
   }
-  for (const label of [item.name, item.title, item.text]) {
-    if (typeof label !== "string") continue
+  for (const label of candidateAliasValues(item)) {
     const normalizedLabel = normalizeGroundingText(label)
-    if (normalizedLabel.length >= 3 && normalizedEvidence.includes(normalizedLabel)) return true
+    if (normalizedLabel.length >= 2 && normalizedEvidence.includes(normalizedLabel)) return true
+    const labelAnchors = parseFactAnchors(label)
+    if (labelAnchors.some((anchor) => anchorCovered(anchor, parseFactAnchors(evidenceText)))) return true
   }
   const semanticTerms = groundingTerms(semanticText)
   if (semanticTerms.length === 0 || evidenceTerms.size === 0) return false
@@ -332,13 +485,240 @@ function evidenceSupportsCandidate(semanticText, evidenceText, item) {
   return overlap >= 2 && overlap / semanticTerms.length >= 0.5
 }
 
-function candidateAssertionTexts(item) {
-  const values = [item.content, item.text]
-  const relationTuple = [item.subject, item.predicate, item.object]
-    .filter((value) => typeof value === "string" && value.trim())
-    .join(" ")
-  if (relationTuple) values.push(relationTuple)
-  return [...new Set(values.filter((value) => typeof value === "string" && value.trim()))]
+function candidateAssertionTexts(item, collection = "claims") {
+  const values = []
+  if (typeof item?.content === "string" && item.content.trim()) values.push(item.content)
+  if (typeof item?.text === "string" && item.text.trim()) values.push(item.text)
+  if (collection === "relations") {
+    const relationTuple = [item.subject, item.object]
+      .filter((value) => typeof value === "string" && value.trim())
+      .join(" ")
+    if (relationTuple) values.push(relationTuple)
+  }
+  // Names, titles, local IDs, and internal relation predicates are metadata,
+  // not factual assertion text. Entity aliases are handled as a semantic
+  // warning/review path below rather than being treated as body assertions.
+  return [...new Set(values)]
+}
+
+function candidateAliasValues(item) {
+  const values = [item?.name, item?.title]
+  if (Array.isArray(item?.aliases)) values.push(...item.aliases)
+  if (Array.isArray(item?.properties?.aliases)) values.push(...item.properties.aliases)
+  return values.filter((value) => typeof value === "string" && value.trim())
+}
+
+const UNIT_ALIASES = new Map([
+  ["ms", "ms"], ["msec", "ms"], ["millisecond", "ms"], ["milliseconds", "ms"], ["毫秒", "ms"],
+  ["s", "s"], ["sec", "s"], ["second", "s"], ["seconds", "s"], ["秒", "s"],
+  ["min", "min"], ["minute", "min"], ["minutes", "min"], ["分钟", "min"],
+  ["h", "h"], ["hr", "h"], ["hour", "h"], ["hours", "h"], ["小时", "h"],
+  ["d", "d"], ["day", "d"], ["days", "d"], ["天", "d"],
+  ["%", "%"], ["percent", "%"], ["percentage", "%"], ["百分比", "%"],
+])
+
+/**
+ * Extract deterministic anchors from a factual assertion. This intentionally
+ * does not attempt general NLP; unknown wording is handled as a warning.
+ */
+export function parseFactAnchors(value) {
+  const text = typeof value === "string" ? value.normalize("NFKC") : ""
+  if (!text) return []
+  const anchors = []
+  const occupied = []
+  const add = (anchor, start, end) => {
+    if (occupied.some((range) => start < range.end && end > range.start)) return
+    occupied.push({ start, end })
+    anchors.push({ ...anchor, raw: text.slice(start, end), _start: start })
+  }
+  const numberSource = "[-+]?(?:\\d{1,3}(?:,\\d{3})+|\\d+)(?:\\.\\d+)?"
+  const numberValue = (raw) => Number(String(raw).replace(/,/g, ""))
+  const parseNumber = (raw) => numberValue(raw)
+
+  // Dates must be occupied before range parsing, otherwise 2024-01-02 would
+  // be mistaken for the numeric range 2024-01.
+  for (const match of text.matchAll(/(?<![\p{L}\p{N}_])(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?(?![\p{L}\p{N}_])/gu)) {
+    add({ kind: "date", granularity: "day", year: Number(match[1]), month: Number(match[2]), day: Number(match[3]) }, match.index, match.index + match[0].length)
+  }
+  for (const match of text.matchAll(/(?<![\p{L}\p{N}_])(\d{4})年(\d{1,2})月(\d{1,2})日?(?![\p{L}\p{N}_])/gu)) {
+    add({ kind: "date", granularity: "day", year: Number(match[1]), month: Number(match[2]), day: Number(match[3]) }, match.index, match.index + match[0].length)
+  }
+
+  for (const match of text.matchAll(new RegExp(`百分之\\s*(${numberSource})`, "gu"))) {
+    add({ kind: "percentage", value: parseNumber(match[1]), unit: "%" }, match.index, match.index + match[0].length)
+  }
+  for (const match of text.matchAll(new RegExp(`(${numberSource})\\s*%`, "gu"))) {
+    add({ kind: "percentage", value: parseNumber(match[1]), unit: "%" }, match.index, match.index + match[0].length)
+  }
+  for (const match of text.matchAll(new RegExp(`(${numberSource})\\s*/\\s*(${numberSource})`, "gu"))) {
+    add({ kind: "ratio", numerator: parseNumber(match[1]), denominator: parseNumber(match[2]) }, match.index, match.index + match[0].length)
+  }
+  for (const match of text.matchAll(new RegExp(`(${numberSource})\\s*(?:-|–|—|~|至|到)\\s*(${numberSource})`, "gu"))) {
+    add({ kind: "range", min: parseNumber(match[1]), max: parseNumber(match[2]) }, match.index, match.index + match[0].length)
+  }
+  const unitPattern = `(${numberSource})\\s*([A-Za-zµμ]+|毫秒|秒|分钟|小时|天|%)`
+  for (const match of text.matchAll(new RegExp(unitPattern, "gu"))) {
+    const unit = normalizeUnit(match[2])
+    if (!unit) continue
+    add({ kind: unit === "%" ? "percentage" : "measurement", value: parseNumber(match[1]), unit }, match.index, match.index + match[0].length)
+  }
+  // Years are distinct from complete dates. A leading separator that is part
+  // of an identifier (A-2001) does not start a standalone year anchor.
+  for (const match of text.matchAll(/(?<![\p{L}\p{N}_-])(\d{4})(?![-/年\d])/gu)) {
+    add({ kind: "date", granularity: "year", year: Number(match[1]) }, match.index, match.index + match[0].length)
+  }
+  // IDs are normalized for case and deterministic separators, but never
+  // interpreted as ordinary numbers. This covers A2001/A-2001/A_2001 and
+  // CamelCase identifiers containing a numeric suffix.
+  for (const match of text.matchAll(/(?<![\p{L}\p{N}_])(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z][A-Za-z0-9_-]*\d[A-Za-z0-9_-]*(?![\p{L}\p{N}_])/gu)) {
+    add({ kind: "identifier", value: normalizeIdentifier(match[0]) }, match.index, match.index + match[0].length)
+  }
+  for (const match of text.matchAll(new RegExp(`(?<![\\p{L}\\p{N}_])(${numberSource})(?![\\p{L}\\p{N}_])`, "gu"))) {
+    add({ kind: "number", value: parseNumber(match[1]) }, match.index, match.index + match[0].length)
+  }
+  return anchors
+    .sort((left, right) => left._start - right._start)
+    .map(({ _start: _ignored, ...anchor }) => anchor)
+}
+
+function normalizeUnit(value) {
+  const normalized = String(value ?? "").normalize("NFKC").trim().toLowerCase()
+  return UNIT_ALIASES.get(normalized) ?? null
+}
+
+function normalizeIdentifier(value) {
+  return String(value ?? "").normalize("NFKC").toLowerCase().replace(/[-_]/g, "")
+}
+
+function anchorCovered(anchor, evidenceAnchors) {
+  return evidenceAnchors.some((candidate) => {
+    if (anchor.kind === "date" && candidate.kind === "date") {
+      if (anchor.granularity === "year") return anchor.year === candidate.year
+      return candidate.granularity === "day"
+        && anchor.year === candidate.year && anchor.month === candidate.month && anchor.day === candidate.day
+    }
+    if (anchor.kind === "identifier" && candidate.kind === "identifier") return anchor.value === candidate.value
+    if (anchor.kind === "percentage" && candidate.kind === "percentage") return anchor.value === candidate.value && anchor.unit === candidate.unit
+    if (anchor.kind === "ratio" && candidate.kind === "ratio") return anchor.numerator === candidate.numerator && anchor.denominator === candidate.denominator
+    if (anchor.kind === "range" && candidate.kind === "range") return anchor.min === candidate.min && anchor.max === candidate.max
+    if (anchor.kind === "measurement" && candidate.kind === "measurement") return anchor.value === candidate.value && anchor.unit === candidate.unit
+    if (anchor.kind === "number" && candidate.kind === "number") return anchor.value === candidate.value
+    if (anchor.kind === "number" && ["measurement", "percentage", "ratio", "range"].includes(candidate.kind)) {
+      return candidate.kind === "measurement" && anchor.value === candidate.value && !candidate.unit
+    }
+    return false
+  })
+}
+
+export function compareFactAnchors(assertion, evidence) {
+  const assertionAnchors = parseFactAnchors(assertion)
+  const evidenceAnchors = parseFactAnchors(evidence)
+  const mismatches = []
+  for (const anchor of assertionAnchors) {
+    if (anchorCovered(anchor, evidenceAnchors)) continue
+    const matchingKind = evidenceAnchors.find((candidate) => candidate.kind === anchor.kind)
+    const message = anchor.kind === "date" && anchor.granularity === "day" && matchingKind?.granularity === "year"
+      ? `完整日期 ${anchor.raw} 不能由仅有年份的证据 ${matchingKind.raw} 支持`
+      : anchor.kind === "measurement" && matchingKind?.kind === "measurement"
+        ? `单位或数值 ${anchor.raw} 与证据中的 ${matchingKind.raw} 不等价`
+        : `事实锚点 ${anchor.raw} 未在所选证据中保持等价`
+    mismatches.push({
+      reason_code: anchor.kind === "identifier" ? "IDENTIFIER_MISMATCH"
+        : anchor.kind === "date" ? "DATE_MISMATCH"
+          : anchor.kind === "measurement" || anchor.kind === "percentage" ? "UNIT_OR_PERCENTAGE_MISMATCH"
+            : "NUMERIC_ANCHOR_MISMATCH",
+      observed: anchor.raw,
+      expected: matchingKind?.raw ?? evidenceAnchors.map((item) => item.raw).slice(0, 20),
+      message,
+    })
+  }
+  // An explicit unit in evidence must not silently disappear from a numeric
+  // assertion; this catches “50” rewritten from “50 ms”.
+  for (const candidate of evidenceAnchors.filter((item) => item.kind === "measurement")) {
+    const plain = assertionAnchors.find((item) => item.kind === "number" && item.value === candidate.value)
+    const explicit = assertionAnchors.find((item) => item.kind === "measurement" && item.value === candidate.value)
+    if (plain && !explicit) {
+      mismatches.push({
+        reason_code: "UNIT_MISSING",
+        observed: plain.raw,
+        expected: candidate.raw,
+        message: `证据中的单位 ${candidate.unit} 不能在事实改写中被省略`,
+      })
+    }
+  }
+  return { assertionAnchors, evidenceAnchors, mismatches: uniqueAnchorMismatches(mismatches) }
+}
+
+function uniqueAnchorMismatches(mismatches) {
+  const seen = new Set()
+  return mismatches.filter((mismatch) => {
+    const key = `${mismatch.reason_code}:${mismatch.observed}:${mismatch.expected}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function compareCertainty(assertion, evidence) {
+  const candidate = certaintySignals(assertion)
+  const source = certaintySignals(evidence)
+  const mismatches = []
+  if (source.hedged && !candidate.hedged && !candidate.question) {
+    mismatches.push({
+      reason_code: "CERTAINTY_STRENGTHENED",
+      observed: assertion,
+      expected: "preserve the source's uncertainty",
+      message: "候选把证据中的可能性/不确定性改写成了确定陈述",
+    })
+  }
+  if (source.negated !== candidate.negated && (source.negated || candidate.negated)) {
+    mismatches.push({
+      reason_code: "POLARITY_MISMATCH",
+      observed: assertion,
+      expected: evidence,
+      message: "候选与证据的否定/肯定极性不一致",
+    })
+  }
+  return mismatches
+}
+
+function certaintySignals(value) {
+  const text = String(value ?? "").normalize("NFKC").toLowerCase()
+  return {
+    hedged: /(可能|或许|也许|预计|大约|约为|不确定|maybe|may|might|could|possibly|likely|approximately|approx\.?)/iu.test(text),
+    // Keep negation detection conservative: a bare `非` also matches words
+    // such as `非常`, which would incorrectly turn an ordinary Wiki sentence
+    // into a polarity hard error. Prefer explicit negative compounds.
+    negated: /(\b(?:not|no|never|disabled|inactive|failed|without)\b|没有|不能|禁用|失败|否定|不(?:是|能|会|可|存在|支持|同意|启用|活动|正确)|未(?:知|能|使用|启用|完成)|无(?:法|需|效))/iu.test(text),
+    question: /[?？]|是否|whether|unknown|未知/iu.test(text),
+  }
+}
+
+function sourceRefRole(ref) {
+  return ref?.role === "context" || ref?.evidence_role === "context" ? "context" : "primary"
+}
+
+function sourceRefContextGroup(ref) {
+  const locator = ref?.locator ?? {}
+  if (locator.cellRange || locator.sheetName) return `table:${locator.sheetName ?? ""}:${locator.cellRange ?? ""}`
+  if (Array.isArray(locator.headingPath) && locator.headingPath.length > 0) return `section:${locator.headingPath.join("/")}`
+  return "chunk"
+}
+
+function sourceRefDiagnostic(ref) {
+  return {
+    sourceId: ref.sourceId,
+    chunkId: ref.chunkId,
+    role: sourceRefRole(ref),
+  }
+}
+
+function boundDiagnosticValue(value) {
+  if (Array.isArray(value)) return value.slice(0, 50).map(boundDiagnosticValue)
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).slice(0, 50).map(([key, item]) => [key, boundDiagnosticValue(item)]))
+  }
+  return typeof value === "string" ? value.slice(0, 2_000) : value
 }
 
 function groundingTerms(value) {
@@ -480,6 +860,9 @@ export function validateSourceRefs(refs, task, batches, limits, chunkIndex) {
     if (!sourceIds.has(ref.sourceId)) fail("INVALID_SOURCE_REF", `Source ${ref.sourceId} is not part of this task.`)
     const chunk = chunks.get(ref.chunkId)
     if (!chunk || chunk.sourceId !== ref.sourceId) fail("INVALID_SOURCE_REF", `Chunk ${ref.chunkId} does not belong to source ${ref.sourceId}.`)
+    if (ref.role !== undefined && !["primary", "context"].includes(ref.role)) {
+      fail("INVALID_SOURCE_REF", "SourceRef role must be primary or context.")
+    }
     if (ref.quote !== undefined) {
       if (typeof ref.quote !== "string" || ref.quote.length > limits.maxQuoteChars) fail("INVALID_SOURCE_REF", "SourceRef quote is invalid or too long.")
       const quote = normalizeQuote(ref.quote)

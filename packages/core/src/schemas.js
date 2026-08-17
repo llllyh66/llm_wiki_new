@@ -12,7 +12,7 @@ export const analysisSchema = Object.freeze({
     batchId: { type: "string" },
     sourceRefs: {
       type: "array",
-      description: "Catalog of every unique complete SourceRef used by this envelope. With sourceRefMode=batch-evidence-index, copy the numeric scaffold catalog and use evidence_catalog indexes in nested candidates; Core persists resolved complete references.",
+      description: "Catalog of every unique complete SourceRef used by this envelope. With sourceRefMode=batch-evidence-index, copy the numeric scaffold catalog and use evidence_catalog indexes in nested candidates; Core persists resolved complete references. Primary and context references are both explicit.",
       items: {
         oneOf: [
           { type: "integer", minimum: 0 },
@@ -51,7 +51,8 @@ export const analysisSchema = Object.freeze({
       properties: {
         sourceId: { type: "string" },
         chunkId: { type: "string" },
-        quote: { type: "string", maxLength: 1000, description: "Short verbatim evidence. Claims, relations, contradictions, and review items require a quote that lexically supports their content." },
+        quote: { type: "string", maxLength: 1000, description: "Short verbatim evidence. Wiki candidates may paraphrase it, but typed facts and certainty must remain equivalent." },
+        role: { enum: ["primary", "context"], description: "primary is the row/passage cited by the candidate; context carries table headers, columns, or headings." },
         locator: { type: "object" },
       },
       additionalProperties: false,

@@ -25,6 +25,11 @@ test("HTML headings and tables normalize into structured blocks", async (t) => {
   assert.equal(document.title, "Data Dictionary")
   assert.equal(document.blocks.some((block) => block.kind === "table" && block.headers[0] === "Name" && block.rows[0][0] === "id"), true)
   assert.equal(JSON.stringify(document).includes("ignore()"), false)
+  const batch = await fixture.core.getBatch({ task_id: imported.task_id })
+  const rowEvidence = batch.evidence_catalog.find((entry) => entry.quote.includes("| id | string |"))
+  assert.ok(rowEvidence)
+  assert.equal(rowEvidence.context_quotes.includes("| Name | Type |"), true)
+  assert.deepEqual(rowEvidence.context.table_headers, ["Name", "Type"])
 })
 
 test("materialized source extension controls parsing instead of display_name", async (t) => {
@@ -146,6 +151,10 @@ test("XLSX worksheets retain ranges, cached formulas, merges, hidden cells, and 
     sheetName: "Sales & Forecast",
     cellRange: "A1:E3",
   })
+  const rowEvidence = batch.evidence_catalog.find((entry) => entry.quote.includes("Widget \\| Pro"))
+  assert.ok(rowEvidence)
+  assert.equal(rowEvidence.context_quotes.includes("| Row | A | B | C | D | E |"), true)
+  assert.deepEqual(rowEvidence.context.table_headers, ["Row", "A", "B", "C", "D", "E"])
   const analysis = spreadsheetAnalysis(imported.task_id, batch.batch_id, {
     ...returnedSpreadsheetChunk.source_ref_templates[0],
   })

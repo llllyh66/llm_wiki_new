@@ -92,6 +92,7 @@ const DRAFT_SHARD_RESPONSE_MAX_CHARS = 40_000
 // second uncommittable wave before the first Writer checkpoint.
 const MAX_CONCURRENT_DRAFTERS = 8
 const MCP_SIGNAL = Symbol.for("llm-wiki.mcp.signal")
+const ANALYSIS_VALIDATION_CODES = new Set(["INVALID_ANALYSIS", "INVALID_DOMAIN_ANALYSIS", "INVALID_SOURCE_REF", "ANALYSIS_TOO_LARGE"])
 const CACHE_LIMITS = Object.freeze({
   domainSchema: { maxEntries: 2, maxBytes: 16 * 1024 * 1024 },
   chunkIndex: { maxEntries: 2, maxBytes: 32 * 1024 * 1024 },
@@ -739,6 +740,7 @@ export class LlmWikiCore {
       workerId,
       repairLeasedBatchId: workerOwnedBatchId,
     })
+    const repairRequiredBatches = repairRequiredBatchIds(record.task)
     if (["planning", "committing", "finalizing", "completed"].includes(record.task.status)
       && record.task.completedBatchIds.length === record.task.batchCount) {
       return { terminalResponse: { task_id: record.task.taskId, completed: true, chunks: [], next_action: nextAction(record.task) } }
@@ -751,6 +753,17 @@ export class LlmWikiCore {
       if (!batch) fail("INVALID_INPUT", "batch_id does not belong to the task.")
       if (record.task.completedBatchIds.includes(requested)) fail("BATCH_ALREADY_COMPLETED", `Batch is already completed: ${requested}`)
       const lease = record.task.batchLeases[requested]
+      if (repairRequiredBatches.has(requested) && (!lease || lease.workerId !== workerId)) {
+        fail("ANALYSIS_REPAIR_REQUIRED", `Batch ${requested} reached the semantic repair limit.`, {
+          retryable: false,
+          details: {
+            batch_id: requested,
+            repair_required: true,
+            validation: record.task.analysisValidation?.batches?.[requested] ?? null,
+          },
+          suggestedAction: "Do not launch a new Extractor for this batch. Keep the existing worker lease if an explicit repair is authorized; otherwise inspect the persisted validation fingerprint and route the batch to review.",
+        })
+      }
       if (lease && lease.workerId !== workerId) {
         fail("BATCH_LEASED", `Batch ${requested} is leased by another extraction worker.`, { retryable: true, details: { lease_expires_at: lease.expiresAt } })
       }
@@ -759,7 +772,9 @@ export class LlmWikiCore {
         .find(([batchId, lease]) => lease.workerId === workerId && !record.task.completedBatchIds.includes(batchId))?.[0]
       batch = existingBatchId
         ? record.batches.find((item) => item.batchId === existingBatchId)
-        : record.batches.find((item) => !record.task.completedBatchIds.includes(item.batchId) && !record.task.batchLeases[item.batchId])
+        : record.batches.find((item) => !record.task.completedBatchIds.includes(item.batchId)
+          && !record.task.batchLeases[item.batchId]
+          && !repairRequiredBatches.has(item.batchId))
     }
     if (!batch) {
       const remaining = record.task.batchCount - record.task.completedBatchIds.length
@@ -773,7 +788,9 @@ export class LlmWikiCore {
           remaining_batches: remaining,
           leased_batches: Object.keys(record.task.batchLeases).length,
           retry_after_ms: 1_000,
-          next_action: { tool: "llm_wiki_get_batch", arguments: { task_id: record.task.taskId, worker_id: workerId } },
+          next_action: allRemainingBatchesRepairRequired(record.task)
+            ? { tool: "llm_wiki_status", arguments: { task_id: record.task.taskId } }
+            : { tool: "llm_wiki_get_batch", arguments: { task_id: record.task.taskId, worker_id: workerId } },
         } }
       }
       return { terminalResponse: { task_id: record.task.taskId, completed: true, chunks: [], next_action: nextAction(record.task) } }
@@ -884,8 +901,8 @@ export class LlmWikiCore {
         schema_version_type: "number",
         source_ref_templates: "Use the prefilled batch-evidence indexes; do not generate complete SourceRef objects or reconstruct sheetName and cellRange on the current hot path.",
         nested_source_refs: "In batch-evidence-index mode, use evidence_catalog.evidence_index values directly in candidate sourceRefs and leave the scaffold catalog unchanged.",
-        evidence: "Do not retype quotes or read the source file. The server generated every evidence_catalog quote as an exact contiguous batch substring. Citing a table-row evidence_index automatically grounds against both the row and its exact table-header SourceRef.",
-        relation_grounding: "Put the directly supported relationship statement in relation.content and cite the evidence entry containing it.",
+        evidence: "Do not retype quotes or read the source file. The server generated primary_quote and context_quotes from the leased batch. Use the evidence_index and keep table column semantics from context_quotes/context; the final Wiki may paraphrase source content while preserving typed factual anchors.",
+        relation_grounding: "Put the evidence-supported relationship in relation.content and cite the evidence entry containing it. Predicate names may be normalized; do not strengthen certainty or alter typed factual anchors.",
         source_language: "Keep every extracted name, title, statement, summary, and question in the language used by its directly supporting source evidence. Do not translate source-authored knowledge into the workspace target language; target_language is only a fallback for language-neutral or genuinely undetermined metadata. Preserve proper names and source terminology verbatim.",
         review_items: "Use {content, sourceRefs} objects only when a batch quote directly supports the concern; otherwise use a plain unresolvedQuestions string.",
         unresolved_questions: "Use plain strings only. Common legacy {question|reason|content|message|text} objects are normalized, but current workers must emit strings.",
@@ -917,8 +934,9 @@ export class LlmWikiCore {
         mode: "batch-evidence-index",
         zero_based: true,
         exact_quotes_server_generated: true,
+        primary_context_explicit: true,
         table_context_auto_resolved: true,
-        instruction: "Copy analysis_scaffold unchanged. Cite evidence_catalog entries by evidence_index in each candidate.sourceRefs; never retype quote text or read the original file. Table-header context is resolved automatically from the same row index.",
+        instruction: "Copy analysis_scaffold unchanged. Cite evidence_catalog entries by evidence_index in each candidate.sourceRefs; never retype quote text or read the original file. Each entry exposes primary_quote plus context_quotes/context (table headers, columns, and headings). Core validates against the same primary/context set; it does not add hidden evidence during commit.",
       },
       completed: false,
     }
@@ -1070,23 +1088,37 @@ export class LlmWikiCore {
       entry.sourceRef,
       ...entry.contextSourceRefs,
     ])
-    const normalized = normalizeAnalysisEnvelope(input?.analysis, { evidenceCatalog })
-    const chunkIndex = this.#taskChunkIndex(record)
-    const normalizedSourceRefQuotes = canonicalizeAnalysisSourceRefQuotes(normalized.analysis, record.batches, chunkIndex)
-    const analysisBytes = Buffer.byteLength(JSON.stringify(normalized.analysis ?? null))
-    if (analysisBytes > workspace.config.limits.maxAnalysisBytes) {
-      fail("ANALYSIS_TOO_LARGE", `Analysis exceeds the ${workspace.config.limits.maxAnalysisBytes}-byte workspace limit.`)
+    let normalized
+    let chunkIndex
+    let normalizedSourceRefQuotes
+    let domainApplied
+    let groundingReport
+    try {
+      normalized = normalizeAnalysisEnvelope(input?.analysis, { evidenceCatalog })
+      chunkIndex = this.#taskChunkIndex(record)
+      normalizedSourceRefQuotes = canonicalizeAnalysisSourceRefQuotes(normalized.analysis, record.batches, chunkIndex)
+      const analysisBytes = Buffer.byteLength(JSON.stringify(normalized.analysis ?? null))
+      if (analysisBytes > workspace.config.limits.maxAnalysisBytes) {
+        fail("ANALYSIS_TOO_LARGE", `Analysis exceeds the ${workspace.config.limits.maxAnalysisBytes}-byte workspace limit.`)
+      }
+      validateAnalysisShape(normalized.analysis, record.task.taskId, batch.batchId)
+      const domainSchema = await this.#taskDomainSchema(record)
+      domainApplied = applyDomainSchema(normalized.analysis, domainSchema)
+      validateSourceRefs(collectSourceRefs(domainApplied.analysis), record.task, record.batches, workspace.config.limits, chunkIndex)
+      groundingReport = validateGroundingQuality(domainApplied.analysis)
+    } catch (error) {
+      if (isAnalysisValidationError(error)) {
+        const recorded = await recordAnalysisValidationFailure(record, batch.batchId, error)
+        throw recorded
+      }
+      throw error
     }
-    validateAnalysisShape(normalized.analysis, record.task.taskId, batch.batchId)
-    const domainSchema = await this.#taskDomainSchema(record)
-    const domainApplied = applyDomainSchema(normalized.analysis, domainSchema)
-    validateSourceRefs(collectSourceRefs(domainApplied.analysis), record.task, record.batches, workspace.config.limits, chunkIndex)
-    validateGroundingQuality(domainApplied.analysis)
     const idempotent = await withIdempotency(record.paths, input?.idempotency_key, { operation: "commit_analysis", batchId: batch.batchId, analysis: normalized.analysis }, async ({ persistResponse }) => {
       if (record.task.completedBatchIds.includes(batch.batchId)) fail("BATCH_ALREADY_COMPLETED", `Batch is already completed: ${batch.batchId}`)
       assertTaskStatus(record.task, ["prepared", "extracting"])
       await writeJsonAtomic(path.join(record.paths.analysis, `${batch.batchId}.json`), domainApplied.analysis)
       if (!record.task.completedBatchIds.includes(batch.batchId)) record.task.completedBatchIds.push(batch.batchId)
+      clearAnalysisValidationFailure(record.task, batch.batchId)
       record.task.batchCompletedAt = record.task.batchCompletedAt && typeof record.task.batchCompletedAt === "object"
         ? record.task.batchCompletedAt : {}
       record.task.batchCompletedAt[batch.batchId] = nowIso()
@@ -1109,6 +1141,10 @@ export class LlmWikiCore {
         batch_completed: true,
         remaining_batches: remaining,
         validation_errors: [],
+        grounding_warnings: groundingReport.grounding_warnings,
+        validation_diagnostics: groundingReport.validation_diagnostics,
+        quality_gate: groundingReport.quality_gate,
+        validation_fingerprint: groundingReport.validation_fingerprint,
         normalized_source_ref_indexes: normalized.resolvedSourceRefIndexes,
         normalized_source_ref_quotes: normalizedSourceRefQuotes,
         normalized_unresolved_questions: normalized.normalizedUnresolvedQuestions,
@@ -1495,7 +1531,7 @@ export class LlmWikiCore {
       page_patch_schema: pagePatchSchema,
       page_patch_scaffold_contract: {
         ready_to_fill: true,
-        instruction: "Copy each shard requirement's patch_scaffold and preserve draft_mode. For create or replace, add one complete content body. For merge, remove no sections and fill sectionChanges with upsert_section entries only for new headings or existing_pages.editable_section_headings; protected sections remain server-side, and parent/child sections cannot be selected together. Keep knowledge in the original language of its directly supporting evidence. Never append a second body, translate source-authored knowledge to target_language, or reconstruct exact SourceRefs.",
+        instruction: "Copy each shard requirement's patch_scaffold and preserve draft_mode. For create or replace, add one complete content body. For merge, remove no sections and fill sectionChanges with upsert_section entries only for new headings or existing_pages.editable_section_headings; protected sections remain server-side, and parent/child sections cannot be selected together. Keep knowledge in the original language of its directly supporting evidence. Draft Wiki prose as semantic synthesis: paraphrase and summarize freely while preserving requirement coverage, typed factual anchors, certainty, polarity, and SourceRef traceability. Do not perform source lexical matching, append a second body, translate source-authored knowledge to target_language, or reconstruct exact SourceRefs.",
         source_ref_mode: "page-requirement-id",
         exact_source_refs_resolved_by_core: true,
       },
@@ -1726,7 +1762,7 @@ export class LlmWikiCore {
         writer_guidance: {
           mode: "concise-incremental-draft",
           recommended_body_chars: { min: 300, max: 1_200 },
-          instruction: "Write only grounded facts required by this shard in the original language of their directly supporting source evidence. Rewrite the complete page only when draft_mode=complete-page-rewrite. When draft_mode=section-upsert, emit bounded upsert_section changes for new or fully editable headings and leave protected sections untouched.",
+          instruction: "Write only grounded facts required by this shard in the original language of their directly supporting source evidence. Rewrite the complete page only when draft_mode=complete-page-rewrite. When draft_mode=section-upsert, emit bounded upsert_section changes for new or fully editable headings and leave protected sections untouched. Wiki pages may paraphrase and summarize; check requirement coverage and SourceRef traceability rather than matching source vocabulary verbatim.",
         },
       } : {}),
       ...(projection.mode === "final" && snapshot.finalizationHint ? { finalization_hint: snapshot.finalizationHint } : {}),
@@ -3864,6 +3900,115 @@ function agentChunkWithSourceRefTemplates(chunk) {
   }
 }
 
+async function recordAnalysisValidationFailure(record, batchId, error) {
+  const normalized = asLlmWikiError(error, "INVALID_ANALYSIS")
+  const originalCode = normalized.code
+  const details = normalized.details && typeof normalized.details === "object" ? normalized.details : {}
+  const fingerprint = typeof details.validation_fingerprint === "string"
+    ? details.validation_fingerprint
+    : sha256(stableStringify({ code: normalized.code, details })).slice(0, 32)
+  const state = record.task.analysisValidation && typeof record.task.analysisValidation === "object"
+    ? record.task.analysisValidation
+    : { schemaVersion: 1, batches: {}, maxSemanticRepairs: 2 }
+  state.batches = state.batches && typeof state.batches === "object" ? state.batches : {}
+  const prior = state.batches[batchId] ?? {}
+  const attempts = (Number(prior.attempts) || 0) + 1
+  const repeatCount = prior.validation_fingerprint === fingerprint ? (Number(prior.repeat_count) || 0) + 1 : 1
+  const maxSemanticRepairs = Math.max(1, Number(state.maxSemanticRepairs) || 2)
+  state.maxSemanticRepairs = maxSemanticRepairs
+  const repairRequired = attempts >= maxSemanticRepairs || repeatCount >= 2
+  state.batches[batchId] = {
+    task_id: record.task.taskId,
+    batch_id: batchId,
+    attempts,
+    repeat_count: repeatCount,
+    validation_fingerprint: fingerprint,
+    last_error_code: normalized.code,
+    last_error_at: nowIso(),
+    repair_required: repairRequired,
+  }
+  state.repairRequiredBatches = Object.entries(state.batches)
+    .filter(([, value]) => value?.repair_required === true)
+    .map(([id]) => id)
+  record.task.analysisValidation = state
+  record.task.lastError = {
+    code: originalCode,
+    message: normalized.message,
+    at: nowIso(),
+    batch_id: batchId,
+    validation_fingerprint: fingerprint,
+    validation_attempt: attempts,
+    repair_required: repairRequired,
+  }
+  await saveTask(record.paths, record.task)
+  normalized.details = {
+    ...details,
+    validation_fingerprint: fingerprint,
+    validation_attempt: attempts,
+    validation_max_attempts: maxSemanticRepairs,
+    repeat_count: repeatCount,
+    repair_required: repairRequired,
+    repair_scope: "same-task-same-batch",
+  }
+  normalized.retryable = !repairRequired
+  if (repairRequired) {
+    normalized.suggestedAction = "Stop launching a new Extractor. Keep the task and batch identities, inspect the structured diagnostics, and request explicit repair or review."
+  }
+  // Once the coordinator has marked a batch repair-required, another invalid
+  // submission is reported as a fuse event. A corrected, valid submission is
+  // still allowed through the normal validation path so an explicit repair
+  // can recover the batch without starting a new Extractor.
+  if (prior.repair_required === true) {
+    normalized.code = "ANALYSIS_REPAIR_REQUIRED"
+    normalized.message = `Batch ${batchId} remains repair-required after a previous semantic validation failure.`
+    normalized.retryable = false
+    normalized.details = {
+      ...normalized.details,
+      prior_validation_fingerprint: prior.validation_fingerprint,
+      repair_required: true,
+    }
+  }
+  return normalized
+}
+
+function isAnalysisValidationError(error) {
+  return ANALYSIS_VALIDATION_CODES.has(asLlmWikiError(error).code)
+}
+
+function clearAnalysisValidationFailure(task, batchId) {
+  const state = task.analysisValidation
+  if (state && typeof state === "object" && state.batches && typeof state.batches === "object") {
+    delete state.batches[batchId]
+    state.repairRequiredBatches = Object.entries(state.batches)
+      .filter(([, value]) => value?.repair_required === true)
+      .map(([id]) => id)
+  }
+  if (task.lastError?.batch_id === batchId) delete task.lastError
+}
+
+function repairRequiredBatchIds(task) {
+  const state = task?.analysisValidation
+  if (Array.isArray(state?.repairRequiredBatches)) return new Set(state.repairRequiredBatches.filter((value) => typeof value === "string"))
+  return new Set(Object.entries(state?.batches ?? {})
+    .filter(([, value]) => value?.repair_required === true)
+    .map(([batchId]) => batchId))
+}
+
+function repairRequiredRemainingBatchCount(task) {
+  const remaining = Math.max(0, (Number(task?.batchCount) || 0) - (Array.isArray(task?.completedBatchIds) ? task.completedBatchIds.length : 0))
+  return Math.min(remaining, repairRequiredBatchIds(task).size)
+}
+
+function schedulableExtractionBatchCount(task) {
+  const remaining = Math.max(0, (Number(task?.batchCount) || 0) - (Array.isArray(task?.completedBatchIds) ? task.completedBatchIds.length : 0))
+  return Math.max(0, remaining - repairRequiredRemainingBatchCount(task))
+}
+
+function allRemainingBatchesRepairRequired(task) {
+  const remaining = Math.max(0, (Number(task?.batchCount) || 0) - (Array.isArray(task?.completedBatchIds) ? task.completedBatchIds.length : 0))
+  return remaining > 0 && schedulableExtractionBatchCount(task) === 0 && repairRequiredRemainingBatchCount(task) > 0
+}
+
 function validBatchLeases(task) {
   const now = Date.now()
   const leases = task.batchLeases && typeof task.batchLeases === "object" ? task.batchLeases : {}
@@ -5712,8 +5857,12 @@ function statusResponse(task) {
   }
   const wikiProjection = pageProjectionStatus(task)
   const remainingBatches = Math.max(0, task.batchCount - task.completedBatchIds.length)
-  const extractionSchedulable = ["prepared", "extracting"].includes(task.status) && remainingBatches > 0
-  const schedulableRemainingBatches = extractionSchedulable ? remainingBatches : 0
+  const repairRequiredBatchSet = repairRequiredBatchIds(task)
+  const repairRequiredBatchCount = Math.min(remainingBatches, repairRequiredBatchSet.size)
+  const schedulableBatchCount = Math.max(0, remainingBatches - repairRequiredBatchCount)
+  const extractionSchedulable = ["prepared", "extracting"].includes(task.status)
+    && schedulableBatchCount > 0
+  const schedulableRemainingBatches = extractionSchedulable ? schedulableBatchCount : 0
   const extractionOverlaps = !wikiProjection.projection_complete
     && !wikiProjection.final_completed
     && (wikiProjection.in_progress || wikiProjection.ready)
@@ -5746,6 +5895,7 @@ function statusResponse(task) {
     batch_id: batchId,
     leased_at: lease.leasedAt,
     expires_at: lease.expiresAt,
+    ...(repairRequiredBatchSet.has(batchId) ? { repair_required: true } : {}),
   })).sort((left, right) => left.worker_id.localeCompare(right.worker_id))
   return {
     task_id: task.taskId,
@@ -5775,7 +5925,7 @@ function statusResponse(task) {
       required: extractionSchedulable,
       mode: "background-agent-first",
       coordinator_direct_extraction: "fallback-only-after-worker-failure",
-      single_batch_background: extractionSchedulable && remainingBatches === 1,
+      single_batch_background: extractionSchedulable && schedulableBatchCount === 1,
       recommended_workers: recommendedWorkers,
       max_workers: pipelineConcurrency.max_background_agents_total,
       max_background_agents_total: pipelineConcurrency.max_background_agents_total,
@@ -5804,6 +5954,7 @@ function statusResponse(task) {
     pipeline_concurrency: publicPipelineConcurrency,
     subagent_recovery: subagentRecoveryStatus(task, wikiProjection, workerLeases, taskNextAction),
     completion_gate: completionGate(task, wikiProjection, taskNextAction),
+    ...(task.analysisValidation ? { analysis_validation: task.analysisValidation } : {}),
     ...(task.lastError ? { last_error: task.lastError } : {}),
     next_action: taskNextAction,
   }
@@ -5834,6 +5985,7 @@ function completionGate(task, wikiProjection, taskNextAction = null) {
     finalize_ready: finalizeReady,
     outstanding: {
       extraction_batches: remainingExtractionBatches,
+      repair_required_batches: repairRequiredRemainingBatchCount(task),
       unprojected_batches: unprojectedBatches,
       active_projection: wikiProjection?.in_progress === true,
       pending_draft_shards: pendingDraftShards,
@@ -5842,9 +5994,13 @@ function completionGate(task, wikiProjection, taskNextAction = null) {
       ? "The durable task status is completed; a final completion report is allowed."
       : taskCancelled
         ? "The task was cancelled. Do not launch SubAgents or report successful completion."
-        : task.status === "failed" && !taskNextAction
-          ? "The task failed in a state with no executable automatic recovery action. Do not launch SubAgents or loop on Finalize; inspect last_error and restart or abort only through an explicit recovery path."
-        : "A completed shard manifest or projection window is only a checkpoint. Execute next_action automatically and do not ask the user whether to continue while durable work remains.",
+        : allRemainingBatchesRepairRequired(task)
+          ? "Semantic analysis repair is required for every remaining batch. Do not launch a new Extractor or retry automatically; inspect the persisted validation fingerprints and diagnostics."
+          : repairRequiredRemainingBatchCount(task) > 0
+            ? "Some batches require semantic repair. Continue only the schedulable batches; do not launch a new Extractor for repair-required batches."
+          : task.status === "failed" && !taskNextAction
+            ? "The task failed in a state with no executable automatic recovery action. Do not launch SubAgents or loop on Finalize; inspect last_error and restart or abort only through an explicit recovery path."
+            : "A completed shard manifest or projection window is only a checkpoint. Execute next_action automatically and do not ask the user whether to continue while durable work remains.",
     ...(taskNextAction ? { next_action: taskNextAction } : {}),
   }
 }
@@ -5859,14 +6015,19 @@ function backgroundImportCompletionGate(task) {
 
 function subagentRecoveryStatus(task, wikiProjection, workerLeases = [], taskNextAction = null) {
   const remainingBatches = Math.max(0, task.batchCount - task.completedBatchIds.length)
+  const repairRequiredBatchSet = repairRequiredBatchIds(task)
+  const repairRequiredBatches = Math.min(remainingBatches, repairRequiredBatchSet.size)
+  const schedulableBatchCount = Math.max(0, remainingBatches - repairRequiredBatches)
+  const resumableWorkerLeases = workerLeases.filter((lease) => !repairRequiredBatchSet.has(lease.batch_id))
   const extractionSchedulingAllowed = ["prepared", "extracting"].includes(task.status)
+    && schedulableBatchCount > 0
   const projectionSchedulingAllowed = !["completed", "cancelled"].includes(task.status)
     && (wikiProjection.in_progress === true || wikiProjection.ready === true)
   const extractionOverlaps = !wikiProjection.projection_complete
     && !wikiProjection.final_completed
     && (wikiProjection.in_progress || wikiProjection.ready)
     && extractionSchedulingAllowed
-    && remainingBatches > 0
+    && schedulableBatchCount > 0
   const pendingDraftShards = Number.isInteger(wikiProjection.pending_draft_shards)
     ? wikiProjection.pending_draft_shards : 0
   const stagedDraftShards = Number.isInteger(wikiProjection.staged_uncommitted_draft_shards)
@@ -5880,7 +6041,7 @@ function subagentRecoveryStatus(task, wikiProjection, workerLeases = [], taskNex
     ? stagedDraftShards > 0 || writerWorkReady ? 1 : Math.max(1, actionableDraftShards)
     : undefined
   const pipelineConcurrency = pipelineConcurrencyPlan({
-    remainingBatches: extractionSchedulingAllowed ? remainingBatches : 0,
+    remainingBatches: extractionSchedulingAllowed ? schedulableBatchCount : 0,
     extractionOverlaps,
     maxBackgroundAgents: task.options?.maxBackgroundAgents,
     projectionDemand,
@@ -5925,10 +6086,11 @@ function subagentRecoveryStatus(task, wikiProjection, workerLeases = [], taskNex
         role: "llm-wiki-extractor",
         work_remaining: extractionSchedulingAllowed && remainingBatches > 0,
         desired_live_invocations: extractionSchedulingAllowed ? pipelineConcurrency.recommended_extractors : 0,
-        persisted_reservations: workerLeases.length,
+        persisted_reservations: resumableWorkerLeases.length,
+        repair_required_reservations: workerLeases.length - resumableWorkerLeases.length,
         reservations_are_live_invocations: false,
         resume_strategy: "restart-same-worker-id-immediately",
-        resume_actions: extractionSchedulingAllowed ? workerLeases.map((lease) => ({
+        resume_actions: extractionSchedulingAllowed ? resumableWorkerLeases.map((lease) => ({
           tool: "llm_wiki_get_batch",
           action_owner: "extractor",
           delegate_to: "llm-wiki-extractor",
@@ -6022,6 +6184,7 @@ function withPublicationStatus(response, publication) {
 }
 
 function nextAction(task, wikiProjection = pageProjectionStatus(task)) {
+  if (allRemainingBatchesRepairRequired(task)) return null
   if (wikiProjection.in_progress || wikiProjection.ready) return projectionAction(task, wikiProjection)
   if (["prepared", "extracting"].includes(task.status)) return { tool: "llm_wiki_get_batch", arguments: { task_id: task.taskId } }
   if (task.status === "planning") return projectionAction(task, wikiProjection)

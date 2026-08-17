@@ -24,7 +24,7 @@ const commitAnalysisContract = namespaceSchema(analysisSchema, "analysis")
 commitAnalysisContract.shape.required = [...new Set([...commitAnalysisContract.shape.required, "sourceRefMode"])]
 commitAnalysisContract.shape.properties.sourceRefs = {
   ...commitAnalysisContract.shape.properties.sourceRefs,
-  description: "Copy the complete numeric evidence-index catalog from get_batch.analysis_scaffold unchanged.",
+  description: "Copy the complete numeric evidence-index catalog from get_batch.analysis_scaffold unchanged. The matching evidence_catalog entry exposes primary_quote plus context_quotes/context metadata.",
   items: { type: "integer", minimum: 0 },
 }
 commitAnalysisContract.definitions.analysis_sourceRefList = {
@@ -39,7 +39,7 @@ const commitAnalysisInputSchema = closedObject({
   lease_token: { type: "string", minLength: 1, maxLength: 200 },
   analysis: {
     ...commitAnalysisContract.shape,
-    description: "Copy get_batch.analysis_scaffold first, then fill semantic arrays. Keep numeric confidence values, sourceRefMode, the numeric top-level evidence catalog, and candidate evidence_index sourceRefs.",
+    description: "Copy get_batch.analysis_scaffold first, then fill semantic arrays. Wiki candidates may paraphrase and merge evidence; keep numeric confidence values, sourceRefMode, the numeric top-level evidence catalog, and candidate evidence_index sourceRefs. Preserve typed numbers, identifiers, dates, units, and source certainty; ordinary lexical mismatch is only a warning.",
   },
   idempotency_key: { type: "string", minLength: 8, maxLength: 200 },
 }, ["task_id", "batch_id", "worker_id", "lease_token", "analysis", "idempotency_key"])
@@ -100,7 +100,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_get_batch",
-    description: "Lease and return one complete, stable, Agent-readable batch with a server-generated exact evidence catalog, progressive Domain Schema disclosure metadata, and a retrieval-optional extraction policy. Candidates cite evidence indexes, avoiding quote transcription and source rereads. Hard transport ceilings repair oversized batches in place.",
+    description: "Lease and return one complete, stable, Agent-readable batch with a server-generated evidence catalog exposing primary_quote, context_quotes, table headers/columns, and heading context, plus progressive Domain Schema disclosure metadata. Candidates cite evidence indexes, avoiding quote transcription and source rereads. Hard transport ceilings repair oversized batches in place.",
     inputSchema: closedObject({
       task_id: taskId,
       batch_id: { type: ["string", "null"] },
@@ -241,7 +241,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_status",
-    description: "Return one current-workspace task's persisted status, completion_gate, current parallel worker recommendation and batch quantum, finalize-first audit state, next action, resumable worker reservations, recoverable staged draft receipts, and unified subagent_recovery demand for Extractor, Drafter, and Writer roles. A completed shard manifest or projection window is not task completion: while completion_gate.automatic_continuation_required=true, execute next_action and never ask the user whether to continue. Core cannot observe host process liveness: leases, in_progress, pending shards, and receipts never prove a SubAgent is live. The coordinator reconciles host-confirmed live sets before waiting and immediately fills every missing desired invocation.",
+    description: "Return one current-workspace task's persisted status, completion_gate, analysis-validation repair budget, current parallel worker recommendation and batch quantum, finalize-first audit state, next action, resumable worker reservations, recoverable staged draft receipts, and unified subagent_recovery demand for Extractor, Drafter, and Writer roles. A completed shard manifest or projection window is not task completion: while completion_gate.automatic_continuation_required=true, execute next_action and never ask the user whether to continue. When analysis_validation marks a batch repair_required, do not launch a new Extractor for that batch; continue only schedulable batches and inspect its fingerprint/diagnostics. Core cannot observe host process liveness: leases, in_progress, pending shards, and receipts never prove a SubAgent is live. The coordinator reconciles host-confirmed live sets before waiting and immediately fills every missing desired invocation.",
     inputSchema: closedObject({ task_id: taskId }, ["task_id"]),
   },
   {

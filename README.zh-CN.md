@@ -652,12 +652,13 @@ Core 会将 requirement ID 解析为任务中已验证的精确 quote 和 locato
 不要把 `reviewItems` 写成字符串数组。无法从目录中的精确证据支持的问题应放入
 `unresolvedQuestions`，不要重新读取源文件猜 quote。
 
-标题引用不能支撑整张表的详细结论。`claims`、`relations`、
-`contradictions` 和 `reviewItems` 会回到 1.0.7 的 Grounding Quality Gate：
-每项必须引用包含其识别词的短原文，Core 用证据与候选内容的词汇支持关系做校验，
-单个 SourceRef 被复用超过八次会拒绝整个 analysis。门禁拒绝时按返回的
-`validation_errors` 修复同一批次，保留仍然有效的候选和 evidence index，并用新
-幂等键重试；不要把内容改写成无意义的逐字摘录或重新创建任务。
+Wiki 抽取是证据支撑的语义归纳，不是原文摘抄。`evidence_catalog` 每项同时提供
+`primary_quote`、`context_quotes` 和表头/列名/章节上下文；Agent 看到的上下文与
+Core 提交时使用的上下文一致。允许摘要化、同义改写、关系谓词归一和实体别名，
+但数字、比例、编号、日期、单位以及“可能/确定”等事实语义必须保持等价。
+普通词汇不重合只产生 warning；SourceRef 来源真实性、类型化事实锚点和明显极性/确定性
+矛盾才会硬失败。门禁拒绝时按结构化 `validation_diagnostics` 修复同一批次，最多两次；
+出现 `repair_required=true` 后停止启动新的 Extractor，转入人工/协调器复核。
 
 ### Excel 无法导入
 

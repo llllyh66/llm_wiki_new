@@ -303,12 +303,13 @@ test("commit_analysis validation failures are recoverable business results, not 
     assert.deepEqual(response.structuredContent.validation_errors, ["fix this field"])
     assert.equal(response.structuredContent.next_action.tool, "llm_wiki_commit_analysis")
     assert.equal(response.structuredContent.next_action.arguments.worker_id, "extractor-4")
-    assert.deepEqual(response.structuredContent.worker_restart, {
+    assert.equal(response.structuredContent.worker_restart, undefined)
+    assert.deepEqual(response.structuredContent.semantic_repair, {
       required: true,
-      strategy: "restart-same-worker-id-immediately",
-      worker_id: "extractor-4",
+      strategy: "repair-same-batch-same-worker",
+      task_id: "task-example",
       batch_id: "batch-0001",
-      delay_ms: 0,
+      worker_id: "extractor-4",
     })
   }
 })

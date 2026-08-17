@@ -338,22 +338,6 @@ test("built MCP server survives errors and completes the full workflow over one 
       batchSummary: "Invalid dense analysis.",
       unresolvedQuestions: [],
     },
-    "analysis is not an object",
-    {
-      schemaVersion: 1,
-      taskId,
-      batchId: batch.structuredContent.batch_id,
-      sourceRefs: [{ ...sourceRef, chunkId: "chunk-does-not-exist" }],
-      entities: [],
-      concepts: [],
-      claims: [],
-      relations: [],
-      contradictions: [],
-      candidatePages: [],
-      reviewItems: [],
-      batchSummary: "Invalid SourceRef.",
-      unresolvedQuestions: [],
-    },
     {
       schemaVersion: 1,
       taskId,
@@ -374,6 +358,22 @@ test("built MCP server survives errors and completes the full workflow over one 
       batchSummary: "Invalid KQI-style title-only grounding.",
       unresolvedQuestions: [],
     },
+    "analysis is not an object",
+    {
+      schemaVersion: 1,
+      taskId,
+      batchId: batch.structuredContent.batch_id,
+      sourceRefs: [{ ...sourceRef, chunkId: "chunk-does-not-exist" }],
+      entities: [],
+      concepts: [],
+      claims: [],
+      relations: [],
+      contradictions: [],
+      candidatePages: [],
+      reviewItems: [],
+      batchSummary: "Invalid SourceRef.",
+      unresolvedQuestions: [],
+    },
   ]
   for (const [index, invalidAnalysis] of invalidAnalyses.entries()) {
     const invalid = await client.callTool({
@@ -388,15 +388,19 @@ test("built MCP server survives errors and completes the full workflow over one 
     assert.equal(invalid.isError, undefined)
     assert.equal(invalid.structuredContent.accepted, false)
     assert.equal(invalid.structuredContent.rejected, true)
-    assert.match(invalid.structuredContent.error.code, /^INVALID_(ANALYSIS|SOURCE_REF)$/)
+    assert.match(invalid.structuredContent.error.code, /^(?:INVALID_(ANALYSIS|SOURCE_REF)|ANALYSIS_REPAIR_REQUIRED)$/)
     if (index === 0) {
       assert.equal(invalid.structuredContent.error.details.validation_error_count, 60)
-      assert.equal(invalid.structuredContent.validation_errors.length, 51)
+      assert.equal(invalid.structuredContent.validation_errors.length, 60)
     }
-    if (index === 3) {
-      assert.equal(invalid.structuredContent.error.details.quality_gate, "source-ref-grounding-v1")
-      assert.equal(invalid.structuredContent.error.details.validation_error_count, 48)
-      assert.equal(invalid.structuredContent.grounding_warnings, undefined)
+    if (index === 1) {
+      assert.equal(invalid.structuredContent.error.details.quality_gate, "source-ref-grounding-v2")
+      assert.equal(invalid.structuredContent.error.details.validation_error_count, 47)
+      assert.equal(Array.isArray(invalid.structuredContent.grounding_warnings), true)
+    }
+    if (index >= 2) {
+      assert.equal(invalid.structuredContent.error.code, "ANALYSIS_REPAIR_REQUIRED")
+      assert.equal(invalid.structuredContent.semantic_repair.coordinator_action, "do_not_launch_new_extractor")
     }
     assert.equal((await client.listTools()).tools.length, 18)
     const liveStatus = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: taskId } })

@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+- Replace lexical-only grounding with Wiki-oriented semantic grounding. SourceRef
+  authenticity remains hard, while typed anchors (numbers, IDs, dates, units)
+  and certainty/polarity are checked independently; lexical mismatch and reuse
+  are warnings. Evidence catalogs now expose primary/context quotes and table
+  semantics consistently to Agents and Core, with structured diagnostics and a
+  two-attempt semantic repair fuse.
+
 ## [1.0.8] - 2026-08-14
 
 - Restore the Grounding Quality Gate to the 1.0.7 behavior. Claims, Relations,

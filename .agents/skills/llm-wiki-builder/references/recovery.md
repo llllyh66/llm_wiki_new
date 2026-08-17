@@ -56,11 +56,15 @@ new idempotency key for a changed payload, and resubmit before continuing.
 Treat `accepted: false` as a normal validation result, not an MCP failure; do
 not restart or create another task for it.
 Submit `analysis` as an object rather than a serialized JSON string or Markdown
-code block. For grounding failures, correct the returned validation errors while
-preserving valid candidates and evidence indexes. Keep the same worker and lease
-for this application-level repair. When the envelope shape itself is invalid,
-rebuild it from the schema while preserving valid candidates, and check every
-evidence index against the catalog length.
+code block. For grounding failures, repair the returned structured diagnostics
+while preserving valid candidates and evidence indexes. Keep the same worker
+and lease for this application-level repair. The gate allows Wiki paraphrase
+and normalization, but typed anchors (numbers, identifiers, dates, units) and
+certainty/polarity must remain equivalent. A second semantic failure for the
+same batch sets `repair_required=true`: stop launching a new Extractor and
+escalate the batch instead of looping. When the envelope shape itself is
+invalid, rebuild it from the schema while preserving valid candidates, and
+check every evidence index against the catalog length.
 For a spreadsheet locator rejection, copy the SourceRef again from the leased
 chunk's `source_ref_templates`; `allowed_sheet_names` and
 `allowed_cell_ranges` in the error are diagnostic values, not text to guess or

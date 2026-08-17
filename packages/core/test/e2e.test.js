@@ -283,10 +283,117 @@ test("grounding quality gate rejects a title-only SourceRef reused for many unre
     }),
     (error) => error instanceof LlmWikiError
       && error.code === "INVALID_ANALYSIS"
-      && error.details.quality_gate === "source-ref-grounding-v1"
-      && error.details.validation_errors.some((message) => message.includes("lexically support")),
+      && error.details.quality_gate === "source-ref-grounding-v2"
+      && error.details.validation_errors.some((diagnostic) => ["NUMERIC_ANCHOR_MISMATCH", "LEXICAL_MISMATCH"].includes(diagnostic.reason_code)),
   )
   assert.equal((await f.core.status({ task_id: imported.task_id })).status, "prepared")
+})
+
+test("repeated semantic grounding failures stop the batch after two repairs", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  const invalid = analysisFor(imported.task_id, batch).analysis
+  invalid.claims[0].text = "Business Entity has identifier A-2001."
+
+  await assert.rejects(
+    () => f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      analysis: invalid,
+      idempotency_key: "semantic-repair-attempt-1",
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "INVALID_ANALYSIS"
+      && error.details.validation_attempt === 1
+      && error.details.repair_required === false
+      && typeof error.details.validation_fingerprint === "string",
+  )
+
+  await assert.rejects(
+    () => f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      analysis: invalid,
+      idempotency_key: "semantic-repair-attempt-2",
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "INVALID_ANALYSIS"
+      && error.details.validation_attempt === 2
+      && error.details.repair_required === true,
+  )
+
+  await assert.rejects(
+    () => f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      analysis: invalid,
+      idempotency_key: "semantic-repair-attempt-3",
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "ANALYSIS_REPAIR_REQUIRED"
+      && error.details.repair_required === true
+      && error.retryable === false,
+  )
+
+  const status = await f.core.status({ task_id: imported.task_id })
+  assert.equal(status.analysis_validation.batches[batch.batch_id].repair_required, true)
+  assert.equal(status.subagent_recovery.roles.extractor.desired_live_invocations, 0)
+  assert.equal(status.next_action, null)
+
+  const repaired = await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    analysis: analysisFor(imported.task_id, batch).analysis,
+    idempotency_key: "semantic-repair-explicit-v1",
+  })
+  assert.equal(repaired.accepted, true)
+  const recovered = await f.core.status({ task_id: imported.task_id })
+  assert.equal(recovered.analysis_validation.batches[batch.batch_id], undefined)
+  assert.equal(recovered.last_error, undefined)
+})
+
+test("a repair-required batch does not stop extraction of other batches", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const largeSource = path.join(f.incoming, "repair-parallel.md")
+  const lines = Array.from({ length: 900 }, (_, index) => `Parallel evidence row ${String(index).padStart(4, "0")} remains independently schedulable.`)
+  await writeFile(largeSource, `# Repair parallelism\n\n${lines.join("\n")}\n`)
+  const imported = await f.core.importFiles({ files: [{ path: largeSource }], options: { max_batch_chars: 9_000 } })
+  assert.equal(imported.batch_count > 2, true)
+  const first = await f.core.getBatch({ task_id: imported.task_id, worker_id: "repair-worker" })
+  const invalid = {
+    ...first.analysis_scaffold,
+    claims: [{ localId: "bad-anchor", content: "This claim has identifier A-2001.", sourceRefs: [0] }],
+    batchSummary: "Invalid semantic repair fixture.",
+  }
+
+  for (const idempotency_key of ["parallel-repair-1", "parallel-repair-2"]) {
+    await assert.rejects(
+      () => f.core.commitAnalysis({
+        task_id: imported.task_id,
+        batch_id: first.batch_id,
+        worker_id: first.worker_id,
+        lease_token: first.lease_token,
+        analysis: invalid,
+        idempotency_key,
+      }),
+      (error) => error instanceof LlmWikiError && error.code === "INVALID_ANALYSIS",
+    )
+  }
+
+  const status = await f.core.status({ task_id: imported.task_id })
+  assert.equal(status.analysis_validation.batches[first.batch_id].repair_required, true)
+  assert.equal(status.subagent_recovery.roles.extractor.desired_live_invocations > 0, true)
+  assert.equal(status.next_action.tool, "llm_wiki_get_batch")
+
+  const other = await f.core.getBatch({ task_id: imported.task_id, worker_id: "other-worker" })
+  assert.notEqual(other.batch_id, first.batch_id)
+  await assert.rejects(
+    () => f.core.getBatch({ task_id: imported.task_id, batch_id: first.batch_id, worker_id: "new-worker" }),
+    (error) => error instanceof LlmWikiError && error.code === "ANALYSIS_REPAIR_REQUIRED",
+  )
 })
 
 test("grounding accepts exact relation content from server evidence without label dilution", async (t) => {
@@ -334,6 +441,9 @@ test("table-row evidence automatically carries its exact header context", async 
   const batch = await f.core.getBatch({ task_id: imported.task_id })
   const rowEvidence = batch.evidence_catalog.find((entry) => entry.quote.includes("timeout") && entry.quote.includes("50"))
   assert.ok(rowEvidence)
+  assert.equal(rowEvidence.primary_quote, rowEvidence.quote)
+  assert.equal(rowEvidence.context_quotes.includes("| 参数名 | 参数值 |"), true)
+  assert.deepEqual(rowEvidence.context.table_headers, ["参数名", "参数值"])
   assert.equal(batch.evidence_catalog_contract.table_context_auto_resolved, true)
   assert.equal(batch.evidence_catalog.some((entry) => entry.quote === "| 参数名 | 参数值 |"), true)
 
