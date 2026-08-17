@@ -283,7 +283,7 @@ test("grounding quality gate rejects a title-only SourceRef reused for many unre
     }),
     (error) => error instanceof LlmWikiError
       && error.code === "INVALID_ANALYSIS"
-      && error.details.quality_gate === "source-ref-grounding-v2"
+      && error.details.quality_gate === "source-ref-grounding-v3"
       && error.details.validation_errors.some((diagnostic) => ["NUMERIC_ANCHOR_MISMATCH", "LEXICAL_MISMATCH"].includes(diagnostic.reason_code)),
   )
   assert.equal((await f.core.status({ task_id: imported.task_id })).status, "prepared")
@@ -296,6 +296,12 @@ test("repeated semantic grounding failures stop the batch after two repairs", as
   const batch = await f.core.getBatch({ task_id: imported.task_id })
   const invalid = analysisFor(imported.task_id, batch).analysis
   invalid.claims[0].text = "Business Entity has identifier A-2001."
+  invalid.claims.push({
+    localId: "claim-preserved-during-repair",
+    text: "Business Entity is the canonical business object.",
+    confidence: 0.9,
+    sourceRefs: invalid.claims[0].sourceRefs,
+  })
 
   await assert.rejects(
     () => f.core.commitAnalysis({
@@ -308,6 +314,8 @@ test("repeated semantic grounding failures stop the batch after two repairs", as
       && error.code === "INVALID_ANALYSIS"
       && error.details.validation_attempt === 1
       && error.details.repair_required === false
+      && error.details.knowledge_coverage.candidate_count === 5
+      && error.details.knowledge_preservation.current.candidate_count === 5
       && typeof error.details.validation_fingerprint === "string",
   )
 
@@ -349,6 +357,8 @@ test("repeated semantic grounding failures stop the batch after two repairs", as
     idempotency_key: "semantic-repair-explicit-v1",
   })
   assert.equal(repaired.accepted, true)
+  assert.equal(repaired.repair_coverage.candidate_delta, -1)
+  assert.equal(repaired.repair_coverage.knowledge_loss_warning, true)
   const recovered = await f.core.status({ task_id: imported.task_id })
   assert.equal(recovered.analysis_validation.batches[batch.batch_id], undefined)
   assert.equal(recovered.last_error, undefined)

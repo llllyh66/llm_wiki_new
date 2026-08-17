@@ -10,6 +10,23 @@ const MAX_ANALYSIS_VALIDATION_ERRORS = 2_000
 const SOURCE_REF_REUSE_WARNING_THRESHOLD = 8
 const GROUNDING_QUALITY_COLLECTIONS = new Set(["entities", "concepts", "claims", "relations", "contradictions", "candidatePages", "reviewItems"])
 const FACT_ASSERTION_COLLECTIONS = new Set(["entities", "concepts", "claims", "relations", "contradictions", "reviewItems"])
+const FACT_KINDS = new Set(["entity", "concept", "claim", "relation", "metric_definition", "parameter_definition", "contradiction", "summary", "review_item"])
+const SUPPORT_MODES = new Set(["explicit_text", "structured_entailment", "derived", "summary"])
+const NATURAL_LANGUAGE_CERTAINTY_KINDS = new Set(["claim", "relation", "contradiction", "review_item"])
+const COLLECTION_FACT_KINDS = Object.freeze({
+  entities: new Set(["entity"]),
+  concepts: new Set(["concept"]),
+  claims: new Set(["claim", "metric_definition", "parameter_definition"]),
+  relations: new Set(["relation"]),
+  contradictions: new Set(["contradiction"]),
+  candidatePages: new Set(["summary"]),
+  reviewItems: new Set(["review_item"]),
+})
+const STRUCTURED_FACT_FIELDS = new Set([
+  "metric", "formula", "condition", "sourceTable", "source_table", "unit",
+  "parameterId", "parameter_id", "defaultValue", "default_value",
+  "recommendedValue", "recommended_value",
+])
 const GENERIC_GROUNDING_TERMS = new Set(["content", "data", "document", "item", "内容", "数据", "文档", "指标", "体系", "关系", "概述", "包含", "包括"])
 const ALLOWED_PAGE_ROOTS = new Set(AGENT_PAGE_ROOTS)
 const SYSTEM_PAGES = new Set(["wiki/index.md", "wiki/overview.md", "wiki/log.md"])
@@ -236,6 +253,26 @@ export function validateAnalysisShape(analysis, taskId, batchId) {
         if (confidence !== undefined && (typeof confidence !== "number" || confidence < 0 || confidence > 1)) {
           addError(`${collection}[${itemIndex}].confidence must be between 0 and 1`)
         }
+        if (item.factKind !== undefined && !FACT_KINDS.has(item.factKind)) {
+          addError(`${collection}[${itemIndex}].factKind must be one of ${[...FACT_KINDS].join(", ")}`)
+        } else if (item.factKind !== undefined && !COLLECTION_FACT_KINDS[collection]?.has(item.factKind)) {
+          addError(`${collection}[${itemIndex}].factKind ${item.factKind} is not valid in the ${collection} collection`)
+        }
+        if (item.supportMode !== undefined && !SUPPORT_MODES.has(item.supportMode)) {
+          addError(`${collection}[${itemIndex}].supportMode must be one of ${[...SUPPORT_MODES].join(", ")}`)
+        }
+        if (item.supportMode === "derived" && !hasDerivationDeclaration(item.derivation)) {
+          addError(`${collection}[${itemIndex}].derivation is required when supportMode is derived`)
+        }
+        if (item.factKind === "summary" && item.supportMode !== undefined && item.supportMode !== "summary") {
+          addError(`${collection}[${itemIndex}].supportMode must be summary when factKind is summary`)
+        }
+        if (item.supportMode === "summary" && item.factKind !== undefined && item.factKind !== "summary") {
+          addError(`${collection}[${itemIndex}].factKind must be summary when supportMode is summary`)
+        }
+        if (item.predicate !== undefined && (typeof item.predicate !== "string" || !item.predicate.trim())) {
+          addError(`${collection}[${itemIndex}].predicate must be a non-empty string`)
+        }
         if (collection === "reviewItems" && (typeof item.content !== "string" || !item.content.trim())) {
           addError(`reviewItems[${itemIndex}].content must be a non-empty string`)
         } else if (collection === "reviewItems" && item.content.length > 10_000) {
@@ -259,11 +296,17 @@ export function validateAnalysisShape(analysis, taskId, batchId) {
   if (errors.length > 0) fail("INVALID_ANALYSIS", "Analysis envelope validation failed.", { details: { validation_errors: errors, validation_error_count: errorCount } })
 }
 
+function hasDerivationDeclaration(value) {
+  if (typeof value === "string") return Boolean(value.trim())
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length > 0)
+}
+
 /**
  * Validate semantic grounding without requiring Wiki prose to be copied from
  * the source. SourceRef authenticity is handled by validateSourceRefs; this
- * gate only hard-fails on altered typed facts or a clear certainty/polarity
- * contradiction. Ordinary lexical mismatch is returned as a warning.
+ * gate hard-fails on altered typed facts, invalid relation contracts, missing
+ * derivation declarations, or clear certainty/polarity contradictions.
+ * Ordinary lexical mismatch is returned as a warning.
  */
 export function validateGroundingQuality(analysis, options = {}) {
   const hardErrors = []
@@ -271,6 +314,10 @@ export function validateGroundingQuality(analysis, options = {}) {
   let hardErrorCount = 0
   let warningCount = 0
   const refUses = new Map()
+  const knownCandidateLocalIds = new Set([
+    ...(Array.isArray(options.knownCandidateLocalIds) ? options.knownCandidateLocalIds : []),
+    ...analysisCandidateLocalIds(analysis),
+  ])
   const maxDiagnostics = Number.isInteger(options.maxDiagnostics) && options.maxDiagnostics > 0
     ? options.maxDiagnostics
     : MAX_ANALYSIS_VALIDATION_ERRORS
@@ -299,6 +346,9 @@ export function validateGroundingQuality(analysis, options = {}) {
       if (!item || typeof item !== "object" || !Array.isArray(item.sourceRefs)) continue
       const refs = item.sourceRefs.filter(isSourceRefObject)
       const primaryRefs = refs.filter((ref) => sourceRefRole(ref) !== "context")
+      if (collection === "relations") {
+        validateRelationContract({ item, itemIndex, refs, knownCandidateLocalIds, addDiagnostic })
+      }
       for (const ref of primaryRefs) {
         const key = stableStringify({
           sourceId: ref.sourceId,
@@ -345,7 +395,8 @@ export function validateGroundingQuality(analysis, options = {}) {
 
       const assertionTexts = candidateAssertionTexts(item, collection)
       for (const assertion of assertionTexts) {
-        const anchorReport = compareFactAnchors(assertion, evidenceText)
+        const scopedEvidence = evidenceScopeForAssertion(assertion, refs)
+        const anchorReport = compareFactAnchors(assertion, scopedEvidence.combinedText || evidenceText)
         for (const mismatch of anchorReport.mismatches) {
           addDiagnostic({
             collection,
@@ -359,7 +410,9 @@ export function validateGroundingQuality(analysis, options = {}) {
             message: `${collection}[${itemIndex}] ${mismatch.message}`,
           })
         }
-        const certainty = compareCertainty(assertion, primaryEvidenceText || evidenceText)
+        const certainty = shouldValidateNaturalLanguageCertainty(item, collection, refs)
+          ? compareCertainty(assertion, scopedEvidence.primaryText || primaryEvidenceText || evidenceText)
+          : []
         for (const mismatch of certainty) {
           addDiagnostic({
             collection,
@@ -373,6 +426,19 @@ export function validateGroundingQuality(analysis, options = {}) {
             message: `${collection}[${itemIndex}] ${mismatch.message}`,
           })
         }
+      }
+      for (const mismatch of compareStructuredFactFields(item, refs)) {
+        addDiagnostic({
+          collection,
+          itemIndex,
+          field: mismatch.field,
+          reasonCode: mismatch.reason_code,
+          severity: "hard",
+          observed: mismatch.observed,
+          expected: mismatch.expected,
+          sourceRefs: refs,
+          message: `${collection}[${itemIndex}] ${mismatch.message}`,
+        })
       }
       if (semanticText && !evidenceSupportsCandidate(semanticText, evidenceText, item, collection)) {
         addDiagnostic({
@@ -432,7 +498,7 @@ export function validateGroundingQuality(analysis, options = {}) {
     errors: hardErrors.map(({ path, field, reason_code, observed, expected, sourceRefs }) => ({ path, field, reason_code, observed, expected, sourceRefs })),
   })).slice(0, 32)
   const report = {
-    quality_gate: "source-ref-grounding-v2",
+    quality_gate: "source-ref-grounding-v3",
     validation_error_count: hardErrorCount,
     validation_errors: hardErrors,
     validation_error_messages: hardErrors.map((diagnostic) => diagnostic.message),
@@ -441,6 +507,12 @@ export function validateGroundingQuality(analysis, options = {}) {
     validation_fingerprint: validationFingerprint,
     warning_count: warningCount,
     diagnostics_truncated: hardErrorCount > maxDiagnostics || warningCount > maxDiagnostics,
+    knowledge_coverage: groundingKnowledgeCoverage(analysis, hardErrors, warnings),
+    repair_guidance: {
+      preserve_supported_candidates: true,
+      remove_only_when_unsupported: true,
+      preferred_actions: ["narrow-evidence-scope", "correct-typed-anchor", "change-fact-kind-or-support-mode", "move-unsupported-inference-to-unresolvedQuestions"],
+    },
   }
   if (hardErrorCount > 0) {
     fail("INVALID_ANALYSIS", "Analysis grounding quality validation failed for typed facts or certainty.", {
@@ -506,6 +578,235 @@ function candidateAliasValues(item) {
   if (Array.isArray(item?.aliases)) values.push(...item.aliases)
   if (Array.isArray(item?.properties?.aliases)) values.push(...item.properties.aliases)
   return values.filter((value) => typeof value === "string" && value.trim())
+}
+
+function analysisCandidateLocalIds(analysis) {
+  const ids = []
+  for (const collection of ["entities", "concepts"]) {
+    for (const item of (Array.isArray(analysis?.[collection]) ? analysis[collection] : [])) {
+      const localId = item?.localId ?? item?.local_id
+      if (typeof localId === "string" && localId.trim()) ids.push(localId)
+    }
+  }
+  return ids
+}
+
+function validateRelationContract({ item, itemIndex, refs, knownCandidateLocalIds, addDiagnostic }) {
+  const sourceId = item.sourceEntityLocalId ?? item.source_entity_local_id ?? item.sourceLocalId
+  const targetId = item.targetEntityLocalId ?? item.target_entity_local_id ?? item.targetLocalId
+  const namedSource = item.source ?? item.from ?? item.subject ?? item.sourceName ?? item.sourceEntityName
+  const namedTarget = item.target ?? item.to ?? item.object ?? item.targetName ?? item.targetEntityName
+  const hasSource = typeof sourceId === "string" && sourceId.trim()
+    || typeof namedSource === "string" && namedSource.trim()
+  const hasTarget = typeof targetId === "string" && targetId.trim()
+    || typeof namedTarget === "string" && namedTarget.trim()
+
+  if (!hasSource && !hasTarget) {
+    addDiagnostic({
+      collection: "relations",
+      itemIndex,
+      field: "source/target",
+      reasonCode: "RELATION_ENDPOINT_MISSING",
+      severity: "warning",
+      observed: null,
+      expected: "source and target endpoint references",
+      sourceRefs: refs,
+      message: `relations[${itemIndex}] has relationship prose but no graph endpoints; it will remain a finding instead of a graph edge`,
+    })
+  } else if (!hasSource || !hasTarget) {
+    addDiagnostic({
+      collection: "relations",
+      itemIndex,
+      field: "source/target",
+      reasonCode: "RELATION_ENDPOINT_INCOMPLETE",
+      severity: "hard",
+      observed: { source: sourceId ?? namedSource ?? null, target: targetId ?? namedTarget ?? null },
+      expected: "both source and target endpoints",
+      sourceRefs: refs,
+      message: `relations[${itemIndex}] must provide both relationship endpoints`,
+    })
+  }
+
+  for (const [field, localId] of [["sourceEntityLocalId", sourceId], ["targetEntityLocalId", targetId]]) {
+    if (typeof localId !== "string" || !localId.trim() || knownCandidateLocalIds.has(localId)) continue
+    addDiagnostic({
+      collection: "relations",
+      itemIndex,
+      field,
+      reasonCode: "RELATION_ENDPOINT_UNRESOLVED",
+      severity: "hard",
+      observed: localId,
+      expected: "a localId declared by an entity or concept in this task",
+      sourceRefs: refs,
+      message: `relations[${itemIndex}] references unknown endpoint ${localId}; extract the endpoint candidate or use a resolvable named endpoint`,
+    })
+  }
+
+  if (typeof item.predicate !== "string" || !item.predicate.trim()) {
+    addDiagnostic({
+      collection: "relations",
+      itemIndex,
+      field: "predicate",
+      reasonCode: "RELATION_PREDICATE_MISSING",
+      severity: "warning",
+      observed: item.predicate ?? null,
+      expected: "a normalized relationship predicate",
+      sourceRefs: refs,
+      message: `relations[${itemIndex}] has no predicate; add one so prose normalization does not define graph semantics`,
+    })
+  }
+}
+
+function candidateFactKind(item, collection) {
+  if (FACT_KINDS.has(item?.factKind)) return item.factKind
+  if (collection === "entities") return "entity"
+  if (collection === "concepts") return "concept"
+  if (collection === "relations") return "relation"
+  if (collection === "contradictions") return "contradiction"
+  if (collection === "candidatePages") return "summary"
+  if (collection === "reviewItems") return "review_item"
+  return "claim"
+}
+
+function candidateSupportMode(item, collection, refs) {
+  if (SUPPORT_MODES.has(item?.supportMode)) return item.supportMode
+  if (collection === "candidatePages") return "summary"
+  const primaryQuotes = refs
+    .filter((ref) => sourceRefRole(ref) !== "context")
+    .map((ref) => String(ref.quote ?? ""))
+  if (primaryQuotes.some(isStructuredEvidenceText)) return "structured_entailment"
+  return "explicit_text"
+}
+
+function shouldValidateNaturalLanguageCertainty(item, collection, refs) {
+  const kind = candidateFactKind(item, collection)
+  const supportMode = candidateSupportMode(item, collection, refs)
+  return NATURAL_LANGUAGE_CERTAINTY_KINDS.has(kind)
+    && ["explicit_text", "structured_entailment"].includes(supportMode)
+}
+
+function isStructuredEvidenceText(value) {
+  const text = String(value ?? "")
+  return /^\s*\|.*\|\s*$/mu.test(text)
+    || /\b(?:IF|THEN|ELSE|END|SELECT|FROM|WHERE|CASE)\b/iu.test(text)
+    || /(?:^|\n)\s*[\w.-]+\s*[:=]\s*[^\n]+/u.test(text)
+}
+
+function evidenceScopeForAssertion(assertion, refs) {
+  const primaryText = refs
+    .filter((ref) => sourceRefRole(ref) !== "context")
+    .map((ref) => scopePrimaryQuoteToAssertion(ref.quote, assertion))
+    .filter(Boolean)
+    .join("\n")
+  const contextText = refs
+    .filter((ref) => sourceRefRole(ref) === "context")
+    .map((ref) => typeof ref.quote === "string" ? ref.quote.trim() : "")
+    .filter(Boolean)
+    .join("\n")
+  return {
+    primaryText,
+    contextText,
+    combinedText: [primaryText, contextText].filter(Boolean).join("\n"),
+  }
+}
+
+function scopePrimaryQuoteToAssertion(value, assertion) {
+  const quote = typeof value === "string" ? value.trim() : ""
+  if (!quote) return ""
+  const tableRows = quote.split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => /^\|.*\|$/u.test(line) && !isMarkdownTableDelimiter(line))
+  if (tableRows.length <= 1) return quote
+
+  const normalizedAssertion = normalizeStructuralText(assertion)
+  const namedRows = tableRows.filter((row) => {
+    const firstCell = tableCells(row)[0]
+    const normalizedCell = normalizeStructuralText(firstCell)
+    return normalizedCell.length >= 3 && normalizedAssertion.includes(normalizedCell)
+  })
+  if (namedRows.length > 0) return namedRows.join("\n")
+
+  const assertionTerms = new Set(groundingTerms(assertion))
+  const scored = tableRows.map((row) => ({
+    row,
+    score: groundingTerms(row).filter((term) => assertionTerms.has(term)).length,
+  }))
+  const bestScore = Math.max(0, ...scored.map(({ score }) => score))
+  if (bestScore === 0) return quote
+  return scored.filter(({ score }) => score === bestScore).map(({ row }) => row).join("\n")
+}
+
+function tableCells(row) {
+  return /^\|.*\|$/u.test(row)
+    ? row.slice(1, -1).split("|").map((cell) => cell.trim())
+    : []
+}
+
+function isMarkdownTableDelimiter(row) {
+  const cells = tableCells(row)
+  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/u.test(cell))
+}
+
+function normalizeStructuralText(value) {
+  return String(value ?? "").normalize("NFKC").toLowerCase().replace(/[\s*`~]/gu, "")
+}
+
+function structuredFactFieldEntries(item) {
+  const entries = []
+  for (const [key, value] of Object.entries(item ?? {})) {
+    if (STRUCTURED_FACT_FIELDS.has(key) && ["string", "number", "boolean"].includes(typeof value)) entries.push([key, value])
+  }
+  if (item?.properties && typeof item.properties === "object" && !Array.isArray(item.properties)) {
+    for (const [key, value] of Object.entries(item.properties)) {
+      if (STRUCTURED_FACT_FIELDS.has(key) && ["string", "number", "boolean"].includes(typeof value)) entries.push([`properties.${key}`, value])
+    }
+  }
+  return entries
+}
+
+function compareStructuredFactFields(item, refs) {
+  const mismatches = []
+  for (const [field, value] of structuredFactFieldEntries(item)) {
+    const scoped = evidenceScopeForAssertion(String(value), refs)
+    const evidence = normalizeStructuralText(scoped.combinedText)
+    const observed = normalizeStructuralText(value)
+    if (observed && evidence.includes(observed)) continue
+    mismatches.push({
+      field,
+      reason_code: "STRUCTURAL_FIELD_MISMATCH",
+      observed: value,
+      expected: "the same structured field value in the selected primary row or its explicit context",
+      message: `structured field ${field} is not bound to the selected evidence scope`,
+    })
+  }
+  return mismatches
+}
+
+function groundingKnowledgeCoverage(analysis, hardErrors, warnings) {
+  const byCollection = {}
+  const primarySpans = new Set()
+  let candidateCount = 0
+  let groundedCandidateCount = 0
+  for (const collection of GROUNDED_ANALYSIS_COLLECTIONS) {
+    const items = Array.isArray(analysis?.[collection]) ? analysis[collection] : []
+    byCollection[collection] = items.length
+    candidateCount += items.length
+    for (const item of items) {
+      const refs = Array.isArray(item?.sourceRefs) ? item.sourceRefs.filter(isSourceRefObject) : []
+      if (refs.length > 0) groundedCandidateCount += 1
+      for (const ref of refs.filter((entry) => sourceRefRole(entry) !== "context")) {
+        primarySpans.add(stableStringify({ sourceId: ref.sourceId, chunkId: ref.chunkId, quote: ref.quote ?? null, locator: ref.locator ?? null }))
+      }
+    }
+  }
+  return {
+    candidate_count: candidateCount,
+    grounded_candidate_count: groundedCandidateCount,
+    primary_evidence_span_count: primarySpans.size,
+    by_collection: byCollection,
+    hard_error_candidate_count: new Set(hardErrors.map((item) => item.path.replace(/\.[^.]+$/u, ""))).size,
+    warning_candidate_count: new Set(warnings.map((item) => item.path.replace(/\.[^.]+$/u, ""))).size,
+  }
 }
 
 const UNIT_ALIASES = new Map([
@@ -710,6 +1011,11 @@ function sourceRefDiagnostic(ref) {
     sourceId: ref.sourceId,
     chunkId: ref.chunkId,
     role: sourceRefRole(ref),
+    quoteHash: typeof ref.quote === "string" && ref.quote
+      ? sha256(ref.quote.normalize("NFKC")).slice(0, 16)
+      : null,
+    locator: ref.locator ?? null,
+    evidenceScope: sourceRefContextGroup(ref),
   }
 }
 

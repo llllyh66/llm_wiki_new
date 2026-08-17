@@ -65,6 +65,11 @@ same batch sets `repair_required=true`: stop launching a new Extractor and
 escalate the batch instead of looping. When the envelope shape itself is
 invalid, rebuild it from the schema while preserving valid candidates, and
 check every evidence index against the catalog length.
+Grounding v3 diagnostics include quote hashes, locators, scoped evidence, and
+`knowledge_coverage`. Repair scoped polarity or typed-field problems before
+rewriting prose. Preserve supported candidates when `repair_coverage` reports
+a negative candidate or primary-evidence-span delta; a negative delta is a
+review signal, not permission to delete unrelated knowledge.
 For a spreadsheet locator rejection, copy the SourceRef again from the leased
 chunk's `source_ref_templates`; `allowed_sheet_names` and
 `allowed_cell_ranges` in the error are diagnostic values, not text to guess or

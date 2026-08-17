@@ -394,7 +394,7 @@ test("built MCP server survives errors and completes the full workflow over one 
       assert.equal(invalid.structuredContent.validation_errors.length, 60)
     }
     if (index === 1) {
-      assert.equal(invalid.structuredContent.error.details.quality_gate, "source-ref-grounding-v2")
+      assert.equal(invalid.structuredContent.error.details.quality_gate, "source-ref-grounding-v3")
       assert.equal(invalid.structuredContent.error.details.validation_error_count, 47)
       assert.equal(Array.isArray(invalid.structuredContent.grounding_warnings), true)
     }

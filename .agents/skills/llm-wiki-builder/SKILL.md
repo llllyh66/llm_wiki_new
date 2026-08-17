@@ -149,6 +149,12 @@ Never submit after `LEASE_FENCED`. Reacquire work and discard the superseded res
   ordinary lexical mismatch as a warning; it hard-fails only invalid SourceRefs,
   altered typed anchors, clear certainty/polarity contradictions, or envelope
   shape/identity errors.
+- For structured, derived, relational, metric, parameter, and summary
+  candidates, use the batch contract's orthogonal `factKind` and `supportMode`.
+  Table rows, formulas, SQL, and configuration structures use
+  `structured_entailment`; candidate-page summaries use `summary`. Do not emit
+  the retired `supportType` field. A `derived` candidate must declare its
+  derivation rule or method.
 - `evidence_catalog[evidence_index]` exposes `primary_quote`, `context_quotes`,
   and `context` metadata for table headers/columns and headings. Use the row or
   passage as primary evidence and retain its context; Core validates the same
@@ -157,8 +163,11 @@ Never submit after `LEASE_FENCED`. Reacquire work and discard the superseded res
 - Put source-grounded concerns in `reviewItems`. Put unsupported uncertainty or
   inference in `unresolvedQuestions`; do not invent evidence.
 - For a relation, put the directly supported relationship statement in
-  `content` and cite the evidence entry containing it. Do not add a stronger
-  relationship than the evidence supports.
+  `content`, add a normalized `predicate`, reference resolvable source/target
+  entity-or-concept localIds, and cite the evidence entry containing it. Do not
+  add a stronger relationship than the evidence supports. Put formulas,
+  conditions, units, and source tables in a typed metric or parameter
+  definition instead of overloading the graph edge.
 - On `INVALID_ANALYSIS`, repair the returned structured diagnostics while
   keeping the same task, batch, worker, and lease. Use a new idempotency key for
   a changed payload. The same batch has at most two semantic repairs; when

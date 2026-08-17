@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { compareFactAnchors, parseFactAnchors, validateGroundingQuality } from "../src/validation.js"
+import { compareFactAnchors, parseFactAnchors, validateAnalysisShape, validateGroundingQuality } from "../src/validation.js"
 
 const sourceRef = Object.freeze({
   sourceId: "source-grounding",
@@ -39,7 +39,7 @@ test("grounding allows Wiki paraphrase and reports lexical mismatch as a warning
   const report = validateGroundingQuality(analysisWithClaims([
     { content: "The billing account is currently enabled.", sourceRefs: [sourceRef] },
   ]))
-  assert.equal(report.quality_gate, "source-ref-grounding-v2")
+  assert.equal(report.quality_gate, "source-ref-grounding-v3")
   assert.equal(report.validation_error_count, 0)
 })
 
@@ -47,7 +47,7 @@ test("grounding hard-fails a polarity contradiction with structured diagnostics"
   const error = groundingError(() => validateGroundingQuality(analysisWithClaims([
     { content: "The billing account is disabled.", sourceRefs: [sourceRef] },
   ])))
-  assert.equal(error.details.quality_gate, "source-ref-grounding-v2")
+  assert.equal(error.details.quality_gate, "source-ref-grounding-v3")
   assert.equal(error.details.validation_errors[0].reason_code, "POLARITY_MISMATCH")
   assert.equal(typeof error.details.validation_errors[0].path, "string")
   assert.equal(typeof error.details.validation_fingerprint, "string")
@@ -101,4 +101,120 @@ test("a table header shared by more than eight rows does not hard-fail", () => {
   const report = validateGroundingQuality(analysisWithClaims(claims))
   assert.equal(report.validation_error_count, 0)
   assert.equal(report.grounding_warnings.some((warning) => warning.reason_code === "SOURCE_REF_REUSE"), false)
+})
+
+test("grounding scopes polarity to the matching table row", () => {
+  const tableRef = {
+    sourceId: "source-grounding",
+    chunkId: "chunk-grounding",
+    role: "primary",
+    quote: [
+      "| 5G切换至4G切换准备次数 | / | IF TRANS_TYPE = 73 AND HO_TYPE = 1 THEN 1 ELSE 0 END | DETAIL_CDR_N2HANDOVER |",
+      "| 5G切换至4G成功次数 | / | IF TRANS_TYPE = 73 AND HO_TYPE = 1 AND E2E_HANDOVER_SUCCED_FLAG = 0 THEN 1 ELSE 0 END | DETAIL_CDR_N2HANDOVER |",
+      "| 5G切换至4G失败次数 | / | IF TRANS_TYPE = 73 AND HO_TYPE = 1 AND E2E_HANDOVER_SUCCED_FLAG = 1 THEN 1 ELSE 0 END | DETAIL_CDR_N2HANDOVER |",
+    ].join("\n"),
+  }
+  const report = validateGroundingQuality({
+    ...analysisWithClaims([]),
+    relations: [{
+      localId: "rel-5g-to-4g-counter-source",
+      content: "5G切换至4G切换准备次数的COUNTER公式基于DETAIL_CDR_N2HANDOVER表,条件为TRANS_TYPE=73 AND HO_TYPE=1",
+      factKind: "relation",
+      supportMode: "explicit_text",
+      sourceRefs: [tableRef],
+    }],
+  })
+  assert.equal(report.validation_error_count, 0)
+  assert.equal(report.grounding_warnings.some((warning) => warning.reason_code === "RELATION_ENDPOINT_MISSING"), true)
+  assert.equal(report.grounding_warnings[0].sourceRefs[0].quoteHash.length, 16)
+})
+
+test("structured facts validate deterministic fields against their evidence scope", () => {
+  const tableRef = {
+    sourceId: "source-grounding",
+    chunkId: "chunk-grounding",
+    role: "primary",
+    quote: "| 5G切换至4G切换准备次数 | / | IF TRANS_TYPE = 73 AND HO_TYPE = 1 THEN 1 ELSE 0 END | DETAIL_CDR_N2HANDOVER |",
+  }
+  const valid = validateGroundingQuality(analysisWithClaims([{
+    localId: "metric-preparation",
+    factKind: "metric_definition",
+    supportMode: "structured_entailment",
+    metric: "5G切换至4G切换准备次数",
+    formula: "IF TRANS_TYPE = 73 AND HO_TYPE = 1 THEN 1 ELSE 0 END",
+    sourceTable: "DETAIL_CDR_N2HANDOVER",
+    sourceRefs: [tableRef],
+  }]))
+  assert.equal(valid.validation_error_count, 0)
+
+  const error = groundingError(() => validateGroundingQuality(analysisWithClaims([{
+    localId: "metric-preparation",
+    factKind: "metric_definition",
+    supportMode: "structured_entailment",
+    metric: "5G切换至4G切换准备次数",
+    sourceTable: "DETAIL_CDR_WRONG_TABLE",
+    sourceRefs: [tableRef],
+  }])))
+  assert.equal(error.details.validation_errors[0].reason_code, "STRUCTURAL_FIELD_MISMATCH")
+})
+
+test("relation endpoint IDs must resolve when an ID-based edge is declared", () => {
+  const relationRef = { ...sourceRef, quote: "Beta depends on Alpha." }
+  const error = groundingError(() => validateGroundingQuality({
+    ...analysisWithClaims([]),
+    entities: [{ localId: "beta", name: "Beta", sourceRefs: [relationRef] }],
+    relations: [{
+      localId: "beta-depends-alpha",
+      content: "Beta depends on Alpha.",
+      predicate: "dependsOn",
+      sourceEntityLocalId: "beta",
+      targetEntityLocalId: "missing-alpha",
+      sourceRefs: [relationRef],
+    }],
+  }))
+  assert.equal(error.details.validation_errors.some((item) => item.reason_code === "RELATION_ENDPOINT_UNRESOLVED"), true)
+
+  const report = validateGroundingQuality({
+    ...analysisWithClaims([]),
+    entities: [{ localId: "beta", name: "Beta", sourceRefs: [relationRef] }],
+    relations: [{
+      localId: "beta-depends-alpha",
+      content: "Beta depends on Alpha.",
+      predicate: "dependsOn",
+      sourceEntityLocalId: "beta",
+      targetEntityLocalId: "alpha",
+      sourceRefs: [relationRef],
+    }],
+  }, { knownCandidateLocalIds: ["alpha"] })
+  assert.equal(report.validation_error_count, 0)
+})
+
+test("typed envelope requires derivation metadata and matching summary semantics", () => {
+  const envelope = {
+    schemaVersion: 1,
+    taskId: "task-grounding",
+    batchId: "batch-grounding",
+    sourceRefs: [sourceRef],
+    entities: [],
+    concepts: [],
+    claims: [{
+      localId: "derived-claim",
+      content: "The account is enabled.",
+      factKind: "claim",
+      supportMode: "derived",
+      sourceRefs: [sourceRef],
+    }],
+    relations: [],
+    contradictions: [],
+    candidatePages: [],
+    reviewItems: [],
+    batchSummary: "Derived fixture.",
+    unresolvedQuestions: [],
+  }
+  assert.throws(
+    () => validateAnalysisShape(envelope, envelope.taskId, envelope.batchId),
+    (error) => error.details.validation_errors.some((message) => message.includes("derivation is required")),
+  )
+  envelope.claims[0].derivation = "rule-based-normalization"
+  assert.doesNotThrow(() => validateAnalysisShape(envelope, envelope.taskId, envelope.batchId))
 })

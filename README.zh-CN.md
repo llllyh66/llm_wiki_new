@@ -660,6 +660,16 @@ Core 提交时使用的上下文一致。允许摘要化、同义改写、关系
 矛盾才会硬失败。门禁拒绝时按结构化 `validation_diagnostics` 修复同一批次，最多两次；
 出现 `repair_required=true` 后停止启动新的 Extractor，转入人工/协调器复核。
 
+Grounding v3 可为候选增加两个正交字段：`factKind` 表示知识类型，`supportMode`
+表示证据支持方式。表格行、公式、SQL 和配置结构使用
+`structured_entailment`；候选页面摘要使用 `summary`；`derived` 候选必须声明
+`derivation` 规则或方法。Validator 会先把候选定位到
+匹配的 primary 行或片段，再检查事实锚点和适用的确定性/极性，避免同一表格中“成功、
+失败、取消”等其他行污染当前事实。Relation 应提供归一化 `predicate` 和可解析的
+source/target localId；公式、条件、单位和来源表应保存在 `metric_definition` 或
+`parameter_definition` 中。诊断返回 quote hash、locator、`knowledge_coverage`，修复成功后
+还会报告 `repair_coverage`，用于发现“删到通过”造成的候选或证据覆盖下降。
+
 ### Excel 无法导入
 
 - 确认文件后缀是 `.xlsx`，不是 `.xls` 或 `.xlsm`。

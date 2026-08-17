@@ -10,6 +10,13 @@
   the predominant evidence language consistently and preserve proper names and
   source terminology in their original form.
 - Distinguish entities, concepts, processes, metrics, claims, and relations.
+- Use the orthogonal `factKind` and `supportMode` fields for typed grounding
+  when the candidate is structured, derived, relational, or a summary. The
+  knowledge kind says what the fact is; the support mode says how the cited
+  evidence supports it. Use `structured_entailment` for table rows, formulas,
+  SQL, and configuration structures, and `summary` only for candidate-page
+  summaries. A `derived` candidate must declare its derivation rule or method.
+  Do not use the retired `supportType` field.
 - Do not create an entity for every noun.
 - Ground each important fact in at least one SourceRef from the current task.
 - When `get_batch` returns `evidence_catalog`, copy its `analysis_scaffold`
@@ -34,9 +41,13 @@
   useful, but reusing a primary passage is allowed when it genuinely supports
   several candidates.
 - For a relation, put the evidence-supported relationship statement in
-  `content` and cite the evidence index containing it. Predicate names may be
+  `content`, add a normalized `predicate`, and reference source/target
+  entity-or-concept `localId` values that are declared in this task. Cite the
+  evidence index containing the relationship. Predicate names may be
   normalized, but do not add a stronger relationship or certainty than the
-  evidence supports. Put source-grounded
+  evidence supports. A table formula with metric, condition, unit, and source
+  table belongs in a `metric_definition`; do not compress the full definition
+  into a graph edge. Put source-grounded
   concerns in `reviewItems` and unsupported inference in
   `unresolvedQuestions`.
 - Use conservative confidence values between 0 and 1.
@@ -61,7 +72,7 @@ standalone envelope):
   "sourceRefMode": "batch-evidence-index",
   "sourceRefs": [0, 1],
   "entities": [{ "localId": "entity-1", "name": "Example", "sourceRefs": [0] }],
-  "relations": [{ "localId": "relation-1", "sourceEntityLocalId": "entity-1", "predicate": "dependsOn", "targetEntityLocalId": "entity-2", "content": "Example depends on Entity 2.", "supportType": "normalized", "sourceRefs": [1] }],
+  "relations": [{ "localId": "relation-1", "factKind": "relation", "supportMode": "explicit_text", "sourceEntityLocalId": "entity-1", "predicate": "dependsOn", "targetEntityLocalId": "entity-2", "content": "Example depends on Entity 2.", "sourceRefs": [1] }],
   "reviewItems": [{ "content": "A sourced issue requiring review", "sourceRefs": [1] }]
 }
 ```

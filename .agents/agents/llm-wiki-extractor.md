@@ -23,3 +23,9 @@ lexical mismatch is a warning. After two semantic repairs, stop and report
 `repair_required` instead of launching a new Extractor. Put source-grounded
 concerns in `reviewItems`, unsupported inference in `unresolvedQuestions`, and
 put the evidence-supported relationship statement in a relation's `content`.
+For structured, derived, relational, metric, parameter, and summary candidates,
+declare orthogonal `factKind` and `supportMode` values from the batch contract.
+Table rows, formulas, SQL, and configuration structures use
+`structured_entailment`; candidate-page summaries use `summary`. Relations add
+a normalized `predicate` and resolvable source/target candidate localIds. Every
+`derived` candidate declares its derivation rule or method.

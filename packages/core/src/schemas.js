@@ -33,7 +33,7 @@ export const analysisSchema = Object.freeze({
     claims: { type: "array", items: { $ref: "#/$defs/groundedCandidate" }, maxItems: 1000 },
     relations: {
       type: "array",
-      description: "Source-grounded relationships between extracted candidates.",
+      description: "Source-grounded relationships between extracted candidates. New relations should declare predicate plus resolvable source and target endpoints; legacy prose-only relations remain accepted with diagnostics.",
       items: { $ref: "#/$defs/groundedCandidate" },
       maxItems: 1000,
     },
@@ -80,8 +80,29 @@ export const analysisSchema = Object.freeze({
         text: { type: "string" },
         content: { type: "string" },
         confidence: { type: "number", minimum: 0, maximum: 1 },
+        factKind: {
+          enum: ["entity", "concept", "claim", "relation", "metric_definition", "parameter_definition", "contradiction", "summary", "review_item"],
+          description: "Semantic knowledge kind. Orthogonal to supportMode so, for example, a relation can be explicit or structurally entailed.",
+        },
+        supportMode: {
+          enum: ["explicit_text", "structured_entailment", "derived", "summary"],
+          description: "How the selected evidence supports this candidate. Omitted values are inferred for backward compatibility.",
+        },
+        derivation: {
+          oneOf: [{ type: "string", minLength: 1 }, { type: "object", minProperties: 1 }],
+          description: "Required rule or method declaration when supportMode is derived.",
+        },
+        predicate: { type: "string", minLength: 1, description: "Normalized relationship predicate for relation candidates." },
         sourceEntityLocalId: { type: "string", description: "localId of the source entity in a relation." },
         targetEntityLocalId: { type: "string", description: "localId of the target entity in a relation." },
+        metric: { type: "string", description: "Metric name for a structured metric definition." },
+        formula: { type: "string", description: "Source-preserving formula for a structured metric definition." },
+        condition: { type: "string", description: "Source-preserving condition for a structured fact." },
+        sourceTable: { type: "string", description: "Source table named by structured evidence." },
+        unit: { type: "string", description: "Unit named by structured evidence." },
+        parameterId: { oneOf: [{ type: "string" }, { type: "number" }], description: "Parameter identifier named by structured evidence." },
+        defaultValue: { description: "Default value named by structured evidence." },
+        recommendedValue: { description: "Recommended value named by structured evidence." },
         properties: { type: "object", description: "Source-grounded structured properties when useful." },
         schemaClassification: {
           type: "object",

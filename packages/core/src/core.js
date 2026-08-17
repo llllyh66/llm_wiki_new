@@ -863,6 +863,16 @@ export class LlmWikiCore {
         top_level_additional_properties: false,
         source_refs: "Copy the scaffold's numeric catalog unchanged and use only evidence_catalog.evidence_index integers in every nested candidate.sourceRefs.",
         grounded_candidates_require_source_refs: true,
+        typed_grounding: {
+          optional_compatibility_fields: ["factKind", "supportMode"],
+          fact_kinds: ["entity", "concept", "claim", "relation", "metric_definition", "parameter_definition", "contradiction", "summary", "review_item"],
+          support_modes: ["explicit_text", "structured_entailment", "derived", "summary"],
+          collection_kinds: {
+            entities: ["entity"], concepts: ["concept"], claims: ["claim", "metric_definition", "parameter_definition"],
+            relations: ["relation"], contradictions: ["contradiction"], candidatePages: ["summary"], reviewItems: ["review_item"],
+          },
+          rule: "factKind says what the knowledge is; supportMode says how evidence supports it. Use structured_entailment for table rows, formulas, SQL, and configuration structures. Use summary only for candidate page summaries. A derived candidate must declare its derivation rule or method.",
+        },
         review_item_shape: { content: "string", sourceRefs: [0] },
         max_quote_chars: 1000,
         generation_limits: {
@@ -902,11 +912,11 @@ export class LlmWikiCore {
         source_ref_templates: "Use the prefilled batch-evidence indexes; do not generate complete SourceRef objects or reconstruct sheetName and cellRange on the current hot path.",
         nested_source_refs: "In batch-evidence-index mode, use evidence_catalog.evidence_index values directly in candidate sourceRefs and leave the scaffold catalog unchanged.",
         evidence: "Do not retype quotes or read the source file. The server generated primary_quote and context_quotes from the leased batch. Use the evidence_index and keep table column semantics from context_quotes/context; the final Wiki may paraphrase source content while preserving typed factual anchors.",
-        relation_grounding: "Put the evidence-supported relationship in relation.content and cite the evidence entry containing it. Predicate names may be normalized; do not strengthen certainty or alter typed factual anchors.",
+        relation_grounding: "Put the evidence-supported relationship in relation.content, add a normalized predicate, and reference resolvable source/target candidate localIds. Cite the evidence entry containing the relationship. Predicate names may be normalized; do not strengthen certainty or alter typed factual anchors.",
         source_language: "Keep every extracted name, title, statement, summary, and question in the language used by its directly supporting source evidence. Do not translate source-authored knowledge into the workspace target language; target_language is only a fallback for language-neutral or genuinely undetermined metadata. Preserve proper names and source terminology verbatim.",
         review_items: "Use {content, sourceRefs} objects only when a batch quote directly supports the concern; otherwise use a plain unresolvedQuestions string.",
         unresolved_questions: "Use plain strings only. Common legacy {question|reason|content|message|text} objects are normalized, but current workers must emit strings.",
-        candidate_shape: "Use candidate objects such as {localId, name|title|content, confidence: 0.9, sourceRefs: [evidence_index]}; confidence is a JSON number, never a quoted string.",
+        candidate_shape: "Use candidate objects such as {localId, name|title|content, factKind, supportMode, confidence: 0.9, sourceRefs: [evidence_index]}; factKind/supportMode are optional for legacy compatibility but should be explicit for structured, derived, relation, metric, parameter, and summary candidates. Confidence is a JSON number, never a quoted string.",
         domain_classification: domainSchema
           ? "Every entity and concept must include schemaClassification copied from the selected ABE classification_scaffold, including snapshotHash; replace its be placeholders from one be_pointer_hints entry and keep confidence numeric."
           : "schemaClassification is not required because this task has no Domain Schema.",
@@ -1093,6 +1103,7 @@ export class LlmWikiCore {
     let normalizedSourceRefQuotes
     let domainApplied
     let groundingReport
+    let priorRepairCoverage = null
     try {
       normalized = normalizeAnalysisEnvelope(input?.analysis, { evidenceCatalog })
       chunkIndex = this.#taskChunkIndex(record)
@@ -1105,7 +1116,13 @@ export class LlmWikiCore {
       const domainSchema = await this.#taskDomainSchema(record)
       domainApplied = applyDomainSchema(normalized.analysis, domainSchema)
       validateSourceRefs(collectSourceRefs(domainApplied.analysis), record.task, record.batches, workspace.config.limits, chunkIndex)
-      groundingReport = validateGroundingQuality(domainApplied.analysis)
+      const priorAnalyses = await loadAnalyses(record, record.task.completedBatchIds)
+      const knownCandidateLocalIds = priorAnalyses.flatMap((analysis) => [
+        ...(analysis.entities ?? []),
+        ...(analysis.concepts ?? []),
+      ]).map((candidate) => candidate?.localId ?? candidate?.local_id).filter((value) => typeof value === "string" && value.trim())
+      groundingReport = validateGroundingQuality(domainApplied.analysis, { knownCandidateLocalIds })
+      priorRepairCoverage = record.task.analysisValidation?.batches?.[batch.batchId]?.knowledge_coverage ?? null
     } catch (error) {
       if (isAnalysisValidationError(error)) {
         const recorded = await recordAnalysisValidationFailure(record, batch.batchId, error)
@@ -1145,6 +1162,10 @@ export class LlmWikiCore {
         validation_diagnostics: groundingReport.validation_diagnostics,
         quality_gate: groundingReport.quality_gate,
         validation_fingerprint: groundingReport.validation_fingerprint,
+        knowledge_coverage: groundingReport.knowledge_coverage,
+        ...(priorRepairCoverage
+          ? { repair_coverage: compareKnowledgeCoverage(priorRepairCoverage, groundingReport.knowledge_coverage) }
+          : {}),
         normalized_source_ref_indexes: normalized.resolvedSourceRefIndexes,
         normalized_source_ref_quotes: normalizedSourceRefQuotes,
         normalized_unresolved_questions: normalized.normalizedUnresolvedQuestions,
@@ -3900,6 +3921,22 @@ function agentChunkWithSourceRefTemplates(chunk) {
   }
 }
 
+function compareKnowledgeCoverage(previous, current) {
+  const before = previous && typeof previous === "object" ? previous : null
+  const after = current && typeof current === "object" ? current : null
+  if (!before && !after) return null
+  const candidateDelta = (Number(after?.candidate_count) || 0) - (Number(before?.candidate_count) || 0)
+  const evidenceSpanDelta = (Number(after?.primary_evidence_span_count) || 0) - (Number(before?.primary_evidence_span_count) || 0)
+  return {
+    previous: before,
+    current: after,
+    candidate_delta: candidateDelta,
+    primary_evidence_span_delta: evidenceSpanDelta,
+    knowledge_loss_warning: Boolean(before && after && (candidateDelta < 0 || evidenceSpanDelta < 0)),
+    instruction: "A negative delta is diagnostic, not proof that the repair is wrong. Preserve supported candidates and move unsupported inference to unresolvedQuestions instead of deleting unrelated knowledge.",
+  }
+}
+
 async function recordAnalysisValidationFailure(record, batchId, error) {
   const normalized = asLlmWikiError(error, "INVALID_ANALYSIS")
   const originalCode = normalized.code
@@ -3926,6 +3963,7 @@ async function recordAnalysisValidationFailure(record, batchId, error) {
     last_error_code: normalized.code,
     last_error_at: nowIso(),
     repair_required: repairRequired,
+    knowledge_coverage: details.knowledge_coverage ?? prior.knowledge_coverage ?? null,
   }
   state.repairRequiredBatches = Object.entries(state.batches)
     .filter(([, value]) => value?.repair_required === true)
@@ -3949,6 +3987,7 @@ async function recordAnalysisValidationFailure(record, batchId, error) {
     repeat_count: repeatCount,
     repair_required: repairRequired,
     repair_scope: "same-task-same-batch",
+    knowledge_preservation: compareKnowledgeCoverage(prior.knowledge_coverage, details.knowledge_coverage),
   }
   normalized.retryable = !repairRequired
   if (repairRequired) {
