@@ -327,7 +327,38 @@ test("grounding accepts exact relation content from server evidence without labe
   assert.equal(committed.accepted, true)
 })
 
-test("commit safely downgrades a source-facing relation with unsupported structure to a claim", async (t) => {
+test("table-row evidence automatically carries its exact header context", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  await writeFile(f.source, "# Parameters\n\n| 参数名 | 参数值 |\n| --- | --- |\n| timeout | 50 |\n| capacity | 500 |\n")
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  const batch = await f.core.getBatch({ task_id: imported.task_id })
+  const rowEvidence = batch.evidence_catalog.find((entry) => entry.quote.includes("timeout") && entry.quote.includes("50"))
+  assert.ok(rowEvidence)
+  assert.equal(batch.evidence_catalog_contract.table_context_auto_resolved, true)
+  assert.equal(batch.evidence_catalog.some((entry) => entry.quote === "| 参数名 | 参数值 |"), true)
+
+  const committed = await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    idempotency_key: "table-header-context-v1",
+    analysis: {
+      ...batch.analysis_scaffold,
+      claims: [{
+        localId: "timeout-parameter",
+        content: "timeout 参数值 50",
+        supportType: "normalized",
+        sourceRefs: [rowEvidence.evidence_index],
+      }],
+    },
+  })
+
+  assert.equal(committed.accepted, true)
+  assert.equal(committed.normalized_source_ref_indexes, 1)
+  assert.equal(committed.grounding_validation.warning_count, 0)
+})
+
+test("commit safely downgrades a directionally invalid source-facing relation to a claim", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
   await writeFile(f.source, "# Campaigns\n\nThe MarketingManager manages MarketingCampaigns.\n")
@@ -348,9 +379,9 @@ test("commit safely downgrades a source-facing relation with unsupported structu
       ],
       relations: [{
         localId: "manager-responsible-for-campaign",
-        sourceEntityLocalId: "marketing-manager",
-        predicate: "responsibleFor",
-        targetEntityLocalId: "marketing-campaign",
+        sourceEntityLocalId: "marketing-campaign",
+        predicate: "manages",
+        targetEntityLocalId: "marketing-manager",
         content: "The MarketingManager manages MarketingCampaigns.",
         supportType: "normalized",
         sourceRefs: [evidence.evidence_index],
@@ -360,7 +391,7 @@ test("commit safely downgrades a source-facing relation with unsupported structu
 
   assert.equal(committed.accepted, true)
   assert.equal(committed.normalized_relation_claims, 1)
-  assert.deepEqual(committed.relation_claim_downgrades[0].reason_codes, ["UNSUPPORTED_RELATION_PREDICATE"])
+  assert.deepEqual(committed.relation_claim_downgrades[0].reason_codes, ["RELATION_DIRECTION_MISMATCH"])
 })
 
 
@@ -948,6 +979,9 @@ test("large tasks use compact 9K batches, cached bounds, and longer worker quant
   const persisted = JSON.parse(await readFile(batchesPath, "utf8"))
   assert.equal(persisted.every((batch) => batch.charCount <= 9_000 && batch.payloadBytes <= 24 * 1024), true)
   assert.equal(persisted.flatMap((batch) => batch.chunks).every((chunk) => chunk.taskPayloadVersion === 3), true)
+  const tableChunks = persisted.flatMap((batch) => batch.chunks).filter((chunk) => chunk.blockKinds?.includes("table"))
+  assert.equal(tableChunks.length > 1, true)
+  assert.equal(tableChunks.every((chunk) => chunk.text.includes("| Customer | Account | Product |\n| --- | --- | --- |")), true)
   assert.equal(persisted.flatMap((batch) => batch.chunks).flatMap((chunk) => chunk.structuredData ?? [])
     .every((table) => table.compacted === true && table.markdown === undefined && table.rows === undefined), true)
 

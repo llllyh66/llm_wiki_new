@@ -22,22 +22,27 @@
   Select their indexes without reading the original source file; never
   reconstruct or normalize locator fields yourself.
 - Judge candidate content by evidence support, not wording identity. Preserve
-  useful semantic normalization and entity canonicalization. Low surface-word
-  overlap is a review warning; zero meaningful overlap, unsupported strong
-  anchors, and changed polarity remain hard errors.
+  useful semantic normalization and entity canonicalization. Surface-word
+  overlap, including zero normalized-term overlap, is a review warning rather
+  than a lexical hard gate. Unsupported strong anchors and changed polarity
+  remain hard errors.
+- Citing a table-row evidence index automatically resolves both the exact row
+  and exact header SourceRefs, so keep supported column labels even when the
+  row cells contain only values.
 - A title-only quote does not support detailed facts from a table. Claims,
   relations, contradictions, and review items must cite quotes containing their
   identifying terms. Split table evidence by row or coherent topic. High reuse
   of one SourceRef is reported as a warning; every candidate is still validated
   independently against that evidence.
 - Create a relation only when the selected evidence supports its endpoints,
-  direction, and predicate. A risk, failure consequence, or counterfactual does
-  not by itself establish a dependency. Preserve the supported consequence as
-  a Claim and put only the uncertain stronger interpretation in
+  direction, and predicate. Lexically absent normalized endpoint or predicate
+  wording is a review warning. A risk, failure consequence, or counterfactual
+  does not by itself establish a dependency. Preserve the supported consequence
+  as a Claim and put only the uncertain stronger interpretation in
   `unresolvedQuestions`. Core safely downgrades a source-facing Relation with
   unsupported structure to a Claim instead of deleting it.
-- Use `supportType=direct` for source wording and `supportType=normalized` only
-  for deterministic identifier, inflection, or declared predicate
+- Use `supportType=direct` for source wording and `supportType=normalized` for
+  evidence-supported semantic, entity, identifier, inflection, or predicate
   normalization. Put source-grounded concerns in `reviewItems` and unsupported
   inference in `unresolvedQuestions`.
 - Use conservative confidence values between 0 and 1.

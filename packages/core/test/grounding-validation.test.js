@@ -63,8 +63,8 @@ test("grounding v2 accepts deterministic predicate and identifier normalization"
   )))
 })
 
-test("grounding v2 does not let matching endpoints hide an unsupported predicate", () => {
-  const error = groundingError(() => validateGroundingQuality(analysisWithRelation(
+test("grounding v2 warns when a normalized predicate is not lexically visible", () => {
+  const result = validateGroundingQuality(analysisWithRelation(
     "The MarketingManager manages MarketingCampaigns.",
     {
       localId: "manager-responsible-for-campaign",
@@ -74,10 +74,11 @@ test("grounding v2 does not let matching endpoints hide an unsupported predicate
       content: "The MarketingManager manages MarketingCampaigns.",
       supportType: "normalized",
     },
-  )))
+  ))
 
-  assert.equal(error.details.grounding_diagnostics[0].reason_code, "UNSUPPORTED_RELATION_PREDICATE")
-  assert.equal(error.details.grounding_diagnostics[0].field, "predicate")
+  assert.equal(result.warning_count, 1)
+  assert.equal(result.warnings[0].reason_code, "UNVERIFIED_RELATION_PREDICATE")
+  assert.equal(result.warnings[0].field, "predicate")
 })
 
 test("grounding v2 warns on low lexical overlap without rejecting semantic normalization", () => {
@@ -95,15 +96,16 @@ test("grounding v2 warns on low lexical overlap without rejecting semantic norma
   assert.ok(result.warnings[0].unsupported_terms.includes("plan"))
 })
 
-test("grounding v2 rejects candidates with no meaningful evidence term support", () => {
-  const error = groundingError(() => validateGroundingQuality({
+test("grounding v2 warns when normalized content has no surface term overlap", () => {
+  const result = validateGroundingQuality({
     claims: [{
       content: "Orbital gardens improve lunar harvests.",
       sourceRefs: [sourceRef("Customer accounts require approval.")],
     }],
-  }))
+  })
 
-  assert.equal(error.details.grounding_diagnostics[0].reason_code, "NO_EVIDENCE_TERM_SUPPORT")
+  assert.equal(result.warning_count, 1)
+  assert.equal(result.warnings[0].reason_code, "NO_EVIDENCE_TERM_SUPPORT")
 })
 
 test("grounding v2 returns all deterministic diagnostics for one candidate", () => {
@@ -117,21 +119,22 @@ test("grounding v2 returns all deterministic diagnostics for one candidate", () 
     },
   )))
   const codes = error.details.grounding_diagnostics.map((diagnostic) => diagnostic.reason_code)
+  const warningCodes = error.details.grounding_warnings.map((diagnostic) => diagnostic.reason_code)
 
   assert.ok(codes.includes("UNSUPPORTED_STRONG_ANCHOR"))
   assert.ok(codes.includes("POLARITY_MISMATCH"))
-  assert.equal(codes.filter((code) => code === "UNSUPPORTED_RELATION_ENDPOINT").length, 2)
-  assert.ok(codes.includes("UNSUPPORTED_RELATION_PREDICATE"))
+  assert.equal(warningCodes.filter((code) => code === "UNVERIFIED_RELATION_ENDPOINT").length, 2)
+  assert.ok(warningCodes.includes("UNVERIFIED_RELATION_PREDICATE"))
 })
 
-test("unsupported source-facing relation structure is downgraded to a claim", () => {
+test("a directionally invalid source-facing relation is downgraded to a claim", () => {
   const analysis = analysisWithRelation(
     "The MarketingManager manages MarketingCampaigns.",
     {
       localId: "manager-responsible-for-campaign",
-      sourceEntityLocalId: "marketing-manager",
-      predicate: "responsibleFor",
-      targetEntityLocalId: "marketing-campaign",
+      sourceEntityLocalId: "marketing-campaign",
+      predicate: "manages",
+      targetEntityLocalId: "marketing-manager",
       content: "The MarketingManager manages MarketingCampaigns.",
       supportType: "normalized",
     },
@@ -144,7 +147,16 @@ test("unsupported source-facing relation structure is downgraded to a claim", ()
   assert.equal(result.analysis.claims[0].content, "The MarketingManager manages MarketingCampaigns.")
   assert.equal(result.analysis.claims[0].supportType, "direct")
   assert.equal(result.analysis.claims[0].predicate, undefined)
-  assert.deepEqual(result.entries[0].reason_codes, ["UNSUPPORTED_RELATION_PREDICATE"])
+  assert.deepEqual(result.entries[0].reason_codes, ["RELATION_DIRECTION_MISMATCH"])
+})
+
+test("composite numeric anchors are supported by the same values in table cells", () => {
+  assert.doesNotThrow(() => validateGroundingQuality({
+    claims: [{
+      content: "参数值为 50/50，容量值为 500/500。",
+      sourceRefs: [sourceRef("| 参数值 | 容量值 |\n| 50 | 500 |\n| 50 | 500 |")],
+    }],
+  }))
 })
 
 test("an unsupported risk relation is downgraded to the supported consequence claim", () => {

@@ -317,7 +317,7 @@ test("commit_analysis validation failures are recoverable business results, not 
 test("grounding diagnostics survive MCP serialization and keep the worker in place", async () => {
   const diagnostic = {
     path: "relations[0]",
-    reason_code: "UNSUPPORTED_RELATION_PREDICATE",
+    reason_code: "RELATION_PREDICATE_CONTRADICTS_EVIDENCE",
     field: "predicate",
     predicate: "responsibleFor",
   }
@@ -346,6 +346,8 @@ test("grounding diagnostics survive MCP serialization and keep the worker in pla
   assert.equal(response.structuredContent.worker_restart.preserve_non_failing_candidates, true)
   assert.equal(response.structuredContent.grounding_repair.candidate_wording_policy, "evidence-supported-semantic-normalization-not-verbatim-identity")
   assert.equal(response.structuredContent.grounding_repair.low_lexical_overlap_is_warning, true)
+  assert.equal(response.structuredContent.grounding_repair.zero_meaningful_term_overlap_is_warning, true)
+  assert.equal(response.structuredContent.grounding_repair.normalized_relation_endpoint_and_predicate_lexical_misses_are_warnings, true)
   assert.equal(response.structuredContent.grounding_repair.all_candidate_diagnostics_returned_together, true)
   assert.equal(response.structuredContent.grounding_repair.safe_source_facing_relation_auto_downgraded_to_claim, true)
   assert.equal(response.structuredContent.grounding_repair.repair_scope, "reported-diagnostic-paths-and-fields-only")

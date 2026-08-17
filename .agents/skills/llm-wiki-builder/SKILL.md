@@ -141,15 +141,21 @@ Never submit after `LEASE_FENCED`. Reacquire work and discard the superseded res
 
 - Every entity, concept, claim, relation, contradiction, and review item needs grounded `sourceRefs`.
 - Judge candidates by evidence support, not wording identity. Preserve useful
-  semantic normalization and entity canonicalization. Low surface-word overlap
-  is a review warning; zero meaningful overlap, unsupported strong anchors, or
-  changed polarity remain hard errors.
+  semantic normalization and entity canonicalization. Surface-word overlap,
+  including zero normalized-term overlap, is a review warning rather than a
+  lexical hard gate. Unsupported strong anchors and changed polarity remain
+  hard errors.
+- For a table-row `evidence_index`, Core automatically includes its exact table
+  header SourceRef. Cite the row index once; do not remove a supported column
+  label merely because it is not repeated in the row cells.
 - Put source-grounded concerns in `reviewItems`. Put unsupported uncertainty or
   inference in `unresolvedQuestions`; do not invent evidence.
 - Create a relation only when the evidence supports its endpoints, direction,
-  and predicate. A risk, failure consequence, or counterfactual does not by
-  itself establish `dependsOn`: preserve the supported consequence as a Claim
-  and put only the uncertain stronger interpretation in `unresolvedQuestions`.
+  and predicate. Lexically absent normalized endpoint or predicate wording is a
+  review warning, not a reason to transcribe the source. A risk, failure
+  consequence, or counterfactual does not by itself establish `dependsOn`:
+  preserve the supported consequence as a Claim and put only the uncertain
+  stronger interpretation in `unresolvedQuestions`.
   Core safely downgrades a source-facing Relation with unsupported structure to
   a Claim instead of deleting it. Use `supportType=normalized` for supported
   semantic normalization.

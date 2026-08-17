@@ -323,7 +323,9 @@ function boundTaskChunks(chunks, maxChars, maxPayloadBytes = MAX_TASK_CHUNK_PAYL
     if (text.length <= maxChars
       && payloadBytes <= maxPayloadBytes
       && nestedStringChars <= MAX_AGENT_NESTED_STRING_CHARS) return [compactedChunk]
-    const pieces = splitChunkText(text, maxChars)
+    const pieces = Array.isArray(compactedChunk?.blockKinds) && compactedChunk.blockKinds.includes("table")
+      ? splitTaskTableText(text, maxChars)
+      : splitChunkText(text, maxChars)
     return pieces.map((piece, index) => {
       const { structuredData: _structuredData, ...base } = compactedChunk
       const pieceText = piece.text
@@ -433,6 +435,44 @@ function splitChunkText(text, maxChars) {
   while (end > start && /\s/u.test(text[end - 1])) end -= 1
   if (start < end || pieces.length === 0) pieces.push({ text: text.slice(start, end), start, end })
   return pieces
+}
+
+function splitTaskTableText(text, maxChars) {
+  const lines = []
+  let cursor = 0
+  for (const line of text.split("\n")) {
+    lines.push({ text: line, start: cursor, end: cursor + line.length })
+    cursor += line.length + 1
+  }
+  if (lines.length < 3 || !/^\s*\|/u.test(lines[0].text) || !isTaskTableDelimiter(lines[1].text)) {
+    return splitChunkText(text, maxChars)
+  }
+  const prefix = `${lines[0].text}\n${lines[1].text}`
+  if (prefix.length + 2 >= maxChars) return splitChunkText(text, maxChars)
+  const pieces = []
+  let rows = []
+  const emit = () => {
+    if (rows.length === 0) return
+    pieces.push({
+      text: `${prefix}\n${rows.map((row) => row.text).join("\n")}`,
+      start: rows[0].start,
+      end: rows.at(-1).end,
+    })
+    rows = []
+  }
+  for (const row of lines.slice(2)) {
+    const currentRowsLength = rows.reduce((sum, item) => sum + item.text.length + 1, 0)
+    if (rows.length > 0 && prefix.length + 1 + currentRowsLength + row.text.length > maxChars) emit()
+    if (prefix.length + 1 + row.text.length > maxChars) return splitChunkText(text, maxChars)
+    rows.push(row)
+  }
+  emit()
+  return pieces.length > 0 ? pieces : splitChunkText(text, maxChars)
+}
+
+function isTaskTableDelimiter(value) {
+  const cells = value.trim().slice(1, -1).split("|").map((cell) => cell.trim())
+  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/u.test(cell))
 }
 
 export async function loadTask(workspacePaths, taskId) {

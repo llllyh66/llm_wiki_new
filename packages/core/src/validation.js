@@ -11,9 +11,8 @@ const MAX_SOURCE_REF_REUSE = 8
 const MAX_ANALYSIS_CLAIMS = 1_000
 const GROUNDING_QUALITY_COLLECTIONS = new Set(["claims", "relations", "contradictions", "reviewItems"])
 const RELATION_STRUCTURE_DIAGNOSTIC_CODES = new Set([
-  "UNSUPPORTED_RELATION_ENDPOINT",
   "RELATION_DIRECTION_MISMATCH",
-  "UNSUPPORTED_RELATION_PREDICATE",
+  "RELATION_PREDICATE_CONTRADICTS_EVIDENCE",
 ])
 const RELATION_STRUCTURE_FIELDS = new Set([
   "sourceEntityLocalId", "targetEntityLocalId", "predicate", "relationType", "relation_type",
@@ -152,13 +151,14 @@ function normalizeBatchEvidenceEnvelope(analysis, evidenceCatalog) {
     return ref
   }
   const resolveEvidenceIndex = (ref, field) => {
-    if (typeof ref !== "number") return isSourceRefObject(ref) ? addUsed(ref) : ref
+    if (typeof ref !== "number") return [isSourceRefObject(ref) ? addUsed(ref) : ref]
     if (!Number.isInteger(ref) || ref < 0 || ref >= available.length) {
       errors.push(`${field} evidence index ${ref} is out of range for evidence_catalog length ${available.length}`)
-      return ref
+      return [ref]
     }
     resolvedSourceRefIndexes += 1
-    return addUsed(available[ref])
+    const selected = Array.isArray(available[ref]) ? available[ref] : [available[ref]]
+    return selected.map((item) => isSourceRefObject(item) ? addUsed(item) : item)
   }
   if (!Array.isArray(analysis.sourceRefs)) {
     errors.push("sourceRefs must be the numeric catalog copied from analysis_scaffold")
@@ -180,7 +180,7 @@ function normalizeBatchEvidenceEnvelope(analysis, evidenceCatalog) {
       if (!item || typeof item !== "object" || Array.isArray(item) || !Array.isArray(item.sourceRefs)) return item
       return {
         ...item,
-        sourceRefs: item.sourceRefs.map((ref, refIndex) => resolveEvidenceIndex(
+        sourceRefs: item.sourceRefs.flatMap((ref, refIndex) => resolveEvidenceIndex(
           ref,
           `${collection}[${itemIndex}].sourceRefs[${refIndex}]`,
         )),
@@ -188,8 +188,7 @@ function normalizeBatchEvidenceEnvelope(analysis, evidenceCatalog) {
     })
   }
   if (used.length === 0 && Array.isArray(analysis.sourceRefs) && analysis.sourceRefs.length > 0) {
-    const fallback = resolveEvidenceIndex(analysis.sourceRefs[0], "sourceRefs[0]")
-    if (isSourceRefObject(fallback)) addUsed(fallback)
+    resolveEvidenceIndex(analysis.sourceRefs[0], "sourceRefs[0]")
   }
   normalized.sourceRefs = used
   if (errors.length > 0) {
@@ -428,7 +427,7 @@ function candidateGroundingDiagnostics(collection, path, item, evidenceText, can
   const assertion = candidateAssertionText(item)
   if (!assertion) return diagnostics
 
-  const unsupportedAnchors = groundingAnchors(assertion).filter((anchor) => !groundingAnchors(evidenceText).includes(anchor))
+  const unsupportedAnchors = groundingAnchors(assertion).filter((anchor) => !groundingAnchorSupported(anchor, evidenceText))
   if (unsupportedAnchors.length > 0) {
     diagnostics.push(groundingDiagnostic(
       path,
@@ -449,22 +448,23 @@ function candidateGroundingDiagnostics(collection, path, item, evidenceText, can
   }
 
   if (collection === "relations") {
-    diagnostics.push(...relationEndpointDiagnostics(path, item, evidenceText, candidateNames))
+    warnings.push(...relationEndpointWarnings(path, item, evidenceText, candidateNames))
     const directionDiagnostic = relationDirectionDiagnostic(path, item, assertion, candidateNames)
     if (directionDiagnostic) diagnostics.push(directionDiagnostic)
     const predicateDiagnostic = relationPredicateDiagnostic(path, item, evidenceText)
-    if (predicateDiagnostic) diagnostics.push(predicateDiagnostic)
+    if (predicateDiagnostic?.hard) diagnostics.push(predicateDiagnostic.diagnostic)
+    else if (predicateDiagnostic) warnings.push(predicateDiagnostic.diagnostic)
   }
 
   const support = groundingTextSupport(assertion, evidenceText)
   if (!support.supported) {
     const field = typeof item.content === "string" ? "content" : typeof item.text === "string" ? "text" : "candidate"
     if (support.matchedTerms.length === 0) {
-      diagnostics.push(groundingDiagnostic(
+      warnings.push(groundingDiagnostic(
         path,
         "NO_EVIDENCE_TERM_SUPPORT",
         field,
-        `${path} shares no meaningful term with its selected evidence`,
+        `${path} shares no normalized surface term with its selected evidence; review semantic support without transcribing the source`,
         { matched_terms: support.matchedTerms, unsupported_terms: support.unsupportedTerms },
       ))
     } else {
@@ -480,24 +480,24 @@ function candidateGroundingDiagnostics(collection, path, item, evidenceText, can
   return diagnostics
 }
 
-function relationEndpointDiagnostics(path, item, evidenceText, candidateNames) {
-  const diagnostics = []
+function relationEndpointWarnings(path, item, evidenceText, candidateNames) {
+  const warnings = []
   const endpoints = relationEndpoints(item, candidateNames)
   for (const endpoint of endpoints) {
     // Stable local IDs may intentionally point to a candidate from another
     // batch. Validate the endpoint surface when it is available here and let
     // page planning perform cross-batch ID resolution later.
     if (endpoint.value && !groundingPhraseSupported(endpoint.value, evidenceText)) {
-      diagnostics.push(groundingDiagnostic(
+      warnings.push(groundingDiagnostic(
         path,
-        "UNSUPPORTED_RELATION_ENDPOINT",
+        "UNVERIFIED_RELATION_ENDPOINT",
         endpoint.field,
-        `${path} ${endpoint.role} endpoint is not supported by its selected evidence`,
+        `${path} ${endpoint.role} endpoint is not lexically visible in its selected evidence; retain supported entity normalization but review the mapping`,
         { endpoint_role: endpoint.role, endpoint: endpoint.value },
       ))
     }
   }
-  return diagnostics
+  return warnings
 }
 
 function relationEndpoints(item, candidateNames) {
@@ -543,13 +543,35 @@ function relationPredicateDiagnostic(path, item, evidenceText) {
   const predicate = firstString(item.predicate, item.relationType, item.relation_type)
   if (!predicate) return null
   if (groundingPredicateSupported(predicate, evidenceText)) return null
-  return groundingDiagnostic(
-    path,
-    "UNSUPPORTED_RELATION_PREDICATE",
-    "predicate",
-    `${path} relation predicate ${JSON.stringify(predicate)} is not directly supported by its SourceRef quote`,
-    { predicate },
-  )
+  if (relationPredicateContradictsEvidence(predicate, evidenceText)) {
+    return {
+      hard: true,
+      diagnostic: groundingDiagnostic(
+        path,
+        "RELATION_PREDICATE_CONTRADICTS_EVIDENCE",
+        "predicate",
+        `${path} relation predicate ${JSON.stringify(predicate)} turns a risk, failure consequence, or conditional statement into an established dependency`,
+        { predicate },
+      ),
+    }
+  }
+  return {
+    hard: false,
+    diagnostic: groundingDiagnostic(
+      path,
+      "UNVERIFIED_RELATION_PREDICATE",
+      "predicate",
+      `${path} relation predicate ${JSON.stringify(predicate)} is not lexically visible in its selected evidence; retain supported semantic normalization but review the mapping`,
+      { predicate },
+    ),
+  }
+}
+
+function relationPredicateContradictsEvidence(predicate, evidenceText) {
+  if (normalizePredicateKey(predicate) !== "dependson") return false
+  const normalized = normalizeGroundingText(evidenceText)
+  return /\b(?:risk|failure|fails?|failed|could|might|conditional|counterfactual)\b/u.test(normalized)
+    || /风险|失败|故障|可能|若|如果|一旦|否则/u.test(normalized)
 }
 
 function groundingPredicateSupported(predicate, evidenceText) {
@@ -690,13 +712,32 @@ function normalizePredicateKey(value) {
 }
 
 function groundingAnchors(value) {
+  return [...new Set(groundingAnchorTokens(value))]
+}
+
+function groundingAnchorTokens(value) {
   const anchors = []
   const normalized = String(value ?? "").normalize("NFKC").toLowerCase()
   for (const match of normalized.matchAll(/[\p{L}\p{N}]+(?:[._:/%-][\p{L}\p{N}%]+)*/gu)) {
     const token = match[0]
     if (/\d/u.test(token) || STRONG_ANCHOR_UNITS.has(token)) anchors.push(token)
   }
-  return [...new Set(anchors)]
+  return anchors
+}
+
+function groundingAnchorSupported(anchor, evidenceText) {
+  const evidenceAnchors = groundingAnchorTokens(evidenceText)
+  if (evidenceAnchors.includes(anchor)) return true
+  const requestedParts = anchor.split(/[._:/%-]+/u).filter(Boolean)
+  if (requestedParts.length < 2 || requestedParts.some((part) => !/\d/u.test(part))) return false
+  const availableCounts = new Map()
+  for (const evidenceAnchor of evidenceAnchors) {
+    const parts = evidenceAnchor.split(/[._:/%-]+/u).filter(Boolean)
+    for (const part of parts) availableCounts.set(part, (availableCounts.get(part) ?? 0) + 1)
+  }
+  const requestedCounts = new Map()
+  for (const part of requestedParts) requestedCounts.set(part, (requestedCounts.get(part) ?? 0) + 1)
+  return [...requestedCounts].every(([part, count]) => (availableCounts.get(part) ?? 0) >= count)
 }
 
 function hasGroundingNegation(value) {

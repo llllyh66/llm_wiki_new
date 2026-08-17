@@ -885,11 +885,11 @@ export class LlmWikiCore {
         schema_version_type: "number",
         source_ref_templates: "Use the prefilled batch-evidence indexes; do not generate complete SourceRef objects or reconstruct sheetName and cellRange on the current hot path.",
         nested_source_refs: "In batch-evidence-index mode, use evidence_catalog.evidence_index values directly in candidate sourceRefs and leave the scaffold catalog unchanged.",
-        evidence: "Do not retype quotes or read the source file. The server generated every evidence_catalog quote as an exact contiguous batch substring.",
+        evidence: "Do not retype quotes or read the source file. The server generated every evidence_catalog quote as an exact contiguous batch substring. Citing a table-row evidence_index automatically grounds against both the row and its exact table-header SourceRef.",
         relation_grounding: "Create a relation only when the selected evidence supports its endpoints, direction, and predicate. Put normalized structure in sourceEntityLocalId, predicate, and targetEntityLocalId. A risk, failure consequence, or counterfactual does not by itself establish a dependency; preserve the supported consequence as a claim and put only the uncertain stronger interpretation in unresolvedQuestions.",
         source_language: "Keep every extracted name, title, statement, summary, and question in the language used by its directly supporting source evidence. Do not translate source-authored knowledge into the workspace target language; target_language is only a fallback for language-neutral or genuinely undetermined metadata. Preserve proper names and source terminology verbatim.",
-        support_type: "Use supportType=direct for source wording and supportType=normalized only for deterministic identifier, inflection, or declared predicate normalization. Put source-grounded concerns in reviewItems and unsupported inference in unresolvedQuestions, never in grounded facts.",
-        grounding_quality: "Judge candidates by evidence support, not wording identity. Preserve useful semantic normalization and entity canonicalization. Low surface-word overlap is a review warning; zero meaningful evidence overlap, unsupported identifiers/numbers/dates/units, polarity changes, and unsupported relation structure are hard errors.",
+        support_type: "Use supportType=direct for source wording and supportType=normalized for evidence-supported semantic, entity, identifier, inflection, or predicate normalization. Put source-grounded concerns in reviewItems and unsupported inference in unresolvedQuestions, never in grounded facts.",
+        grounding_quality: "Judge candidates by evidence support, not wording identity. Preserve useful semantic normalization and entity canonicalization. Surface-word overlap, including zero normalized term overlap, and normalized relation endpoint/predicate wording are review warnings rather than lexical hard gates. Unsupported identifiers/numbers/dates/units, polarity changes, reversed direction, and explicit risk-to-dependency contradictions remain hard errors.",
         grounding_repair: "On INVALID_ANALYSIS, inspect the complete diagnostic set returned for each candidate, edit only the reported paths and fields, preserve every non-failing candidate and evidence index, keep the same worker and lease, and retry the changed payload with a new idempotency key. Do not replace supported normalization with source-sentence transcription.",
         review_items: "Use {content, sourceRefs} objects only when a batch quote directly supports the concern; otherwise use a plain unresolvedQuestions string.",
         unresolved_questions: "Use plain strings only. Common legacy {question|reason|content|message|text} objects are normalized, but current workers must emit strings.",
@@ -921,7 +921,8 @@ export class LlmWikiCore {
         mode: "batch-evidence-index",
         zero_based: true,
         exact_quotes_server_generated: true,
-        instruction: "Copy analysis_scaffold unchanged. Cite evidence_catalog entries by evidence_index in each candidate.sourceRefs; never retype quote text or read the original file.",
+        table_context_auto_resolved: true,
+        instruction: "Copy analysis_scaffold unchanged. Cite evidence_catalog entries by evidence_index in each candidate.sourceRefs; never retype quote text or read the original file. Table-header context is resolved automatically from the same row index.",
       },
       completed: false,
     }
@@ -1069,7 +1070,10 @@ export class LlmWikiCore {
       })
     }
     const agentChunks = batch.chunks.map(agentChunkWithSourceRefTemplates)
-    const evidenceCatalog = batchEvidenceCatalog(agentChunks).map((entry) => entry.sourceRef)
+    const evidenceCatalog = batchEvidenceCatalog(agentChunks).map((entry) => [
+      entry.sourceRef,
+      ...entry.contextSourceRefs,
+    ])
     const normalized = normalizeAnalysisEnvelope(input?.analysis, { evidenceCatalog })
     const relationDowngrade = downgradeUnsupportedRelationsToClaims(normalized.analysis)
     const chunkIndex = this.#taskChunkIndex(record)

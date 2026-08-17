@@ -78,7 +78,7 @@ export const analysisSchema = Object.freeze({
         title: { type: "string" },
         text: { type: "string" },
         content: { type: "string" },
-        supportType: { enum: ["direct", "normalized", "inferred"], description: "direct preserves a source-supported statement; normalized uses deterministic lexical or predicate normalization; inferred items must be moved to reviewItems or unresolvedQuestions before commit." },
+        supportType: { enum: ["direct", "normalized", "inferred"], description: "direct preserves source wording; normalized preserves an evidence-supported semantic, entity, identifier, inflection, or predicate normalization; unsupported inferred items must be moved to unresolvedQuestions before commit." },
         confidence: { type: "number", minimum: 0, maximum: 1 },
         sourceEntityLocalId: { type: "string", description: "localId of the source entity in a relation." },
         predicate: { type: "string", description: "Canonical relation predicate. Core validates it independently so endpoint overlap cannot hide an unsupported predicate." },

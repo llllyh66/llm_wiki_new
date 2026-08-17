@@ -29,8 +29,10 @@ path and field. Preserve all non-failing candidates and evidence indexes, keep
 the same worker and lease, and use a new idempotency key for the changed retry.
 Judge candidates by evidence support, not wording identity. Preserve semantic
 normalization and entity canonicalization; low surface-word overlap is a review
-warning. Keep source-grounded concerns in `reviewItems` and unsupported
-inference in `unresolvedQuestions`. Create a Relation only when evidence
+warning, including zero normalized-term overlap. A table-row evidence index
+automatically includes its exact header SourceRef; keep supported column labels.
+Keep source-grounded concerns in `reviewItems` and unsupported inference in
+`unresolvedQuestions`. Create a Relation only when evidence
 supports its endpoints, direction, and predicate; express a supported risk or
 failure consequence as a Claim rather than inventing a dependency. Inspect all
 diagnostics returned for the candidate and do not rebuild the entire analysis.

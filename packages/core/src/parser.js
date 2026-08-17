@@ -633,7 +633,9 @@ function chunkDocument(document, options) {
     const text = block.text || block.markdown || ""
     if (pending.length > 0 && pending.join("\n\n").length + text.length + 2 > maxChars) emit()
     if (text.length > maxChars) {
-      const pieces = splitTextWithOffsets(text, maxChars)
+      const pieces = block.kind === "table"
+        ? splitTableWithOffsets(block, maxChars)
+        : splitTextWithOffsets(text, maxChars)
       for (const piece of pieces) {
         pending = [piece.text]
         pendingKinds = [block.kind]
@@ -652,6 +654,48 @@ function chunkDocument(document, options) {
   }
   emit()
   return chunks
+}
+
+function splitTableWithOffsets(block, maxChars) {
+  const text = block.text || block.markdown || ""
+  const lines = []
+  let cursor = 0
+  for (const line of text.split("\n")) {
+    lines.push({ text: line, start: cursor, end: cursor + line.length })
+    cursor += line.length + 1
+  }
+  if (lines.length < 3 || !isMarkdownTableDelimiter(lines[1].text)) {
+    return splitTextWithOffsets(text, maxChars)
+  }
+  const prefix = `${lines[0].text}\n${lines[1].text}`
+  if (prefix.length + 2 >= maxChars) return splitTextWithOffsets(text, maxChars)
+  const pieces = []
+  let rows = []
+  const emit = () => {
+    if (rows.length === 0) return
+    pieces.push({
+      text: `${prefix}\n${rows.map((row) => row.text).join("\n")}`,
+      relativeStart: rows[0].start,
+      relativeEnd: rows.at(-1).end,
+    })
+    rows = []
+  }
+  for (const row of lines.slice(2)) {
+    const nextLength = prefix.length + 1 + rows.reduce((sum, item) => sum + item.text.length + 1, 0) + row.text.length
+    if (rows.length > 0 && nextLength > maxChars) emit()
+    if (prefix.length + 1 + row.text.length > maxChars) {
+      emit()
+      return splitTextWithOffsets(text, maxChars)
+    }
+    rows.push(row)
+  }
+  emit()
+  return pieces.length > 0 ? pieces : splitTextWithOffsets(text, maxChars)
+}
+
+function isMarkdownTableDelimiter(value) {
+  const cells = value.trim().slice(1, -1).split("|").map((cell) => cell.trim())
+  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/u.test(cell))
 }
 
 function tableFragment(block, markdown) {
