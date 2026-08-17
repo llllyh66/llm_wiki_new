@@ -13,7 +13,7 @@ const MAX_MCP_IN_FLIGHT = 8
 const MAX_TASK_IN_FLIGHT = 4
 const BUSY_RETRY_AFTER_MS = 1_500
 const MCP_SIGNAL = Symbol.for("llm-wiki.mcp.signal")
-const RECOVERABLE_ANALYSIS_CODES = new Set(["INVALID_ANALYSIS", "INVALID_DOMAIN_ANALYSIS", "INVALID_SOURCE_REF", "ANALYSIS_TOO_LARGE"])
+const RECOVERABLE_ANALYSIS_CODES = new Set(["INVALID_ANALYSIS", "INVALID_DOMAIN_ANALYSIS", "INVALID_SOURCE_REF", "ANALYSIS_TOO_LARGE", "FORCE_COMMIT_NOT_AVAILABLE", "FORCE_COMMIT_REWRITE_REQUIRED"])
 const ATOMIC_PAGE_REJECTION_CODES = new Set([
   "INVALID_PAGE_PATCH",
   "INVALID_WIKI_UPDATE",
@@ -138,6 +138,10 @@ function errorResult(error, context = {}) {
     ...(Array.isArray(normalized.details?.validation_errors)
       ? { validation_errors: normalized.details.validation_errors }
       : analysisRetry ? { validation_errors: [normalized.message] } : {}),
+    ...(analysisRetry && normalized.details?.force_commit_available_after_rewrite === true ? {
+      force_commit_available_after_rewrite: true,
+      force_commit_policy: normalized.details.force_commit_policy,
+    } : {}),
     ...(analysisRetry ? {
       worker_restart: {
         required: true,

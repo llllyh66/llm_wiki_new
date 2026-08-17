@@ -14,6 +14,10 @@
 - Validate the fully prepared page against workspace size limits before an
   atomic commit, preserving unseen content without duplicate H1 or section
   growth.
+- Add an audited `force_commit` escape hatch for rewritten analyses after a
+  `source-ref-grounding-v1` rejection. Only that semantic gate can be bypassed;
+  shape, Domain Schema, SourceRef, size, lease, and task-state checks remain
+  mandatory.
 
 ## [1.0.7] - 2026-08-12
 

@@ -40,6 +40,10 @@ const commitAnalysisInputSchema = closedObject({
     ...commitAnalysisContract.shape,
     description: "Copy get_batch.analysis_scaffold first, then fill semantic arrays. Keep numeric confidence values, sourceRefMode, the numeric top-level evidence catalog, and candidate evidence_index sourceRefs.",
   },
+  force_commit: {
+    type: "boolean",
+    description: "Exceptional semantic override. Set true only for a rewritten payload after this same batch was rejected by source-ref-grounding-v1 and the model still judges the corrected knowledge to be supported. Core still enforces shape, Domain Schema, SourceRefs, lease, task state, and size limits, and records an audit entry.",
+  },
   idempotency_key: { type: "string", minLength: 8, maxLength: 200 },
 }, ["task_id", "batch_id", "analysis", "idempotency_key"])
 commitAnalysisInputSchema.$defs = commitAnalysisContract.definitions
@@ -142,7 +146,7 @@ const toolDefinitions = [
   },
   {
     name: "llm_wiki_commit_analysis",
-    description: "Submit an AnalysisEnvelope by copying get_batch.analysis_scaffold and filling its semantic arrays. The nested tool schema constrains required fields, numeric confidence values, evidence-index sourceRefs, and classification shape before the call. Core then resolves evidence, enforces progressive Schema classification, and persists the batch.",
+    description: "Submit an AnalysisEnvelope by copying get_batch.analysis_scaffold and filling its semantic arrays. Core resolves evidence and validates shape, Domain Schema, SourceRefs, and grounding. After one grounding-quality rejection, a rewritten payload may use force_commit=true when the model remains confident; only source-ref-grounding-v1 is bypassed, and the decision is audited.",
     inputSchema: commitAnalysisInputSchema,
   },
   {

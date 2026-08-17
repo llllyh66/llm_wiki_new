@@ -295,7 +295,8 @@ documented fallback; never yield after starting only the first worker.
       Entity and concept page requirements are derived automatically.
    6. Call `llm_wiki_commit_analysis` with its `worker_id` and an idempotency
       key deterministic for that exact task, batch, and payload. Core rejects invalid Schema classifications before
-      persistence; correct the payload rather than dropping candidates.
+      persistence; correct the payload rather than dropping candidates. Never
+      set `force_commit` on the initial submission.
       If the accepted result has `wiki_projection.ready: true`, stop this
       extractor immediately and return `writer_required: true`, the supplied
       `next_action`, and `worker_next_action` to the coordinator. Do not lease
@@ -332,9 +333,21 @@ documented fallback; never yield after starting only the first worker.
       The same rule applies to every tool: `ok: false` or `accepted: false`
       with `mcp_connection_usable: true` is a normal tool result. Follow its
       `next_action`; do not run `/mcp` merely because an operation was rejected.
-      Permit at most two `commit_analysis` attempts for each batch:
+      Permit two Validator-governed `commit_analysis` attempts for each batch:
       the scaffold-based initial submission and one corrected submission built
-      directly from the returned validation list. If the second is rejected,
+      directly from the returned validation list. When a rejection is
+      specifically from `source-ref-grounding-v1`, reconsider every error and
+      rewrite the payload. If, after that review, the corrected candidate is
+      still clearly supported and the disagreement reflects lexical or typed-fact
+      Validator mismatch, either submit that rewritten second attempt with
+      `force_commit: true`, or—if the corrected normal attempt is also
+      rejected—make one final force attempt with the same reviewed payload.
+      This is a deliberate model judgment, not a default retry flag: Core
+      requires a changed payload and a persisted prior grounding rejection,
+      bypasses only that grounding gate, and audits the decision. Shape,
+      Domain Schema, SourceRef, size, lease, and task-state checks remain
+      mandatory. Never use `force_commit` to preserve an invented number,
+      identifier, polarity, or unsupported fact. If the second is rejected,
       return a compact recoverable report with the exact errors instead of
       continuing a speculative retry loop.
       On a current server, an `INVALID_SOURCE_REF` normally means an invalid
@@ -363,7 +376,8 @@ documented fallback; never yield after starting only the first worker.
    exceeding the four-Agent budget. When no restart signal is available, call
    `llm_wiki_status` immediately and reconcile from persisted state. Reconcile that freed slot
    independently of every other still-running worker. A worker that has used
-   both permitted validation attempts is the exception: do not automatically
+   both Validator-governed attempts plus the optional final `force_commit` is
+   the exception: do not automatically
    relaunch the same unchanged failing lease. Preserve the lease, return the
    exact validation errors, and wait for a coordinator-directed correction
    before starting another invocation. Use the

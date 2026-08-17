@@ -107,6 +107,8 @@ export async function createTask(workspace, sources, options = {}) {
     completedBatchIds: [],
     batchLeases: {},
     batchCompletedAt: {},
+    analysisGroundingRejections: {},
+    forcedAnalysisCommits: [],
     pageProjection: {
       batchThreshold: 4,
       batchLimit: 8,

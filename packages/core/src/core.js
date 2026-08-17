@@ -808,6 +808,7 @@ export class LlmWikiCore {
       operation: "commit_analysis",
       batchId: batch.batchId,
       analysis: input?.analysis,
+      forceCommit: input?.force_commit === true,
     }
     const exactReplay = await readExactIdempotencyReplay(record.paths, input?.idempotency_key, exactIdempotencyRequest)
     if (exactReplay) return { ...exactReplay, idempotent_replay: true }
@@ -838,8 +839,110 @@ export class LlmWikiCore {
     const domainSchema = await this.#taskDomainSchema(record)
     const domainApplied = applyDomainSchema(normalized.analysis, domainSchema)
     validateSourceRefs(collectSourceRefs(domainApplied.analysis), record.task, record.batches, workspace.config.limits, chunkIndex)
-    validateGroundingQuality(domainApplied.analysis)
-    const idempotent = await withIdempotency(record.paths, input?.idempotency_key, { operation: "commit_analysis", batchId: batch.batchId, analysis: normalized.analysis }, async ({ persistResponse }) => {
+    const forceCommit = input?.force_commit === true
+    const analysisHash = sha256(stableStringify(domainApplied.analysis))
+    const groundingPayloadHash = sha256(stableStringify({
+      sourceRefs: domainApplied.analysis.sourceRefs,
+      entities: domainApplied.analysis.entities,
+      concepts: domainApplied.analysis.concepts,
+      claims: domainApplied.analysis.claims,
+      relations: domainApplied.analysis.relations,
+      contradictions: domainApplied.analysis.contradictions,
+      candidatePages: domainApplied.analysis.candidatePages,
+      reviewItems: domainApplied.analysis.reviewItems,
+    }))
+    record.task.analysisGroundingRejections = record.task.analysisGroundingRejections
+      && typeof record.task.analysisGroundingRejections === "object"
+      && !Array.isArray(record.task.analysisGroundingRejections)
+      ? record.task.analysisGroundingRejections
+      : {}
+    const priorGroundingRejection = record.task.analysisGroundingRejections[batch.batchId]
+    let forceCommitAudit = null
+    if (forceCommit) {
+      if (!priorGroundingRejection || !Number.isInteger(priorGroundingRejection.count) || priorGroundingRejection.count < 1) {
+        fail("FORCE_COMMIT_NOT_AVAILABLE", "force_commit is available only after this batch has been rejected by the grounding quality Validator.", {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: {
+            batch_id: batch.batchId,
+            force_commit_available: false,
+            required_prior_grounding_rejections: 1,
+            structural_validation_bypassed: false,
+          },
+          suggestedAction: "Submit the scaffold-based analysis normally first. Use force_commit only for a rewritten payload after a grounding-quality rejection.",
+        })
+      }
+      if (priorGroundingRejection.count < 2
+        && (priorGroundingRejection.groundingPayloadHash ?? priorGroundingRejection.analysisHash) === groundingPayloadHash) {
+        fail("FORCE_COMMIT_REWRITE_REQUIRED", "force_commit requires a rewritten analysis payload, not the unchanged payload rejected by the Validator.", {
+          retryable: true,
+          taskId: record.task.taskId,
+          details: {
+            batch_id: batch.batchId,
+            force_commit_available: true,
+            prior_grounding_rejections: priorGroundingRejection.count,
+            rewrite_required: true,
+            structural_validation_bypassed: false,
+          },
+          suggestedAction: "Reconsider every returned grounding error and rewrite the analysis. After a corrected payload has itself been rejected, that same reviewed payload may be resubmitted with force_commit=true.",
+        })
+      }
+      forceCommitAudit = {
+        batchId: batch.batchId,
+        workerId,
+        committedAt: nowIso(),
+        analysisHash,
+        groundingPayloadHash,
+        priorGroundingRejections: priorGroundingRejection.count,
+        bypassedValidator: "source-ref-grounding-v1",
+        decision: "model-asserted-after-rewrite",
+        priorValidationErrors: Array.isArray(priorGroundingRejection.validationErrors)
+          ? priorGroundingRejection.validationErrors.slice(0, 20)
+          : [],
+      }
+    } else {
+      try {
+        validateGroundingQuality(domainApplied.analysis)
+      } catch (error) {
+        const normalizedError = asLlmWikiError(error)
+        if (normalizedError.details?.quality_gate === "source-ref-grounding-v1") {
+          const previousCount = Number.isInteger(priorGroundingRejection?.count) ? priorGroundingRejection.count : 0
+          record.task.analysisGroundingRejections[batch.batchId] = {
+            count: previousCount + 1,
+            lastRejectedAt: nowIso(),
+            analysisHash,
+            groundingPayloadHash,
+            validationErrors: Array.isArray(normalizedError.details.validation_errors)
+              ? normalizedError.details.validation_errors.slice(0, 20)
+              : [],
+          }
+          await saveTask(record.paths, record.task)
+          normalizedError.retryable = true
+          normalizedError.taskId = record.task.taskId
+          normalizedError.details = {
+            ...normalizedError.details,
+            batch_id: batch.batchId,
+            grounding_rejection_count: previousCount + 1,
+            force_commit_available_after_rewrite: true,
+            force_commit_policy: {
+              parameter: "force_commit",
+              required_value: true,
+              rewrite_required: true,
+              bypassed_validator: "source-ref-grounding-v1",
+              preserved_validators: ["analysis-shape", "domain-schema", "source-refs", "task-state", "batch-lease"],
+            },
+          }
+          normalizedError.suggestedAction = "Rewrite the payload from the returned errors. If the rewritten analysis is still semantically justified, retry once with force_commit=true and a new idempotency key."
+        }
+        throw normalizedError
+      }
+    }
+    const idempotent = await withIdempotency(record.paths, input?.idempotency_key, {
+      operation: "commit_analysis",
+      batchId: batch.batchId,
+      analysis: normalized.analysis,
+      forceCommit,
+    }, async ({ persistResponse }) => {
       if (record.task.completedBatchIds.includes(batch.batchId)) fail("BATCH_ALREADY_COMPLETED", `Batch is already completed: ${batch.batchId}`)
       assertTaskStatus(record.task, ["prepared", "extracting"])
       await writeJsonAtomic(path.join(record.paths.analysis, `${batch.batchId}.json`), domainApplied.analysis)
@@ -849,6 +952,11 @@ export class LlmWikiCore {
       record.task.batchCompletedAt[batch.batchId] = nowIso()
       record.task.analysisRevision += 1
       if (record.task.batchLeases) delete record.task.batchLeases[batch.batchId]
+      delete record.task.analysisGroundingRejections[batch.batchId]
+      if (forceCommitAudit) {
+        const previousForcedCommits = Array.isArray(record.task.forcedAnalysisCommits) ? record.task.forcedAnalysisCommits : []
+        record.task.forcedAnalysisCommits = [...previousForcedCommits, forceCommitAudit].slice(-200)
+      }
       const remaining = record.task.batchCount - record.task.completedBatchIds.length
       record.task.status = remaining === 0 ? "planning" : "extracting"
       const wikiProjection = pageProjectionStatus(record.task)
@@ -865,6 +973,14 @@ export class LlmWikiCore {
         batch_completed: true,
         remaining_batches: remaining,
         validation_errors: [],
+        force_commit: forceCommit,
+        ...(forceCommitAudit ? {
+          validator_bypass: {
+            bypassed: ["source-ref-grounding-v1"],
+            preserved: ["analysis-shape", "domain-schema", "source-refs", "task-state", "batch-lease"],
+            audit: forceCommitAudit,
+          },
+        } : {}),
         normalized_source_ref_indexes: normalized.resolvedSourceRefIndexes,
         normalized_source_ref_quotes: normalizedSourceRefQuotes,
         normalized_unresolved_questions: normalized.normalizedUnresolvedQuestions,

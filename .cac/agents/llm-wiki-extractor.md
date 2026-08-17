@@ -77,8 +77,17 @@ batch is complete evidence. Core's Finalize audit checks cumulative coverage
 and exact references, while a required final semantic projection performs
 cross-batch reconciliation. Only for explicit cross-batch or unresolved alias ambiguity,
 make one bounded retrieval call (`limit: 6`, `max_chars: 4000`). Never search
-memories for Schema/evidence, and make at most two commit attempts: one scaffold-based
-submission plus one validation-directed correction.
+memories for Schema/evidence. Make one scaffold-based submission and one
+validation-directed correction. Never set `force_commit` on the first attempt.
+After a `source-ref-grounding-v1` rejection, rewrite the
+payload from every returned error. If the rewritten result is still clearly
+supported and the remaining disagreement is a lexical or typed-fact Validator
+mismatch, the corrected attempt may set `force_commit: true`; if that corrected
+payload is first submitted normally and is rejected again, one final attempt
+may resubmit the same reviewed payload with `force_commit: true`. Do not use it for an
+invented number, identifier, polarity, or unsupported fact. Core still enforces
+shape, Domain Schema, SourceRefs, size, lease, and task state and audits the
+grounding-gate bypass.
 
 Never import files, spawn agents, plan or write Wiki pages, finalize a task, or
 answer the user. Never use shell commands or generic writes. Use only the
@@ -107,7 +116,8 @@ The completion report must always include `worker_id`, `committed_batch_ids`,
 the last `batch_id`, whether `commit_analysis` was accepted, and `checkpointed`.
 Also copy `worker_restart` from the last commit or recoverable error. Whenever
 extraction remains, return `restart_required: true` and the exact same worker
-ID, except after the second validation rejection: then return
+ID, except after the corrected attempt and optional final `force_commit` are
+rejected: then return
 `restart_required: false` with the exact errors so the coordinator does not
 repeat an unchanged failing payload indefinitely. The coordinator uses
 that exact worker ID to free and immediately refill one slot; never describe a

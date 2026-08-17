@@ -137,9 +137,10 @@ test("Claude project agents inherit llm-wiki MCP without a restrictive tool allo
   assert.match(skill, /never retype a quote, read the\s+original source file/)
   assert.match(extractor, /cite `evidence_index` values directly/)
   assert.match(extractor, /including `batch_count: 1`/)
-  assert.match(skill, /at most two `commit_analysis` attempts for each batch/)
-  assert.match(skill, /both permitted validation attempts is the exception/)
-  assert.match(extractor, /second validation rejection.*`restart_required: false`/s)
+  assert.match(skill, /two Validator-governed `commit_analysis` attempts for each batch/)
+  assert.match(skill, /one final force attempt with the same reviewed payload/)
+  assert.match(skill, /both Validator-governed attempts plus the optional final `force_commit`/)
+  assert.match(extractor, /corrected attempt and optional final `force_commit` are\s+rejected.*`restart_required: false`/s)
   assert.match(skill, /leave the\s+scaffold's prefilled numeric top-level `sourceRefs` catalog unchanged/)
   assert.match(analysisRules, /"sourceRefMode": "batch-evidence-index"/)
   assert.doesNotMatch(domainSchema, /customer_management#\/businessEntities/)
@@ -270,6 +271,8 @@ test("MCP publishes the complete Agent-first tool contract without desktop tools
   assert.match(pagePlan.description, /parallel drafting.*coordinator/i)
   assert.match(pagePlan.description, /sole committer/i)
   const analysisCommit = TOOL_DEFINITIONS.find((tool) => tool.name === "llm_wiki_commit_analysis")
+  assert.equal(analysisCommit.inputSchema.properties.force_commit.type, "boolean")
+  assert.match(analysisCommit.description, /only source-ref-grounding-v1 is bypassed/i)
   const analysisInput = analysisCommit.inputSchema.properties.analysis
   assert.equal(analysisInput.additionalProperties, false)
   assert.equal(analysisInput.required.includes("schemaVersion"), true)
@@ -339,7 +342,15 @@ test("commit_analysis validation failures are recoverable business results, not 
   for (const code of ["INVALID_ANALYSIS", "INVALID_DOMAIN_ANALYSIS", "INVALID_SOURCE_REF", "ANALYSIS_TOO_LARGE"]) {
     const router = new HeadlessToolRouter({
       commitAnalysis: async () => {
-        throw new LlmWikiError(code, `Recoverable ${code}.`, { details: { validation_errors: ["fix this field"] } })
+        throw new LlmWikiError(code, `Recoverable ${code}.`, {
+          details: {
+            validation_errors: ["fix this field"],
+            ...(code === "INVALID_ANALYSIS" ? {
+              force_commit_available_after_rewrite: true,
+              force_commit_policy: { bypassed_validator: "source-ref-grounding-v1" },
+            } : {}),
+          },
+        })
       },
     })
     const response = await router.callMcp("llm_wiki_commit_analysis", {
@@ -355,6 +366,10 @@ test("commit_analysis validation failures are recoverable business results, not 
     assert.deepEqual(response.structuredContent.validation_errors, ["fix this field"])
     assert.equal(response.structuredContent.next_action.tool, "llm_wiki_commit_analysis")
     assert.equal(response.structuredContent.next_action.arguments.worker_id, "extractor-4")
+    if (code === "INVALID_ANALYSIS") {
+      assert.equal(response.structuredContent.force_commit_available_after_rewrite, true)
+      assert.equal(response.structuredContent.force_commit_policy.bypassed_validator, "source-ref-grounding-v1")
+    }
     assert.deepEqual(response.structuredContent.worker_restart, {
       required: true,
       strategy: "restart-same-worker-id-immediately",

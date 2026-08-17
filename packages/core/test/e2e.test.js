@@ -231,7 +231,7 @@ test("legacy hand-written quotes are canonicalized only after a unique safe matc
   assert.equal(plan.analysis_summary.entities[0].sourceRefs[0].quote, "客户张三的客户编号为 **C1001**，客户类别为“个人客户”。")
 })
 
-test("grounding quality gate rejects a title-only SourceRef reused for many unrelated claims", async (t) => {
+test("force_commit audits a rewritten grounding override without bypassing structural validation", async (t) => {
   const f = await fixture()
   t.after(() => rm(f.root, { recursive: true, force: true }))
   const imported = await f.core.importFiles({ files: [{ path: f.source }] })
@@ -274,10 +274,67 @@ test("grounding quality gate rejects a title-only SourceRef reused for many unre
     (error) => error instanceof LlmWikiError
       && error.code === "INVALID_ANALYSIS"
       && error.details.quality_gate === "source-ref-grounding-v1"
+      && error.details.force_commit_available_after_rewrite === true
+      && error.details.force_commit_policy.preserved_validators.includes("analysis-shape")
       && error.details.validation_errors.some((message) => message.includes("does not lexically support"))
       && error.details.validation_errors.some((message) => message.includes("reused by 12 grounded candidates")),
   )
   assert.equal((await f.core.status({ task_id: imported.task_id })).status, "prepared")
+
+  await assert.rejects(
+    () => f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      analysis,
+      force_commit: true,
+      idempotency_key: "title-only-grounding-force-unchanged",
+    }),
+    (error) => error instanceof LlmWikiError && error.code === "FORCE_COMMIT_REWRITE_REQUIRED",
+  )
+
+  const rewritten = structuredClone(analysis)
+  rewritten.claims[0].content = "After review, DNS query latency metric zero measures network response time."
+  await assert.rejects(
+    () => f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      analysis: rewritten,
+      idempotency_key: "title-only-grounding-rewritten-normal",
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "INVALID_ANALYSIS"
+      && error.details.grounding_rejection_count === 2,
+  )
+  const structurallyInvalid = structuredClone(rewritten)
+  delete structurallyInvalid.claims[0].sourceRefs
+  await assert.rejects(
+    () => f.core.commitAnalysis({
+      task_id: imported.task_id,
+      batch_id: batch.batch_id,
+      analysis: structurallyInvalid,
+      force_commit: true,
+      idempotency_key: "title-only-grounding-force-invalid-shape",
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "INVALID_ANALYSIS"
+      && error.details.validation_errors.some((message) => message.includes("sourceRefs must contain at least one complete SourceRef object")),
+  )
+
+  const forced = await f.core.commitAnalysis({
+    task_id: imported.task_id,
+    batch_id: batch.batch_id,
+    analysis: rewritten,
+    force_commit: true,
+    idempotency_key: "title-only-grounding-force-rewritten",
+  })
+  assert.equal(forced.accepted, true)
+  assert.equal(forced.force_commit, true)
+  assert.deepEqual(forced.validator_bypass.bypassed, ["source-ref-grounding-v1"])
+  assert.equal(forced.validator_bypass.audit.priorGroundingRejections, 2)
+  const persistedTask = JSON.parse(await readFile(path.join(f.workspace, ".llm-wiki", "tasks", imported.task_id, "task.json"), "utf8"))
+  assert.equal(persistedTask.forcedAnalysisCommits.length, 1)
+  assert.equal(persistedTask.forcedAnalysisCommits[0].batchId, batch.batch_id)
+  assert.equal(persistedTask.analysisGroundingRejections[batch.batch_id], undefined)
 })
 
 test("grounding accepts exact relation content from server evidence without label dilution", async (t) => {
