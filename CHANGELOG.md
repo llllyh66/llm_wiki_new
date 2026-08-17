@@ -46,7 +46,9 @@
   Public reads use only the active generation and validate artifact hashes.
 - Add host-capacity scheduling, explicit worker/writer identities, extraction
   fencing tokens and epochs, bounded lease renewal, projection fencing,
-  orphaned-draft quarantine, and exact busy-operation replay actions.
+  orphaned-draft quarantine, and exact busy-operation replay actions. The
+  coordinator now forbids Agent Team lifecycle calls and duplicate relaunches
+  after the host has confirmed independent background Agents.
 - Make semantic requirement coverage include independent claims, relations,
   contradictions, review items, and unresolved questions. Existing pages that
   fit the Drafter context use coherent full-page `replace`; truncated pages use

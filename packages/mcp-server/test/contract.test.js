@@ -101,6 +101,8 @@ test("project agents and canonical Skill expose only the current capacity-aware 
   assert.match(skill, /running_draft_shard_ids/)
   assert.match(skill, /running_writer_projection_ids/)
   assert.match(skill, /Do not say “waiting”/)
+  assert.match(skill, /Never call\s+`TeamCreate` or `TeamDelete`, and never pass `team_name`/)
+  assert.match(skill, /never relaunch them because a later\s+Team lifecycle message fails/)
   assert.match(skill, /waiting_reason/)
   assert.match(skill, /never means all Extractors must finish/)
   assert.match(skill, /never hard-code a `2 Extractors \+ 1\s+Drafter` topology/)
