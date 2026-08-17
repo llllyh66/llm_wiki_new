@@ -21,7 +21,8 @@ Use only the current manifest → draft-shard → staged receipt → single Writ
   evidence, use the predominant evidence language consistently and preserve
   proper names and source terminology in their original form.
 - Use a new idempotency key for a changed payload. Reuse the same key only for an unchanged retry.
-- Launch named workers as independent background Agents. Never call
+- By default, parallelize extraction with named independent background
+  subagents. Do not create an Agent Team. Never call
   `TeamCreate` or `TeamDelete`, and never pass `team_name`. Treat
   `Backgrounded agent` or `N background agents launched` as successful
   creation: record those live handles and never relaunch them because a later
