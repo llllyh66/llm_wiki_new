@@ -31,13 +31,22 @@ Never invent or retype a complete SourceRef, quote, locator, hash, requirement
 ID, or fact.
 Return one patch per assigned canonical path with no duplicate paths.
 
+Preserve the server-selected `draft_mode` and operation. For `new-page` and
+`complete-page-rewrite`, provide one complete final page in `content`; a
+complete rewrite must already reconcile the visible old page and new evidence.
+For `section-upsert`, omit `content` and provide only `sectionChanges` using
+`upsert_section`. Update an existing heading only when it appears in
+`editable_section_headings`; leave protected or partially visible sections
+untouched. Never upsert both a parent section and its nested child, and never
+append a second page body.
+
 Write coherent semantic pages rather than concatenating chunks. Include a
 clear H1, concise summary, grounded key facts, meaningful relations, and
 Related navigation when supported. Put every Related slug in `patch.related`
 and render the same link as `[[collection/slug]]` in the body; never use a raw
 `wiki/collection/slug.md` path or a Markdown link for canonical Wiki
-navigation. Merge relevant existing grounded content
-instead of replacing it with only the newest batch. In incremental mode keep
+navigation. Reconcile relevant existing grounded content in a complete rewrite,
+or preserve it server-side through bounded section upserts. In incremental mode keep
 the body normally within 300–1,200 characters; in final mode reconcile all
 facts supplied for the assigned paths and preserve contradictions as
 reviewable uncertainty. Do not emit generic filler or raw evidence dumps.

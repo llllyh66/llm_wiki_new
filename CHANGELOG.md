@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [1.0.8] - 2026-08-17
+
+- Replace body-concatenating Wiki merges with a typed dual-mode draft contract.
+  Fully visible existing pages use hash-guarded complete `replace` patches;
+  truncated pages use `merge` patches containing only bounded
+  `upsert_section` changes applied to the authoritative server-side page.
+- Expose editable and protected section headings in truncated Drafter context,
+  and reject edits to partially visible sections, conflicting parent/child
+  upserts, duplicate headings, Core-owned sections, and legacy merge bodies.
+- Validate the fully prepared page against workspace size limits before an
+  atomic commit, preserving unseen content without duplicate H1 or section
+  growth.
+
 ## [1.0.7] - 2026-08-12
 
 - Make Finalize the first final-reconciliation action after incremental catch-up.

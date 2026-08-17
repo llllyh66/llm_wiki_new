@@ -1153,9 +1153,19 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
       existing.sourceRefs = [...new Set([...existing.sourceRefs, requirement.requirement_id])]
       continue
     }
+    const semanticUpdate = requirement.patch_scaffold.operation === "merge"
+      ? {
+          sectionChanges: [{
+            operation: "upsert_section",
+            heading: "Reconciled Analysis",
+            level: 2,
+            content: `A reconciled cross-batch summary for ${requirement.title}.`,
+          }],
+        }
+      : { content: `# ${requirement.title}\n\n## Overview\n\nA reconciled cross-batch summary for ${requirement.title}.\n` }
     finalPatchesByPath.set(requirement.patch_scaffold.path, {
       ...requirement.patch_scaffold,
-      content: `# ${requirement.title}\n\n## Overview\n\nA reconciled cross-batch summary for ${requirement.title}.\n`,
+      ...semanticUpdate,
       summary: `A reconciled cross-batch summary for ${requirement.title}.`,
       tags: [requirement.page_kind],
     })
@@ -1175,14 +1185,14 @@ test("micro-batch Wiki projection uses one writer, hides provisional pages, and 
   const finalized = await f.core.finalize({ task_id: imported.task_id })
   assert.deepEqual(finalized.created_pages, ["wiki/topics/projected-entity.md"])
   assert.deepEqual(finalized.updated_pages, [])
-  // replace is a complete final-body rewrite. Provisional-only content must
-  // be intentionally reintroduced by the final Writer if it remains valid.
+  // The oversized existing page was truncated in Drafter context, so the
+  // final patch is a section upsert and the unseen body remains intact.
   const completed = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["reconciled cross-batch summary"] })
   assert.equal(completed.retrieval_phase, "knowledge-base-complete")
   assert.deepEqual(completed.available_channels, ["bm25", "embedding", "wiki"])
   assert.equal(completed.hits.some((hit) => hit.path === "wiki/topics/projected-entity.md"), true)
   const provisionalAfterReplace = await f.core.retrieveContext({ task_id: imported.task_id, queries: ["ProvisionalOnlyMarker"] })
-  assert.equal(provisionalAfterReplace.hits.some((hit) => hit.path === "wiki/topics/projected-entity.md"), false)
+  assert.equal(provisionalAfterReplace.hits.some((hit) => hit.path === "wiki/topics/projected-entity.md"), true)
 
   // Simulate a process exit after the generation pointer was durable but
   // before task/result completion. A fresh Core instance must repair only the
@@ -2233,6 +2243,152 @@ test("page drafters stage receipt-only shards and the Writer commits them server
   assert.equal(committed.writer_next_action, null)
   const after = await f.core.getStagedPageDrafts(staged.next_action.arguments)
   assert.deepEqual(after.missing_shard_ids, [shard.shard.shard_id])
+})
+
+test("projection replaces fully visible pages and section-upserts truncated pages without body duplication", async (t) => {
+  const f = await fixture()
+  t.after(() => rm(f.root, { recursive: true, force: true }))
+  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
+  await analyzeAll(f.core, imported)
+  const concepts = path.join(f.workspace, "wiki", "concepts")
+  await mkdir(concepts, { recursive: true })
+  await writeFile(path.join(concepts, "business-entity.md"), `# Business Entity
+
+## Details
+
+Old short-page fact.
+`)
+  await writeFile(path.join(concepts, "aggregate.md"), `# Aggregate
+
+## Legacy Details
+
+${"Preserved hidden aggregate fact. ".repeat(1_000)}
+
+## Recent Evidence
+
+Old visible tail fact.
+
+### Evidence Details
+
+Old visible nested detail.
+`)
+
+  const manifest = await f.core.getPagePlanContext({
+    task_id: imported.task_id,
+    writer_id: "dual-mode-writer",
+    view: "manifest",
+    cursor: 0,
+    max_chars: 40_000,
+  })
+  const action = manifest.draft_manifest.draft_actions[0].arguments
+  const requirements = []
+  const existingPages = []
+  let cursor = 0
+  let finalShard
+  do {
+    const shard = await f.core.getPagePlanContext({ ...action, cursor })
+    requirements.push(...shard.page_requirements)
+    existingPages.push(...shard.existing_pages)
+    cursor = shard.next_cursor
+    finalShard = shard
+  } while (cursor !== null)
+
+  const shortRequirement = requirements.find((item) => item.patch_scaffold.path === "wiki/concepts/business-entity.md")
+  const largeRequirement = requirements.find((item) => item.patch_scaffold.path === "wiki/concepts/aggregate.md")
+  assert.equal(shortRequirement.draft_mode, "complete-page-rewrite")
+  assert.equal(shortRequirement.patch_scaffold.operation, "replace")
+  assert.equal(largeRequirement.draft_mode, "section-upsert")
+  assert.equal(largeRequirement.patch_scaffold.operation, "merge")
+  assert.deepEqual(largeRequirement.patch_scaffold.sectionChanges, [])
+  const largeContext = existingPages.find((page) => page.path === "wiki/concepts/aggregate.md")
+  assert.equal(largeContext.content_truncated, true)
+  assert.equal(largeContext.editable_section_headings.includes("Recent Evidence"), true)
+  assert.equal(largeContext.protected_section_headings.includes("Legacy Details"), true)
+
+  const patches = requirements.map((requirement) => {
+    if (requirement.patch_scaffold.operation === "merge") {
+      return {
+        ...requirement.patch_scaffold,
+        sectionChanges: [{
+          operation: "upsert_section",
+          heading: "Recent Evidence",
+          level: 2,
+          content: "Reconciled visible tail fact.",
+        }],
+      }
+    }
+    return {
+      ...requirement.patch_scaffold,
+      content: `# ${requirement.title}\n\n## Details\n\nRewritten complete-page fact.\n`,
+    }
+  })
+  const unsafePatches = patches.map((patch) => patch.operation === "merge"
+    ? { ...patch, sectionChanges: [{ operation: "upsert_section", heading: "Legacy Details", level: 2, content: "Unsafe partial rewrite." }] }
+    : patch)
+  const legacyBodyPatches = patches.map((patch) => {
+    if (patch.operation !== "merge") return patch
+    const { sectionChanges, ...legacyPatch } = patch
+    return { ...legacyPatch, content: "# Aggregate\n\nA legacy concatenation body." }
+  })
+  await assert.rejects(
+    () => f.core.stagePageDrafts({
+      ...finalShard.next_action.arguments,
+      patches: legacyBodyPatches,
+      idempotency_key: "dual-mode-legacy-body-stage-v1",
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "INVALID_PAGE_PATCH"
+      && /sectionChanges/.test(error.message),
+  )
+  await assert.rejects(
+    () => f.core.stagePageDrafts({
+      ...finalShard.next_action.arguments,
+      patches: unsafePatches,
+      idempotency_key: "dual-mode-unsafe-stage-v1",
+    }),
+    (error) => error instanceof LlmWikiError && error.code === "PAGE_DRAFT_SECTION_NOT_FULLY_VISIBLE",
+  )
+
+  const overlappingPatches = patches.map((patch) => patch.operation === "merge"
+    ? {
+        ...patch,
+        sectionChanges: [
+          { operation: "upsert_section", heading: "Recent Evidence", level: 2, content: "Rewritten parent." },
+          { operation: "upsert_section", heading: "Evidence Details", level: 3, content: "Conflicting child rewrite." },
+        ],
+      }
+    : patch)
+  await assert.rejects(
+    () => f.core.stagePageDrafts({
+      ...finalShard.next_action.arguments,
+      patches: overlappingPatches,
+      idempotency_key: "dual-mode-overlapping-stage-v1",
+    }),
+    (error) => error instanceof LlmWikiError
+      && error.code === "INVALID_PAGE_PATCH"
+      && error.details.overlapping_sections[0].ancestor === "Recent Evidence",
+  )
+
+  const staged = await f.core.stagePageDrafts({
+    ...finalShard.next_action.arguments,
+    patches,
+    idempotency_key: "dual-mode-safe-stage-v1",
+  })
+  const ready = await f.core.getStagedPageDrafts(staged.next_action.arguments)
+  const committed = await f.core.commitPages({
+    ...ready.next_action.arguments,
+    idempotency_key: "dual-mode-safe-commit-v1",
+  })
+  assert.equal(committed.accepted, true)
+  const shortPage = await readFile(path.join(concepts, "business-entity.md"), "utf8")
+  const largePage = await readFile(path.join(concepts, "aggregate.md"), "utf8")
+  assert.doesNotMatch(shortPage, /Old short-page fact/)
+  assert.match(shortPage, /Rewritten complete-page fact/)
+  assert.match(largePage, /Preserved hidden aggregate fact/)
+  assert.doesNotMatch(largePage, /Old visible tail fact/)
+  assert.match(largePage, /Reconciled visible tail fact/)
+  assert.equal((largePage.match(/^# Aggregate$/gm) ?? []).length, 1)
+  assert.equal((largePage.match(/^## Recent Evidence$/gm) ?? []).length, 1)
 })
 
 test("status repairs a legacy empty-committed draft shard and resumes it", async (t) => {

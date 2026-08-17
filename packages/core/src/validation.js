@@ -17,7 +17,8 @@ const ANALYSIS_TOP_LEVEL_FIELDS = new Set([
   "claims", "relations", "contradictions", "candidatePages", "reviewItems", "batchSummary", "unresolvedQuestions",
 ])
 const ANALYSIS_ARRAY_LIMITS = Object.freeze({ sourceRefs: 500, entities: 500, concepts: 500, claims: 1_000, relations: 1_000, contradictions: 500, candidatePages: 500, reviewItems: 500, unresolvedQuestions: 200 })
-const PAGE_PATCH_FIELDS = new Set(["patchId", "path", "operation", "expectedFileHash", "title", "pageKind", "content", "summary", "domainSchemaId", "domainSchemaVersion", "domainClassifications", "tags", "related", "covers", "sourceRefs", "rationale"])
+const PAGE_PATCH_FIELDS = new Set(["patchId", "path", "operation", "expectedFileHash", "title", "pageKind", "content", "sectionChanges", "summary", "domainSchemaId", "domainSchemaVersion", "domainClassifications", "tags", "related", "covers", "sourceRefs", "rationale"])
+const CORE_OWNED_SECTION_HEADINGS = new Set(["related", "related pages", "相关页面", "关联页面", "domain classification", "领域分类", "领域类型"])
 
 export function normalizeAnalysisEnvelope(analysis, options = {}) {
   if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) {
@@ -554,10 +555,17 @@ function normalizeQuote(value) {
 export function validatePagePatchShape(patch, limits) {
   if (!patch || typeof patch !== "object" || Array.isArray(patch)) fail("INVALID_PAGE_PATCH", "Each patch must be an object.")
   for (const key of Object.keys(patch)) if (!PAGE_PATCH_FIELDS.has(key)) fail("INVALID_PAGE_PATCH", `Patch contains unsupported field: ${key}`)
-  for (const key of ["patchId", "path", "operation", "title", "pageKind", "content", "rationale"]) {
+  for (const key of ["patchId", "path", "operation", "title", "pageKind", "rationale"]) {
     if (typeof patch[key] !== "string" || !patch[key].trim()) fail("INVALID_PAGE_PATCH", `Patch ${key} is required.`)
   }
   if (!new Set(["create", "replace", "merge"]).has(patch.operation)) fail("INVALID_PAGE_PATCH", `Unsupported page operation: ${patch.operation}`)
+  if (patch.operation === "merge") {
+    if (patch.content !== undefined) fail("INVALID_PAGE_PATCH", "Merge patches use sectionChanges, not a complete content body.")
+    validateMergeSectionChanges(patch.sectionChanges, limits)
+  } else {
+    if (typeof patch.content !== "string" || !patch.content.trim()) fail("INVALID_PAGE_PATCH", `Patch content is required for ${patch.operation}.`)
+    if (patch.sectionChanges !== undefined) fail("INVALID_PAGE_PATCH", `${patch.operation} patches use complete content, not sectionChanges.`)
+  }
   if (!Array.isArray(patch.sourceRefs) || patch.sourceRefs.length === 0) fail("INVALID_PAGE_PATCH", "Every page patch requires at least one SourceRef.")
   if (patch.sourceRefs.length > 500) fail("INVALID_PAGE_PATCH", "Patch sourceRefs exceeds 500 items.")
   if (patch.patchId.length > 200) fail("INVALID_PAGE_PATCH", "Patch patchId exceeds 200 characters.")
@@ -623,8 +631,35 @@ export function validatePagePatchShape(patch, limits) {
   const normalizedKind = normalizePageKind(patch.pageKind)
   const pathKind = pageKindForPath(patch.path)
   if (!normalizedKind || !pathKind || normalizedKind !== pathKind) fail("INVALID_PAGE_PATCH", "pageKind must match the Wiki collection in path.")
-  if (patch.content.length > limits.maxPageChars) fail("INVALID_PAGE_PATCH", "Page content exceeds the workspace limit.")
+  if (typeof patch.content === "string" && patch.content.length > limits.maxPageChars) fail("INVALID_PAGE_PATCH", "Page content exceeds the workspace limit.")
   if (patch.expectedFileHash !== undefined && !/^[0-9a-f]{64}$/i.test(patch.expectedFileHash)) fail("INVALID_PAGE_PATCH", "expectedFileHash must be a SHA256 value.")
+}
+
+function validateMergeSectionChanges(value, limits) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 20) {
+    fail("INVALID_PAGE_PATCH", "Merge patch sectionChanges must contain 1 to 20 section upserts.")
+  }
+  const headings = new Set()
+  let totalChars = 0
+  for (const [index, change] of value.entries()) {
+    if (!change || typeof change !== "object" || Array.isArray(change)) fail("INVALID_PAGE_PATCH", `sectionChanges[${index}] must be an object.`)
+    for (const key of Object.keys(change)) {
+      if (!["operation", "heading", "level", "content"].includes(key)) fail("INVALID_PAGE_PATCH", `sectionChanges[${index}] contains unsupported field: ${key}`)
+    }
+    if (change.operation !== "upsert_section") fail("INVALID_PAGE_PATCH", `sectionChanges[${index}].operation must be upsert_section.`)
+    const heading = String(change.heading ?? "").normalize("NFKC").trim()
+    const normalizedHeading = heading.replace(/\s+/g, " ").toLowerCase()
+    const level = change.level === undefined ? 2 : Number(change.level)
+    const content = String(change.content ?? "").replace(/\r\n?/g, "\n").trim()
+    if (!heading || heading.length > 300 || /[\r\n]/.test(heading)) fail("INVALID_PAGE_PATCH", `Invalid sectionChanges[${index}].heading.`)
+    if (CORE_OWNED_SECTION_HEADINGS.has(normalizedHeading)) fail("INVALID_PAGE_PATCH", `Section ${heading} is maintained by Core and cannot be edited directly.`)
+    if (headings.has(normalizedHeading)) fail("INVALID_PAGE_PATCH", `Duplicate section change in one merge patch: ${heading}`)
+    headings.add(normalizedHeading)
+    if (!Number.isInteger(level) || level < 2 || level > 6) fail("INVALID_PAGE_PATCH", `Section level must be an integer from 2 to 6 for ${heading}.`)
+    if (!content || content.length > limits.maxPageChars) fail("INVALID_PAGE_PATCH", `Section content for ${heading} must contain 1 to ${limits.maxPageChars} characters.`)
+    totalChars += content.length
+  }
+  if (totalChars > limits.maxPageChars) fail("INVALID_PAGE_PATCH", "Merge patch section content exceeds the workspace page limit.")
 }
 
 // Domain classifications are derived from the server-side page requirements.

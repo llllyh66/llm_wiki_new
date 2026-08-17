@@ -570,9 +570,15 @@ documented fallback; never yield after starting only the first worker.
       the returned schema. Use the exact
       `file_hash` as `expectedFileHash` for `replace` or `merge`.
       Every `page_requirement` now contains a server-generated
-      `patch_scaffold`. Copy that object, add `content`, and keep its path,
+      `patch_scaffold`. Copy that object and preserve its `draft_mode`, path,
       operation, optional `expectedFileHash`, covers, related links, and
-      requirement-ID `sourceRefs`. Core resolves those IDs to the exact
+      requirement-ID `sourceRefs`. For `new-page` and
+      `complete-page-rewrite`, add one complete final page in `content`. For
+      `section-upsert`, omit `content` and add only `sectionChanges` with
+      `upsert_section` operations for new headings or headings listed in
+      `editable_section_headings`; never edit protected or partially visible
+      sections and never select both a parent section and its nested child.
+      Core resolves requirement IDs to the exact
       complete SourceRefs, so the Writer must not copy, normalize, or retype
       quotes and locators. When deliberately merging several requirements into
       one canonical page, union their scaffold `covers`, `sourceRefs`, and
@@ -583,10 +589,10 @@ documented fallback; never yield after starting only the first worker.
       a raw `wiki/collection/slug.md` path. Author a clear H1 and a
       self-contained source-grounded body.
       `replace` is a complete authoritative body rewrite: it does not retain
-      stale provisional prose. Use `merge` only when the existing grounded
-      body is intentionally being retained, and carry every retained fact with
-      its SourceRef. Core cannot infer which provisional claims survive a final
-      `replace`.
+      stale provisional prose. `merge` is reserved for a truncated existing
+      page and applies section-level changes to the full server-side body; it
+      never concatenates a second generated body. Core cannot infer which
+      provisional claims survive a final `replace`.
       When a page requirement carries `domain_classifications`, preserve the
       scaffold and describe the supplied entity or concept type in the page.
       Core recomputes and writes the authoritative type metadata from `covers`,
