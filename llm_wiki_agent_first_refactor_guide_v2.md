@@ -866,15 +866,13 @@ export interface RelationCandidate {
   predicate?: string;
   targetEntityLocalId?: string;
   content: string;
-  supportType?: "direct" | "normalized" | "inferred";
   confidence?: number;
   sourceRefs: SourceRef[] | number[];
 }
 ```
 
-`content` 是 evidence-facing statement；`predicate` 是规范化关系类型。
-`inferred` 不能作为 grounded fact 提交，应转入 review item 或 unresolved
-question。
+`content` 是 evidence-facing statement；`predicate` 可作为关系分类字段，
+但关系表述仍必须直接得到所选证据支持。
 
 `AnalysisEnvelope.sourceRefs` 是本批次使用的完整 `SourceRef` 对象目录。各
 Candidate 的 `sourceRefs` 在线路输入中优先使用指向该目录的零起始整数索引；
@@ -883,13 +881,11 @@ Core 在校验前将其确定性解析为完整 `SourceRef[]`，并仅持久化�
 `content` 和可解析的 `sourceRefs`。无法引用原文的问题放入
 `unresolvedQuestions`。
 
-Core 在结构校验之后执行确定性的 Grounding Quality Gate v2：SourceRef 的
-quote 来源真实性继续硬校验；claim、关系、矛盾和 review item 再按字段检查
-内容、强标识符与否定极性。关系的主语、谓词和宾语分别验证，主客体重合不能
-掩盖不受支持的谓词。camelCase、单复数和显式谓词别名可确定性归一化；推断
-必须进入 review item 或 unresolved question。单个 SourceRef 的高复用只产生
-warning，每个候选仍独立校验。门禁失败返回结构化 `grounding_diagnostics`，
-属于可恢复的业务拒绝，不是 MCP 传输错误。
+Core 在结构校验之后恢复 1.0.7 的 Grounding Quality Gate：SourceRef 的
+quote 来源真实性继续硬校验；claim、关系、矛盾和 review item 必须能由所选
+证据的词汇直接支持。单个 SourceRef 被复用超过八次会拒绝整个 analysis。
+门禁失败返回普通的 `validation_errors`，属于可恢复的业务拒绝，不是 MCP
+传输错误；按错误修复同一批次并使用新的幂等键重试。
 
 ## 9.6 Page Patch
 

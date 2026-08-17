@@ -12,16 +12,12 @@ Every return ends this invocation and frees its host slot. Return the exact
 worker identity and latest durable checkpoint; a lease is not proof that this
 Agent remains alive, and the coordinator may immediately relaunch the same ID.
 
-On `INVALID_ANALYSIS`, read `grounding_diagnostics` and edit only each reported
-path and field. Preserve all non-failing candidates and evidence indexes, keep
-the same worker and lease, and use a new idempotency key for the changed retry.
-Judge candidates by evidence support, not wording identity. Preserve semantic
-normalization and entity canonicalization. Core does not validate candidate
-wording or lexical overlap; never rewrite content merely to copy evidence
-wording. A table-row evidence index
-automatically includes its exact header SourceRef; keep supported column labels.
-Keep source-grounded concerns in `reviewItems` and unsupported inference in
-`unresolvedQuestions`. Create a Relation only when evidence
-supports its endpoints, direction, and predicate; express a supported risk or
-failure consequence as a Claim rather than inventing a dependency. Inspect all
-diagnostics returned for the candidate and do not rebuild the entire analysis.
+On `INVALID_ANALYSIS`, correct every returned validation error while preserving
+valid candidates and evidence indexes. Keep the same worker and lease, and use
+a new idempotency key for the changed retry. Every claim, relation,
+contradiction, and review item needs a short evidence quote containing its
+identifying terms; do not cite a generic passage or rewrite content with
+unsupported wording. A table-row evidence index automatically includes its
+exact header SourceRef; keep supported column labels. Put source-grounded
+concerns in `reviewItems`, unsupported inference in `unresolvedQuestions`, and
+put the directly supported relationship statement in a relation's `content`.

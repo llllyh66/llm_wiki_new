@@ -283,9 +283,8 @@ test("grounding quality gate rejects a title-only SourceRef reused for many unre
     }),
     (error) => error instanceof LlmWikiError
       && error.code === "INVALID_ANALYSIS"
-      && error.details.quality_gate === "source-ref-grounding-v2"
-      && error.details.grounding_diagnostics.some((diagnostic) => diagnostic.reason_code === "UNSUPPORTED_STRONG_ANCHOR")
-      && error.details.grounding_warnings.some((warning) => warning.reason_code === "HIGH_SOURCE_REF_REUSE"),
+      && error.details.quality_gate === "source-ref-grounding-v1"
+      && error.details.validation_errors.some((message) => message.includes("lexically support")),
   )
   assert.equal((await f.core.status({ task_id: imported.task_id })).status, "prepared")
 })
@@ -347,7 +346,6 @@ test("table-row evidence automatically carries its exact header context", async 
       claims: [{
         localId: "timeout-parameter",
         content: "timeout 参数值 50",
-        supportType: "normalized",
         sourceRefs: [rowEvidence.evidence_index],
       }],
     },
@@ -355,45 +353,7 @@ test("table-row evidence automatically carries its exact header context", async 
 
   assert.equal(committed.accepted, true)
   assert.equal(committed.normalized_source_ref_indexes, 1)
-  assert.equal(committed.grounding_validation.warning_count, 0)
 })
-
-test("commit safely downgrades a directionally invalid source-facing relation to a claim", async (t) => {
-  const f = await fixture()
-  t.after(() => rm(f.root, { recursive: true, force: true }))
-  await writeFile(f.source, "# Campaigns\n\nThe MarketingManager manages MarketingCampaigns.\n")
-  const imported = await f.core.importFiles({ files: [{ path: f.source }] })
-  const batch = await f.core.getBatch({ task_id: imported.task_id })
-  const evidence = batch.evidence_catalog.find((entry) => entry.quote.includes("MarketingManager manages MarketingCampaigns"))
-  assert.ok(evidence)
-
-  const committed = await f.core.commitAnalysis({
-    task_id: imported.task_id,
-    batch_id: batch.batch_id,
-    idempotency_key: "relation-claim-downgrade-v1",
-    analysis: {
-      ...batch.analysis_scaffold,
-      entities: [
-        { localId: "marketing-manager", name: "MarketingManager", sourceRefs: [evidence.evidence_index] },
-        { localId: "marketing-campaign", name: "MarketingCampaigns", sourceRefs: [evidence.evidence_index] },
-      ],
-      relations: [{
-        localId: "manager-responsible-for-campaign",
-        sourceEntityLocalId: "marketing-campaign",
-        predicate: "manages",
-        targetEntityLocalId: "marketing-manager",
-        content: "The MarketingManager manages MarketingCampaigns.",
-        supportType: "normalized",
-        sourceRefs: [evidence.evidence_index],
-      }],
-    },
-  })
-
-  assert.equal(committed.accepted, true)
-  assert.equal(committed.normalized_relation_claims, 1)
-  assert.deepEqual(committed.relation_claim_downgrades[0].reason_codes, ["RELATION_DIRECTION_MISMATCH"])
-})
-
 
 test("real embedding recall is cached and endpoint failures degrade without failing retrieval", async (t) => {
   const f = await fixture()
@@ -1235,8 +1195,8 @@ test("overlap scheduling scales to multiple Drafters when host capacity and shar
   assert.equal(imported.wiki_projection.parallel_page_drafting.recommended_drafters_when_extraction_overlaps, 3)
 
   const batch = await f.core.getBatch({ task_id: imported.task_id, worker_id: "scaled-overlap-extractor" })
-  const evidence = batch.evidence_catalog.find((entry) => statements.every((statement) => entry.quote.includes(statement)))
-    ?? batch.evidence_catalog[0]
+  const evidenceByStatement = statements.map((statement) => batch.evidence_catalog.find((entry) => entry.quote.includes(statement)))
+  assert.equal(evidenceByStatement.every(Boolean), true)
   await f.core.commitAnalysis({
     task_id: imported.task_id,
     batch_id: batch.batch_id,
@@ -1249,7 +1209,7 @@ test("overlap scheduling scales to multiple Drafters when host capacity and shar
         localId: `scaled-entity-${index + 1}`,
         name: `Entity ${index + 1}`,
         content,
-        sourceRefs: [evidence.evidence_index],
+        sourceRefs: [evidenceByStatement[index].evidence_index],
       })),
       batchSummary: "Thirteen supported business entities.",
     },

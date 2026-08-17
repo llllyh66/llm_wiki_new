@@ -394,9 +394,9 @@ test("built MCP server survives errors and completes the full workflow over one 
       assert.equal(invalid.structuredContent.validation_errors.length, 51)
     }
     if (index === 3) {
-      assert.equal(invalid.structuredContent.error.details.quality_gate, "source-ref-grounding-v2")
-      assert.equal(invalid.structuredContent.error.details.validation_error_count, 47)
-      assert.equal(invalid.structuredContent.grounding_warnings.some((warning) => warning.reason_code === "HIGH_SOURCE_REF_REUSE"), true)
+      assert.equal(invalid.structuredContent.error.details.quality_gate, "source-ref-grounding-v1")
+      assert.equal(invalid.structuredContent.error.details.validation_error_count, 48)
+      assert.equal(invalid.structuredContent.grounding_warnings, undefined)
     }
     assert.equal((await client.listTools()).tools.length, 18)
     const liveStatus = await client.callTool({ name: "llm_wiki_status", arguments: { task_id: taskId } })

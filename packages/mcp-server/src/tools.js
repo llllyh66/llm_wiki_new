@@ -152,43 +152,16 @@ function errorResult(error, context = {}) {
     ...(Array.isArray(normalized.details?.validation_errors)
       ? { validation_errors: normalized.details.validation_errors }
       : analysisRetry ? { validation_errors: [normalized.message] } : {}),
-    ...(Array.isArray(normalized.details?.grounding_diagnostics)
-      ? { grounding_diagnostics: normalized.details.grounding_diagnostics }
-      : {}),
-    ...(Array.isArray(normalized.details?.grounding_warnings)
-      ? { grounding_warnings: normalized.details.grounding_warnings }
-      : {}),
     ...(normalized.details?.completion_gate && typeof normalized.details.completion_gate === "object"
       ? { completion_gate: normalized.details.completion_gate }
       : {}),
     ...(analysisRetry ? {
       worker_restart: {
-        required: false,
-        strategy: "repair-in-place-same-worker-and-lease",
+        required: true,
+        strategy: "restart-same-worker-id-immediately",
         worker_id: context.args?.worker_id,
         batch_id: context.args?.batch_id,
         delay_ms: 0,
-        preserve_non_failing_candidates: true,
-      },
-    } : {}),
-    ...(analysisRetry && Array.isArray(normalized.details?.grounding_diagnostics) ? {
-      grounding_repair: {
-        candidate_wording_policy: "evidence-supported-semantic-normalization-not-verbatim-identity",
-        candidate_wording_validation_enabled: false,
-        lexical_overlap_diagnostics_enabled: false,
-        normalized_relation_field_lexical_validation_enabled: false,
-        all_candidate_diagnostics_returned_together: true,
-        repair_scope: "reported-diagnostic-paths-and-fields-only",
-        preserve_non_failing_candidates: true,
-        preserve_evidence_indexes: true,
-        same_worker_and_lease: true,
-        changed_payload_requires_new_idempotency_key: true,
-        strong_anchors_must_occur_in_selected_evidence: true,
-        preserve_polarity: true,
-        relation_fields_validated_independently: ["endpoints", "direction", "predicate"],
-        safe_source_facing_relation_auto_downgraded_to_claim: true,
-        source_grounded_concerns_destination: "reviewItems",
-        unsupported_inference_destination: "unresolvedQuestions",
       },
     } : {}),
     ...(atomicPageRejection ? {

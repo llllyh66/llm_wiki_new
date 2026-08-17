@@ -140,30 +140,23 @@ Never submit after `LEASE_FENCED`. Reacquire work and discard the superseded res
 ### Analysis quality
 
 - Every entity, concept, claim, relation, contradiction, and review item needs grounded `sourceRefs`.
-- Judge candidates by evidence support, not wording identity. Preserve useful
-  semantic normalization and entity canonicalization. Core does not validate
-  candidate wording or lexical overlap for Claims, ReviewItems, or normalized
-  Relation fields. Never rewrite them merely to copy evidence wording.
-  Unsupported strong anchors and changed polarity remain hard errors.
+- For every claim, relation, contradiction, and review item, cite a short
+  verbatim quote that contains its identifying terms. Core checks that the
+  candidate content is lexically supported by its selected evidence; do not
+  cite a generic passage for an unrelated candidate. Split table evidence by
+  row or coherent topic instead of reusing one title-only reference.
 - For a table-row `evidence_index`, Core automatically includes its exact table
   header SourceRef. Cite the row index once; do not remove a supported column
   label merely because it is not repeated in the row cells.
 - Put source-grounded concerns in `reviewItems`. Put unsupported uncertainty or
   inference in `unresolvedQuestions`; do not invent evidence.
-- Create a relation only when the evidence supports its endpoints, direction,
-  and predicate. Core does not lexically compare normalized endpoints or
-  predicates with source wording. A risk, failure consequence, or
-  counterfactual does not by itself establish `dependsOn`:
-  preserve the supported consequence as a Claim and put only the uncertain
-  stronger interpretation in `unresolvedQuestions`.
-  Core safely downgrades a source-facing Relation with unsupported structure to
-  a Claim instead of deleting it. Use `supportType=normalized` for supported
-  semantic normalization.
-- On `INVALID_ANALYSIS`, repair only the exact `grounding_diagnostics[].path`
-  and `.field`, preserve every non-failing candidate and evidence index, keep
-  the same worker and lease, and use a new idempotency key for the changed
-  payload. Do not replace supported normalization with source-sentence
-  transcription.
+- For a relation, put the directly supported relationship statement in
+  `content` and cite the evidence entry containing it. Do not add a stronger
+  relationship than the evidence supports.
+- On `INVALID_ANALYSIS`, correct every returned validation error while keeping
+  the same task, batch, worker, and lease. Use a new idempotency key for a
+  changed payload; if several entries fail, rebuild a small valid envelope
+  from the supplied schema instead of retrying unchanged content.
 - Preserve conflicting claims. Do not silently choose a winner.
 - Use numeric confidence values.
 

@@ -4,26 +4,12 @@
 
 ## [1.0.8] - 2026-08-14
 
-- Remove candidate-wording and lexical-overlap validation for Claims,
-  ReviewItems, and normalized Relation fields. Grounding now checks provenance
-  and deterministic structural conflicts without steering Extractors toward
-  source-sentence transcription.
+- Restore the Grounding Quality Gate to the 1.0.7 behavior. Claims, Relations,
+  Contradictions, and ReviewItems must be lexically supported by their selected
+  evidence, and SourceRef reuse above eight candidates rejects the envelope.
 - Preserve table semantics across chunk and evidence boundaries: oversized
   table fragments repeat their headers, and citing a table-row evidence index
-  automatically includes its exact header SourceRef. Further relax lexical
-  grounding into warnings while keeping strong anchors, polarity, relation
-  direction, and explicit risk-to-dependency contradictions as hard failures.
-- Keep grounding validation evidence-semantic instead of transcription-driven:
-  lexical overlap does not produce diagnostics, while strong anchor changes,
-  polarity errors, reversed relations, and explicit semantic contradictions remain hard
-  failures. Core returns every diagnostic for a candidate in one response and
-  safely downgrades source-facing unsupported Relations to Claims.
-- Make Grounding Quality Gate polarity checks sentence-local so unrelated
-  negation elsewhere in a cited passage does not reject a supported fact.
-  Extractors now receive an explicit diagnostic-local repair contract: concise
-  grounded paraphrases remain valid, non-failing candidates are preserved, and
-  unsupported inference moves to unresolved questions instead of triggering a
-  full-envelope rewrite.
+  automatically includes its exact header SourceRef.
 - Add unified `subagent_recovery` status for Extractor, Drafter, and Writer
   demand. Persisted leases, projections, shards, and receipts are explicitly
   separated from host process liveness, and coordinator contracts now require
@@ -33,14 +19,6 @@
   completing one bounded shard manifest cannot be mistaken for task
   completion. Newly extracted or unprojected batches now route directly into
   the next catch-up action without requesting user confirmation.
-- Replace aggregate lexical-overlap grounding with Grounding Quality Gate v2.
-  Source provenance remains exact, while relation endpoints and predicates,
-  strong identifiers, numeric/unit anchors, and polarity are validated
-  independently. Deterministic camelCase and inflection normalization is
-  accepted without letting endpoint overlap hide an unsupported predicate.
-- Return structured grounding diagnostics, keep validation repair in the same
-  worker lease, preserve non-failing candidates, and report high SourceRef
-  reuse as a warning instead of an unconditional whole-envelope rejection.
 - Make recovery scheduling state-safe and capacity-safe: failed partial imports
   no longer loop Finalize or launch unusable Extractors, one host background
   budget is shared across Extractor/Drafter/Writer roles, and publication waits

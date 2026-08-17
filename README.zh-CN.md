@@ -653,14 +653,11 @@ Core 会将 requirement ID 解析为任务中已验证的精确 quote 和 locato
 `unresolvedQuestions`，不要重新读取源文件猜 quote。
 
 标题引用不能支撑整张表的详细结论。`claims`、`relations`、
-`contradictions` 和 `reviewItems` 使用字段感知的 Grounding Quality Gate。
-关系的 `content` 保存原文直接支持的陈述，规范化结构放在
-`sourceEntityLocalId`、`predicate`、`targetEntityLocalId`；谓词必须独立获得
-证据支持，不能依靠主客体重合通过。标识符、数字、单位和否定极性发生变化会
-被拒绝。单个 SourceRef 被大量复用时返回 warning，每个候选仍独立校验。
-门禁拒绝时读取 `grounding_diagnostics` 的 `path`、`reason_code` 和 `field`，
-在同一 worker/lease 中只修复对应字段，并保留所有未报错候选。不要通过删除
-规范化字段或缩小整个 analysis 来盲目重试。
+`contradictions` 和 `reviewItems` 会回到 1.0.7 的 Grounding Quality Gate：
+每项必须引用包含其识别词的短原文，Core 用证据与候选内容的词汇支持关系做校验，
+单个 SourceRef 被复用超过八次会拒绝整个 analysis。门禁拒绝时按返回的
+`validation_errors` 修复同一批次，保留仍然有效的候选和 evidence index，并用新
+幂等键重试；不要把内容改写成无意义的逐字摘录或重新创建任务。
 
 ### Excel 无法导入
 

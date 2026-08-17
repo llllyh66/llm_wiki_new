@@ -34,7 +34,6 @@ import {
   assertNoSymlinkEscape,
   canonicalizeAnalysisSourceRefQuotes,
   collectSourceRefs,
-  downgradeUnsupportedRelationsToClaims,
   normalizeAnalysisEnvelope,
   normalizePagePatchDomainClassifications,
   normalizePagePatchSourceRefs,
@@ -886,14 +885,11 @@ export class LlmWikiCore {
         source_ref_templates: "Use the prefilled batch-evidence indexes; do not generate complete SourceRef objects or reconstruct sheetName and cellRange on the current hot path.",
         nested_source_refs: "In batch-evidence-index mode, use evidence_catalog.evidence_index values directly in candidate sourceRefs and leave the scaffold catalog unchanged.",
         evidence: "Do not retype quotes or read the source file. The server generated every evidence_catalog quote as an exact contiguous batch substring. Citing a table-row evidence_index automatically grounds against both the row and its exact table-header SourceRef.",
-        relation_grounding: "Create a relation only when the selected evidence supports its endpoints, direction, and predicate. Put normalized structure in sourceEntityLocalId, predicate, and targetEntityLocalId. A risk, failure consequence, or counterfactual does not by itself establish a dependency; preserve the supported consequence as a claim and put only the uncertain stronger interpretation in unresolvedQuestions.",
+        relation_grounding: "Put the directly supported relationship statement in relation.content and cite the evidence entry containing it.",
         source_language: "Keep every extracted name, title, statement, summary, and question in the language used by its directly supporting source evidence. Do not translate source-authored knowledge into the workspace target language; target_language is only a fallback for language-neutral or genuinely undetermined metadata. Preserve proper names and source terminology verbatim.",
-        support_type: "Use supportType=direct for source wording and supportType=normalized for evidence-supported semantic, entity, identifier, inflection, or predicate normalization. Put source-grounded concerns in reviewItems and unsupported inference in unresolvedQuestions, never in grounded facts.",
-        grounding_quality: "Core does not compare candidate wording or lexical overlap with evidence wording for claims, reviewItems, or normalized relation fields. Preserve semantic normalization and entity canonicalization. Unsupported identifiers/numbers/dates/units, polarity changes, reversed direction, and explicit risk-to-dependency contradictions remain hard errors.",
-        grounding_repair: "On INVALID_ANALYSIS, inspect the complete structural diagnostic set returned for each candidate, edit only the reported paths and fields, preserve every non-failing candidate and evidence index, keep the same worker and lease, and retry the changed payload with a new idempotency key. Never rewrite candidate wording merely to match evidence wording.",
         review_items: "Use {content, sourceRefs} objects only when a batch quote directly supports the concern; otherwise use a plain unresolvedQuestions string.",
         unresolved_questions: "Use plain strings only. Common legacy {question|reason|content|message|text} objects are normalized, but current workers must emit strings.",
-        candidate_shape: "Use candidate objects such as {localId, name|title|content, supportType: 'direct', confidence: 0.9, sourceRefs: [evidence_index]}; relations should also use sourceEntityLocalId, predicate, and targetEntityLocalId. Confidence is a JSON number, never a quoted string.",
+        candidate_shape: "Use candidate objects such as {localId, name|title|content, confidence: 0.9, sourceRefs: [evidence_index]}; confidence is a JSON number, never a quoted string.",
         domain_classification: domainSchema
           ? "Every entity and concept must include schemaClassification copied from the selected ABE classification_scaffold, including snapshotHash; replace its be placeholders from one be_pointer_hints entry and keep confidence numeric."
           : "schemaClassification is not required because this task has no Domain Schema.",
@@ -1075,18 +1071,17 @@ export class LlmWikiCore {
       ...entry.contextSourceRefs,
     ])
     const normalized = normalizeAnalysisEnvelope(input?.analysis, { evidenceCatalog })
-    const relationDowngrade = downgradeUnsupportedRelationsToClaims(normalized.analysis)
     const chunkIndex = this.#taskChunkIndex(record)
-    const normalizedSourceRefQuotes = canonicalizeAnalysisSourceRefQuotes(relationDowngrade.analysis, record.batches, chunkIndex)
-    const analysisBytes = Buffer.byteLength(JSON.stringify(relationDowngrade.analysis ?? null))
+    const normalizedSourceRefQuotes = canonicalizeAnalysisSourceRefQuotes(normalized.analysis, record.batches, chunkIndex)
+    const analysisBytes = Buffer.byteLength(JSON.stringify(normalized.analysis ?? null))
     if (analysisBytes > workspace.config.limits.maxAnalysisBytes) {
       fail("ANALYSIS_TOO_LARGE", `Analysis exceeds the ${workspace.config.limits.maxAnalysisBytes}-byte workspace limit.`)
     }
-    validateAnalysisShape(relationDowngrade.analysis, record.task.taskId, batch.batchId)
+    validateAnalysisShape(normalized.analysis, record.task.taskId, batch.batchId)
     const domainSchema = await this.#taskDomainSchema(record)
-    const domainApplied = applyDomainSchema(relationDowngrade.analysis, domainSchema)
+    const domainApplied = applyDomainSchema(normalized.analysis, domainSchema)
     validateSourceRefs(collectSourceRefs(domainApplied.analysis), record.task, record.batches, workspace.config.limits, chunkIndex)
-    const groundingValidation = validateGroundingQuality(domainApplied.analysis)
+    validateGroundingQuality(domainApplied.analysis)
     const idempotent = await withIdempotency(record.paths, input?.idempotency_key, { operation: "commit_analysis", batchId: batch.batchId, analysis: normalized.analysis }, async ({ persistResponse }) => {
       if (record.task.completedBatchIds.includes(batch.batchId)) fail("BATCH_ALREADY_COMPLETED", `Batch is already completed: ${batch.batchId}`)
       assertTaskStatus(record.task, ["prepared", "extracting"])
@@ -1118,10 +1113,7 @@ export class LlmWikiCore {
         normalized_source_ref_quotes: normalizedSourceRefQuotes,
         normalized_unresolved_questions: normalized.normalizedUnresolvedQuestions,
         normalized_numeric_confidences: normalized.normalizedNumericConfidences,
-        normalized_relation_claims: relationDowngrade.downgraded,
-        relation_claim_downgrades: relationDowngrade.entries,
         inferred_batch_evidence_mode: normalized.inferredBatchEvidenceMode,
-        grounding_validation: groundingValidation,
         domain_validation: domainApplied.report,
         wiki_projection: wikiProjection,
         next_action: projectionNextAction ?? extractionNextAction,

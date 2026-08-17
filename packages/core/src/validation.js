@@ -1,43 +1,15 @@
 import { lstat } from "node:fs/promises"
 import path from "node:path"
 import { fail } from "./errors.js"
-import { stableStringify } from "./utils.js"
+import { stableStringify, tokenize } from "./utils.js"
 import { AGENT_PAGE_ROOTS, normalizePageKind, pageKindForPath } from "./wiki-page.js"
 
 const ANALYSIS_ARRAYS = ["sourceRefs", "entities", "concepts", "claims", "relations", "contradictions", "candidatePages", "reviewItems", "unresolvedQuestions"]
 const GROUNDED_ANALYSIS_COLLECTIONS = new Set(["entities", "concepts", "claims", "relations", "contradictions", "candidatePages", "reviewItems"])
 const MAX_ANALYSIS_VALIDATION_ERRORS = 50
 const MAX_SOURCE_REF_REUSE = 8
-const MAX_ANALYSIS_CLAIMS = 1_000
 const GROUNDING_QUALITY_COLLECTIONS = new Set(["claims", "relations", "contradictions", "reviewItems"])
-const RELATION_STRUCTURE_DIAGNOSTIC_CODES = new Set([
-  "RELATION_DIRECTION_MISMATCH",
-  "RELATION_PREDICATE_CONTRADICTS_EVIDENCE",
-])
-const RELATION_STRUCTURE_FIELDS = new Set([
-  "sourceEntityLocalId", "targetEntityLocalId", "predicate", "relationType", "relation_type",
-  "subject", "object", "source", "target", "from", "to", "sourceName", "targetName",
-  "sourceEntityName", "targetEntityName", "name", "title",
-])
 const GENERIC_GROUNDING_TERMS = new Set(["content", "data", "document", "item", "内容", "数据", "文档", "指标", "体系", "关系", "概述", "包含", "包括"])
-const GROUNDING_STOP_WORDS = new Set([
-  "the", "is", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
-  "this", "that", "these", "those", "be", "as", "by", "from", "it", "its",
-  "的", "是", "了", "在", "有", "和", "与", "对", "从", "一个",
-])
-const NEGATION_TERMS = new Set(["not", "no", "never", "without", "cannot", "disabled", "prohibited", "禁止", "不能", "不得", "未", "无", "不"])
-const STRONG_ANCHOR_UNITS = new Set([
-  "usd", "eur", "cny", "rmb", "gbp", "jpy", "ms", "sec", "min", "hour", "hz", "khz", "mhz", "ghz",
-  "kb", "mb", "gb", "tb", "bps", "kbps", "mbps", "gbps", "kg", "km", "cm", "mm", "kw",
-  "%", "美元", "欧元", "人民币", "毫秒", "秒", "分钟", "小时", "千克", "公里", "米",
-])
-const PREDICATE_ALIAS_GROUPS = new Map([
-  ["responsiblefor", ["responsible for", "is responsible for", "负责"]],
-  ["dependson", ["depends on", "dependent on", "依赖"]],
-  ["partof", ["part of", "belongs to", "属于"]],
-  ["managedby", ["managed by", "管理"]],
-])
-const GROUNDING_QUALITY_GATE = "source-ref-grounding-v2"
 const ALLOWED_PAGE_ROOTS = new Set(AGENT_PAGE_ROOTS)
 const SYSTEM_PAGES = new Set(["wiki/index.md", "wiki/overview.md", "wiki/log.md"])
 const ANALYSIS_TOP_LEVEL_FIELDS = new Set([
@@ -288,10 +260,7 @@ export function validateAnalysisShape(analysis, taskId, batchId) {
 
 export function validateGroundingQuality(analysis) {
   const errors = []
-  const diagnostics = []
-  const warnings = []
   const refUses = new Map()
-  const candidateNames = analysisCandidateNames(analysis)
   for (const collection of GROUNDED_ANALYSIS_COLLECTIONS) {
     for (const [itemIndex, item] of (Array.isArray(analysis?.[collection]) ? analysis[collection] : []).entries()) {
       if (!item || typeof item !== "object" || !Array.isArray(item.sourceRefs)) continue
@@ -304,33 +273,23 @@ export function validateGroundingQuality(analysis) {
         refUses.set(signature, current)
       }
       if (!GROUNDING_QUALITY_COLLECTIONS.has(collection)) continue
-      const path = `${collection}[${itemIndex}]`
+      const semanticText = candidateSemanticText(item)
+      if (!semanticText) continue
       const evidenceText = item.sourceRefs
         .filter(isSourceRefObject)
         .map((ref) => typeof ref.quote === "string" ? ref.quote.trim() : "")
         .filter(Boolean)
         .join("\n")
       if (!evidenceText) {
-        const diagnostic = groundingDiagnostic(path, "MISSING_EVIDENCE_QUOTE", "sourceRefs", `${path} requires a non-empty SourceRef quote that supports its content`)
-        diagnostics.push(diagnostic)
-        errors.push(diagnostic.message)
-        continue
-      }
-      const candidateDiagnostics = candidateGroundingDiagnostics(collection, path, item, evidenceText, candidateNames)
-      for (const diagnostic of candidateDiagnostics) {
-        diagnostics.push(diagnostic)
-        errors.push(diagnostic.message)
+        errors.push(`${collection}[${itemIndex}] requires a non-empty SourceRef quote that supports its content`)
+      } else if (!evidenceSupportsCandidate(semanticText, evidenceText, item)) {
+        errors.push(`${collection}[${itemIndex}] SourceRef quote does not lexically support the candidate content; cite the relevant row or passage`)
       }
     }
   }
   for (const { count, paths } of refUses.values()) {
     if (count > MAX_SOURCE_REF_REUSE) {
-      warnings.push({
-        reason_code: "HIGH_SOURCE_REF_REUSE",
-        count,
-        candidate_paths: paths,
-        message: `one SourceRef is reused by ${count} grounded candidates (${paths.join(", ")}, ...); verify that the passage is specific enough for each candidate`,
-      })
+      errors.push(`one SourceRef is reused by ${count} grounded candidates (${paths.join(", ")}, ...); split evidence by row or topic (maximum ${MAX_SOURCE_REF_REUSE} uses per reference)`)
     }
   }
   if (errors.length > 0) {
@@ -338,346 +297,59 @@ export function validateGroundingQuality(analysis) {
       details: {
         validation_errors: errors.slice(0, MAX_ANALYSIS_VALIDATION_ERRORS),
         validation_error_count: errors.length,
-        grounding_diagnostics: diagnostics.slice(0, MAX_ANALYSIS_VALIDATION_ERRORS),
-        grounding_warnings: warnings,
-        quality_gate: GROUNDING_QUALITY_GATE,
+        quality_gate: "source-ref-grounding-v1",
       },
     })
   }
-  return {
-    quality_gate: GROUNDING_QUALITY_GATE,
-    warning_count: warnings.length,
-    warnings,
-  }
 }
 
-export function downgradeUnsupportedRelationsToClaims(analysis) {
-  if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) {
-    return { analysis, downgraded: 0, entries: [] }
-  }
-  const relations = Array.isArray(analysis.relations) ? analysis.relations : []
-  const claims = Array.isArray(analysis.claims) ? [...analysis.claims] : []
-  if (relations.length === 0 || claims.length >= MAX_ANALYSIS_CLAIMS) {
-    return { analysis, downgraded: 0, entries: [] }
-  }
-  const candidateNames = analysisCandidateNames(analysis)
-  const keptRelations = []
-  const entries = []
-  for (const [itemIndex, item] of relations.entries()) {
-    if (!item || typeof item !== "object" || Array.isArray(item) || !Array.isArray(item.sourceRefs)) {
-      keptRelations.push(item)
-      continue
-    }
-    const evidenceText = item.sourceRefs
-      .filter(isSourceRefObject)
-      .map((ref) => typeof ref.quote === "string" ? ref.quote.trim() : "")
-      .filter(Boolean)
-      .join("\n")
-    const assertion = candidateAssertionText(item)
-    const diagnostics = evidenceText
-      ? candidateGroundingDiagnostics("relations", `relations[${itemIndex}]`, item, evidenceText, candidateNames)
-      : []
-    const structuralDiagnostics = diagnostics.filter((diagnostic) => RELATION_STRUCTURE_DIAGNOSTIC_CODES.has(diagnostic.reason_code))
-    const nonStructuralDiagnostics = diagnostics.filter((diagnostic) => !RELATION_STRUCTURE_DIAGNOSTIC_CODES.has(diagnostic.reason_code))
-    const sourceFacingContent = Boolean(assertion
-      && normalizeGroundingText(evidenceText).includes(normalizeGroundingText(assertion)))
-    if (structuralDiagnostics.length === 0 || nonStructuralDiagnostics.length > 0
-      || claims.length >= MAX_ANALYSIS_CLAIMS) {
-      keptRelations.push(item)
-      continue
-    }
-    const claimContent = sourceFacingContent
-      ? assertion
-      : bestSupportedEvidenceSegment(assertion, evidenceText)
-    if (!claimContent) {
-      keptRelations.push(item)
-      continue
-    }
-    const claim = { ...item, content: claimContent, supportType: "direct" }
-    for (const field of RELATION_STRUCTURE_FIELDS) delete claim[field]
-    claims.push(claim)
-    entries.push({
-      relation_path: `relations[${itemIndex}]`,
-      claim_index: claims.length - 1,
-      reason_codes: [...new Set(structuralDiagnostics.map((diagnostic) => diagnostic.reason_code))],
-      used_evidence_wording: !sourceFacingContent,
-    })
-  }
-  if (entries.length === 0) return { analysis, downgraded: 0, entries: [] }
-  return {
-    analysis: { ...analysis, claims, relations: keptRelations },
-    downgraded: entries.length,
-    entries,
-  }
+function candidateSemanticText(item) {
+  return [item.name, item.title, item.text, item.content, item.subject, item.predicate, item.object]
+    .filter((value) => typeof value === "string" && value.trim())
+    .join(" ")
 }
 
-function candidateGroundingDiagnostics(collection, path, item, evidenceText, candidateNames) {
-  const diagnostics = []
-  const supportType = item.supportType ?? item.support_type
-  if (supportType === "inferred") {
-    diagnostics.push(groundingDiagnostic(
-      path,
-      "INFERRED_FACT_NOT_PUBLISHABLE",
-      "supportType",
-      `${path} is marked inferred and cannot be committed as a grounded fact; rewrite it as a source-supported candidate or move the unsupported inference to unresolvedQuestions`,
-    ))
-  }
-  const assertion = candidateAssertionText(item)
-  if (!assertion) return diagnostics
-
-  const unsupportedAnchors = groundingAnchors(assertion).filter((anchor) => !groundingAnchorSupported(anchor, evidenceText))
-  if (unsupportedAnchors.length > 0) {
-    diagnostics.push(groundingDiagnostic(
-      path,
-      "UNSUPPORTED_STRONG_ANCHOR",
-      "content",
-      `${path} introduces identifiers, numbers, dates, or units that do not occur in its selected evidence`,
-      { unsupported_anchors: unsupportedAnchors },
-    ))
-  }
-
-  if (groundingPolarityMismatch(assertion, evidenceText)) {
-    diagnostics.push(groundingDiagnostic(
-      path,
-      "POLARITY_MISMATCH",
-      "content",
-      `${path} changes the positive or negative polarity of its selected evidence`,
-    ))
-  }
-
-  if (collection === "relations") {
-    const directionDiagnostic = relationDirectionDiagnostic(path, item, assertion, candidateNames)
-    if (directionDiagnostic) diagnostics.push(directionDiagnostic)
-    const predicateDiagnostic = relationPredicateDiagnostic(path, item, evidenceText)
-    if (predicateDiagnostic) diagnostics.push(predicateDiagnostic)
-  }
-  return diagnostics
-}
-
-function relationEndpoints(item, candidateNames) {
-  return [
-    {
-      field: "sourceEntityLocalId",
-      role: "source",
-      value: firstString(item.subject, item.source, item.from, item.sourceName, item.sourceEntityName)
-        ?? candidateNames.get(item.sourceEntityLocalId),
-      localId: item.sourceEntityLocalId,
-    },
-    {
-      field: "targetEntityLocalId",
-      role: "target",
-      value: firstString(item.object, item.target, item.to, item.targetName, item.targetEntityName)
-        ?? candidateNames.get(item.targetEntityLocalId),
-      localId: item.targetEntityLocalId,
-    },
-  ]
-}
-
-function relationDirectionDiagnostic(path, item, assertion, candidateNames) {
-  const [source, target] = relationEndpoints(item, candidateNames)
-  if (!source.value || !target.value) return null
-  const normalizedSource = normalizeGroundingText(source.value)
-  const normalizedTarget = normalizeGroundingText(target.value)
-  if (!normalizedSource || !normalizedTarget || normalizedSource === normalizedTarget) return null
-  if (normalizedSource.includes(normalizedTarget) || normalizedTarget.includes(normalizedSource)) return null
-  const normalizedAssertion = normalizeGroundingText(assertion)
-  const sourceIndex = normalizedAssertion.indexOf(normalizedSource)
-  const targetIndex = normalizedAssertion.indexOf(normalizedTarget)
-  if (sourceIndex < 0 || targetIndex < 0 || sourceIndex < targetIndex) return null
-  return groundingDiagnostic(
-    path,
-    "RELATION_DIRECTION_MISMATCH",
-    "sourceEntityLocalId",
-    `${path} relation endpoints are reversed relative to the evidence-facing content; use the inverse predicate when the source statement is passive`,
-    { source_endpoint: source.value, target_endpoint: target.value },
-  )
-}
-
-function relationPredicateDiagnostic(path, item, evidenceText) {
-  const predicate = firstString(item.predicate, item.relationType, item.relation_type)
-  if (!predicate) return null
-  if (groundingPredicateSupported(predicate, evidenceText)) return null
-  if (!relationPredicateContradictsEvidence(predicate, evidenceText)) return null
-  return groundingDiagnostic(
-      path,
-      "RELATION_PREDICATE_CONTRADICTS_EVIDENCE",
-      "predicate",
-      `${path} relation predicate ${JSON.stringify(predicate)} turns a risk, failure consequence, or conditional statement into an established dependency`,
-      { predicate },
-    )
-}
-
-function relationPredicateContradictsEvidence(predicate, evidenceText) {
-  if (normalizePredicateKey(predicate) !== "dependson") return false
-  const normalized = normalizeGroundingText(evidenceText)
-  return /\b(?:risk|failure|fails?|failed|could|might|conditional|counterfactual)\b/u.test(normalized)
-    || /风险|失败|故障|可能|若|如果|一旦|否则/u.test(normalized)
-}
-
-function groundingPredicateSupported(predicate, evidenceText) {
-  const key = normalizePredicateKey(predicate)
+function evidenceSupportsCandidate(semanticText, evidenceText, item) {
   const normalizedEvidence = normalizeGroundingText(evidenceText)
-  const aliases = PREDICATE_ALIAS_GROUPS.get(key) ?? []
-  if (aliases.some((alias) => normalizedEvidence.includes(normalizeGroundingText(alias)))) return true
-  const predicateTerms = groundingTerms(predicate)
-  if (predicateTerms.length === 0) return false
   const evidenceTerms = new Set(groundingTerms(evidenceText))
-  return predicateTerms.every((term) => evidenceTerms.has(term))
-}
-
-function groundingPolarityMismatch(assertion, evidenceText) {
-  const assertionNegated = hasGroundingNegation(assertion)
-  const segments = groundingEvidenceSegments(evidenceText)
-  if (segments.length <= 1) return assertionNegated !== hasGroundingNegation(evidenceText)
-
-  const assertionAnchors = groundingAnchors(assertion)
-  const scored = segments.map((segment) => ({
-    segment,
-    score: groundingSegmentScore(assertion, segment),
-    anchorsSupported: assertionAnchors.every((anchor) => groundingAnchors(segment).includes(anchor)),
-  }))
-  const anchored = assertionAnchors.length > 0 && scored.some((entry) => entry.anchorsSupported)
-    ? scored.filter((entry) => entry.anchorsSupported)
-    : scored
-  const bestScore = Math.max(0, ...anchored.map((entry) => entry.score))
-  if (bestScore === 0) return false
-  const bestSegments = anchored.filter((entry) => entry.score === bestScore)
-  return bestSegments.every((entry) => hasGroundingNegation(entry.segment) !== assertionNegated)
-}
-
-function groundingEvidenceSegments(value) {
-  return String(value ?? "")
-    .replace(/\r\n?/gu, "\n")
-    .split(/\n+|(?<=[!?\u3002\uff01\uff1f\uff1b;])\s*|(?<=\.)\s+/u)
-    .map((segment) => segment.trim())
-    .filter(Boolean)
-}
-
-function groundingSegmentScore(assertion, evidenceSegment) {
-  const normalizedAssertion = normalizeGroundingText(assertion)
-  const normalizedEvidence = normalizeGroundingText(evidenceSegment)
-  if (normalizedAssertion.length >= 3 && normalizedEvidence.includes(normalizedAssertion)) return Number.MAX_SAFE_INTEGER
-  const assertionTerms = groundingTerms(assertion)
-  if (assertionTerms.length === 0) return 0
-  const evidenceTerms = new Set(groundingTerms(evidenceSegment))
-  const matched = assertionTerms.filter((term) => evidenceTerms.has(term)).length
-  return matched === 0 ? 0 : (matched * 100) + (matched / assertionTerms.length)
-}
-
-function bestSupportedEvidenceSegment(assertion, evidenceText) {
-  const segments = groundingEvidenceSegments(evidenceText)
-  let bestSegment = ""
-  let bestScore = 0
-  for (const segment of segments) {
-    const score = groundingSegmentScore(assertion, segment)
-    if (score > bestScore) {
-      bestScore = score
-      bestSegment = segment
-    }
+  // Schema relation names can be long canonical identifiers which are not
+  // expected to occur verbatim in source prose. Judge the actual assertion
+  // independently first so a directly quoted fact cannot be diluted by its
+  // classification label (for example, a billing-account relation type).
+  for (const assertion of candidateAssertionTexts(item)) {
+    const normalizedAssertion = normalizeGroundingText(assertion)
+    if (normalizedAssertion.length >= 3 && normalizedEvidence.includes(normalizedAssertion)) return true
+    if (groundingTermsSupported(assertion, evidenceTerms)) return true
   }
-  return bestSegment
+  for (const label of [item.name, item.title, item.text]) {
+    if (typeof label !== "string") continue
+    const normalizedLabel = normalizeGroundingText(label)
+    if (normalizedLabel.length >= 3 && normalizedEvidence.includes(normalizedLabel)) return true
+  }
+  const semanticTerms = groundingTerms(semanticText)
+  if (semanticTerms.length === 0 || evidenceTerms.size === 0) return false
+  const overlap = semanticTerms.filter((term) => evidenceTerms.has(term)).length
+  return overlap >= 2 && overlap / semanticTerms.length >= 0.5
 }
 
-function candidateAssertionText(item) {
-  return firstString(item.content, item.text, item.name, item.title)
+function candidateAssertionTexts(item) {
+  const values = [item.content, item.text]
+  const relationTuple = [item.subject, item.predicate, item.object]
+    .filter((value) => typeof value === "string" && value.trim())
+    .join(" ")
+  if (relationTuple) values.push(relationTuple)
+  return [...new Set(values.filter((value) => typeof value === "string" && value.trim()))]
 }
 
 function groundingTerms(value) {
-  const prepared = splitGroundingIdentifiers(String(value ?? "")).normalize("NFKC").toLowerCase()
-  const terms = []
-  for (const match of prepared.matchAll(/[\p{L}\p{N}]+/gu)) {
-    const token = match[0]
-    if (!GROUNDING_STOP_WORDS.has(token) && token.length > 1) terms.push(groundingLemma(token))
-    if (/[\u3400-\u9fff]/u.test(token)) {
-      const chars = Array.from(token)
-      for (let index = 0; index < chars.length - 1; index += 1) {
-        const bigram = `${chars[index]}${chars[index + 1]}`
-        if (!GROUNDING_STOP_WORDS.has(bigram)) terms.push(bigram)
-      }
-    }
-  }
-  return [...new Set(terms.filter((term) => term && !GENERIC_GROUNDING_TERMS.has(term)))]
+  return tokenize(value).filter((term) => !GENERIC_GROUNDING_TERMS.has(term))
 }
 
-function groundingLemma(token) {
-  if (!/^[a-z]+$/u.test(token) || token.length <= 3) return token
-  if (token.endsWith("ies") && token.length > 4) return `${token.slice(0, -3)}y`
-  if (token.endsWith("ing") && token.length > 5) {
-    const base = token.slice(0, -3).replace(/([a-z])\1$/u, "$1")
-    return /(?:at|ag|iz)$/u.test(base) ? `${base}e` : base
-  }
-  if (token.endsWith("ed") && token.length > 4) {
-    if (/(?:ated|ged|ized|eed)$/u.test(token)) return token.slice(0, -1)
-    return token.slice(0, -2).replace(/([a-z])\1$/u, "$1")
-  }
-  if (/(?:ches|shes|xes|zes|ses|oes)$/u.test(token) && token.length > 4) return token.slice(0, -2)
-  if (token.endsWith("s") && !token.endsWith("ss") && token.length > 3) return token.slice(0, -1)
-  return token
-}
-
-function splitGroundingIdentifiers(value) {
-  return value
-    .replace(/([\p{Ll}\d])([\p{Lu}])/gu, "$1 $2")
-    .replace(/[_-]+/gu, " ")
-}
-
-function normalizePredicateKey(value) {
-  return normalizeGroundingText(splitGroundingIdentifiers(value)).replace(/[^\p{L}\p{N}]+/gu, "")
-}
-
-function groundingAnchors(value) {
-  return [...new Set(groundingAnchorTokens(value))]
-}
-
-function groundingAnchorTokens(value) {
-  const anchors = []
-  const normalized = String(value ?? "").normalize("NFKC").toLowerCase()
-  for (const match of normalized.matchAll(/[\p{L}\p{N}]+(?:[._:/%-][\p{L}\p{N}%]+)*/gu)) {
-    const token = match[0]
-    if (/\d/u.test(token) || STRONG_ANCHOR_UNITS.has(token)) anchors.push(token)
-  }
-  return anchors
-}
-
-function groundingAnchorSupported(anchor, evidenceText) {
-  const evidenceAnchors = groundingAnchorTokens(evidenceText)
-  if (evidenceAnchors.includes(anchor)) return true
-  const requestedParts = anchor.split(/[._:/%-]+/u).filter(Boolean)
-  if (requestedParts.length < 2 || requestedParts.some((part) => !/\d/u.test(part))) return false
-  const availableCounts = new Map()
-  for (const evidenceAnchor of evidenceAnchors) {
-    const parts = evidenceAnchor.split(/[._:/%-]+/u).filter(Boolean)
-    for (const part of parts) availableCounts.set(part, (availableCounts.get(part) ?? 0) + 1)
-  }
-  const requestedCounts = new Map()
-  for (const part of requestedParts) requestedCounts.set(part, (requestedCounts.get(part) ?? 0) + 1)
-  return [...requestedCounts].every(([part, count]) => (availableCounts.get(part) ?? 0) >= count)
-}
-
-function hasGroundingNegation(value) {
-  const normalized = normalizeGroundingText(value)
-  if (/[不未无]/u.test(normalized) || /禁止|不能|不得/u.test(normalized)) return true
-  return normalized.split(/[^\p{L}\p{N}]+/u).some((term) => NEGATION_TERMS.has(term))
-}
-
-function analysisCandidateNames(analysis) {
-  const names = new Map()
-  for (const collection of ["entities", "concepts"]) {
-    for (const item of Array.isArray(analysis?.[collection]) ? analysis[collection] : []) {
-      const localId = item?.localId ?? item?.local_id
-      const name = firstString(item?.name, item?.title, item?.text)
-      if (typeof localId === "string" && name) names.set(localId, name)
-    }
-  }
-  return names
-}
-
-function firstString(...values) {
-  return values.find((value) => typeof value === "string" && value.trim())?.trim()
-}
-
-function groundingDiagnostic(path, reasonCode, field, message, extra = {}) {
-  return { path, reason_code: reasonCode, field, message, ...extra }
+function groundingTermsSupported(value, evidenceTerms) {
+  const terms = groundingTerms(value)
+  if (terms.length < 2 || evidenceTerms.size === 0) return false
+  const overlap = terms.filter((term) => evidenceTerms.has(term)).length
+  return overlap >= 2 && overlap / terms.length >= 0.5
 }
 
 function normalizeGroundingText(value) {
