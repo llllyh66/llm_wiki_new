@@ -63,7 +63,7 @@ test("grounding v2 accepts deterministic predicate and identifier normalization"
   )))
 })
 
-test("grounding v2 warns when a normalized predicate is not lexically visible", () => {
+test("grounding v2 does not validate normalized predicate wording lexically", () => {
   const result = validateGroundingQuality(analysisWithRelation(
     "The MarketingManager manages MarketingCampaigns.",
     {
@@ -76,12 +76,10 @@ test("grounding v2 warns when a normalized predicate is not lexically visible", 
     },
   ))
 
-  assert.equal(result.warning_count, 1)
-  assert.equal(result.warnings[0].reason_code, "UNVERIFIED_RELATION_PREDICATE")
-  assert.equal(result.warnings[0].field, "predicate")
+  assert.equal(result.warning_count, 0)
 })
 
-test("grounding v2 warns on low lexical overlap without rejecting semantic normalization", () => {
+test("grounding v2 does not validate low lexical overlap", () => {
   const result = validateGroundingQuality(analysisWithRelation(
     "The MarketingManager manages MarketingCampaigns.",
     {
@@ -91,21 +89,22 @@ test("grounding v2 warns on low lexical overlap without rejecting semantic norma
     },
   ))
 
-  assert.equal(result.warning_count, 1)
-  assert.equal(result.warnings[0].reason_code, "LOW_LEXICAL_SUPPORT")
-  assert.ok(result.warnings[0].unsupported_terms.includes("plan"))
+  assert.equal(result.warning_count, 0)
 })
 
-test("grounding v2 warns when normalized content has no surface term overlap", () => {
+test("grounding v2 does not validate claim or review-item wording against evidence wording", () => {
   const result = validateGroundingQuality({
     claims: [{
       content: "Orbital gardens improve lunar harvests.",
       sourceRefs: [sourceRef("Customer accounts require approval.")],
     }],
+    reviewItems: [{
+      content: "Assess the normalized business interpretation.",
+      sourceRefs: [sourceRef("Customer accounts require approval.")],
+    }],
   })
 
-  assert.equal(result.warning_count, 1)
-  assert.equal(result.warnings[0].reason_code, "NO_EVIDENCE_TERM_SUPPORT")
+  assert.equal(result.warning_count, 0)
 })
 
 test("grounding v2 returns all deterministic diagnostics for one candidate", () => {
@@ -119,12 +118,10 @@ test("grounding v2 returns all deterministic diagnostics for one candidate", () 
     },
   )))
   const codes = error.details.grounding_diagnostics.map((diagnostic) => diagnostic.reason_code)
-  const warningCodes = error.details.grounding_warnings.map((diagnostic) => diagnostic.reason_code)
 
   assert.ok(codes.includes("UNSUPPORTED_STRONG_ANCHOR"))
   assert.ok(codes.includes("POLARITY_MISMATCH"))
-  assert.equal(warningCodes.filter((code) => code === "UNVERIFIED_RELATION_ENDPOINT").length, 2)
-  assert.ok(warningCodes.includes("UNVERIFIED_RELATION_PREDICATE"))
+  assert.equal(error.details.grounding_warnings.length, 0)
 })
 
 test("a directionally invalid source-facing relation is downgraded to a claim", () => {

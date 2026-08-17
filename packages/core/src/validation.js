@@ -316,13 +316,11 @@ export function validateGroundingQuality(analysis) {
         errors.push(diagnostic.message)
         continue
       }
-      const candidateWarnings = []
-      const candidateDiagnostics = candidateGroundingDiagnostics(collection, path, item, evidenceText, candidateNames, candidateWarnings)
+      const candidateDiagnostics = candidateGroundingDiagnostics(collection, path, item, evidenceText, candidateNames)
       for (const diagnostic of candidateDiagnostics) {
         diagnostics.push(diagnostic)
         errors.push(diagnostic.message)
       }
-      warnings.push(...candidateWarnings)
     }
   }
   for (const { count, paths } of refUses.values()) {
@@ -413,7 +411,7 @@ export function downgradeUnsupportedRelationsToClaims(analysis) {
   }
 }
 
-function candidateGroundingDiagnostics(collection, path, item, evidenceText, candidateNames, warnings = []) {
+function candidateGroundingDiagnostics(collection, path, item, evidenceText, candidateNames) {
   const diagnostics = []
   const supportType = item.supportType ?? item.support_type
   if (supportType === "inferred") {
@@ -448,56 +446,12 @@ function candidateGroundingDiagnostics(collection, path, item, evidenceText, can
   }
 
   if (collection === "relations") {
-    warnings.push(...relationEndpointWarnings(path, item, evidenceText, candidateNames))
     const directionDiagnostic = relationDirectionDiagnostic(path, item, assertion, candidateNames)
     if (directionDiagnostic) diagnostics.push(directionDiagnostic)
     const predicateDiagnostic = relationPredicateDiagnostic(path, item, evidenceText)
-    if (predicateDiagnostic?.hard) diagnostics.push(predicateDiagnostic.diagnostic)
-    else if (predicateDiagnostic) warnings.push(predicateDiagnostic.diagnostic)
-  }
-
-  const support = groundingTextSupport(assertion, evidenceText)
-  if (!support.supported) {
-    const field = typeof item.content === "string" ? "content" : typeof item.text === "string" ? "text" : "candidate"
-    if (support.matchedTerms.length === 0) {
-      warnings.push(groundingDiagnostic(
-        path,
-        "NO_EVIDENCE_TERM_SUPPORT",
-        field,
-        `${path} shares no normalized surface term with its selected evidence; review semantic support without transcribing the source`,
-        { matched_terms: support.matchedTerms, unsupported_terms: support.unsupportedTerms },
-      ))
-    } else {
-      warnings.push(groundingDiagnostic(
-        path,
-        "LOW_LEXICAL_SUPPORT",
-        field,
-        `${path} has low surface-word overlap with its selected evidence; retain semantic normalization but review the mapping`,
-        { matched_terms: support.matchedTerms, unsupported_terms: support.unsupportedTerms },
-      ))
-    }
+    if (predicateDiagnostic) diagnostics.push(predicateDiagnostic)
   }
   return diagnostics
-}
-
-function relationEndpointWarnings(path, item, evidenceText, candidateNames) {
-  const warnings = []
-  const endpoints = relationEndpoints(item, candidateNames)
-  for (const endpoint of endpoints) {
-    // Stable local IDs may intentionally point to a candidate from another
-    // batch. Validate the endpoint surface when it is available here and let
-    // page planning perform cross-batch ID resolution later.
-    if (endpoint.value && !groundingPhraseSupported(endpoint.value, evidenceText)) {
-      warnings.push(groundingDiagnostic(
-        path,
-        "UNVERIFIED_RELATION_ENDPOINT",
-        endpoint.field,
-        `${path} ${endpoint.role} endpoint is not lexically visible in its selected evidence; retain supported entity normalization but review the mapping`,
-        { endpoint_role: endpoint.role, endpoint: endpoint.value },
-      ))
-    }
-  }
-  return warnings
 }
 
 function relationEndpoints(item, candidateNames) {
@@ -543,28 +497,14 @@ function relationPredicateDiagnostic(path, item, evidenceText) {
   const predicate = firstString(item.predicate, item.relationType, item.relation_type)
   if (!predicate) return null
   if (groundingPredicateSupported(predicate, evidenceText)) return null
-  if (relationPredicateContradictsEvidence(predicate, evidenceText)) {
-    return {
-      hard: true,
-      diagnostic: groundingDiagnostic(
-        path,
-        "RELATION_PREDICATE_CONTRADICTS_EVIDENCE",
-        "predicate",
-        `${path} relation predicate ${JSON.stringify(predicate)} turns a risk, failure consequence, or conditional statement into an established dependency`,
-        { predicate },
-      ),
-    }
-  }
-  return {
-    hard: false,
-    diagnostic: groundingDiagnostic(
+  if (!relationPredicateContradictsEvidence(predicate, evidenceText)) return null
+  return groundingDiagnostic(
       path,
-      "UNVERIFIED_RELATION_PREDICATE",
+      "RELATION_PREDICATE_CONTRADICTS_EVIDENCE",
       "predicate",
-      `${path} relation predicate ${JSON.stringify(predicate)} is not lexically visible in its selected evidence; retain supported semantic normalization but review the mapping`,
+      `${path} relation predicate ${JSON.stringify(predicate)} turns a risk, failure consequence, or conditional statement into an established dependency`,
       { predicate },
-    ),
-  }
+    )
 }
 
 function relationPredicateContradictsEvidence(predicate, evidenceText) {
@@ -583,32 +523,6 @@ function groundingPredicateSupported(predicate, evidenceText) {
   if (predicateTerms.length === 0) return false
   const evidenceTerms = new Set(groundingTerms(evidenceText))
   return predicateTerms.every((term) => evidenceTerms.has(term))
-}
-
-function groundingPhraseSupported(value, evidenceText) {
-  const normalizedValue = normalizeGroundingText(value)
-  const normalizedEvidence = normalizeGroundingText(evidenceText)
-  if (normalizedValue && normalizedEvidence.includes(normalizedValue)) return true
-  const terms = groundingTerms(value)
-  const evidenceTerms = new Set(groundingTerms(evidenceText))
-  return terms.length > 0 && terms.every((term) => evidenceTerms.has(term))
-}
-
-function groundingTextSupport(assertion, evidenceText) {
-  const normalizedAssertion = normalizeGroundingText(assertion)
-  const normalizedEvidence = normalizeGroundingText(evidenceText)
-  if (normalizedAssertion.length >= 3 && normalizedEvidence.includes(normalizedAssertion)) {
-    return { supported: true, matchedTerms: groundingTerms(assertion), unsupportedTerms: [] }
-  }
-  const assertionTerms = groundingTerms(assertion)
-  const evidenceTerms = new Set(groundingTerms(evidenceText))
-  const matchedTerms = assertionTerms.filter((term) => evidenceTerms.has(term))
-  const unsupportedTerms = assertionTerms.filter((term) => !evidenceTerms.has(term))
-  const supported = assertionTerms.length > 0
-    && (assertionTerms.length === 1
-      ? matchedTerms.length === 1
-      : matchedTerms.length >= 2 && matchedTerms.length / assertionTerms.length >= 0.5)
-  return { supported, matchedTerms, unsupportedTerms }
 }
 
 function groundingPolarityMismatch(assertion, evidenceText) {

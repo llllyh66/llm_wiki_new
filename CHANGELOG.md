@@ -4,14 +4,18 @@
 
 ## [1.0.8] - 2026-08-14
 
+- Remove candidate-wording and lexical-overlap validation for Claims,
+  ReviewItems, and normalized Relation fields. Grounding now checks provenance
+  and deterministic structural conflicts without steering Extractors toward
+  source-sentence transcription.
 - Preserve table semantics across chunk and evidence boundaries: oversized
   table fragments repeat their headers, and citing a table-row evidence index
   automatically includes its exact header SourceRef. Further relax lexical
   grounding into warnings while keeping strong anchors, polarity, relation
   direction, and explicit risk-to-dependency contradictions as hard failures.
 - Keep grounding validation evidence-semantic instead of transcription-driven:
-  lexical overlap is now a warning, while strong anchor changes, polarity
-  errors, reversed relations, and explicit semantic contradictions remain hard
+  lexical overlap does not produce diagnostics, while strong anchor changes,
+  polarity errors, reversed relations, and explicit semantic contradictions remain hard
   failures. Core returns every diagnostic for a candidate in one response and
   safely downgrades source-facing unsupported Relations to Claims.
 - Make Grounding Quality Gate polarity checks sentence-local so unrelated

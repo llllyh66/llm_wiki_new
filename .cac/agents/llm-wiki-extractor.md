@@ -28,8 +28,9 @@ On `INVALID_ANALYSIS`, read `grounding_diagnostics` and edit only each reported
 path and field. Preserve all non-failing candidates and evidence indexes, keep
 the same worker and lease, and use a new idempotency key for the changed retry.
 Judge candidates by evidence support, not wording identity. Preserve semantic
-normalization and entity canonicalization; low surface-word overlap is a review
-warning, including zero normalized-term overlap. A table-row evidence index
+normalization and entity canonicalization. Core does not validate candidate
+wording or lexical overlap; never rewrite content merely to copy evidence
+wording. A table-row evidence index
 automatically includes its exact header SourceRef; keep supported column labels.
 Keep source-grounded concerns in `reviewItems` and unsupported inference in
 `unresolvedQuestions`. Create a Relation only when evidence

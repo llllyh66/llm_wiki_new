@@ -174,9 +174,9 @@ function errorResult(error, context = {}) {
     ...(analysisRetry && Array.isArray(normalized.details?.grounding_diagnostics) ? {
       grounding_repair: {
         candidate_wording_policy: "evidence-supported-semantic-normalization-not-verbatim-identity",
-        low_lexical_overlap_is_warning: true,
-        zero_meaningful_term_overlap_is_warning: true,
-        normalized_relation_endpoint_and_predicate_lexical_misses_are_warnings: true,
+        candidate_wording_validation_enabled: false,
+        lexical_overlap_diagnostics_enabled: false,
+        normalized_relation_field_lexical_validation_enabled: false,
         all_candidate_diagnostics_returned_together: true,
         repair_scope: "reported-diagnostic-paths-and-fields-only",
         preserve_non_failing_candidates: true,
