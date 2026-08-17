@@ -21,6 +21,10 @@
 - Evidence-catalog quotes are already short, exact, and verbatim. Select their
   indexes without reading the original source file; never reconstruct or
   normalize locator fields yourself.
+- Candidate content need not copy an evidence quote verbatim. A concise
+  paraphrase is acceptable when meaningful terms remain supported, all strong
+  anchors such as identifiers, numbers, dates, and units occur in the selected
+  evidence, and polarity is unchanged.
 - A title-only quote does not support detailed facts from a table. Claims,
   relations, contradictions, and review items must cite quotes containing their
   identifying terms. Split table evidence by row or coherent topic. High reuse
@@ -32,7 +36,8 @@
   is validated independently from the endpoints.
 - Use `supportType=direct` for source wording and `supportType=normalized` only
   for deterministic identifier, inflection, or declared predicate
-  normalization. Put inference in `reviewItems` or `unresolvedQuestions`.
+  normalization. Put source-grounded concerns in `reviewItems` and unsupported
+  inference in `unresolvedQuestions`.
 - Use conservative confidence values between 0 and 1.
 - Put uncertainty in `unresolvedQuestions` instead of guessing.
 - Keep sourced facts separate from inference.

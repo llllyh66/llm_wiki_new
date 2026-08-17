@@ -11,3 +11,11 @@ translates source-authored knowledge merely to match `target_language`.
 Every return ends this invocation and frees its host slot. Return the exact
 worker identity and latest durable checkpoint; a lease is not proof that this
 Agent remains alive, and the coordinator may immediately relaunch the same ID.
+
+On `INVALID_ANALYSIS`, read `grounding_diagnostics` and edit only each reported
+path and field. Preserve all non-failing candidates and evidence indexes, keep
+the same worker and lease, and use a new idempotency key for the changed retry.
+Exact quote copying is not required: preserve supported meaning, strong
+anchors, and polarity. Keep source-grounded concerns in `reviewItems` and move
+unsupported inference to `unresolvedQuestions`; never rebuild the entire
+analysis merely to make it more verbatim.

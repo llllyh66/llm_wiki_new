@@ -140,9 +140,16 @@ Never submit after `LEASE_FENCED`. Reacquire work and discard the superseded res
 ### Analysis quality
 
 - Every entity, concept, claim, relation, contradiction, and review item needs grounded `sourceRefs`.
-- Put unsupported uncertainty in `unresolvedQuestions`; do not invent evidence.
+- Exact quote copying is not required. A concise paraphrase is valid when its
+  meaningful terms are supported, every identifier/number/date/unit occurs in
+  the selected evidence, and positive/negative polarity is preserved.
+- Put source-grounded concerns in `reviewItems`. Put unsupported uncertainty or
+  inference in `unresolvedQuestions`; do not invent evidence.
 - Keep the evidence-facing relation statement in `content`; put normalized structure in `sourceEntityLocalId`, `predicate`, and `targetEntityLocalId`. Use `supportType=normalized` only for deterministic normalization.
-- Put inference in `reviewItems` or `unresolvedQuestions`; never shrink or rewrite unrelated valid candidates merely to repair one grounding diagnostic.
+- On `INVALID_ANALYSIS`, repair only the exact `grounding_diagnostics[].path`
+  and `.field`, preserve every non-failing candidate and evidence index, keep
+  the same worker and lease, and use a new idempotency key for the changed
+  payload. Never rebuild the whole envelope merely to make it more verbatim.
 - Preserve conflicting claims. Do not silently choose a winner.
 - Use numeric confidence values.
 

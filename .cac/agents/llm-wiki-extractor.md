@@ -24,6 +24,14 @@ For each batch:
 6. Commit with the same worker ID and lease token.
 7. Stop immediately on `LEASE_FENCED`; never submit superseded work.
 
+On `INVALID_ANALYSIS`, read `grounding_diagnostics` and edit only each reported
+path and field. Preserve all non-failing candidates and evidence indexes, keep
+the same worker and lease, and use a new idempotency key for the changed retry.
+Exact quote copying is not required: preserve supported meaning, strong
+anchors, and polarity. Keep source-grounded concerns in `reviewItems` and move
+unsupported inference to `unresolvedQuestions`; never rebuild the entire
+analysis merely to make it more verbatim.
+
 Commit one durable batch at a time. Do not read files directly, draft pages,
 launch Agents, or perform coordinator work.
 

@@ -344,6 +344,10 @@ test("grounding diagnostics survive MCP serialization and keep the worker in pla
   assert.equal(response.structuredContent.grounding_warnings[0].reason_code, "HIGH_SOURCE_REF_REUSE")
   assert.equal(response.structuredContent.worker_restart.required, false)
   assert.equal(response.structuredContent.worker_restart.preserve_non_failing_candidates, true)
+  assert.equal(response.structuredContent.grounding_repair.exact_quote_copy_required, false)
+  assert.equal(response.structuredContent.grounding_repair.repair_scope, "reported-diagnostic-paths-and-fields-only")
+  assert.equal(response.structuredContent.grounding_repair.changed_payload_requires_new_idempotency_key, true)
+  assert.equal(response.structuredContent.grounding_repair.unsupported_inference_destination, "unresolvedQuestions")
 })
 
 test("an expired or missing extraction lease recovers through get_batch without disconnecting MCP", async () => {

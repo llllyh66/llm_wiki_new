@@ -365,7 +365,7 @@ function candidateGroundingDiagnostic(collection, path, item, evidenceText, cand
     )
   }
 
-  if (hasGroundingNegation(assertion) !== hasGroundingNegation(evidenceText)) {
+  if (groundingPolarityMismatch(assertion, evidenceText)) {
     return groundingDiagnostic(
       path,
       "POLARITY_MISMATCH",
@@ -502,6 +502,45 @@ function groundingTextSupport(assertion, evidenceText) {
       ? matchedTerms.length === 1
       : matchedTerms.length >= 2 && matchedTerms.length / assertionTerms.length >= 0.5)
   return { supported, matchedTerms, unsupportedTerms }
+}
+
+function groundingPolarityMismatch(assertion, evidenceText) {
+  const assertionNegated = hasGroundingNegation(assertion)
+  const segments = groundingEvidenceSegments(evidenceText)
+  if (segments.length <= 1) return assertionNegated !== hasGroundingNegation(evidenceText)
+
+  const assertionAnchors = groundingAnchors(assertion)
+  const scored = segments.map((segment) => ({
+    segment,
+    score: groundingSegmentScore(assertion, segment),
+    anchorsSupported: assertionAnchors.every((anchor) => groundingAnchors(segment).includes(anchor)),
+  }))
+  const anchored = assertionAnchors.length > 0 && scored.some((entry) => entry.anchorsSupported)
+    ? scored.filter((entry) => entry.anchorsSupported)
+    : scored
+  const bestScore = Math.max(0, ...anchored.map((entry) => entry.score))
+  if (bestScore === 0) return false
+  const bestSegments = anchored.filter((entry) => entry.score === bestScore)
+  return bestSegments.every((entry) => hasGroundingNegation(entry.segment) !== assertionNegated)
+}
+
+function groundingEvidenceSegments(value) {
+  return String(value ?? "")
+    .replace(/\r\n?/gu, "\n")
+    .split(/\n+|(?<=[!?\u3002\uff01\uff1f\uff1b;])\s*|(?<=\.)\s+/u)
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+}
+
+function groundingSegmentScore(assertion, evidenceSegment) {
+  const normalizedAssertion = normalizeGroundingText(assertion)
+  const normalizedEvidence = normalizeGroundingText(evidenceSegment)
+  if (normalizedAssertion.length >= 3 && normalizedEvidence.includes(normalizedAssertion)) return Number.MAX_SAFE_INTEGER
+  const assertionTerms = groundingTerms(assertion)
+  if (assertionTerms.length === 0) return 0
+  const evidenceTerms = new Set(groundingTerms(evidenceSegment))
+  const matched = assertionTerms.filter((term) => evidenceTerms.has(term)).length
+  return matched === 0 ? 0 : (matched * 100) + (matched / assertionTerms.length)
 }
 
 function candidateAssertionText(item) {

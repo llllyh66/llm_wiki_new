@@ -4,6 +4,12 @@
 
 ## [1.0.8] - 2026-08-14
 
+- Make Grounding Quality Gate polarity checks sentence-local so unrelated
+  negation elsewhere in a cited passage does not reject a supported fact.
+  Extractors now receive an explicit diagnostic-local repair contract: concise
+  grounded paraphrases remain valid, non-failing candidates are preserved, and
+  unsupported inference moves to unresolved questions instead of triggering a
+  full-envelope rewrite.
 - Add unified `subagent_recovery` status for Extractor, Drafter, and Writer
   demand. Persisted leases, projections, shards, and receipts are explicitly
   separated from host process liveness, and coordinator contracts now require

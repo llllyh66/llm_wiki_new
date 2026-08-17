@@ -171,6 +171,21 @@ function errorResult(error, context = {}) {
         preserve_non_failing_candidates: true,
       },
     } : {}),
+    ...(analysisRetry && Array.isArray(normalized.details?.grounding_diagnostics) ? {
+      grounding_repair: {
+        exact_quote_copy_required: false,
+        repair_scope: "reported-diagnostic-paths-and-fields-only",
+        preserve_non_failing_candidates: true,
+        preserve_evidence_indexes: true,
+        same_worker_and_lease: true,
+        changed_payload_requires_new_idempotency_key: true,
+        strong_anchors_must_occur_in_selected_evidence: true,
+        preserve_polarity: true,
+        relation_fields_validated_independently: ["endpoints", "direction", "predicate"],
+        source_grounded_concerns_destination: "reviewItems",
+        unsupported_inference_destination: "unresolvedQuestions",
+      },
+    } : {}),
     ...(atomicPageRejection ? {
       atomic_commit_applied: false,
       page_commit_recovery: {

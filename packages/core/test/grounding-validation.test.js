@@ -113,6 +113,49 @@ test("grounding v2 rejects changed identifiers and polarity", () => {
   assert.equal(polarityError.details.grounding_diagnostics[0].reason_code, "POLARITY_MISMATCH")
 })
 
+test("grounding v2 compares polarity with the best matching evidence sentence", () => {
+  assert.doesNotThrow(() => validateGroundingQuality({
+    claims: [{
+      content: "Account B4001 pays 40 USD.",
+      sourceRefs: [sourceRef("The retired account is not active. Account B4001 pays 40 USD.")],
+    }],
+  }))
+
+  const error = groundingError(() => validateGroundingQuality({
+    claims: [{
+      content: "Account B4001 is active.",
+      sourceRefs: [sourceRef("The retired account is active. Account B4001 is not active.")],
+    }],
+  }))
+  assert.equal(error.details.grounding_diagnostics[0].reason_code, "POLARITY_MISMATCH")
+})
+
+test("grounding v2 uses strong anchors to select the relevant polarity sentence", () => {
+  assert.doesNotThrow(() => validateGroundingQuality({
+    claims: [{
+      content: "Account B4002 is active.",
+      sourceRefs: [sourceRef("Account B4001 is not active. Account B4002 is active.")],
+    }],
+  }))
+
+  const error = groundingError(() => validateGroundingQuality({
+    claims: [{
+      content: "Account B4001 is active.",
+      sourceRefs: [sourceRef("Account B4001 is not active. Account B4002 is active.")],
+    }],
+  }))
+  assert.equal(error.details.grounding_diagnostics[0].reason_code, "POLARITY_MISMATCH")
+})
+
+test("grounding v2 ignores unrelated Chinese negation in another evidence sentence", () => {
+  assert.doesNotThrow(() => validateGroundingQuality({
+    claims: [{
+      content: "工作温度应保持在 40 摄氏度。",
+      sourceRefs: [sourceRef("旧版接口不得使用。工作温度应保持在 40 摄氏度。")],
+    }],
+  }))
+})
+
 test("grounding v2 rejects reversed relation endpoints", () => {
   const error = groundingError(() => validateGroundingQuality(analysisWithRelation(
     "The MarketingManager manages MarketingCampaigns.",
